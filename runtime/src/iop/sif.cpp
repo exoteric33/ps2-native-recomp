@@ -135,6 +135,22 @@ void release_iop_rpc_packet(std::uint32_t destination) {
     }
 }
 
+// The RPC end command (cid 0x80000008) frees the call's packet through the client's own packet pointer (hdr.pkt_addr, client + 0), not through
+// the end packet's pkt_addr. This is the rule of PS2SDK's IOP sifcmd library (AFL-2.0, iop/system/sifcmd/src/sifrpc.c: its end handler
+// frees rpkt->cd->hdr.pkt_addr and clears it). The EE's sceSifExecRequest never fills the end packet's pkt_addr for a call (it only sets
+// client and cid, clears rpc_id and rec_id), and Silent Hill 2's EE sends exactly that: pkt_addr 0. Only a bind reply carries the packet
+// address. A pointer that is not a busy ring packet of this very call (the same rpc_id) is left alone.
+void release_client_iop_rpc_packet(std::uint32_t client) {
+    if (!g_iop_rpc_packets) return;
+    const std::uint32_t packet = iop::phys(iop::read32(client));
+    const std::uint32_t end = g_iop_rpc_packets + kIopRpcPacketCount * kIopRpcPacketSize;
+    if (packet < g_iop_rpc_packets || packet >= end || (packet - g_iop_rpc_packets) % kIopRpcPacketSize != 0) return;
+    const std::uint32_t slot = (packet - g_iop_rpc_packets) / kIopRpcPacketSize;
+    if (!g_iop_rpc_packet_busy[slot] || iop::read32(packet + 24u) != iop::read32(client + 4u)) return;
+    g_iop_rpc_packet_busy[slot] = 0;
+    g_iop_rpc_packet_reply[slot] = 0;
+}
+
 std::uint32_t begin_iop_rpc_packet(std::uint32_t client, std::uint32_t reply, std::uint32_t &record_id) {
     const std::uint32_t address = acquire_iop_rpc_packet(reply);
     if (!address) return 0;
@@ -264,7 +280,14 @@ void call(const std::uint8_t *packet) {
     Call c;
     std::memcpy(&c, packet, sizeof c);
     const auto guest = g_guest_servers.find(c.server_data);
+    // A client that bound before this build (a state of version 4 to 6) holds sid ^ kServerXor as its endpoint, also for a server of an
+    // IOP module, and its data went to kRpcRecvAddr (g_data_addr). Such a call is still answered the old way instead of being dropped.
+    const Server *legacy = nullptr;
     if (guest == g_guest_servers.end()) {
+        const auto old = g_servers.find(c.server_data ^ kServerXor);
+        if (old != g_servers.end() && !old->second.hle) legacy = &old->second;
+    }
+    if (guest == g_guest_servers.end() && !legacy) {
         const std::uint32_t sid = c.server_data ^ kServerXor;
         const auto it = g_servers.find(sid);
         if (it == g_servers.end() || !it->second.hle) {
@@ -283,9 +306,13 @@ void call(const std::uint8_t *packet) {
         }
         return;
     }
-    const Server &s = guest->second;
+    const Server &s = legacy ? *legacy : guest->second;
     Request request{c, c.send_size, {}};
-    if (s.buf) {
+    if (s.buf && legacy) {
+        const std::uint32_t size = (c.send_size + 15u) & ~15u;
+        const std::uint32_t from = g_data_addr & (kRamSize - 1);
+        request.data.assign(g_ram + from, g_ram + from + std::min(size, kRamSize - from));
+    } else if (s.buf) {
         if (c.send_size > std::numeric_limits<std::uint32_t>::max() - 15u) {
             std::fprintf(stderr, "[sif] reject RPC fn %u: send size 0x%08X overflows alignment\n", c.rpc_number, c.send_size);
             return;
@@ -370,6 +397,7 @@ void command(std::uint32_t src, std::uint32_t size) {
         std::uint32_t words[12];
         std::memcpy(words, packet, sizeof words);
         const std::uint32_t client = words[7], cmd = words[8];
+        release_client_iop_rpc_packet(client);
         release_iop_rpc_packet(words[5]);
         if (cmd == 0x80000009u) {
             iop::write32(client + 36, words[9]);
@@ -444,13 +472,16 @@ void def(const char *library, std::uint32_t index, const char *name, std::functi
 // Hands a request to its server: the data into the server's buffer, then the server's function is called with `ret` as its return address.
 void start_request(iop::Cpu &c, iop::kernel::Thread &t, const Request &request, std::uint32_t ret) {
     const std::uint32_t server = request.call.server_data;
-    const auto endpoint = g_guest_servers.find(server);
-    if (endpoint == g_guest_servers.end()) {
+    const Server *found = nullptr;
+    if (const auto endpoint = g_guest_servers.find(server); endpoint != g_guest_servers.end()) found = &endpoint->second;
+    // A call queued in a state of version 4 to 6 has sid ^ kServerXor as its endpoint (see call()).
+    else if (const auto old = g_servers.find(server ^ kServerXor); old != g_servers.end() && !old->second.hle) found = &old->second;
+    if (!found) {
         std::fprintf(stderr, "[sif] queued call %u lost endpoint 0x%08X\n", request.call.rpc_number, server);
         reply_call(request.call);
         return;
     }
-    const Server &s = endpoint->second;
+    const Server &s = *found;
     if (s.buf && !request.data.empty()) {
         iop::watch_copy("RPC data", s.buf, 0, static_cast<std::uint32_t>(request.data.size()), 0);
         std::memcpy(iop::ram_ptr(s.buf), request.data.data(), request.data.size());
@@ -1233,7 +1264,7 @@ void state(ps2::state::Stream &s) {
     s.pod(g_sreg);
     s.map(g_iop_clients);
     s.pod(g_iop_rpc_id);
-    if (s.version() >= 8) {
+    if (s.version() >= 7) {
         s.pod(g_iop_rpc_packets);
         s.pod(g_iop_rpc_next_packet);
         s.pod(g_iop_rpc_packet_busy);

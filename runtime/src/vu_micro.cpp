@@ -14,7 +14,9 @@
 
 #include "ps2/state.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -844,6 +846,64 @@ void interpret(int unit, std::uint32_t pc) {
     g_chaining = false;
 }
 
+// PS2_VU_TIME=1: the time stamp counter ticks spent in each compiled vector program, printed when the runner ends (a headless
+// run of N frames from a state: the same work every time, so two builds can be compared program by program).
+std::uint64_t time_stamp() {
+#if defined(__x86_64__) || defined(__i386__)
+    return __builtin_ia32_rdtsc();
+#else
+    return static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
+
+struct TimeRow {
+    std::uint64_t calls = 0, ticks = 0;
+};
+
+std::unordered_map<std::uint64_t, TimeRow> &time_rows() {
+    static std::unordered_map<std::uint64_t, TimeRow> rows;
+    return rows;
+}
+
+std::chrono::steady_clock::time_point &time_start() {
+    static std::chrono::steady_clock::time_point start;
+    return start;
+}
+std::uint64_t &time_first_stamp() {
+    static std::uint64_t v = 0;
+    return v;
+}
+std::uint64_t &time_last_stamp() {
+    static std::uint64_t v = 0;
+    return v;
+}
+
+void time_report() {
+    time_last_stamp() = time_stamp();
+    std::uint64_t calls = 0, ticks = 0;
+    std::vector<std::pair<std::uint64_t, TimeRow>> sorted(time_rows().begin(), time_rows().end());
+    for (const auto &[k, row] : sorted) {
+        calls += row.calls;
+        ticks += row.ticks;
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.second.ticks > b.second.ticks; });
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - time_start()).count();
+    std::fprintf(stderr, "[vu-time] %zu programs, %llu calls, %llu ticks in compiled programs (%.3f ticks per nanosecond of run time)\n", sorted.size(), static_cast<unsigned long long>(calls),
+                 static_cast<unsigned long long>(ticks), static_cast<double>(time_first_stamp()) > 0 ? static_cast<double>(time_last_stamp() - time_first_stamp()) / (seconds * 1e9) : 0.0);
+    for (std::size_t i = 0; i < sorted.size() && i < 12; ++i)
+        std::fprintf(stderr, "[vu-time] %016llX calls %llu ticks %llu (%llu per call)\n", static_cast<unsigned long long>(sorted[i].first),
+                     static_cast<unsigned long long>(sorted[i].second.calls), static_cast<unsigned long long>(sorted[i].second.ticks),
+                     static_cast<unsigned long long>(sorted[i].second.ticks / std::max<std::uint64_t>(1, sorted[i].second.calls)));
+}
+
+void time_note(std::uint64_t key, std::uint64_t ticks) {
+    static const bool registered = (std::atexit(time_report), time_start() = std::chrono::steady_clock::now(), time_first_stamp() = time_stamp(), true);
+    (void)registered;
+    TimeRow &row = time_rows()[key];
+    ++row.calls;
+    row.ticks += ticks;
+}
+
 void run_entry(int unit, std::uint32_t pc) {
     if (unit == 1) g_trace_vu1_pc = pc;
     if (unit == 1) { static const bool log_runs = std::getenv("PS2_TRACE_VU1RUN") != nullptr; if (log_runs) std::fprintf(stderr, "[vu1-run] pc %X\n", pc); }
@@ -908,6 +968,13 @@ void run_entry(int unit, std::uint32_t pc) {
                 g_vu1 = after;
                 std::memcpy(g_vu1_mem, run_mem, sizeof g_vu1_mem);
                 if (escape >= 0) interpret(1, static_cast<std::uint32_t>(escape));
+                return;
+            }
+            static const bool timed = std::getenv("PS2_VU_TIME") != nullptr;
+            if (timed) {
+                const std::uint64_t t0 = time_stamp();
+                fn(g_vu1, g_vu1_mem);
+                time_note(g_entries[(pc & 16383u) >> 3].key, time_stamp() - t0);
                 return;
             }
             if (jit && jit != fn && ++sampled % 32 == 0) check_jit(fn, jit);

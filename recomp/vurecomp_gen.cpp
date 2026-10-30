@@ -186,12 +186,20 @@ Upper upper(std::uint32_t hi, bool flags_live) {
         }
         const std::string ns = operand(fs);
         if (kind == Madd || kind == Msub) u.shadow_reads.push_back(kAcc);
+        // vf00 is the constant (0, 0, 0, 1), and its broadcast lanes are 0 or 1. Both operands have been through vfix, so a sum, difference
+        // or product with such a constant needs no vfix of its own: x +- 0 is x (or +0 for -0), x +- 1 stays clear of the largest
+        // float (it rounds back to it) and of the denormals (a sum with 1 is 0 or at least 2^-24 away from it), x * 1 is x and x * 0 is
+        // a signed zero. Programs are full of ADD/MULA/MADD with vf00 (the matrix
+        // translation row, the w lane), which this makes as cheap as the float operation.
+        const auto vf0_operand = [&](bool second) { return second ? ((src == Vec || src == Bc) && !ft) : !fs; };
+        // (vf00 as one of the two registers makes every lane constant, so the lanes written do not matter here.)
+        const bool constant_lanes = vf0_operand(false) || vf0_operand(true);
         switch (kind) {
-        case Add: u.pre += std::format("const v4u uv = vaddn({}, {}); ", ns, nb); break;
-        case Sub: u.pre += std::format("const v4u uv = vsubn({}, {}); ", ns, nb); break;
-        case Mul: u.pre += std::format("const v4u uv = vmuln({}, {}); ", ns, nb); break;
-        case Madd: u.pre += std::format("const v4u uv = vmaddn(nacc, {}, {}); ", ns, nb); break;
-        default: u.pre += std::format("const v4u uv = vmsubn(nacc, {}, {}); ", ns, nb); break;
+        case Add: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} + (v4f){}); ", ns, nb) : std::format("const v4u uv = vaddn({}, {}); ", ns, nb); break;
+        case Sub: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} - (v4f){}); ", ns, nb) : std::format("const v4u uv = vsubn({}, {}); ", ns, nb); break;
+        case Mul: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} * (v4f){}); ", ns, nb) : std::format("const v4u uv = vmuln({}, {}); ", ns, nb); break;
+        case Madd: u.pre += constant_lanes ? std::format("const v4u uv = vaddn(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmaddn(nacc, {}, {}); ", ns, nb); break;
+        default: u.pre += constant_lanes ? std::format("const v4u uv = vsubn(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmsubn(nacc, {}, {}); ", ns, nb); break;
         }
     }
     if (vector) {
@@ -662,7 +670,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp).
-const char *const kGeneratorVersion = "vurecomp 1";
+const char *const kGeneratorVersion = "vurecomp 2";
 
 Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
     std::vector<Program> programs;

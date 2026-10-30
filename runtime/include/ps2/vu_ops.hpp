@@ -4,7 +4,9 @@
 #include "fpu.hpp"
 #include "vu.hpp"
 
-#if defined(__SSE2__)
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+#elif defined(__SSE2__)
 #include <emmintrin.h>
 #endif
 
@@ -575,7 +577,20 @@ PS2_VU_INLINE v4u vfix_generic(v4u x) {
     const v4i normal = (v4f)clamped >= (v4f)(v4i){0x00800000, 0x00800000, 0x00800000, 0x00800000};
     return (x & 0x80000000u) | (v4u)(clamped & normal);
 }
-#if defined(__SSE2__)
+#if defined(__SSE4_1__)
+// The same on every one of the 2^32 inputs (checked one by one against vfix_generic), as integer operations only. The magnitude is
+// cut at the largest float with an unsigned minimum (an exponent of 255, NaNs included, ends up at 0x7F7FFFFF), everything below the
+// smallest normal number is zeroed, and the sign is put back. Compared with the float version below (MINPS and CMPPS on the
+// magnitude) it has the same six instructions, but the chain from input to output is five cycles long instead of eleven: the
+// vector programs are one long chain of such steps (every add and multiply ends in one), which is where their time goes.
+PS2_VU_INLINE v4u vfix(v4u x) {
+    const __m128i xi = (__m128i)x;
+    const __m128i magnitude = _mm_and_si128(xi, _mm_set1_epi32(0x7FFFFFFF));
+    const __m128i clamped = _mm_min_epu32(magnitude, _mm_set1_epi32(0x7F7FFFFF));
+    const __m128i normal = _mm_cmpgt_epi32(clamped, _mm_set1_epi32(0x007FFFFF));
+    return (v4u)_mm_or_si128(_mm_and_si128(xi, _mm_set1_epi32(static_cast<int>(0x80000000u))), _mm_and_si128(clamped, normal));
+}
+#elif defined(__SSE2__)
 // The same on every one of the 2^32 inputs (checked one by one against vfix_generic), in fewer instructions: the SSE2 integer
 // minimum only exists for 16-bit lanes and takes four instructions for 32 bits, but MINPS on the magnitude read as a float does the
 // cut for all the cases. It hands back its second operand when the first is a NaN (an exponent of 255 with a mantissa) and the

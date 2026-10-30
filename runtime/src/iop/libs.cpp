@@ -652,6 +652,21 @@ void install_thmsgbx() {
         it->second.messages.pop_front();
         c.r[2] = 0;
     });
+    auto refer = [](Cpu &c) {
+        const auto it = g_mbxs.find(static_cast<int>(arg(c, 0)));
+        if (it == g_mbxs.end()) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownMbx); return; }
+        const std::uint32_t status = arg(c, 1);
+        write32(status + 0u, it->second.attr);
+        write32(status + 4u, it->second.option);
+        write32(status + 8u, static_cast<std::uint32_t>(it->second.waiters.size()));
+        write32(status + 12u, static_cast<std::uint32_t>(it->second.messages.size()));
+        write32(status + 16u, it->second.messages.empty() ? 0u : it->second.messages.front());
+        write32(status + 20u, 0u);
+        write32(status + 24u, 0u);
+        c.r[2] = 0;
+    };
+    def("thmsgbx", 11, "ReferMbxStatus", refer);
+    def("thmsgbx", 12, "iReferMbxStatus", refer);
 }
 
 void install_thfpool() {

@@ -334,20 +334,24 @@ void stats() {
     }
 }
 
-void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
-    if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);
+// `count` words, not quadwords: the 64 bits of a DMA tag that a chain with the tag transfer enabled sends ahead of its data are two
+// words, and a command waiting for data (an UNPACK that spans several tags) takes exactly those two.
+void transfer_words(int unit, const std::uint32_t *words, std::uint32_t count) {
+    if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, count, 0, words, count * 4);
     Unit &u = state(unit);
     if (u.pending.empty() && !u.stalled) {
-        const auto *words = reinterpret_cast<const std::uint32_t *>(data);
-        const std::size_t count = static_cast<std::size_t>(qwc) * 4;
         const std::size_t pos = run(unit, words, count);
         if (pos < count) u.pending.assign(words + pos, words + count);
         return;
     }
     const std::size_t old = u.pending.size();
-    u.pending.resize(old + static_cast<std::size_t>(qwc) * 4);
-    std::memcpy(u.pending.data() + old, data, static_cast<std::size_t>(qwc) * 16);
+    u.pending.resize(old + static_cast<std::size_t>(count));
+    std::memcpy(u.pending.data() + old, words, static_cast<std::size_t>(count) * 4);
     process(unit);
+}
+
+void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
+    transfer_words(unit, reinterpret_cast<const std::uint32_t *>(data), qwc * 4);
 }
 
 // The DMA keeps sending into a stalled unit until the unit's FIFO is full.

@@ -105,6 +105,11 @@ inline std::vector<Case> cases() {
     const std::vector<Pair> join = {{branch(0x28, 1, 0, 0, 24), kUnop}, kNop, W, C, A, kNop, G};
     c.push_back({"a join: the path with an ADD in flight waits", finish(join), 1, 2, 0xA95, false});
     c.push_back({"a join: the path without does not", finish(join), 0, 2, 0x2A, false});
+    // Tekken 5: LOI 3 and MAXi vf3, vf0, I in one pair; the denormal 3 must come out as it went in (MTIR vi2, vf3.x reads 3).
+    const Pair L3 = {3u, kUnop | kLoi}, M = {kLnop, fmac(0x1D, 15, 3, 0, 0)}, T = {lower_special(0x3C, 0, 2, 3), kUnop};
+    c.push_back({"MAXi keeps a denormal operand", finish({L3, M, kNop, T}), 0, 2, 3, true});
+    const Pair N = {kLnop, fmac(0x1F, 15, 3, 0, 0)};
+    c.push_back({"MINIi keeps a denormal operand (vf0.x = 0 against 3: the smaller is 0)", finish({L3, N, kNop, T}), 0, 2, 0, true});
     return c;
 }
 
@@ -651,7 +656,7 @@ with tempfile.TemporaryDirectory(prefix='vu-codegen-') as tmp:
     tmp = pathlib.Path(tmp)
     (tmp / 'generator.cpp').write_text('#define RANDOM_PROGRAMS %d\n' % RANDOM_PROGRAMS + GENERATOR)
     (tmp / 'cases.h').write_text(CASES_H)
-    (tmp / 'interp.cpp').write_text('#define RANDOM_PROGRAMS %d\n' % RANDOM_PROGRAMS + INTERP)
+    (tmp / 'interp.cpp').write_text('#define RANDOM_PROGRAMS %d\n#include <atomic>\n#include <vector>\n#include "ps2/vu_live.hpp"\nnamespace ps2 { std::uint64_t frame_count() { return 0; } bool halted() { return false; } namespace vif { std::uint32_t itop(int) { return 0; } } namespace vu::live { std::atomic<bool> g_ready{false}; bool active() { return false; } void note_call(std::uint64_t) {} std::vector<Program> take() { return {}; } void unknown(std::uint64_t, std::uint32_t, const std::uint8_t *) {} } }\n' % RANDOM_PROGRAMS + INTERP)
     base = [CXX, '-std=c++20', '-I.', '-Iruntime/include', f'-I{tmp}']
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
         interp = pool.submit(compile_, *base, '-O2' if os.environ.get('VU_BENCH') else '-O1', '-Iruntime/src', str(tmp / 'interp.cpp'), 'runtime/src/vu_micro.cpp', 'runtime/src/vu_jit_web.cpp', '-o', str(tmp / 'interp'))

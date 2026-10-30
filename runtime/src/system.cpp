@@ -805,7 +805,7 @@ void run_vu_thread() {
         core_sample(Who::Vu);
         while (in.peek(h, payload)) {
             switch (h.type) {
-            case gs::queue::kVif1: vif::transfer(1, payload, h.arg0); break;
+            case gs::queue::kVif1: vif::transfer_words(1, reinterpret_cast<const std::uint32_t *>(payload), h.arg0); break;
             case gs::queue::kVif1Write: vif::write(1, h.arg0, h.arg1); break;
             case gs::queue::kGif: gif::transfer(static_cast<int>(h.arg0), payload, h.arg1); break;
             case gs::queue::kPath3Idle: gif::vif1_idle(); break;

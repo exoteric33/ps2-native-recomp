@@ -8,6 +8,7 @@
 #include <deque>
 #include <fstream>
 #include <set>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -26,10 +27,16 @@ constexpr std::uint32_t kModuleMagic = 0x32524E53u;
 // The "xff2" objects of Shadow of the Colossus: same search, the size sits at 0x14
 constexpr std::uint32_t kXffMagic = 0x32666678u;
 
+// The soft checks of one module, by entry offset (ee_live.hpp, SoftChecks).
+struct SoftIndex {
+    std::unordered_map<std::uint32_t, const std::uint32_t *> groups;   // entry offset -> {entry offset, n, n * {offset, word}}
+};
+
 struct Instance {
     std::uint32_t base;
     const ModuleInfo *module;
     int rank;
+    const SoftIndex *soft = nullptr;
 };
 
 // Every module there is: the ones the build was translated with and the ones translated while the game ran (ee_live.cpp, added by
@@ -38,6 +45,8 @@ std::deque<ModuleInfo> g_modules;
 // How good each module's code is, in step with g_modules: of two modules of the same content that both have an entry, the higher rank
 // runs (ee_live.cpp translates a window quickly first, with little optimisation, and again with more in the background).
 std::deque<int> g_ranks;
+// The soft checks of each module, in step with g_modules (empty for a module that has none).
+std::deque<SoftIndex> g_soft;
 int g_max_rank = 0;
 std::uint32_t g_module_span = 0;
 std::vector<Instance> g_instances;
@@ -68,10 +77,10 @@ const Instance *in_place(const Instance &i) {
 
 // Adds an instance, keeping g_instances in order of rank (higher first, the earlier one first among equals): the first one in place that
 // has an entry is the one that runs.
-Instance *add_instance(std::uint32_t base, const ModuleInfo *m, int rank) {
+Instance *add_instance(std::uint32_t base, const ModuleInfo *m, int rank, const SoftIndex *soft = nullptr) {
     auto at = g_instances.begin();
     while (at != g_instances.end() && at->rank >= rank) ++at;
-    return &*g_instances.insert(at, Instance{base, m, rank});
+    return &*g_instances.insert(at, Instance{base, m, rank, soft && !soft->groups.empty() ? soft : nullptr});
 }
 
 const UnitInfo *module_unit(const ModuleInfo &m, std::uint32_t offset) {
@@ -83,7 +92,16 @@ const UnitInfo *module_unit(const ModuleInfo &m, std::uint32_t offset) {
 // The translated code of a module at pc: its unit and the entry number there, zero when the module does not have that entry.
 std::uint16_t module_entry(const Instance &i, std::uint32_t pc, const UnitInfo *&unit) {
     unit = module_unit(*i.module, pc - i.base);
-    return unit ? unit->entries[(pc - i.base - unit->base) >> 2] : 0;
+    const std::uint16_t entry = unit ? unit->entries[(pc - i.base - unit->base) >> 2] : 0;
+    if (entry && i.soft) {
+        // An entry that only a guess found: it is served while its own first words are what was translated.
+        if (const auto at = i.soft->groups.find(pc - i.base); at != i.soft->groups.end()) {
+            const std::uint32_t *group = at->second;
+            for (std::uint32_t k = 0; k < group[1]; ++k)
+                if (ld32(i.base + group[2 + 2 * k]) != group[3 + 2 * k]) return 0;
+        }
+    }
+    return entry;
 }
 
 // The module that serves a window or relocatable module at pc. With `needs_entry` the first module in place that has code for pc
@@ -113,7 +131,7 @@ const Instance *instance_for(std::uint32_t pc, bool needs_entry = false) {
             if (g_ranks[k] != rank) continue;
             if (m.fixed_base && pc - m.fixed_base < m.size && loaded_at(m, m.fixed_base)) {
                 if (std::any_of(g_instances.begin(), g_instances.end(), [&](const Instance &i) { return i.module == &m; })) continue;
-                const Instance *added = add_instance(m.fixed_base, &m, rank);
+                const Instance *added = add_instance(m.fixed_base, &m, rank, &g_soft[k]);
                 if (!needs_entry || module_entry(*added, pc, unit)) return added;
                 serving = true;
             }
@@ -168,6 +186,7 @@ void register_units(const UnitInfo *units, std::uint32_t count) {
 void register_modules(const ModuleInfo *modules, std::uint32_t count) {
     g_modules.assign(modules, modules + count);
     g_ranks.assign(count, 0);
+    g_soft.assign(count, SoftIndex{});
     g_max_rank = 0;
     g_instances.clear();
     g_module_span = 0;
@@ -176,10 +195,14 @@ void register_modules(const ModuleInfo *modules, std::uint32_t count) {
 
 void add_modules(const ModuleInfo *modules, std::uint32_t count) { add_modules_ranked(modules, count, 0); }
 
-void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank) {
+void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank, const SoftChecks *soft) {
     for (std::uint32_t k = 0; k < count; ++k) {
         g_modules.push_back(modules[k]);
         g_ranks.push_back(rank);
+        SoftIndex &index = g_soft.emplace_back();
+        if (soft && soft[k].words)
+            for (std::uint32_t at = 0; at + 2 <= soft[k].count && at + 2 + 2 * soft[k].words[at + 1] <= soft[k].count; at += 2 + 2 * soft[k].words[at + 1])
+                index.groups.emplace(soft[k].words[at], soft[k].words + at);
         g_module_span = std::max(g_module_span, modules[k].size);
     }
     // A module of a better rank than the ones in use must be looked at first: the instances made so far are made again when they are
@@ -196,6 +219,27 @@ bool window_covered(std::uint32_t base, std::uint32_t size) {
     for (const ModuleInfo &m : g_modules)
         if (m.fixed_base && base >= m.fixed_base && base - m.fixed_base <= m.size && size <= m.size - (base - m.fixed_base) && loaded_at(m, m.fixed_base)) return true;
     return false;
+}
+
+std::string module_report(std::uint32_t pc) {
+    std::size_t covering = 0, changed = 0;
+    std::string example;
+    for (const ModuleInfo &m : g_modules) {
+        if (!m.fixed_base || pc - m.fixed_base >= m.size) continue;
+        ++covering;
+        std::uint32_t bad = 0, first = 0;
+        for (std::uint32_t k = 0; k < m.check_count; ++k)
+            if (ld32(m.fixed_base + m.checks[2 * k]) != m.checks[2 * k + 1] && !bad++) first = m.checks[2 * k];
+        if (!bad) continue;
+        if (!changed++) {
+            char text[160];
+            std::snprintf(text, sizeof text, "; first of them: %s, %u of %u checks differ, the first at 0x%08X", m.name, bad, m.check_count, m.fixed_base + first);
+            example = text;
+        }
+    }
+    char text[96];
+    std::snprintf(text, sizeof text, "%zu modules cover it, %zu of them are not in place", covering, changed);
+    return text + example;
 }
 
 bool has_code(std::uint32_t pc) {

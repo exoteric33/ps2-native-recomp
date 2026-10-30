@@ -131,10 +131,18 @@ inline std::uint32_t min(std::uint32_t a, std::uint32_t b) {
     return (x < 0 && y < 0) ? (x > y ? a : b) : (x < y ? a : b);
 }
 
-// The vector units' MAX and MINI keep the key() order: emulators disagree on their -0 behaviour and no hardware test
-// covers it, and the games that already run were brought up with this.
-inline std::uint32_t vu_max(std::uint32_t a, std::uint32_t b) { return key(a) >= key(b) ? a : b; }
-inline std::uint32_t vu_min(std::uint32_t a, std::uint32_t b) { return key(a) <= key(b) ? a : b; }
+// The vector units' MAX and MINI keep the key() order for the zeros: emulators disagree on their -0 behaviour and no hardware test
+// covers it, and the games that already run were brought up with this (-0 and +0 are equal, the first operand wins).
+// Denormals are NOT flushed in this order: they compare by their bits like any other number and come out as they went in. Tekken 5
+// builds its GIF tags with `MAXi vf1, vf00, I` after a LOI of a small integer (3, 14: denormals as floats), and a flush to zero
+// there made every tag empty (a fight drawn as colour noise). Order of the result, not of the arithmetic: ADD, MUL and the like
+// still flush their inputs.
+inline std::int32_t order_key(std::uint32_t x) {
+    const auto magnitude = static_cast<std::int32_t>(x & kAbs);
+    return (x & kSign) ? -magnitude : magnitude;
+}
+inline std::uint32_t vu_max(std::uint32_t a, std::uint32_t b) { return order_key(a) >= order_key(b) ? a : b; }
+inline std::uint32_t vu_min(std::uint32_t a, std::uint32_t b) { return order_key(a) <= order_key(b) ? a : b; }
 
 inline std::uint32_t to_fixed(std::uint32_t x, int fraction) {
     const int e = static_cast<int>(exponent(x)) + fraction;

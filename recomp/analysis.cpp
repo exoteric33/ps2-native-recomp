@@ -257,6 +257,8 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
                 for (std::size_t offset = 0; offset + 4 <= segment.bytes.size(); offset += 4)
                     candidates.push_back(*image.word(segment.address + static_cast<std::uint32_t>(offset)));
         }
+        for (const std::uint32_t pointed : search.candidates)
+            if (image.word(pointed).value_or(0)) candidates.push_back(pointed);   // a pointer at zeros is no function
         if (search.after_return) {
             const std::vector<std::uint32_t> leaves = return_starts(image, text_begin, text_end);
             candidates.insert(candidates.end(), leaves.begin(), leaves.end());
@@ -270,6 +272,7 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
             if (p.entries.count(target) || p.rejected.count(target)) continue;
             if (p.is_code(target) || explorer.tentative(target)) {
                 p.entries.insert(target);
+                p.weak.insert(target);
                 if (!p.is_code(target)) explorer.strong(target, false);
                 ++added;
             } else {
@@ -279,6 +282,7 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
         explorer.drain();
         if (!added) break;
     }
+    for (const std::uint32_t function : p.functions) p.weak.erase(function);
     return p;
 }
 

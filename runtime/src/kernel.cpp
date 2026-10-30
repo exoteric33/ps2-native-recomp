@@ -517,8 +517,8 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         return false;
     };
     if (g_options.trace_syscalls && trace_shown())
-        std::fprintf(stderr, "[sys] f%llu %s(0x%02X) %08X %08X %08X %08X from 0x%08X thread %d\n",
-                     static_cast<unsigned long long>(frame_count()), syscall_name(n), n, arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), pc, g_current);
+        std::fprintf(stderr, "[sys] f%llu %s(0x%02X) %08X %08X %08X %08X from 0x%08X ra 0x%08X thread %d\n",
+                     static_cast<unsigned long long>(frame_count()), syscall_name(n), n, arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), pc, c.r[31].w[0], g_current);
     switch (n) {
     case 0x02: hw::gs_set_crt(arg(c, 0), arg(c, 1), arg(c, 2)); ret(c, 0); break;
     case 0x04: halt("Exit"); break;

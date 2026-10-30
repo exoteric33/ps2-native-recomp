@@ -605,11 +605,10 @@ PS2_VU_INLINE v4u vsub(v4u a, v4u b) { return vsubn(vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vmul(v4u a, v4u b) { return vmuln(vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vmadd(v4u acc, v4u a, v4u b) { return vmaddn(vfix(acc), vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vmsub(v4u acc, v4u a, v4u b) { return vmsubn(vfix(acc), vfix(a), vfix(b)); }
+// The order of MAX and MINI (fp::order_key): sign and magnitude, -0 equal to +0, denormals not flushed (they must come out as they went in).
 PS2_VU_INLINE v4i vkey(v4u x) {
-    const v4u zero = (v4u)((x & 0x7F800000u) == 0u);
-    const v4u f = (x & ~zero) | (x & 0x80000000u & zero);
-    const v4i m = (v4i)(f & 0x7FFFFFFFu);
-    const v4i negative = (v4i)((f & 0x80000000u) != 0u);
+    const v4i m = (v4i)(x & 0x7FFFFFFFu);
+    const v4i negative = (v4i)((x & 0x80000000u) != 0u);
     return (m & ~negative) | (-m & negative);
 }
 PS2_VU_INLINE v4u vmax(v4u a, v4u b) {

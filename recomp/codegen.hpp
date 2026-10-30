@@ -48,6 +48,10 @@ struct Translation {
     // occupies.
     bool fixed_module{};
     std::uint32_t fixed_base{};
+    // Live libraries only: checks of the entries that only a guess made (Program::weak). They do not decide whether the module is in
+    // place; the runner looks at the ones of an entry when that entry is called, and a changed one only takes that entry out. Groups of
+    // {entry offset, n, n * {offset, word}} (runtime/src/dispatch.cpp, ps2_ee_live_soft).
+    std::vector<std::uint32_t> soft;
 };
 
 void generate(const std::vector<Translation> &translations, const CodegenOptions &options);

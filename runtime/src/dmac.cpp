@@ -270,10 +270,12 @@ void run_chain(int ch) {
         const std::uint32_t addr = static_cast<std::uint32_t>(tag >> 32) & 0x7FFFFFF0u;
         const std::uint32_t addr_full = addr | (static_cast<std::uint32_t>(tag >> 63) << 31);
         if (tte && (ch == 0 || ch == 1)) {
-            std::uint8_t q[16];
-            std::memcpy(q, tagp, 16);
-            std::memset(q, 0, 8);
-            vif::transfer(ch, q, 1);
+            // The upper 64 bits of the tag go to the unit as two words, nothing else. (Padding them to a quadword with two zero words
+            // looked harmless, since a zero word is a NOP, but a command still waiting for its data takes those words as data:
+            // Tekken 5 sends an UNPACK across a tag, and the two extra words pushed its last two data words out as commands.)
+            std::uint32_t q[2];
+            std::memcpy(q, tagp + 8, 8);
+            vif::transfer_words(ch, q, 2);
         } else if (tte && ch == 9) {
             // toSPR with the tag transfer enabled copies the whole 16-byte tag into the scratchpad ahead of its data (the game
             // reads its list at SADR+16). The tag goes to the SPR address the transfer is at, which then moves on by one quadword.

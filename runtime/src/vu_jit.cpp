@@ -540,6 +540,21 @@ private:
         c_.simd(kVBitselect);
     }
 
+    // The order key of MAX and MINI (the same as `vkey` in vu_ops.hpp): sign and magnitude, -0 equal to +0, denormals NOT flushed
+    // (Tekken 5 builds its GIF tags with `MAXi vf1, vf00, I` after a LOI of a small integer, which has to come out unchanged).
+    void vorder_of(std::uint32_t local) {
+        c_.get(local);
+        c_.vsplatc(0x7FFFFFFFu);
+        c_.simd(kVAnd);
+        c_.tee(kV5);
+        c_.simd(kI32x4Neg);
+        c_.get(kV5);
+        c_.get(local);
+        c_.vsplatc(0);
+        c_.simd(kI32x4LtS);
+        c_.simd(kVBitselect);
+    }
+
     void raw_vec(unsigned reg) {
         if (!reg) {
             c_.vconst(0, 0, 0, kOne);
@@ -1156,8 +1171,8 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
     c_.set(kV3);
     c_.get(kV2);
     c_.get(kV3);
-    vkey_of(kV2);
-    vkey_of(kV3);
+    vorder_of(kV2);
+    vorder_of(kV3);
     c_.simd(u.kind == Max ? kI32x4GeS : kI32x4LeS);
     c_.simd(kVBitselect);
     c_.set(kUv);

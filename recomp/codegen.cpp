@@ -976,7 +976,7 @@ private:
 
 void generate(const std::vector<Translation> &translations, const CodegenOptions &options) {
     fs::create_directories(ps2::os::path(options.output));
-    std::ostringstream header, table, modules;
+    std::ostringstream header, table, modules, soft_cases;
     // A live library (options.live_stamp, runtime/src/ee_live.cpp) is compiled against the live variant of the runtime headers: the
     // runner's functions are reached through a table (ps2/ee_live_abi.hpp), defined once in table.cpp.
     const bool live = options.live_stamp != 0;
@@ -1005,6 +1005,12 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
         for (const auto &[at, value] : t.checks) table << std::format("{}, {}, ", hex(at), hex(value));
         table << "};\n\n";
         modules << std::format("    {{\"{}\", {}, {}, {}checks, {}u, {}units, {}u}},\n", t.name, hex(t.fixed_base), hex(t.size), t.prefix, t.checks.size(), t.prefix, rows.size());
+        if (live && !t.soft.empty()) {
+            table << "const std::uint32_t " << t.prefix << "soft[] = {";
+            for (const std::uint32_t word : t.soft) table << hex(word) << ", ";
+            table << "};\n\n";
+            soft_cases << std::format("    case {}u: *count = {}u; return gen::{}soft;\n", module_count, t.soft.size(), t.prefix);
+        }
         ++module_count;
     }
     header << "}\n";
@@ -1023,7 +1029,9 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
                  "    ps2::g_watch_on = host->watch_on;\n"
                  "    ps2::g_watch_base = host->watch_base;\n"
                  "    ps2::g_watch_end = host->watch_end;\n";
-        table << "    *count = " << module_count << "u;\n    return gen::kModules;\n}\n";
+        table << "    *count = " << module_count << "u;\n    return gen::kModules;\n}\n\n";
+        table << "PS2_LIVE_EXPORT const std::uint32_t *ps2_ee_live_soft(std::uint32_t module, std::uint32_t *count) {\n    *count = 0;\n    switch (module) {\n"
+              << soft_cases.str() << "    default: break;\n    }\n    return nullptr;\n}\n";
     } else {
         table << "}\n\nvoid register_generated_code() { ps2::register_units(gen::kUnits, " << main_units << "u);";
         if (module_count) table << " ps2::register_modules(gen::kModules, " << module_count << "u);";

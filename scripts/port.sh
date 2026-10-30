@@ -219,6 +219,8 @@ echo "== [5/6] vector unit programs"
 if compgen -G "$game/vu1/*.bin" > /dev/null; then
   "$tools/vurecomp" "$game/vu1" "$generated" | tail -1
 else
+  # vurecomp replaces the old files itself; with nothing recorded it never runs, so programs of an earlier run would stay in the build.
+  rm -f "$generated"/vu1_*.cpp
   echo "none recorded, the native runner interprets them and the page compiles them on the fly"
 fi
 

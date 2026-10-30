@@ -9,29 +9,57 @@ console a little differently, so many still stop at a black screen, crash, or pl
 When a game doesn't work, please send me a report (see [*Playtesters wanted*](#playtesters-wanted)): every report shows
 me what to fix next, and one fix often helps several games at once.
 
-The game's main-CPU code is translated once into C++ (static recompilation) and compiled into a normal program, so there is
-no emulator for the main CPU. The rest of the console (graphics chip, vector units, sound, disc, controller, memory card)
-is reimplemented by a runtime that draws with WebGPU (wgpu-native, on Vulkan or Direct3D 12).
+## What it does
 
-This project builds on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri (MIT), which does the
-same on Linux, macOS and in the browser, and whose README explains how the recompiler and the runtime work. The recompiler
-and the runtime started as his. What I added:
+- **Turns your disc into a PC game:** in the app, choose the disc image, press *Build*, then *Play*. You get a program of
+  its own with a desktop shortcut. The app downloads its own build tools, so nothing has to be installed.
+- **Windows and Linux**, drawing through Direct3D 12 or Vulkan.
+- **Keyboard and mouse or a game controller**, with a key card (F1) and keys you can change.
+- **Saving:** quick saves (F5 and F8) and the game's own memory card saves.
+- **A clearer picture:** sharper text and HUD, smoother edges, picture styles to switch between (F2), and twice the
+  resolution on a strong graphics card.
+- **Widescreen and other patches** from PCSX2's community, picked in the app.
+- **Smooth sound** when a game runs below full speed: it is stretched instead of chopped.
+- **Nothing left out:** game code the first build did not see is translated while you play and kept for the next start.
 
-- **Windows:** the recompiler, the runtime and the game build with llvm-mingw and draw through Direct3D 12 or Vulkan.
-- **Faster drawing:** the graphics chip's drawing program does about a fifth less work per frame, with the same pictures
-  pixel for pixel. On Windows it is compiled with Microsoft's newer shader compiler and drawn through Direct3D 12 by
-  default, and the processor side (game, vector units, window) no longer holds the game back.
-- **A clearer picture:** a new scaling step with light sharpening keeps text and the HUD crisp, slanted edges are
-  smoothed, shadows are solid instead of dotted, and faces move as they should (Silent Hill 2).
-- **An app for players:** choose a disc image, press *Build*, press *Play*. It downloads its own build tools, so nothing
-  has to be installed.
-- **Code translated while you play:** game code and graphics programs the first build did not see are translated in the
-  background while the game runs, and kept for the next start.
-- **More games:** God of War, Gran Turismo 4 (US), Silent Hill 2, Resident Evil 4 and Shadow of the Colossus run too,
-  with fixes in the runtime where they needed them.
-- **Playing:** keyboard and mouse controls with a key card, quick saves, sound that is stretched instead of chopped when
-  the game runs below full speed, picture styles to switch between, and PCSX2's community patches (widescreen and more)
-  to pick in the app.
+## How far it is
+
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. More than 15
+other games play well as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
+Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
+yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
+real console prints.
+
+## Why recompile instead of emulate
+
+An emulator works like a whole PS2 inside your PC: while you play, it reads the game's code piece by piece and works out
+what each piece means. This project does the biggest part of that work once, before you play: it translates the code of
+the PS2's main processor into C++ and compiles it into a normal program. That gives you:
+
+- **A real PC program for each game**, with its own shortcut, instead of an emulator with a game loaded into it.
+- **Code that is already translated** when you play, so the PC spends its time running the game. How much that matters:
+  in God of War II on a laptop, the same scene ran at about 5 fps while the game's vector-unit programs were still worked
+  out piece by piece, and at 24 fps once they were translated ahead, about 4.4 times as fast.
+- **A game whose code can be changed:** fixes and improvements can go right into the game itself, not only around it.
+  That is what opens the door to the ideas below.
+
+To be fair: an emulator like PCSX2 runs far more games today and has years of work behind it. It also translates code,
+while you play, so the number above is not a comparison with PCSX2; that one I haven't measured yet. If your game doesn't
+run here yet, PCSX2 is the better choice for now.
+
+Under the hood, the rest of the console (graphics chip, vector units, sound, disc, controller, memory card) is rebuilt
+in a runtime that draws with WebGPU (wgpu-native, on Vulkan or Direct3D 12).
+
+## Ideas for later
+
+Not promises, just where this can go:
+
+- **An in-game menu** for resolution, picture look and 16:9.
+- **A folder you can move:** the game program and your disc image together, to take to another PC.
+- **60 fps** for games that run at 30, where the game allows it, and **mods** that change the game's code directly.
+- **Faster on weak laptops**, so more games reach full speed on built-in graphics.
+- **The Steam Deck and other handhelds:** Linux already works; it needs testing there.
+- **More games:** every report shows me what to fix next.
 
 ## What runs
 
@@ -130,6 +158,9 @@ not share them. Please do not ask for disc images here. There is no decryption o
 (PS2 discs need none).
 
 ## Credits and license
+
+The recompiler and the runtime started as [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri,
+which also runs on macOS and in the browser; its README explains how the recompiler and the runtime work.
 
 MIT, see [LICENSE](LICENSE): the original copyright is Samir Nuri's, and my changes are under the same license. The VLC
 tables of the MPEG decoder are adapted from [Play!](https://github.com/jpd002/Play-) (BSD 2-clause, notice in

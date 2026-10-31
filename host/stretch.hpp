@@ -70,7 +70,7 @@ struct PipeConfig {
     double max_ratio = 5.0;       // slowest tempo is 1 / max_ratio; below it the queue runs dry like without stretching
     double target_ms = 60.0;      // the amount of waiting sound (game time) the controller steers to
     double pace_ms = 80.0;        // the emulation waits while more than this is waiting
-    double pace_stretch_ms = 120.0;  // the same while the sound is stretched (it swings more then, and a wait would slow the game down)
+    double pace_stretch_ms = 120.0;  // minimum recovery headroom; a long recent gap may require more
     double restart_ms = 50.0;     // after running dry: play again once this much is waiting
 };
 
@@ -138,6 +138,7 @@ private:
     Stretcher stretcher_;
     std::atomic<bool> flush_{false};
     std::atomic<double> position_{0.0}, tempo_{1.0}, last_push_{-1.0};
+    std::atomic<double> device_block_ms_{0.0};  // callback granularity, for recovery headroom
     std::atomic<double> rate_{1.0}, frame_gap_{0.0};  // from the emulation thread: speed of the game, longest recent frame (seconds)
 
     // emulation thread only

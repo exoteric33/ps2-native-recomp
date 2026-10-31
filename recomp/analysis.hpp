@@ -37,6 +37,10 @@ struct Search {
     // Addresses that something outside the image points at (words of memory, a jump table that a file brought in) and that may be function
     // starts: taken like the words of the image itself, as an entry point when what follows decodes as code (the check `tentative`).
     std::vector<std::uint32_t> candidates;
+    // Addresses of the image that some other translation serves already (the program's own code, a library made earlier): a call or a
+    // tail jump (`jal`, `j`) to one of them is not followed, it stays a call through the dispatcher, so that a library holds what is new
+    // and not the whole call tree below one new function.
+    std::set<std::uint32_t> served;
 };
 
 Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic = {}, const Search &search = {});

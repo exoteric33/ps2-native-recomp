@@ -1018,6 +1018,30 @@ std::vector<std::uint32_t> pointers_into(std::uint32_t base, std::uint32_t size)
     return found;
 }
 
+// Keeps of the pointers the ones that can be the start of a function: the instruction before it is the delay slot of a `jr ra` (zero
+// padding between skipped), the way the code of a program is packed, or the `jr ra` itself when its delay slot is a nop. A pointer into the
+// middle of a function (a jump table, a return address, a number that looks like an address) is no entry: for the program's own code the
+// build has found its functions already (it looks at every word of the file), and what such a pointer would add is a copy of a function
+// body from the middle on, with everything that body calls.
+std::vector<std::uint32_t> function_starts(std::vector<std::uint32_t> pointers) {
+    constexpr std::uint32_t kJrRa = 0x03E00008u;
+    const auto word = [](std::uint32_t at) {
+        std::uint32_t w;
+        std::memcpy(&w, g_ram + at, 4);
+        return w;
+    };
+    pointers.erase(std::remove_if(pointers.begin(), pointers.end(), [&](std::uint32_t target) {
+        std::uint32_t at = target;
+        for (int pad = 0; pad < 9; ++pad) {
+            if (at < 8) return true;
+            at -= 4;
+            if (word(at)) return word(at) != kJrRa && word(at - 4) != kJrRa;
+        }
+        return true;
+    }), pointers.end());
+    return pointers;
+}
+
 // The image for code of the executable's segment [address, address + bytes) around `at`: all of the segment, or the longest stretch kLoadedCap
 // allows around `at` when it is bigger than that. At least two units, so that a short segment still has room for a function's tail.
 void segment_image(std::uint32_t address, std::uint32_t bytes, std::uint32_t at, std::uint32_t &base, std::uint32_t &size) {
@@ -1026,6 +1050,39 @@ void segment_image(std::uint32_t address, std::uint32_t bytes, std::uint32_t at,
     if (last - first > kLoadedCap) base = std::max(first, std::min((at & ~3u) > kLoadedCap / 2 ? (at & ~3u) - kLoadedCap / 2 : first, last - kLoadedCap));
     size = std::min<std::uint32_t>(std::min(kLoadedCap, last - base), kRamSize - base);
     if (size < 2 * recomp::kWindowUnit) size = std::min<std::uint32_t>(2 * recomp::kWindowUnit, kRamSize - base);
+}
+
+// The targets of the calls and jumps (jal, j) of the image that point into the image and that something translated already serves
+// (the build, a library made earlier, in place now). A translation of a miss in the program's own code leaves them alone: they stay
+// calls through the dispatcher, and the library holds what is new, not the whole call tree below the one function that was missed.
+std::vector<std::uint32_t> served_calls(const std::vector<std::uint8_t> &image, std::uint32_t base) {
+    std::vector<std::uint32_t> targets;
+    for (std::size_t at = 0; at + 4 <= image.size(); at += 4) {
+        std::uint32_t word;
+        std::memcpy(&word, image.data() + at, 4);
+        if ((word >> 26) != 2u && (word >> 26) != 3u) continue;
+        const std::uint32_t target = ((base + static_cast<std::uint32_t>(at) + 4u) & 0xF0000000u) | ((word & 0x03FFFFFFu) << 2);
+        if (target - base < image.size()) targets.push_back(target);
+    }
+    std::sort(targets.begin(), targets.end());
+    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+    targets.erase(std::remove_if(targets.begin(), targets.end(), [](std::uint32_t t) { return !ps2::has_code(t); }), targets.end());
+    return targets;
+}
+
+// A translation of the program's own segment: its code is the stretch the program's analysis reached, the rest of the segment is data
+// (tables, strings, the game's variables), and a word of memory that points into the data is a number, not a function. What is served
+// already is left alone (served_calls). The checks are the first words of the entries, as for any image with data between its code: a
+// guess that was data and is rewritten takes only its own entry out.
+void limit_to_new_code(recomp::LiveRequest &request) {
+    ensure_analysis();
+    if (g->program_analysis) {
+        const auto [begin, end] = g->program_analysis->code_range();
+        request.text_begin = begin;
+        request.text_end = end;
+    }
+    request.sparse_checks = true;
+    request.served = served_calls(request.image, request.base);
 }
 
 // Functions of the program itself that a translated image calls (jal, j) and nothing translated serves. The build never reached them,
@@ -1063,7 +1120,8 @@ void translate_program_calls(const std::vector<std::uint8_t> &image, std::uint32
         request.name = "main_" + recomp::window_name(request.base, request.image.data(), request.image.size());
         request.focused = true;
         request.entries = mine;
-        request.candidates = pointers_into(request.base, static_cast<std::uint32_t>(request.image.size()));
+        request.candidates = function_starts(pointers_into(request.base, static_cast<std::uint32_t>(request.image.size())));
+        limit_to_new_code(request);
         const auto began = Clock::now();
         const Built built = build_library(request, "functions of the program that " + std::to_string(mine.size()) + " calls reach", false, nullptr, nullptr);
         std::size_t modules = 0;
@@ -1150,8 +1208,11 @@ bool translate_missing(std::uint32_t pc) {
     static const bool force_focus = !ps2::os::env("PS2_EE_LIVE_FOCUS").empty();   // debugging: every miss translates only what it reaches
     request.focused = region || whole_done || force_focus;
     request.sparse_checks = flat;
+    if (region) limit_to_new_code(request);
     const auto pointers_began = Clock::now();
     request.candidates = pointers_into(base, size);
+    if (g->verbose && region) say("%zu pointers into the program's code, %zu of them follow a return", request.candidates.size(), function_starts(request.candidates).size());
+    if (region) request.candidates = function_starts(std::move(request.candidates));
     const double pointers_s = lb::seconds_since(pointers_began);
     // The first translation of a whole window is the long one: it is compiled with little optimisation (the game waits for it), and the
     // same code is made again with the normal flags in the background afterwards. Single functions (the focused ones) are small: normal flags.

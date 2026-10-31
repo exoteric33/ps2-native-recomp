@@ -80,6 +80,9 @@ class StaticProgram {
 public:
     StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries);
     std::vector<std::uint32_t> calls_into(std::uint32_t base, std::uint32_t size) const;
+    // The stretch of the program that holds its code: from the first to the last instruction the analysis reached (and the `.text` section
+    // when the file has one). The rest of an executable segment is data; {0, 0} when nothing was reached.
+    std::pair<std::uint32_t, std::uint32_t> code_range() const;
 
 private:
     Image image_;
@@ -96,6 +99,8 @@ struct LiveRequest {
     bool focused = false;                // true: translate only what the entries reach (an earlier library covers the rest of the image)
     bool sparse_checks = false;          // true: the image is checked by the first words of its functions (entry_head_checks)
     std::vector<std::uint32_t> candidates;  // words of memory that point into the image: possible function starts (Search::candidates)
+    std::uint32_t text_begin = 0, text_end = 0;   // not 0: the image holds code only in [text_begin, text_end), the rest is data and no pointer into it is a function
+    std::vector<std::uint32_t> served;      // calls and jumps to these addresses of the image are not followed: something else translated them (Search::served)
 };
 
 struct LiveResult {

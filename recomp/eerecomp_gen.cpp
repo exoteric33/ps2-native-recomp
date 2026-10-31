@@ -224,6 +224,20 @@ std::vector<std::uint32_t> StaticProgram::calls_into(std::uint32_t base, std::ui
     return window_entries(image_, program_, base, size);
 }
 
+std::pair<std::uint32_t, std::uint32_t> StaticProgram::code_range() const {
+    std::uint32_t first = program_.end, last = program_.base;
+    for (std::uint32_t pc = program_.base; pc < program_.end; pc += 4)
+        if (program_.is_code(pc)) {
+            first = std::min(first, pc);
+            last = pc + 4;
+        }
+    if (image_.text().second > image_.text().first) {
+        first = std::min(first, image_.text().first);
+        last = std::max(last, image_.text().second);
+    }
+    return first < last ? std::pair<std::uint32_t, std::uint32_t>{first, last} : std::pair<std::uint32_t, std::uint32_t>{0, 0};
+}
+
 LiveResult generate_live(const LiveRequest &request, const std::filesystem::path &out_dir) {
     LiveResult result;
     try {
@@ -236,7 +250,8 @@ LiveResult generate_live(const LiveRequest &request, const std::filesystem::path
         // code, translate it as a module that sits at a fixed base.
         // The text range is the whole window: with {0, size}, which is right for a module that sits at address 0, the search for function
         // starts stopped at the last place the entries reached, and a window's other functions were each found by a pause of their own.
-        const Image image = Image::raw(request.base, request.image, {request.base, request.base + size});
+        const bool code_only = request.text_end > request.text_begin;
+        const Image image = Image::raw(request.base, request.image, code_only ? std::pair{request.text_begin, request.text_end} : std::pair{request.base, request.base + size});
         // The first translation of an image looks through all of it (and takes every place after a return as a function start, so that the
         // short functions that only pointer tables name are there too: each missed one used to cost a pause of its own). A later one for an
         // image that is already in place translates just what the missed entry reaches, which is a fraction of the compile time.
@@ -244,6 +259,7 @@ LiveResult generate_live(const LiveRequest &request, const std::filesystem::path
         search.whole_image = !request.focused;
         search.after_return = !request.focused;
         search.candidates = request.candidates;
+        search.served.insert(request.served.begin(), request.served.end());
         const auto began = std::chrono::steady_clock::now();
         Program program = analyse(image, request.entries, {}, search);
         result.analyse_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();

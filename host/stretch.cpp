@@ -236,7 +236,7 @@ void Tap::take(std::vector<std::int16_t> &out) {
     data_.clear();
 }
 
-SoundPipe::SoundPipe(const PipeConfig &config) : config_(config), marks_(512) {}
+SoundPipe::SoundPipe(const PipeConfig &config) : config_(config), marks_(512), pace_limit_ms_(config.pace_ms) {}
 
 // ---- emulation thread
 
@@ -258,6 +258,13 @@ void SoundPipe::push(const std::int16_t *lr, std::size_t frames, double now) {
 }
 
 void SoundPipe::frame(double now) {
+    const double dt = pace_frame_time_ < 0.0 ? 0.0 : std::max(0.0, now - pace_frame_time_);
+    pace_frame_time_ = now;
+    // Keep room to replenish audio while playback is stretched. Once tempo
+    // recovers, lower the allowance gradually in wall time: dropping it by
+    // 40 ms at once makes the producer wait and introduces another hitch.
+    if (tempo() < kEnter) pace_limit_ms_ = config_.pace_stretch_ms;
+    else pace_limit_ms_ = std::max(config_.pace_ms, pace_limit_ms_ - 100.0 * dt);
     double alive = alive_;
     if (last_push_t_ >= 0.0 && now - last_push_t_ < kStall) alive += std::max(0.0, now - last_push_t_ - wait_since_);
     const std::size_t size = marks_.size();

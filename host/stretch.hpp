@@ -111,7 +111,7 @@ public:
     // Sound waiting, in milliseconds of game time (what the title bar shows).
     double queued_ms() const { return (static_cast<double>(stretcher_.head()) - position_.load(std::memory_order_relaxed)) / (kRate / 1000.0); }
     // The emulation waits while this is true.
-    bool full() const { return queued_ms() > (tempo() < 1.0 ? config_.pace_stretch_ms : config_.pace_ms); }
+    bool full() const { return queued_ms() > pace_limit_ms_; }
     // The tempo now: 1 plays as made, 0.5 twice as slow.
     double tempo() const { return tempo_.load(std::memory_order_relaxed); }
     // Drop what is waiting (a state was loaded); the device thread does it before its next block.
@@ -148,6 +148,7 @@ private:
     std::vector<Mark> marks_;
     std::size_t marks_next_ = 0, marks_count_ = 0;
     double alive_ = 0.0, last_push_t_ = -1.0, wait_since_ = 0.0;
+    double pace_limit_ms_, pace_frame_time_ = -1.0;
     std::uint64_t pushed_ = 0, dropped_ = 0;
 
     // device thread only

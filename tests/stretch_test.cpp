@@ -1,6 +1,7 @@
 // Offline test of the sound stretcher (host/stretch.cpp): no game, no sound device, no SDL.
 //
-//   python tests/stretch_test.py            builds this file with clang++ and runs it (from the repository root)
+//   clang++ -std=c++20 -O2 tests/stretch_test.cpp host/stretch.cpp -o /tmp/ps2-stretch-test
+//   /tmp/ps2-stretch-test
 //
 // Part 1 feeds known signals through the Stretcher: at tempo 1 the samples come out bit for bit as they went in; at ratios 1.5, 2,
 // 3 (and 5, the cap) the output is continuous (no click, no hole), has the right length and the same pitch.
@@ -332,12 +333,12 @@ struct Sim {
         result.input.insert(result.input.end(), buf, buf + 64);
         pipe.push(buf, 32, at);
     }
-    void run_frame(double frame_s) {
+    void run_frame(double frame_s, unsigned sound_frames = 800) {
         const double start = t, cluster = uniform(0.35, 0.85) * frame_s;
-        double times[25];
+        std::vector<double> times(sound_frames / 32);
         for (int i = 0; i < 5; ++i) times[i] = uniform(0.0002, std::max(0.0003, cluster));
-        std::sort(times, times + 5);
-        for (int i = 5; i < 25; ++i) times[i] = cluster + 0.00005 * (i - 5);
+        std::sort(times.begin(), times.begin() + 5);
+        for (std::size_t i = 5; i < times.size(); ++i) times[i] = cluster + 0.00005 * (i - 5);
         for (double off : times) push32(start + off);
         device_until(start + frame_s);
         t = start + frame_s;
@@ -437,6 +438,39 @@ int simulation_main() {
               fmt("%.1f s compared", n / 2.0 / kRate).c_str());
         check(extreme_queued(r, 2, 20, false) > 50 && extreme_queued(r, 2, 20, true) <= 90, "the waiting sound stays between 50 and 90 ms",
               fmt("%.0f to %.0f ms", extreme_queued(r, 2, 20, false), extreme_queued(r, 2, 20, true)).c_str());
+    }
+    for (const std::size_t block : {1024u, 512u}) {
+        std::printf("recovery to full speed, %zu-frame audio blocks:\n", block);
+        Sim sim(on, block);
+        sim.run({{3, 32}});
+        double longest = 0;
+        for (int frame = 0; frame < 600; ++frame) {
+            const double start = sim.t, tempo = sim.pipe.tempo();
+            sim.run_frame(0.008);  // ample CPU headroom after the slow scene
+            // Early recovery legitimately paces to the still-slow audio tempo.
+            // Near unity the controller must not inject a new 40 ms queue drain.
+            if (tempo >= 0.95) longest = std::max(longest, (sim.t - start) * 1000.0);
+        }
+        check(longest < 30.0, "no pacing hitch near normal tempo after recovery", fmt("longest %.1f ms", longest).c_str());
+        check(sim.pipe.stats().dry == 0, "recovery keeps audio supplied");
+        check(sim.pipe.tempo() == 1.0, "recovery reaches normal tempo");
+    }
+    for (const unsigned sound_frames : {800u, 960u}) {
+        std::printf("one 72 ms frame, then CPU headroom (%u audio frames per video frame):\n", sound_frames);
+        Sim sim(on, 512);
+        for (int i = 0; i < 300; ++i) sim.run_frame(0.011, sound_frames);
+        const double begin = sim.t;
+        sim.run_frame(0.072, sound_frames);
+        double recovery = -1.0, longest_wait = 0.0;
+        for (int i = 0; i < 120; ++i) {
+            const double start = sim.t;
+            sim.run_frame(0.011, sound_frames);
+            longest_wait = std::max(longest_wait, (sim.t - start) * 1000.0 - 11.0);
+            if (recovery < 0.0 && sim.t - begin > 0.1 && sim.pipe.tempo() >= 0.995) recovery = sim.t - begin;
+        }
+        check(recovery >= 0.0 && recovery < 1.0, "one long frame does not sustain slow playback", fmt("recovered in %.3f s", recovery).c_str());
+        check(longest_wait < 40.0, "no large pacing drain after one long frame", fmt("longest wait %.1f ms", longest_wait).c_str());
+        check(sim.pipe.stats().dry == 0, "single-frame recovery keeps audio supplied");
     }
     for (const double fps : {45.0, 33.0, 20.0}) {
         std::printf("steady %.0f frames a second:\n", fps);

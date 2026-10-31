@@ -12,6 +12,7 @@
 #include <SDL.h>
 #include <SDL_syswm.h>
 #ifdef __APPLE__
+#include <SDL_metal.h>
 #include <mach/mach.h>
 #endif
 #ifndef _WIN32
@@ -72,6 +73,9 @@ constexpr PadBinding kPadButtons[] = {
 };
 
 SDL_Window *g_window = nullptr;
+#ifdef __APPLE__
+SDL_MetalView g_metal_view = nullptr;
+#endif
 SDL_Renderer *g_renderer = nullptr;
 SDL_Texture *g_texture = nullptr;
 SDL_AudioDeviceID g_audio = 0;
@@ -141,6 +145,14 @@ bool create_renderer() {
     return true;
 }
 
+#ifdef __APPLE__
+void destroy_metal_view() {
+    if (!g_metal_view) return;
+    SDL_Metal_DestroyView(g_metal_view);
+    g_metal_view = nullptr;
+}
+#endif
+
 bool attach_gpu() {
     if (std::getenv("PS2_SDL_RENDERER")) return false;
     SDL_SysWMinfo info;
@@ -152,6 +164,14 @@ bool attach_gpu() {
     target.width = static_cast<std::uint32_t>(w);
     target.height = static_cast<std::uint32_t>(h);
     switch (info.subsystem) {
+#if defined(__APPLE__) && defined(SDL_VIDEO_DRIVER_COCOA)
+    case SDL_SYSWM_COCOA:
+        g_metal_view = SDL_Metal_CreateView(g_window);
+        if (!g_metal_view) return false;
+        target.kind = ps2::WindowTarget::Metal;
+        target.surface = SDL_Metal_GetLayer(g_metal_view);
+        break;
+#endif
 #if defined(SDL_VIDEO_DRIVER_X11)
     case SDL_SYSWM_X11:
         target.kind = ps2::WindowTarget::X11;
@@ -175,7 +195,11 @@ bool attach_gpu() {
 #endif
     default: return false;
     }
-    return ps2::attach_window(target);
+    const bool attached = ps2::attach_window(target);
+#ifdef __APPLE__
+    if (!attached) destroy_metal_view();
+#endif
+    return attached;
 }
 
 std::uint8_t axis(SDL_GameController *pad, SDL_GameControllerAxis a) {
@@ -1245,7 +1269,10 @@ bool open_window(bool fullscreen) {
         if (!g_look_forced) std::fprintf(stderr, "[video] PS2_LOOK=%s is not crisp, crisp_edges, soft, soft_edges, sharp, sharp_edges or 0 to 5, ignored\n", word.c_str());
     }
     load_keys();
-    const Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
+    Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
+#ifdef __APPLE__
+    if (!std::getenv("PS2_SDL_RENDERER")) flags |= SDL_WINDOW_METAL;
+#endif
     g_game_title = ps2::os::env("PS2_WINDOW_TITLE");
     const std::string initial_title = g_game_title.empty() ? g_speed_title : g_game_title + "   |   " + g_speed_title;
     g_window = SDL_CreateWindow(initial_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
@@ -1411,6 +1438,9 @@ int run_window(const std::function<int()> &emulate) {
         ps2::g_options.on_vblank = on_vblank;
         const int result = emulate();
         finish_audio();
+#ifdef __APPLE__
+        destroy_metal_view();
+#endif
         return result;
     }
     ps2::g_options.on_vblank = [] {
@@ -1483,6 +1513,9 @@ int run_window(const std::function<int()> &emulate) {
     emulation.join();
     ps2::flush_memory_card();
     finish_audio();
+#ifdef __APPLE__
+    destroy_metal_view();
+#endif
     if (g_card.state.load() == 0) SDL_Quit();  // a key card still open is on a thread inside SDL: the program ends without taking SDL down under it
     if (ps2::g_options.on_exit) ps2::g_options.on_exit();  // the host's log copy hands over the last lines before the process ends
     std::fflush(nullptr);

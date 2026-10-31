@@ -15,7 +15,7 @@ struct DisplaySource {
 };
 
 struct SurfaceTarget {
-    enum Kind { X11, Wayland, Canvas, Win32 } kind;
+    enum Kind { X11, Wayland, Canvas, Win32, Metal } kind;
     void *display;
     std::uint64_t window;
     void *surface;

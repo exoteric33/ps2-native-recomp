@@ -181,3 +181,15 @@ own discs.
 
 PlayStation and PS2 are trademarks of Sony Interactive Entertainment. All game names are trademarks of their owners. This
 project is not affiliated with or endorsed by Sony or any game publisher.
+
+### Native window title
+
+Launchers can set `PS2_WINDOW_TITLE` to a game's display name. For example:
+
+```sh
+PS2_WINDOW_TITLE="My Game" ./ps2run game.elf --window
+```
+
+The name stays first in the window title, followed by any temporary key/save notice and the runtime's speed statistics.
+Leaving the variable unset or empty keeps the default title. The RAM statistic is the process's current resident memory;
+on macOS it is read through Mach rather than Linux's `/proc`.

@@ -2245,6 +2245,11 @@ bool attach_surface(const SurfaceTarget &target) {
     hwnd.hinstance = target.display;
     hwnd.hwnd = target.surface;
     sd.nextInChain = &hwnd.chain;
+#elif defined(__APPLE__)
+    if (target.kind != SurfaceTarget::Metal || !target.surface) return false;
+    WGPUSurfaceSourceMetalLayer metal = WGPU_SURFACE_SOURCE_METAL_LAYER_INIT;
+    metal.layer = target.surface;
+    sd.nextInChain = &metal.chain;
 #else
     WGPUSurfaceSourceXlibWindow xlib = WGPU_SURFACE_SOURCE_XLIB_WINDOW_INIT;
     WGPUSurfaceSourceWaylandSurface wayland = WGPU_SURFACE_SOURCE_WAYLAND_SURFACE_INIT;

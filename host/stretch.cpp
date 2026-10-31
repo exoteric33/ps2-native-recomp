@@ -218,6 +218,7 @@ constexpr double kLevelTau = 0.12;     // smoothing of the level the controller 
 constexpr double kFloorMs = Stretcher::lookahead() * 1000.0 / kRate + 4.0;  // below this waiting a step may not be possible
 constexpr double kHealthy = 0.98;      // a game that makes this much sound per second of running time needs no stretching
 constexpr double kEnter = 0.995;       // stretching starts only when it asks for less than this
+constexpr double kRecoveredUp = 0.03;  // a healthy producer with enough buffered sound can recover promptly
 constexpr double kSmoothUp = 0.15;     // the tempo may rise only this fast (seconds); it may fall at once
 constexpr std::size_t kFade = 96;      // 2 ms: the fade at the edges of a stretch of sound, so a start or a cut does not click
 constexpr double kDropAbove = 500.0 * (kRate / 1000.0);  // more than this waiting: the new sound is dropped (the device stopped)
@@ -263,8 +264,16 @@ void SoundPipe::frame(double now) {
     // Keep room to replenish audio while playback is stretched. Once tempo
     // recovers, lower the allowance gradually in wall time: dropping it by
     // 40 ms at once makes the producer wait and introduces another hitch.
-    if (tempo() < kEnter) pace_limit_ms_ = config_.pace_stretch_ms;
-    else pace_limit_ms_ = std::max(config_.pace_ms, pace_limit_ms_ - 100.0 * dt);
+    double target = config_.pace_ms;
+    if (tempo() < kEnter) {
+        // A recent gap must fit together with WSOLA lookahead and one device
+        // block. Otherwise pacing can pin the queue below the gap guard's
+        // unity-tempo threshold even after the producer has recovered.
+        const double reserve = frame_gap_.load(std::memory_order_relaxed) * 1000.0 + kFloorMs + device_block_ms_.load(std::memory_order_relaxed);
+        target = std::max(config_.pace_stretch_ms, reserve);
+    }
+    // Ageing out a long gap must not abruptly drain its extra headroom either.
+    pace_limit_ms_ = std::max(target, pace_limit_ms_ - 100.0 * dt);
     double alive = alive_;
     if (last_push_t_ >= 0.0 && now - last_push_t_ < kStall) alive += std::max(0.0, now - last_push_t_ - wait_since_);
     const std::size_t size = marks_.size();
@@ -311,6 +320,7 @@ void SoundPipe::fade(std::int16_t *lr, std::size_t frames, bool in) {
 }
 
 void SoundPipe::render(std::int16_t *out, std::size_t frames, double now, void (*overlay)(std::int16_t *, std::size_t)) {
+    device_block_ms_.store(frames * 1000.0 / kRate, std::memory_order_relaxed);
     if (flush_.exchange(false, std::memory_order_relaxed)) {
         stretcher_.flush();
         if (config_.stretch && playing_) {
@@ -336,7 +346,15 @@ void SoundPipe::render(std::int16_t *out, std::size_t frames, double now, void (
         if (!starved_) {
             const double before = tempo_.load(std::memory_order_relaxed);
             tempo = choose_tempo(now, waiting_ms);
-            if (tempo > before && stretcher_.stretching()) tempo = before + (tempo - before) * (1.0 - std::exp(-dt / kSmoothUp));  // up slowly, down at once
+            if (tempo > before && stretcher_.stretching()) {
+                // After an isolated pause, the producer can already be healthy
+                // and the queue refilled while the old slow tempo still paces
+                // the emulation. Recover faster only when the gap guard permits
+                // normal playback; sustained slow production keeps its smoothing.
+                const bool recovered = tempo == 1.0 && rate_.load(std::memory_order_relaxed) >= kHealthy && waiting_ms >= config_.target_ms;
+                const double tau = recovered ? kRecoveredUp : kSmoothUp;
+                tempo = before + (tempo - before) * (1.0 - std::exp(-dt / tau));
+            }
             if (tempo > kEnter) tempo = 1.0;
             capped = tempo <= 1.0 / config_.max_ratio + 1e-9;
             made = stretcher_.pull(out, frames, tempo);

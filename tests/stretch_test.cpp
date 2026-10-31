@@ -472,6 +472,69 @@ int simulation_main() {
         check(longest_wait < 40.0, "no large pacing drain after one long frame", fmt("longest wait %.1f ms", longest_wait).c_str());
         check(sim.pipe.stats().dry == 0, "single-frame recovery keeps audio supplied");
     }
+    // A single pause can empty part of the queue without making the producer
+    // persistently slow. Once it has refilled, a slow tempo ramp must not make
+    // the emulation wait through several extra device blocks per frame.
+    for (const std::size_t block : {512u, 1024u}) {
+        for (const unsigned sound_frames : {800u, 960u}) {
+            for (const double pause : {0.048, 0.079, 0.160}) {
+                for (const bool silent_pause : {false, true}) {
+                    Sim sim(on, block);
+                    for (int i = 0; i < 300; ++i) sim.run_frame(0.011, sound_frames);
+                    const double begin = sim.t;
+                    if (silent_pause) {
+                        sim.t += pause;
+                        sim.device_until(sim.t);
+                    } else sim.run_frame(pause, sound_frames);
+                    const auto dry_at_resume = sim.pipe.stats().dry;
+                    double recovery = -1.0, longest_wait = 0.0;
+                    for (int i = 0; i < 120; ++i) {
+                        const double start = sim.t;
+                        sim.run_frame(0.011, sound_frames);
+                        longest_wait = std::max(longest_wait, (sim.t - start) * 1000.0 - 11.0);
+                        if (recovery < 0.0 && sim.t - begin > 0.1 && sim.pipe.tempo() == 1.0) recovery = sim.t - begin;
+                    }
+                    std::printf("  [isolated pause] block %zu, sound %u, pause %.0f ms, silent %d: recovery %.3f s, longest wait %.1f ms\n",
+                                block, sound_frames, pause * 1000.0, silent_pause, recovery, longest_wait);
+                    check(recovery >= 0.0 && recovery < 0.5, "refilled queue recovers normal tempo within half a second");
+                    check(longest_wait < (block + sound_frames) * 1000.0 / kRate + 3.0, "recovery wait stays within one video period plus one device block");
+                    check(sim.pipe.stats().dry == dry_at_resume, "recovery adds no starvation after the pause ends");
+                    check(sim.pipe.queued_ms() < on.pace_ms + sound_frames * 1000.0 / kRate + 5.0,
+                          "temporary recovery headroom returns to the normal queue limit");
+                    const SimResult result = sim.finish();
+                    check(steepest(result) < 1300, "prompt recovery does not introduce a click");
+                }
+            }
+        }
+    }
+    for (const std::size_t block : {512u, 1024u}) {
+        Sim sim(on, block);
+        for (int i = 0; i < 300; ++i) sim.run_frame(0.011, 960);
+        for (int pause = 0; pause < 8; ++pause) {
+            sim.t += 0.079;
+            sim.device_until(sim.t);
+            for (int i = 0; i < 40; ++i) sim.run_frame(0.011, 960);
+        }
+        const SimResult result = sim.finish();
+        check(result.stats.dry == 0, "repeated isolated pauses keep audio supplied");
+        check(extreme_queued(result, 6, result.duration, true) < 200.0, "repeated pauses do not accumulate an unbounded queue");
+        check(steepest(result) < 1300, "repeated recoveries do not click");
+    }
+    {
+        // Extra headroom can expire before a slow producer returns to unity.
+        // Its removal must remain gradual, just like the normal recovery drain.
+        Sim sim(on, 512);
+        for (int i = 0; i < 300; ++i) sim.run_frame(0.011, 960);
+        sim.run_frame(0.160, 960);
+        for (int i = 0; i < 10; ++i) sim.run_frame(0.011, 960);
+        double longest = 0.0;
+        for (int i = 0; i < 180; ++i) {
+            const double start = sim.t;
+            sim.run_frame(0.030, 960);
+            longest = std::max(longest, (sim.t - start) * 1000.0);
+        }
+        check(longest < 65.0, "ageing out recovery headroom does not create a large drain hitch", fmt("longest %.1f ms", longest).c_str());
+    }
     for (const double fps : {45.0, 33.0, 20.0}) {
         std::printf("steady %.0f frames a second:\n", fps);
         Sim sim(on);

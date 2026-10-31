@@ -800,7 +800,17 @@ void install_iop_side() {
         c.r[2] = 0;
     });
     def("sifcmd", 25, "sceSifRemoveRpcQueue", [](iop::Cpu &c) { g_queue_threads.erase(arg(c, 0)); c.r[2] = 0; });
-    def("sifcmd", 28, "sceSifSendCmdIntr", send_cmd);
+    auto send_cmd_intr = [send_cmd](iop::Cpu &c) {
+        const std::uint32_t callback = arg(c, 6), data = arg(c, 7);
+        send_cmd(c);
+        // PADMAN waits on a semaphore signalled by this DMA completion before
+        // it starts another poll. Use the same deferred interrupt-context job
+        // as sceSifSetDmaIntr; the packet and its extra data are already copied.
+        if (c.r[2] && callback)
+            iop::kernel::schedule(iop::kernel::now() + 32, iop::kernel::Job{iop::kernel::kJobSifDmaCallback, callback, data});
+    };
+    def("sifcmd", 28, "sceSifSendCmdIntr", send_cmd_intr);
+    def("sifcmd", 29, "isceSifSendCmdIntr", send_cmd_intr);
 }
 
 // printf in ps2sdk ends in fioWrite(1, ...): echo stdout and stderr to the log.

@@ -135,6 +135,12 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
     endif()
 endif()
 
+if(NOT EMSCRIPTEN)
+    add_executable(ps2sifcmdtest EXCLUDE_FROM_ALL tests/sif_cmd_intr.cpp)
+    target_include_directories(ps2sifcmdtest PRIVATE runtime/src)
+    target_link_libraries(ps2sifcmdtest PRIVATE ps2runtime)
+endif()
+
 if(PS2_GENERATED)
     file(GLOB PS2_UNITS CONFIGURE_DEPENDS "${PS2_GENERATED}/*.cpp")
     add_library(ps2game STATIC ${PS2_UNITS})

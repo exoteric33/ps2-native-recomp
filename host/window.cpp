@@ -172,9 +172,20 @@ bool attach_gpu() {
     return ps2::attach_window(target);
 }
 
-std::uint8_t axis(SDL_GameController *pad, SDL_GameControllerAxis a) {
-    const int v = SDL_GameControllerGetAxis(pad, a);
-    return static_cast<std::uint8_t>(std::clamp((v + 32768) >> 8, 0, 255));
+// A pad's stick moves in a round gate: pushed all the way on a diagonal it reads about 0.71 on each axis, where a DualShock 2 reads
+// close to the corner. A game that tests each axis on its own (Harvest Moon: A Wonderful Life runs only on a full push) then never
+// sees a full push on a diagonal, so the push is stretched from the circle to the square: same direction, and max(|x|, |y|) becomes
+// the length. A push along one axis is not changed.
+void stick(SDL_GameController *pad, SDL_GameControllerAxis ax, SDL_GameControllerAxis ay, std::uint8_t &x, std::uint8_t &y) {
+    const int vx = SDL_GameControllerGetAxis(pad, ax), vy = SDL_GameControllerGetAxis(pad, ay);
+    const int m = std::max(std::abs(vx), std::abs(vy));
+    const double scale = m ? std::min(std::hypot(vx, vy), 32768.0) / m : 1.0;
+    const auto to_byte = [scale](int v) {
+        const long s = std::clamp(std::lround(v * scale), -32768l, 32767l);
+        return static_cast<std::uint8_t>((s + 32768) >> 8);
+    };
+    if (x == 0x80) x = to_byte(vx);
+    if (y == 0x80) y = to_byte(vy);
 }
 
 void rumble(int port) {
@@ -697,10 +708,8 @@ void poll_port(int port) {
         };
         trigger(SDL_CONTROLLER_AXIS_TRIGGERLEFT, kL2, l2);
         trigger(SDL_CONTROLLER_AXIS_TRIGGERRIGHT, kR2, r2);
-        if (lx == 0x80) lx = axis(pad, SDL_CONTROLLER_AXIS_LEFTX);
-        if (ly == 0x80) ly = axis(pad, SDL_CONTROLLER_AXIS_LEFTY);
-        if (rx == 0x80) rx = axis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
-        if (ry == 0x80) ry = axis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
+        stick(pad, SDL_CONTROLLER_AXIS_LEFTX, SDL_CONTROLLER_AXIS_LEFTY, lx, ly);
+        stick(pad, SDL_CONTROLLER_AXIS_RIGHTX, SDL_CONTROLLER_AXIS_RIGHTY, rx, ry);
     }
     rumble(port);
     static std::uint64_t last[2] = {~0ull, ~0ull};

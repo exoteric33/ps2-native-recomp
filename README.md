@@ -181,3 +181,24 @@ own discs.
 
 PlayStation and PS2 are trademarks of Sony Interactive Entertainment. All game names are trademarks of their owners. This
 project is not affiliated with or endorsed by Sony or any game publisher.
+
+### GPU readback diagnostics
+
+Set `PS2_READBACK_LOG=1` before launching to report CPU-visible waits for GPU memory:
+
+```sh
+PS2_READBACK_LOG=1 ./ps2run game.elf --window
+```
+
+Synchronous `[readback]` lines show the emulation frame, byte count, `encode/submit`
+(command encoding/submission and callback preparation), `map-wait` (mapping request
+and wait for its callback), and `copy` (mapped-range access, CPU copy and unmap),
+all in milliseconds. Asynchronous lines show the frame, transfer serial, byte
+count and the time spent waiting when the transfer is finished; they do not
+measure the transfer's full lifetime or its final CPU copy.
+
+These are wall-clock intervals, including driver and GPU queue waits, not GPU
+timestamp measurements. The frame identifies when the log is emitted, which may
+be ahead of the rendering thread. Only reads with a measured wait/encoding
+interval of at least 10 ms are reported: the first 20, then every 100th slow read
+across both paths. With the variable unset, no readback timers or lines are added.

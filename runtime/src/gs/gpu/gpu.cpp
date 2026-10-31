@@ -1074,7 +1074,21 @@ void submit(WGPUTextureView present_view = nullptr) {
     g_clut_loads = 0;
 }
 
+bool readback_log_enabled() {
+    static const bool enabled = std::getenv("PS2_READBACK_LOG") != nullptr;
+    return enabled;
+}
+
+bool log_slow_readback(double ms) {
+    if (ms < 10.0) return false;
+    static std::uint64_t slow_reads = 0;
+    ++slow_reads;
+    return slow_reads <= 20 || slow_reads % 100 == 0;
+}
+
 void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) {
+    const bool diagnose = readback_log_enabled();
+    const auto started = diagnose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     wgpuCommandEncoderCopyBufferToBuffer(enc, source, offset, g_readback, 0, bytes);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
@@ -1088,12 +1102,19 @@ void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t 
         if (status != WGPUMapAsyncStatus_Success) std::fprintf(stderr, "[gpu] map failed %d\n", static_cast<int>(status));
         *static_cast<bool *>(flag) = true;
     };
+    const auto submitted = diagnose ? std::chrono::steady_clock::now() : started;
     cb.userdata1 = &done;
     wgpuBufferMapAsync(g_readback, WGPUMapMode_Read, 0, bytes, cb);
     wait_until(done);
+    const auto ready = diagnose ? std::chrono::steady_clock::now() : started;
     const void *mapped = wgpuBufferGetConstMappedRange(g_readback, 0, bytes);
     if (mapped) std::memcpy(out, mapped, bytes);
     wgpuBufferUnmap(g_readback);
+    if (diagnose && log_slow_readback(std::chrono::duration<double, std::milli>(ready - started).count())) std::fprintf(stderr, "[readback] sync frame %llu bytes %llu: encode/submit %.3f ms, map-wait %.3f ms, copy %.3f ms\n",
+        static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(bytes),
+        std::chrono::duration<double, std::milli>(submitted - started).count(),
+        std::chrono::duration<double, std::milli>(ready - submitted).count(),
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ready).count());
 }
 
 void wait_gpu() {
@@ -2150,7 +2171,12 @@ bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t by
 
 bool finish_download(std::uint32_t serial) {
     if (!g_pending.busy || g_pending.serial != serial) return false;
+    const bool diagnose = readback_log_enabled();
+    const auto started = diagnose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     while (g_pending.busy && !g_pending.ready) pump();
+    if (diagnose && log_slow_readback(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count())) std::fprintf(stderr, "[readback] async frame %llu serial %u bytes %u: wait %.3f ms\n",
+        static_cast<unsigned long long>(frame_count()), serial, g_pending.bytes,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
     const bool done = g_pending.ready;
     collect_download();
     return done;

@@ -400,40 +400,9 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 struct Setup {
+    at: u32,
     flags: u32,
-    fbp: u32,
-    fbw: u32,
-    fpsm: u32,
-    fbmsk: u32,
-    zbp: u32,
-    zpsm: u32,
     modes: u32,
-    aref: u32,
-    fix: u32,
-    scax0: i32,
-    scax1: i32,
-    scay0: i32,
-    scay1: i32,
-    tbp: u32,
-    tbw: u32,
-    tpsm: u32,
-    tw: u32,
-    th: u32,
-    cpsm: u32,
-    csa: u32,
-    minu: u32,
-    maxu: u32,
-    minv: u32,
-    maxv: u32,
-    ta0: u32,
-    ta1: u32,
-    fogcol: u32,
-    clut: u32,
-    zmax: u32,
-    dec: u32,
-    tf: Fmt,
-    ff: Fmt,
-    zf: Fmt,
 }
 
 const F_IIP: u32 = 1u;
@@ -453,44 +422,38 @@ const F_TCC: u32 = 8192u;
 const F_BILINEAR: u32 = 16384u;
 const F_AEM: u32 = 32768u;
 
+// Keep only frequently used words live across shading. Loading every setup field
+// together can increase register pressure in the general-purpose raster shader.
 fn load_setup(at: u32) -> Setup {
-    var s: Setup;
-    s.flags = data[at];
-    s.fbp = data[at + 1u];
-    s.fbw = data[at + 2u];
-    s.fpsm = data[at + 3u];
-    s.fbmsk = data[at + 4u];
-    s.zbp = data[at + 5u];
-    s.zpsm = data[at + 6u];
-    s.modes = data[at + 7u];
-    s.aref = data[at + 8u];
-    s.fix = data[at + 9u];
-    s.scax0 = i32(data[at + 10u] & 0xFFFFu);
-    s.scax1 = i32(data[at + 10u] >> 16u);
-    s.scay0 = i32(data[at + 11u] & 0xFFFFu);
-    s.scay1 = i32(data[at + 11u] >> 16u);
-    s.tbp = data[at + 12u];
-    s.tbw = data[at + 13u];
-    s.tpsm = data[at + 14u];
-    s.tw = data[at + 15u] & 0xFFu;
-    s.th = data[at + 15u] >> 8u;
-    s.cpsm = data[at + 16u];
-    s.csa = data[at + 17u];
-    s.minu = data[at + 18u] & 0xFFFFu;
-    s.maxu = data[at + 18u] >> 16u;
-    s.minv = data[at + 19u] & 0xFFFFu;
-    s.maxv = data[at + 19u] >> 16u;
-    s.ta0 = data[at + 20u] & 0xFFu;
-    s.ta1 = (data[at + 20u] >> 8u) & 0xFFu;
-    s.fogcol = data[at + 21u];
-    s.clut = data[at + 22u];
-    s.zmax = data[at + 23u];
-    s.dec = data[at + 24u];
-    s.tf = fmt_at(at + 25u);
-    s.ff = fmt_at(at + 30u);
-    s.zf = fmt_at(at + 35u);
-    return s;
+    return Setup(at, data[at], data[at + 7u]);
 }
+
+fn setup_fpsm(s: Setup) -> u32 { return data[s.at + 3u]; }
+fn setup_fbmsk(s: Setup) -> u32 { return data[s.at + 4u]; }
+fn setup_aref(s: Setup) -> u32 { return data[s.at + 8u]; }
+fn setup_fix(s: Setup) -> u32 { return data[s.at + 9u]; }
+fn setup_scax0(s: Setup) -> i32 { return i32(data[s.at + 10u] & 0xFFFFu); }
+fn setup_scax1(s: Setup) -> i32 { return i32(data[s.at + 10u] >> 16u); }
+fn setup_scay0(s: Setup) -> i32 { return i32(data[s.at + 11u] & 0xFFFFu); }
+fn setup_scay1(s: Setup) -> i32 { return i32(data[s.at + 11u] >> 16u); }
+fn setup_tpsm(s: Setup) -> u32 { return data[s.at + 14u]; }
+fn setup_tw(s: Setup) -> u32 { return data[s.at + 15u] & 0xFFu; }
+fn setup_th(s: Setup) -> u32 { return data[s.at + 15u] >> 8u; }
+fn setup_cpsm(s: Setup) -> u32 { return data[s.at + 16u]; }
+fn setup_csa(s: Setup) -> u32 { return data[s.at + 17u]; }
+fn setup_minu(s: Setup) -> u32 { return data[s.at + 18u] & 0xFFFFu; }
+fn setup_maxu(s: Setup) -> u32 { return data[s.at + 18u] >> 16u; }
+fn setup_minv(s: Setup) -> u32 { return data[s.at + 19u] & 0xFFFFu; }
+fn setup_maxv(s: Setup) -> u32 { return data[s.at + 19u] >> 16u; }
+fn setup_ta0(s: Setup) -> u32 { return data[s.at + 20u] & 0xFFu; }
+fn setup_ta1(s: Setup) -> u32 { return (data[s.at + 20u] >> 8u) & 0xFFu; }
+fn setup_fogcol(s: Setup) -> u32 { return data[s.at + 21u]; }
+fn setup_clut(s: Setup) -> u32 { return data[s.at + 22u]; }
+fn setup_zmax(s: Setup) -> u32 { return data[s.at + 23u]; }
+fn setup_dec(s: Setup) -> u32 { return data[s.at + 24u]; }
+fn setup_tf(s: Setup) -> Fmt { return fmt_at(s.at + 25u); }
+fn setup_ff(s: Setup) -> Fmt { return fmt_at(s.at + 30u); }
+fn setup_zf(s: Setup) -> Fmt { return fmt_at(s.at + 35u); }
 
 fn has(s: Setup, f: u32) -> bool {
     return (s.flags & f) != 0u;
@@ -508,9 +471,9 @@ fn expand16(c: u32, s: Setup) -> u32 {
     let r = (c & 0x1Fu) << 3u;
     let g = ((c >> 5u) & 0x1Fu) << 3u;
     let b = ((c >> 10u) & 0x1Fu) << 3u;
-    var a = s.ta0;
+    var a = setup_ta0(s);
     if ((c & 0x8000u) != 0u) {
-        a = s.ta1;
+        a = setup_ta1(s);
     } else if (has(s, F_AEM) && (c & 0x7FFFu) == 0u) {
         a = 0u;
     }
@@ -535,11 +498,11 @@ fn wrap_coord(v: i32, size: i32, m: u32, mn: u32, mx: u32) -> i32 {
 }
 
 fn texel_x(s: Setup, xi: i32) -> u32 {
-    return u32(wrap_coord(xi, 1 << s.tw, mode(s, 24u, 2u), s.minu, s.maxu));
+    return u32(wrap_coord(xi, 1 << setup_tw(s), mode(s, 24u, 2u), setup_minu(s), setup_maxu(s)));
 }
 
 fn texel_y(s: Setup, yi: i32) -> u32 {
-    return u32(wrap_coord(yi, 1 << s.th, mode(s, 26u, 2u), s.minv, s.maxv));
+    return u32(wrap_coord(yi, 1 << setup_th(s), mode(s, 26u, 2u), setup_minv(s), setup_maxv(s)));
 }
 
 var<private> snapshot_lo: u32 = 0u;
@@ -557,19 +520,19 @@ fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
 }
 
 fn fetch_at(s: Setup, x: u32, y: u32, k: u32) -> u32 {
-    if (s.dec != 0xFFFFFFFFu) {
-        return decoded[s.dec + (y << s.tw) + x];
+    if (setup_dec(s) != 0xFFFFFFFFu) {
+        return decoded[setup_dec(s) + (y << setup_tw(s)) + x];
     }
-    return convert(s, load_texel(addr(s.tf, x, y), k));
+    return convert(s, load_texel(addr(setup_tf(s), x, y), k));
 }
 
 fn convert(s: Setup, raw: u32) -> u32 {
-    switch s.tpsm {
+    switch setup_tpsm(s) {
         case 0x00u, 0x30u {
             return raw;
         }
         case 0x01u, 0x31u {
-            var a = s.ta0;
+            var a = setup_ta0(s);
             if (has(s, F_AEM) && (raw & 0xFFFFFFu) == 0u) {
                 a = 0u;
             }
@@ -579,15 +542,15 @@ fn convert(s: Setup, raw: u32) -> u32 {
             return expand16(raw, s);
         }
         case 0x13u, 0x1Bu {
-            let e = clut[s.clut * CLUT_ENTRIES + (raw & 255u)];
-            if (s.cpsm == PSMCT32 || s.cpsm == PSMCT24) {
+            let e = clut[setup_clut(s) * CLUT_ENTRIES + (raw & 255u)];
+            if (setup_cpsm(s) == PSMCT32 || setup_cpsm(s) == PSMCT24) {
                 return e;
             }
             return expand16(e, s);
         }
         case 0x14u, 0x24u, 0x2Cu {
-            let e = clut[s.clut * CLUT_ENTRIES + (((s.csa & 15u) * 16u + (raw & 15u)) & 511u)];
-            if (s.cpsm == PSMCT32 || s.cpsm == PSMCT24) {
+            let e = clut[setup_clut(s) * CLUT_ENTRIES + (((setup_csa(s) & 15u) * 16u + (raw & 15u)) & 511u)];
+            if (setup_cpsm(s) == PSMCT32 || setup_cpsm(s) == PSMCT24) {
                 return e;
             }
             return expand16(e, s);
@@ -614,7 +577,7 @@ fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
     } else {
         raw = atomicLoad(&vram[word * SCALE * SCALE + k]);
     }
-    return convert(s, raw & s.tf.mask);
+    return convert(s, raw & setup_tf(s).mask);
 }
 
 fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
@@ -629,12 +592,12 @@ fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
     let xb = texel_x(s, x0 + 1);
     let ya = texel_y(s, y0);
     let yb = texel_y(s, y0 + 1);
-    if (s.dec == 0xFFFFFFFFu && s.tpsm <= 1u) {
+    if (setup_dec(s) == 0xFFFFFFFFu && setup_tpsm(s) <= 1u) {
         // 32-bit colour: the page position and the position inside the page are separate sums of the x and the y part
-        let pxa = (xa >> 6u) * 8192u + s.tf.base;
-        let pxb = (xb >> 6u) * 8192u + s.tf.base;
-        let pya = (ya >> 5u) * s.tf.per_row * 8192u;
-        let pyb = (yb >> 5u) * s.tf.per_row * 8192u;
+        let pxa = (xa >> 6u) * 8192u + setup_tf(s).base;
+        let pxb = (xb >> 6u) * 8192u + setup_tf(s).base;
+        let pya = (ya >> 5u) * setup_tf(s).per_row * 8192u;
+        let pyb = (yb >> 5u) * setup_tf(s).per_row * 8192u;
         let nxa = spread_x(xa);
         let nxb = spread_x(xb);
         let nya = spread_y(ya);
@@ -657,7 +620,7 @@ fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
 
 fn read_frame(s: Setup, l: Loc, k: u32) -> u32 {
     let raw = load_at(l, k);
-    switch s.fpsm {
+    switch setup_fpsm(s) {
         case 0x01u {
             return raw | 0x80000000u;
         }
@@ -683,7 +646,7 @@ fn pack16(v: u32) -> u32 {
 }
 
 fn write_frame(s: Setup, l: Loc, k: u32, c: u32, mask: u32) {
-    switch s.fpsm {
+    switch setup_fpsm(s) {
         case 0x02u, 0x0Au {
             let old = load_at(l, k);
             var m16 = pack16(mask);
@@ -722,7 +685,7 @@ struct Attr {
 }
 
 fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
-    if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) {
+    if (x < setup_scax0(s) || x > setup_scax1(s) || y < setup_scay0(s) || y > setup_scay1(s)) {
         return;
     }
     let scanmsk = mode(s, 28u, 2u);
@@ -734,8 +697,8 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     }
     let ux = u32(x);
     let uy = u32(y);
-    let z = min(at.z, s.zmax);
-    let fl = addr(s.ff, ux, uy);
+    let z = min(at.z, setup_zmax(s));
+    let fl = addr(setup_ff(s), ux, uy);
     var zl = Loc(0u, 0u, 0u);
 
     var dst = 0u;
@@ -754,9 +717,9 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         if (ztst == 0u) {
             return;
         }
-        zl = addr(s.zf, ux, uy);
+        zl = addr(setup_zf(s), ux, uy);
         if (ztst != 1u) {
-            let old = load_at(zl, k) & s.zmax;
+            let old = load_at(zl, k) & setup_zmax(s);
             if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
                 return;
             }
@@ -778,8 +741,8 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
             if (q == 0.0) {
                 q = 1.0;
             }
-            u = at.s / q * f32(1u << s.tw);
-            v = at.t / q * f32(1u << s.th);
+            u = at.s / q * f32(1u << setup_tw(s));
+            v = at.t / q * f32(1u << setup_th(s));
         }
         let t = sample(s, u, v, k);
         let tr = i32(t & 0xFFu);
@@ -824,9 +787,9 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     }
     if (has(s, F_FGE)) {
         let f = i32(at.f);
-        let fr = i32(s.fogcol & 0xFFu);
-        let fg = i32((s.fogcol >> 8u) & 0xFFu);
-        let fb = i32((s.fogcol >> 16u) & 0xFFu);
+        let fr = i32(setup_fogcol(s) & 0xFFu);
+        let fg = i32((setup_fogcol(s) >> 8u) & 0xFFu);
+        let fb = i32((setup_fogcol(s) >> 16u) & 0xFFu);
         r = (f * r + (255 - f) * fr) >> 8u;
         g = (f * g + (255 - f) * fg) >> 8u;
         b = (f * b + (255 - f) * fb) >> 8u;
@@ -846,22 +809,22 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
                 ok = true;
             }
             case 2u {
-                ok = av < s.aref;
+                ok = av < setup_aref(s);
             }
             case 3u {
-                ok = av <= s.aref;
+                ok = av <= setup_aref(s);
             }
             case 4u {
-                ok = av == s.aref;
+                ok = av == setup_aref(s);
             }
             case 5u {
-                ok = av >= s.aref;
+                ok = av >= setup_aref(s);
             }
             case 6u {
-                ok = av > s.aref;
+                ok = av > setup_aref(s);
             }
             default {
-                ok = av != s.aref;
+                ok = av != setup_aref(s);
             }
         }
         if (!ok) {
@@ -896,7 +859,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
             let bb = mode(s, 14u, 2u);
             let bc = mode(s, 16u, 2u);
             let bd = mode(s, 18u, 2u);
-            var cc = i32(s.fix);
+            var cc = i32(setup_fix(s));
             if (bc == 0u) {
                 cc = a;
             } else if (bc == 1u) {
@@ -938,7 +901,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         if (has(s, F_FBA)) {
             out_a = out_a | 0x80u;
         }
-        var mask = s.fbmsk;
+        var mask = setup_fbmsk(s);
         if (!write_alpha) {
             mask = mask | 0xFF000000u;
         }
@@ -1027,12 +990,12 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
                 if (q == 0.0) {
                     q = 1.0;
                 }
-                du = du / q * f32(1u << s.tw);
-                dv = dv / q * f32(1u << s.th);
+                du = du / q * f32(1u << setup_tw(s));
+                dv = dv / q * f32(1u << setup_th(s));
             }
             var ux = px;
             var uy = py;
-            let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
+            let direct = setup_tpsm(s) == 0x00u || setup_tpsm(s) == 0x01u || setup_tpsm(s) == 0x02u || setup_tpsm(s) == 0x0Au || setup_tpsm(s) >= 0x30u;
             let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct);
             if (point && abs(du) >= abs(dx) * 0.999) {
                 ux = f32(x);
@@ -1118,9 +1081,9 @@ fn decode(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let s = load_setup(prm(0u));
-    let x = i & ((1u << s.tw) - 1u);
-    let y = i >> s.tw;
-    decoded[prm(1u) + i] = convert(s, load_at(addr(s.tf, x, y), 0u));
+    let x = i & ((1u << setup_tw(s)) - 1u);
+    let y = i >> setup_tw(s);
+    decoded[prm(1u) + i] = convert(s, load_at(addr(setup_tf(s), x, y), 0u));
 }
 
 @compute @workgroup_size(64)
@@ -1163,21 +1126,16 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     let setups = prm(2u);
     snapshot_lo = prm(5u);
     snapshot_hi = prm(6u);
-    var last_setup = 0xFFFFFFFFu;
-    var s: Setup;
     for (var i = 0u; i < count; i = i + 1u) {
         let h = first + i;
         let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
         let si = data[p];
-        if (si != last_setup) {
-            s = load_setup(setups + si * SETUP_WORDS);
-            last_setup = si;
-        }
         let lo = data[p + 2u];
         let hi = data[p + 3u];
         if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
             continue;
         }
+        let s = load_setup(setups + si * SETUP_WORDS);
         shade_at(p, s, x, y, k, px, py);
     }
 }

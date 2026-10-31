@@ -640,28 +640,28 @@ int main(int argc, char **argv) {
 #endif
 
 #ifdef PS2_WINDOW
-    // Playing records the vector programs that are not compiled into this build into the vu1 folder of the game that port.sh
-    // made, games/<name>/vu1, so `port.sh <name> <image> --no-explore` can compile them afterwards (docs/gow2.md). Without that, a
-    // game is slow wherever the exploring runs did not go: unknown programs run in the interpreter. A PS2_VU_RECORD the user set
-    // wins. This runs before anything reads the variable (the vector unit code reads it on its first program, long after main).
-    // The game folder is found from the program first: port.sh always extracts it into the game folder (disc/<program>,
-    // patched/<program>, or core.elf at the top), so the folder is the program's own or the one above it. The disc image is no
-    // guide on its own: port.sh hard-links it into the game folder, but a hard link cannot reach another drive, and an image on
-    // another drive is played from where it is, with no vu1 folder next to it. Next to the disc image is still looked at last.
-    if (window && ps2::os::env("PS2_VU_RECORD").empty()) {
+    // Record unknown microprograms beside the game that port.sh prepared.
+    // Explicit per-unit recording directories take precedence. Find the game
+    // folder from the executable (disc/, patched/ or a top-level core ELF),
+    // then use the disc image's folder as a final fallback.
+    if (window) {
         std::error_code error;
         std::vector<std::filesystem::path> places;
         const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
         if (!error) places = {program.parent_path(), program.parent_path().parent_path()};
         if (!ps2::g_options.disc_path.empty()) {
-            const std::filesystem::path disc = std::filesystem::absolute(ps2::os::path(ps2::g_options.disc_path), error);
+            const auto disc = std::filesystem::absolute(ps2::os::path(ps2::g_options.disc_path), error);
             if (!error) places.push_back(disc.parent_path());
         }
-        for (const std::filesystem::path &place : places) {
-            const std::filesystem::path vu1 = (place / "vu1").lexically_normal();
-            if (std::filesystem::is_directory(vu1, error) && ps2::os::set_env("PS2_VU_RECORD", ps2::os::utf8(vu1))) {
-                std::fprintf(stderr, "[vu1] recording vector programs that are not compiled yet into %s\n", ps2::os::env("PS2_VU_RECORD").c_str());
-                break;
+        for (int unit : {1, 0}) {
+            const char *setting = unit ? "PS2_VU_RECORD" : "PS2_VU0_RECORD";
+            if (!ps2::os::env(setting).empty()) continue;
+            for (const auto &place : places) {
+                const auto directory = (place / (unit ? "vu1" : "vu0")).lexically_normal();
+                if (std::filesystem::is_directory(directory, error) && ps2::os::set_env(setting, ps2::os::utf8(directory))) {
+                    std::fprintf(stderr, "[vu%d] recording unknown vector programs into %s\n", unit, ps2::os::env(setting).c_str());
+                    break;
+                }
             }
         }
     }

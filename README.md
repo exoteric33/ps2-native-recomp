@@ -182,7 +182,6 @@ own discs.
 PlayStation and PS2 are trademarks of Sony Interactive Entertainment. All game names are trademarks of their owners. This
 project is not affiliated with or endorsed by Sony or any game publisher.
 
-<<<<<<< HEAD
 ### Native window title
 
 Launchers can set `PS2_WINDOW_TITLE` to a game's display name. For example:
@@ -194,7 +193,7 @@ PS2_WINDOW_TITLE="My Game" ./ps2run game.elf --window
 The name stays first in the window title, followed by any temporary key/save notice and the runtime's speed statistics.
 Leaving the variable unset or empty keeps the default title. The RAM statistic is the process's current resident memory;
 on macOS it is read through Mach rather than Linux's `/proc`.
-=======
+
 ### GPU readback diagnostics
 
 Set `PS2_READBACK_LOG=1` before launching to report CPU-visible waits for GPU memory:
@@ -215,4 +214,3 @@ timestamp measurements. The frame identifies when the log is emitted, which may
 be ahead of the rendering thread. Only reads with a measured wait/encoding
 interval of at least 10 ms are reported: the first 20, then every 100th slow read
 across both paths. With the variable unset, no readback timers or lines are added.
->>>>>>> pr40

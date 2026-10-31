@@ -11,6 +11,9 @@
 #endif
 #include <SDL.h>
 #include <SDL_syswm.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #ifndef _WIN32
 #include <sys/resource.h>
 #include <unistd.h>
@@ -113,6 +116,7 @@ bool g_look_forced = false;
 
 // The title shows the speed; for a few seconds after F5, F8 or F9 a message is put in front of it.
 std::string g_speed_title = "ps2-native-recomp";
+std::string g_game_title;  // optional PS2_WINDOW_TITLE, supplied by the launcher
 std::string g_notice_text;
 Uint32 g_notice_until = 0;
 // A short tone mixed into the game's sound says that a key worked, which the title cannot do in full screen. 0 none, else the kind of
@@ -121,8 +125,10 @@ std::atomic<int> g_beep_request{0};
 bool g_beep_on = true;
 
 void refresh_title() {
-    if (g_notice_text.empty()) SDL_SetWindowTitle(g_window, g_speed_title.c_str());
-    else SDL_SetWindowTitle(g_window, (g_notice_text + "   |   " + g_speed_title).c_str());
+    std::string title = g_speed_title;
+    if (!g_notice_text.empty()) title = g_notice_text + "   |   " + title;
+    if (!g_game_title.empty()) title = g_game_title + "   |   " + title;
+    SDL_SetWindowTitle(g_window, title.c_str());
 }
 
 bool create_renderer() {
@@ -929,6 +935,11 @@ double resident_mb() {
     PROCESS_MEMORY_COUNTERS counters{};
     GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof counters);
     return static_cast<double>(counters.WorkingSetSize) / (1024.0 * 1024.0);
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) return 0.0;
+    return static_cast<double>(info.resident_size) / (1024.0 * 1024.0);
 #else
     long pages = 0, resident = 0;
     if (std::FILE *f = std::fopen("/proc/self/statm", "r")) {
@@ -1235,7 +1246,9 @@ bool open_window(bool fullscreen) {
     }
     load_keys();
     const Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
-    g_window = SDL_CreateWindow("ps2-native-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
+    g_game_title = ps2::os::env("PS2_WINDOW_TITLE");
+    const std::string initial_title = g_game_title.empty() ? g_speed_title : g_game_title + "   |   " + g_speed_title;
+    g_window = SDL_CreateWindow(initial_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
     if (!g_window) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;

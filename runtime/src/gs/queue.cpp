@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <ctime>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -237,6 +238,10 @@ double thread_cpu_ms() {
     if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0.0;
     const auto ticks = [](const FILETIME &t) { return static_cast<double>((static_cast<unsigned long long>(t.dwHighDateTime) << 32) | t.dwLowDateTime); };
     return (ticks(kernel) + ticks(user)) / 1e4;
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec time{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) != 0) return 0.0;
+    return static_cast<double>(time.tv_sec) * 1000.0 + static_cast<double>(time.tv_nsec) / 1e6;
 #else
     return 0.0;
 #endif

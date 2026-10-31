@@ -77,6 +77,8 @@ void schedule(std::uint64_t at, const Job &job);
 
 Thread *current();
 Thread *thread(int id);
+std::vector<int> thread_ids();      // every thread id, ascending
+std::uint64_t switch_count();      // how often the scheduler changed the running thread
 int create_thread(std::uint32_t entry, std::uint32_t stack_size, int priority, std::uint32_t gp, std::uint32_t attr, std::uint32_t option);
 void start_thread(int id, std::uint32_t a0, std::uint32_t a1 = 0);
 bool delete_thread(int id);

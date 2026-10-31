@@ -103,6 +103,16 @@ if(NOT WIN32 AND NOT EMSCRIPTEN)
 endif()
 target_include_directories(ps2runtime ${PS2_API} "${CMAKE_CURRENT_SOURCE_DIR}/runtime/include")
 
+# the IOP thread manager tested through a synthetic module, no game needed: ninja ps2thbasetest
+if(NOT EMSCRIPTEN)
+    add_executable(ps2thbasetest EXCLUDE_FROM_ALL tests/iop_thbase.cpp)
+    target_include_directories(ps2thbasetest PRIVATE runtime/src)
+    target_link_libraries(ps2thbasetest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2thbasetest PRIVATE synchronization)  # the GS queue's WaitOnAddress, which the wgpu line above adds only with wgpu
+    endif()
+endif()
+
 set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
 if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
     set(PS2_GS_WGSL "${CMAKE_BINARY_DIR}/gs_wgsl.cpp")
@@ -139,6 +149,9 @@ if(NOT EMSCRIPTEN)
     add_executable(ps2sifcmdtest EXCLUDE_FROM_ALL tests/sif_cmd_intr.cpp)
     target_include_directories(ps2sifcmdtest PRIVATE runtime/src)
     target_link_libraries(ps2sifcmdtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2sifcmdtest PRIVATE synchronization)  # the GS queue's WaitOnAddress, which the wgpu line above adds only with wgpu
+    endif()
 endif()
 
 if(PS2_GENERATED)

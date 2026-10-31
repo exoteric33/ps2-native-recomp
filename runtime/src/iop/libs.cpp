@@ -326,6 +326,29 @@ void install_intrman() {
     def("intrman", 23, "QueryIntrContext", [](Cpu &c) { c.r[2] = in_interrupt() ? 1u : 0u; });
 }
 
+// thbase, the IOP thread manager. The export numbers and names are those of ps2sdk's thread manager
+// (iop/system/threadman/src/exports.tab, AFL-2.0): 3 GetThreadmanData, 4 CreateThread ... 41 GetSystemStatusFlag, and from export
+// version 1.2 on (iop/system/threadman/include/xthbase.h) 42 GetThreadCurrentPriority, 43 GetSystemTimeLow, 44 ReferSystemStatus,
+// 45 ReferThreadRunStatus, 46 GetThreadStackFreeSize, 47 GetThreadmanIdList. Argument layouts, constants and error codes come from
+// ps2sdk's thbase.h, xthbase.h, kerr.h and thbase.c; where ps2sdk only has a stub or keeps no such statistics, the comment says so.
+
+// The wait types of ps2sdk thbase.h (TSW_*) for the wait kinds of this kernel.
+int sdk_wait_type(WaitKind kind) {
+    switch (kind) {
+    case kWaitNone: return 0;
+    case kWaitSleep: return 1;
+    case kWaitDelay: return 2;
+    case kWaitSema: return 3;
+    case kWaitEvent: return 4;
+    case kWaitMbx: return 5;
+    case kWaitVpl: return 6;
+    case kWaitFpl: return 7;
+    default: return 1;  // the waits this kernel uses inside its own libraries (vblank, SIF RPC): a sleep as far as a game can tell
+    }
+}
+
+bool waiting(const Thread &t) { return t.status == kWait || t.status == kWaitSuspend; }
+
 void install_thbase() {
     register_hle_library("thbase", 0x0101);
     def("thbase", 4, "CreateThread", [](Cpu &c) {
@@ -427,7 +450,7 @@ void install_thbase() {
             write32(p + 24, t->gp);
             write32(p + 28, static_cast<std::uint32_t>(t->init_priority));
             write32(p + 32, static_cast<std::uint32_t>(t->priority));
-            write32(p + 36, static_cast<std::uint32_t>(t->wait));
+            write32(p + 36, waiting(*t) ? static_cast<std::uint32_t>(sdk_wait_type(t->wait)) : 0u);
             write32(p + 40, static_cast<std::uint32_t>(t->wait_id));
             write32(p + 44, static_cast<std::uint32_t>(t->wakeups));
         }
@@ -444,7 +467,7 @@ void install_thbase() {
     auto wakeup = [](Cpu &c) {
         Thread *t = thread(static_cast<int>(arg(c, 0)));
         if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
-        if (t->status == kWait && t->wait == kWaitSleep) {
+        if (waiting(*t) && t->wait == kWaitSleep) {
             wake(*t, 0);
             reschedule();
         } else {
@@ -461,8 +484,42 @@ void install_thbase() {
     };
     def("thbase", 27, "CancelWakeupThread", cancel_wakeup);
     def("thbase", 28, "iCancelWakeupThread", cancel_wakeup);
-    def("thbase", 29, "SuspendThread", [](Cpu &c) { c.r[2] = 0; });
-    def("thbase", 31, "ResumeThread", [](Cpu &c) { c.r[2] = 0; });
+    // SuspendThread / ResumeThread (and the i- variants for interrupt handlers). ps2sdk's own thread manager only has stubs that
+    // return KE_ERROR here, so the behaviour is that of the console's thread manager as its documentation describes it: a ready or
+    // running thread becomes SUSPEND, a waiting one WAIT-SUSPEND (it stays suspended when the wait ends); a dormant thread gives
+    // KE_DORMANT, a thread that is suspended already KE_ERROR; thid 0 (TH_SELF) is not allowed (KE_ILLEGAL_THID, as in
+    // StartThread of thbase.c). ResumeThread on a thread that is not suspended gives KE_NOT_SUSPEND.
+    auto suspend = [](Cpu &c) {
+        const int id = static_cast<int>(arg(c, 0));
+        if (id == 0) { c.r[2] = static_cast<std::uint32_t>(-406); return; }
+        Thread *t = thread(id);
+        if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
+        c.r[2] = 0;
+        switch (t->status) {
+        case kDormant: c.r[2] = static_cast<std::uint32_t>(-413); break;
+        case kSuspend:
+        case kWaitSuspend: c.r[2] = static_cast<std::uint32_t>(-1); break;
+        case kWait: t->status = kWaitSuspend; break;
+        default:
+            t->status = kSuspend;
+            reschedule();
+            break;
+        }
+    };
+    auto resume = [](Cpu &c) {
+        const int id = static_cast<int>(arg(c, 0));
+        if (id == 0) { c.r[2] = static_cast<std::uint32_t>(-406); return; }
+        Thread *t = thread(id);
+        if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
+        c.r[2] = 0;
+        if (t->status == kSuspend) ready(*t);
+        else if (t->status == kWaitSuspend) t->status = kWait;
+        else c.r[2] = static_cast<std::uint32_t>(-415);
+    };
+    def("thbase", 29, "SuspendThread", suspend);
+    def("thbase", 30, "iSuspendThread", suspend);
+    def("thbase", 31, "ResumeThread", resume);
+    def("thbase", 32, "iResumeThread", resume);
     def("thbase", 33, "DelayThread", [](Cpu &c) {
         Thread *t = current();
         c.r[2] = 0;
@@ -497,6 +554,115 @@ void install_thbase() {
     });
     def("thbase", 41, "GetSystemStatusFlag", [](Cpu &c) { c.r[2] = 0; });
     def("thbase", 43, "GetSystemTimeLow", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(now()); });
+
+    // 42 GetThreadCurrentPriority: KE_ILLEGAL_CONTEXT inside an interrupt handler, else the running thread's current priority
+    // (thbase.c). With no thread running the idle thread is meant, whose priority is 127 (CreateThread refuses anything above 126).
+    def("thbase", 42, "GetThreadCurrentPriority", [](Cpu &c) {
+        if (in_interrupt()) { c.r[2] = static_cast<std::uint32_t>(-100); return; }
+        const Thread *t = current();
+        c.r[2] = static_cast<std::uint32_t>(t ? t->priority : 127);
+    });
+
+    // 44 ReferSystemStatus(info, size): size below sizeof(iop_sys_status_t) (0x40) gives KE_ERROR; else `size` bytes are zeroed and
+    // status (0 in a thread, 3 with interrupts disabled, 4 in an interrupt handler), systemLowTimerWidth (32), idleClocks, kernelClocks,
+    // comesOutOfIdleCount and threadSwitchCount are filled (thbase.c). This kernel keeps no clock statistics, so those stay 0.
+    def("thbase", 44, "ReferSystemStatus", [](Cpu &c) {
+        const std::uint32_t p = arg(c, 0), size = arg(c, 1);
+        if (size < 0x40u) { c.r[2] = static_cast<std::uint32_t>(-1); return; }
+        for (std::uint32_t i = 0; i < size; i += 4) write32(p + i, 0);
+        write32(p + 0, in_interrupt() ? 4u : (interrupts_suspended() ? 3u : 0u));
+        write32(p + 4, 32);
+        write32(p + 28, static_cast<std::uint32_t>(switch_count()));
+        c.r[2] = 0;
+    });
+
+    // 45 ReferThreadRunStatus(thid, stat, size): KE_ILLEGAL_CONTEXT in an interrupt handler, KE_UNKNOWN_THID for a bad id (0 means the
+    // running thread), KE_ILLEGAL_SIZE (-432) when size is below sizeof(iop_thread_run_status_t) (0x2C). Layout (thbase.h):
+    // status, currentPriority, waitType, waitId, wakeupCount, regContext, runClocks (lo, hi), intrPreemptCount, threadPreemptCount,
+    // releaseCount. The register context and the run statistics are not kept here and read 0.
+    def("thbase", 45, "ReferThreadRunStatus", [](Cpu &c) {
+        if (in_interrupt()) { c.r[2] = static_cast<std::uint32_t>(-100); return; }
+        const int id = static_cast<int>(arg(c, 0));
+        const std::uint32_t p = arg(c, 1), size = arg(c, 2);
+        Thread *t = id < 0 ? nullptr : thread(id);
+        if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
+        if (size < 0x2Cu) { c.r[2] = static_cast<std::uint32_t>(-432); return; }
+        for (std::uint32_t i = 0; i < size; i += 4) write32(p + i, 0);
+        write32(p + 0, static_cast<std::uint32_t>(t->status));
+        write32(p + 4, static_cast<std::uint32_t>(t->priority));
+        if (waiting(*t)) {
+            write32(p + 8, static_cast<std::uint32_t>(sdk_wait_type(t->wait)));
+            write32(p + 12, static_cast<std::uint32_t>(t->wait_id));
+        }
+        write32(p + 16, static_cast<std::uint32_t>(t->wakeups));
+        c.r[2] = 0;
+    });
+
+    // 46 GetThreadStackFreeSize(thid): KE_ILLEGAL_CONTEXT in an interrupt handler, KE_UNKNOWN_THID for a bad id (0 means the running
+    // thread). The console's thread manager fills a new stack with 0xFF and returns how much of it was never touched. This kernel
+    // does not fill stacks (a game can depend on what is in there), so it returns the room that is left below the thread's stack
+    // pointer: the same figure at the moment of the call, never smaller than the console's lowest-ever figure.
+    def("thbase", 46, "GetThreadStackFreeSize", [](Cpu &c) {
+        if (in_interrupt()) { c.r[2] = static_cast<std::uint32_t>(-100); return; }
+        const int id = static_cast<int>(arg(c, 0));
+        Thread *t = id < 0 ? nullptr : thread(id);
+        if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
+        std::uint32_t free_bytes = t->stack_size;
+        if (t->status != kDormant) {
+            const std::uint32_t sp = t == current() ? c.r[29] : t->context.r[29];
+            if (sp >= t->stack && sp <= t->stack + t->stack_size) free_bytes = sp - t->stack;
+        }
+        c.r[2] = free_bytes;
+    });
+
+    // 47 GetThreadmanIdList(type, buf, bufsize, *count): writes up to bufsize ids to buf and returns how many it wrote; *count (if
+    // not NULL) gets the number that exist. type 1..9 is TMID_Thread, Semaphore, EventFlag, Mbox, Vpl, Fpl, SleepThread, DelayThread,
+    // DormantThread (xthbase.h); any other value is the id of a semaphore, event flag, mailbox, variable or fixed pool and lists the
+    // threads waiting on it, KE_ILLEGAL_TYPE (-431) when it is none of those (thbase.c). Object ids here are small numbers, so the
+    // first nine objects of a game share their id with a TMID_ type; the type wins, as the ids of the console are far above 9.
+    def("thbase", 47, "GetThreadmanIdList", [](Cpu &c) {
+        if (in_interrupt()) { c.r[2] = static_cast<std::uint32_t>(-100); return; }
+        const int type = static_cast<int>(arg(c, 0));
+        const std::uint32_t buf = arg(c, 1), count_at = arg(c, 3);
+        const int capacity = static_cast<int>(arg(c, 2));
+        std::vector<int> ids;
+        const auto threads_where = [&ids](const std::function<bool(const Thread &)> &pick) {
+            for (const int id : thread_ids())
+                if (const Thread *t = thread(id); t && pick(*t)) ids.push_back(id);
+        };
+        const auto keys = [&ids](const auto &objects) {
+            for (const auto &entry : objects) ids.push_back(entry.first);
+        };
+        switch (type) {
+        case 1: threads_where([](const Thread &) { return true; }); break;
+        case 2: keys(g_semas); break;
+        case 3: keys(g_events); break;
+        case 4: keys(g_mbxs); break;
+        case 5: keys(g_vpls); break;
+        case 6: keys(g_fpls); break;
+        case 7: threads_where([](const Thread &t) { return waiting(t) && t.wait == kWaitSleep; }); break;
+        case 8: threads_where([](const Thread &t) { return waiting(t) && t.wait == kWaitDelay; }); break;
+        case 9: threads_where([](const Thread &t) { return t.status == kDormant; }); break;
+        default: {
+            WaitKind kind = kWaitNone;
+            if (g_semas.count(type)) kind = kWaitSema;
+            else if (g_events.count(type)) kind = kWaitEvent;
+            else if (g_mbxs.count(type)) kind = kWaitMbx;
+            else if (g_vpls.count(type)) kind = kWaitVpl;
+            else if (g_fpls.count(type)) kind = kWaitFpl;
+            if (kind == kWaitNone) { c.r[2] = static_cast<std::uint32_t>(-431); return; }
+            threads_where([kind, type](const Thread &t) { return waiting(t) && t.wait == kind && t.wait_id == type; });
+        }
+        }
+        int written = 0;
+        for (const int id : ids) {
+            if (written >= capacity) break;
+            write32(buf + 4u * static_cast<std::uint32_t>(written), static_cast<std::uint32_t>(id));
+            ++written;
+        }
+        if (count_at) write32(count_at, static_cast<std::uint32_t>(ids.size()));
+        c.r[2] = static_cast<std::uint32_t>(written);
+    });
 }
 
 void install_thsemap() {

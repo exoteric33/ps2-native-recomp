@@ -68,6 +68,7 @@ int g_current = 0;
 int g_next_thread = 1;
 std::uint64_t g_order = 0;
 bool g_switch = false;
+std::uint64_t g_switch_count = 0;  // thread switches so far (statistics for ReferSystemStatus; not part of the save state)
 
 std::map<std::uint32_t, std::uint32_t> g_used;
 std::uint32_t g_kernel_top = kKernelBase;
@@ -100,6 +101,7 @@ void do_switch() {
     Thread *cur = current();
     Thread *next = best_ready();
     if (next == cur && cur && cur->status == kRun) return;
+    ++g_switch_count;
     if (cur && cur->status != kDormant) {
         cur->context = g_cpu;
         cur->suspended = g_suspended;
@@ -293,6 +295,15 @@ Thread *thread(int id) {
     auto it = g_threads.find(id);
     return it == g_threads.end() ? nullptr : &it->second;
 }
+
+std::vector<int> thread_ids() {
+    std::vector<int> ids;
+    ids.reserve(g_threads.size());
+    for (const auto &[id, t] : g_threads) ids.push_back(id);
+    return ids;
+}
+
+std::uint64_t switch_count() { return g_switch_count; }
 
 int create_thread(std::uint32_t entry, std::uint32_t stack_size, int priority, std::uint32_t gp, std::uint32_t attr, std::uint32_t option) {
     Thread t;

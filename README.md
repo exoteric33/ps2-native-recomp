@@ -72,6 +72,7 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 | Resident Evil 4 | plays well, not played through yet: the menus, the opening, Leon in the forest | me |
 | Silent Hill 2 | plays well, not played through yet: the opening at the rest stop and about 20 minutes of play from there but works fine| me |
 | Shadow of the Colossus | plays well, not played through yet: played like 30 minutes that went very well | me |
+| Grand Theft Auto III | plays well, not played through yet: from power-on through the first mission, and the game's own save and load work, also in 16:9 | Chewing_Character, me |
 | The Super Dimension Fortress Macross | plays well, not played through yet: menus and gameplay at about 60 fps (Windows 11, a laptop with Intel graphics, a game controller; [#3](https://github.com/exoteric33/ps2-native-recomp/issues/3)) | omegakatana92 |
 | The King of Fighters XI | plays well, not played through yet: works perfectly | TsimpleD (Reddit) |
 | God Hand | plays well, not played through yet: as far as the casino hub, no problems so far | theraineydaze (Reddit) |

@@ -4,6 +4,14 @@ Turns the disc image of a PS2 game you own into a native program for Windows or 
 stage** and still changes a lot. God of War II has been played from start to end on Windows; a few more games run as far
 as they have been played.
 
+**13 games ran with no extra work at all:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
+Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
+Western, Thunder Force VI, Raiden III and Heavenly Guardian. *No extra work* means nobody changed anything for these games: the
+tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)).
+
+**The goal is a universal tool:** any PS2 game, recompiled the same way, with no work for each game. When a game doesn't run
+yet, the fix goes into the tool, so it helps every game.
+
 **Don't expect every game to work on the first try.** Only a few games have been tried so far, and each game uses the
 console a little differently, so many still stop at a black screen, crash, or play with missing sound or wrong pictures.
 When a game doesn't work, please send me a report (see [*Playtesters wanted*](#playtesters-wanted)): every report shows

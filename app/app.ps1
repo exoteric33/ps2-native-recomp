@@ -435,15 +435,22 @@ try {
         $r = Open-Get $url $accept 10000
         try { (New-Object IO.StreamReader($r.GetResponseStream(), [Text.Encoding]::UTF8)).ReadToEnd() } finally { $r.Close() }
     }
-    if ($mode -eq 'check') {
-        $newest = (Get-Text "$api/commits/main" 'application/vnd.github.sha').Trim()
-        if ($newest -notmatch '^[0-9a-f]{40}$') { throw 'unexpected answer' }
-        $sh.Sha = $newest
-        $installed = ''
-        try { $installed = (Get-Content -LiteralPath (Join-Path $dir 'installed.txt') -Raw).Trim() } catch { }
-        if ($installed -eq $newest) { $sh.Result = 'current'; return }
-        # Not the version this app recorded (or none): are the files the same as the newest version's anyway?
-        $tree = (Get-Text "$api/git/trees/${newest}?recursive=1" 'application/vnd.github+json') | ConvertFrom-Json
+    function Get-BlobSha([byte[]]$bytes) {
+        $head = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+        $hash = [Security.Cryptography.SHA1]::Create()
+        [void]$hash.TransformBlock($head, 0, $head.Length, $null, 0)
+        [void]$hash.TransformFinalBlock($bytes, 0, $bytes.Length)
+        ($hash.Hash | ForEach-Object { $_.ToString('x2') }) -join ''
+    }
+    function ConvertTo-Lf([byte[]]$bytes) {
+        $out = New-Object IO.MemoryStream
+        for ($i = 0; $i -lt $bytes.Length; $i++) {
+            if ($bytes[$i] -eq 13 -and $i + 1 -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { continue }
+            $out.WriteByte($bytes[$i])
+        }
+        ,$out.ToArray()
+    }
+    function Compare-TreeToFiles($tree, [string]$root) {
         $same = $true
         $count = 0
         foreach ($entry in $tree.tree) {
@@ -454,13 +461,26 @@ try {
             $file = Join-Path $root ($path.Replace('/', '\'))
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { $same = $false; break }
             $bytes = [IO.File]::ReadAllBytes($file)
-            $head = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
-            $hash = [Security.Cryptography.SHA1]::Create()
-            [void]$hash.TransformBlock($head, 0, $head.Length, $null, 0)
-            [void]$hash.TransformFinalBlock($bytes, 0, $bytes.Length)
-            $hex = ($hash.Hash | ForEach-Object { $_.ToString('x2') }) -join ''
-            if ($hex -ne [string]$entry.sha) { $same = $false; break }
+            if ((Get-BlobSha $bytes) -eq [string]$entry.sha) { continue }
+            # GitHub's zip applies .gitattributes (eol=crlf for .ps1/.cmd/.bat), so such a file holds CRLF while git stores LF:
+            # compare once more with CRLF turned into LF (git's own text normalisation), only for files that contain a CR.
+            if ([Array]::IndexOf($bytes, [byte]13) -ge 0 -and (Get-BlobSha (ConvertTo-Lf $bytes)) -eq [string]$entry.sha) { continue }
+            $same = $false; break
         }
+        @{ Same = $same; Count = $count }
+    }
+    if ($mode -eq 'check') {
+        $newest = (Get-Text "$api/commits/main" 'application/vnd.github.sha').Trim()
+        if ($newest -notmatch '^[0-9a-f]{40}$') { throw 'unexpected answer' }
+        $sh.Sha = $newest
+        $installed = ''
+        try { $installed = (Get-Content -LiteralPath (Join-Path $dir 'installed.txt') -Raw).Trim() } catch { }
+        if ($installed -eq $newest) { $sh.Result = 'current'; return }
+        # Not the version this app recorded (or none): are the files the same as the newest version's anyway?
+        $tree = (Get-Text "$api/git/trees/${newest}?recursive=1" 'application/vnd.github+json') | ConvertFrom-Json
+        $cmp = Compare-TreeToFiles $tree $root
+        $same = $cmp.Same
+        $count = $cmp.Count
         if ($same -and $count -gt 20) {
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
             Set-Content -LiteralPath (Join-Path $dir 'installed.txt') -Value $newest -Encoding ASCII

@@ -149,7 +149,7 @@ You need git, clang, CMake, Ninja, Python 3, the SDL2 development files and a Vu
 `bash scripts/setup.sh --native-only` and `bash scripts/port.sh mygame "My Game.iso" --native-only`, and run the line it
 prints. Checked on CachyOS with an NVIDIA graphics card.
 
-On macOS the original project builds and runs (on Metal); my changes have not been tried on a Mac yet.
+**macOS:** [n0madic](https://github.com/n0madic) is the macOS maintainer: builds and tests it on an Apple Silicon Mac and looks after Mac issues and pull requests. GitHub also builds every change on macOS.
 
 ## Playing
 

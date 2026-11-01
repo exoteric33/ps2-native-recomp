@@ -14,7 +14,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # The event is part of the group: in a private repo a push run skips its jobs, and must not cancel a run started by hand.
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -97,11 +98,15 @@ jobs:
 
       - name: Free test programs (ps2autotests), one on macOS
         if: runner.os == 'macOS'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}   # the test listing comes from GitHub's API, which limits anonymous requests
         run: python3 scripts/autotests.py --jobs 1 --timeout 900 cpu/ee/alu
 
       - name: Free test programs (ps2autotests), all on Linux
         if: runner.os == 'Linux'
         timeout-minutes: 25
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/autotests.py --jobs 4 --timeout 900
 
       - name: Keep the logs of a failed run

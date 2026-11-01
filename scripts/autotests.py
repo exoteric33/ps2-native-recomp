@@ -47,7 +47,13 @@ ps2tools.set_program('autotests')
 def http_get(url, tries=3):
     for attempt in range(tries):
         try:
-            request = urllib.request.Request(url, headers={'User-Agent': 'ps2-native-recomp-autotests'})
+            headers = {'User-Agent': 'ps2-native-recomp-autotests'}
+            # GitHub's API allows few anonymous requests per address, and shared CI machines run out (HTTP 403); with a
+            # token (GitHub Actions sets GITHUB_TOKEN in ci.yml) the limit is per repo. Only sent to api.github.com.
+            token = os.environ.get('GITHUB_TOKEN')
+            if token and url.startswith('https://api.github.com/'):
+                headers['Authorization'] = 'Bearer ' + token
+            request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=60) as response:
                 return response.read()
         except Exception as error:

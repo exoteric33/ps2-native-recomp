@@ -37,6 +37,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#include <timeapi.h>
 #include <shellapi.h>
 #else
 #include <cerrno>
@@ -533,6 +534,8 @@ static int run_threads_headless(const std::function<int()> &emulate) {
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
+    // The runtime uses short SDL/condition-variable waits; request 1 ms timer granularity for Windows pacing.
+    timeBeginPeriod(1);
     connect_output();
     // argv is in the ANSI code page and loses every character outside it: take the UTF-16 command line and use it as UTF-8
     std::vector<std::string> utf8_args;
@@ -554,7 +557,11 @@ int main(int argc, char **argv) {
 #else
     install_signal_handlers();
 #endif
-    std::atexit([] { ps2::flush_memory_card(); });  // whatever way the program ends through exit()
+#ifdef _WIN32
+    std::atexit([] { timeEndPeriod(1); ps2::flush_memory_card(); });
+#else
+    std::atexit([] { ps2::flush_memory_card(); });
+#endif
     std::vector<std::string> args{argv[1]};
     [[maybe_unused]] bool window = false, fullscreen = false;
     std::string load_path;

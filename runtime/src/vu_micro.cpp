@@ -747,6 +747,7 @@ void code_changed(int unit) {
 void register_programs(const Program *programs, std::uint32_t count) {
     for (std::uint32_t i = 0; i < count; ++i)
         if (programs[i].function) g_programs[programs[i].key] = programs[i].function;
+    if (count > 0) std::fprintf(stderr, "[vu1] Statically registered %u compiled vector programs\n", count);
 }
 
 // Programs the background thread compiled and loaded (vu_live.cpp) join the table of built-in ones. A program the build knew keeps

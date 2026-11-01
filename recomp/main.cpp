@@ -123,6 +123,7 @@ std::map<std::uint32_t, Toggle> read_toggles(const std::string &path) {
 
 int usage() {
     std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--overlays dir] [--probes file] [--toggles file] [--out dir] [--stats]\n");
+    std::fprintf(stderr, "       eerecomp --live-image <captured.bin> --base <hex> --stamp <hex> --out <dir> [--entry <hex>]... [--expect-name <base_crc>] [--dense-checks]\n");
     return 2;
 }
 
@@ -144,6 +145,61 @@ int main(int argc, char **argv) {
     }
 #endif
     if (argc < 2) return usage();
+    if (std::strcmp(argv[1], "--live-image") == 0) {
+        if (argc < 3) return usage();
+        std::string image_path = argv[2], out_dir, expected_name;
+        std::uint32_t base = 0;
+        std::uint64_t stamp = 0;
+        bool have_base = false, have_stamp = false, dense_checks = false;
+        std::vector<std::uint32_t> entries;
+        try {
+            for (int i = 3; i < argc; ++i) {
+                const std::string arg = argv[i];
+                if (arg == "--base" && i + 1 < argc) {
+                    const unsigned long long value = std::stoull(argv[++i], nullptr, 16);
+                    if (value > UINT32_MAX) return usage();
+                    base = static_cast<std::uint32_t>(value);
+                    have_base = true;
+                } else if (arg == "--stamp" && i + 1 < argc) {
+                    stamp = std::stoull(argv[++i], nullptr, 16);
+                    have_stamp = true;
+                } else if (arg == "--out" && i + 1 < argc) out_dir = argv[++i];
+                else if (arg == "--expect-name" && i + 1 < argc) expected_name = argv[++i];
+                else if (arg == "--entry" && i + 1 < argc) {
+                    const unsigned long long value = std::stoull(argv[++i], nullptr, 16);
+                    if (value > UINT32_MAX) return usage();
+                    entries.push_back(static_cast<std::uint32_t>(value));
+                } else if (arg == "--dense-checks") dense_checks = true;
+                else return usage();
+            }
+            if (image_path.empty() || out_dir.empty() || !have_base || !have_stamp || !stamp) return usage();
+            std::ifstream input(ps2::os::path(image_path), std::ios::binary);
+            if (!input) throw std::runtime_error("cannot open captured image");
+            std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            if (bytes.size() > UINT32_MAX - base) throw std::runtime_error("image exceeds 32-bit address space");
+            const std::string name = window_name(base, bytes.data(), bytes.size());
+            if (!expected_name.empty() && expected_name != name) throw std::runtime_error("image content does not match expected window name");
+            std::filesystem::create_directories(ps2::os::path(out_dir));
+            LiveRequest request;
+            request.base = base;
+            request.image = std::move(bytes);
+            request.name = name;
+            request.prefix = "m_" + name + "_offline_";
+            request.entries = std::move(entries);
+            request.stamp = stamp;
+            request.sparse_checks = !dense_checks;
+            const LiveResult result = generate_live(request, ps2::os::path(out_dir));
+            std::printf("live-image %s base=0x%08X bytes=%zu sparse=%d ok=%d code=%zu units=%zu accepted=%zu rejected=%zu\n",
+                        name.c_str(), base, request.image.size(), request.sparse_checks, result.ok, result.code,
+                        result.units, result.accepted.size(), result.rejected.size());
+            for (const std::uint32_t pc : result.rejected) std::printf("rejected 0x%08X\n", pc);
+            if (!result.ok) std::fprintf(stderr, "live-image error: %s\n", result.error.c_str());
+            return result.ok ? 0 : 1;
+        } catch (const std::exception &error) {
+            std::fprintf(stderr, "live-image error: %s\n", error.what());
+            return 1;
+        }
+    }
     std::string elf_path = argv[1], entries_path, out, probes_path, toggles_path, modules_dir, overlays_dir;
     bool stats = false;
     for (int i = 2; i < argc; ++i) {

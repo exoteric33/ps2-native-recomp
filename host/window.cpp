@@ -1678,6 +1678,16 @@ bool open_window(bool fullscreen) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
     }
+    SDL_ShowWindow(g_window);
+    SDL_RaiseWindow(g_window);
+#ifdef _WIN32
+    SDL_SysWMinfo wm_info;
+    SDL_VERSION(&wm_info.version);
+    if (SDL_GetWindowWMInfo(g_window, &wm_info) && wm_info.subsystem == SDL_SYSWM_WINDOWS) {
+        ShowWindow(static_cast<HWND>(wm_info.info.win.window), SW_SHOWNORMAL);
+        SetForegroundWindow(static_cast<HWND>(wm_info.info.win.window));
+    }
+#endif
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
     SDL_AudioSpec want{}, have{};
     want.freq = 48000;

@@ -168,6 +168,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2sifcmdtest PRIVATE synchronization)  # the GS queue's WaitOnAddress, which the wgpu line above adds only with wgpu
     endif()
+    # VU control-flow, E-bit return, and ILW/branch-register timing regression fixture: ninja ps2vuregtest
+    add_executable(ps2vuregtest EXCLUDE_FROM_ALL tests/test_vu_regression.cpp)
+    target_include_directories(ps2vuregtest PRIVATE runtime/src)
+    target_link_libraries(ps2vuregtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2vuregtest PRIVATE synchronization)
+    endif()
     # damaged disc images, IOP modules and boot ELFs refused cleanly, no game needed: ninja ps2discinputtest
     add_executable(ps2discinputtest EXCLUDE_FROM_ALL tests/disc_input.cpp)
     target_include_directories(ps2discinputtest PRIVATE runtime/src)

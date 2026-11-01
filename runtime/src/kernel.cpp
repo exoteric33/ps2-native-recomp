@@ -329,6 +329,13 @@ void exit_current(Cpu &c, bool remove) {
         return;
     }
     reschedule(c);
+    // ExitDeleteThread has erased the running thread, so reschedule() finds "no thread" before and after (nothing else is
+    // ready, the others wait for an interrupt handler) and leaves everything as it is: the caller would run on after the call
+    // that must never return. The console idles until a handler wakes a thread.
+    if (remove && !g_in_handler && g_current == 0) {
+        c.pc = kIdle | kUnwind;
+        if (g_options.trace_threads) std::fprintf(stderr, "[thread] -> idle\n");
+    }
 }
 
 void write_thread_status(int id, std::uint32_t p) {

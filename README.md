@@ -68,6 +68,12 @@ Not promises, just where this can go:
 - **The Steam Deck and other handhelds:** Linux already works; it needs testing there.
 - **More games:** every report shows me what to fix next.
 
+## Offline runtime inspection
+
+Developers can request exact screenshot frames and opt-in EE RAM window captures for repeatable offline recompilation
+work. See [`docs/aot-window-capture.md`](docs/aot-window-capture.md). Capturing RAM does not itself prove that a
+translated cache is complete or correct; the offline build and cache validation must establish that.
+
 ## What runs
 
 Tried with real discs (mine are US releases), as far as each was played (no known bugs):

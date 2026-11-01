@@ -50,6 +50,7 @@ struct Options {
     bool trace_iop_hle = false;
     std::string frames_dir;
     std::uint32_t frame_every = 60;
+    std::vector<std::uint64_t> frame_capture_frames; // additional exact frames requested by --frame-at
     bool sync_pictures = false;  // render_pending reads each picture back at once instead of a picture or two later (headless runs with threads)
     std::vector<Press> presses;
     std::vector<AxisPress> axis_presses;
@@ -92,6 +93,7 @@ void save_context(const Cpu &c, ThreadContext &t);
 void load_context(Cpu &c, const ThreadContext &t);
 
 std::uint64_t now();
+bool frame_capture_requested(std::uint64_t frame);
 std::uint64_t rtc_seconds();  // the clock the game reads, in seconds since 1970 (UTC), see Options::rtc_epoch
 std::uint64_t hblank_cycles();
 void set_budget(Cpu &c, std::int64_t cycles);

@@ -55,6 +55,11 @@ namespace ps2 {
 Cpu g_cpu;
 Options g_options;
 
+bool frame_capture_requested(std::uint64_t frame) {
+    if (g_options.frame_every && frame % g_options.frame_every == 0) return true;
+    return std::binary_search(g_options.frame_capture_frames.begin(), g_options.frame_capture_frames.end(), frame);
+}
+
 // What the game's controller port gets: the pad state of one port as the host tells it. The host (window thread) writes g_pad_in at any
 // time; the emulation takes it over once per frame (latch_pads), so a run is the same however the host's timing falls. The recording
 // (quick_keys.inc) notes what was taken over.
@@ -292,23 +297,54 @@ void vblank() {
     // Disabled for normal runs; the filenames retain the frame and address so
     // a headless preparer can associate each image with the scripted input.
     static const auto aot_capture = [] {
-        struct Config { std::string dir; std::vector<std::uint64_t> frames; } config;
+        struct Config {
+            std::string dir;
+            std::vector<std::uint64_t> frames;
+            std::vector<std::uint32_t> bases;
+        } config;
         config.dir = os::env("PS2_CAPTURE_AOT_DIR");
         const std::string list = os::env("PS2_CAPTURE_AOT_FRAMES");
-        if (config.dir.empty() || list.empty()) return config;
-        std::size_t at = 0;
-        while (at < list.size()) {
-            const std::size_t next = list.find(',', at);
-            const std::string token = list.substr(at, next == std::string::npos ? next : next - at);
-            char *end = nullptr;
-            const auto frame = std::strtoull(token.c_str(), &end, 10);
-            if (end == token.c_str() || *end) { config.frames.clear(); break; }
-            config.frames.push_back(frame);
-            if (next == std::string::npos) break;
-            at = next + 1;
+        const std::string base_list = os::env("PS2_CAPTURE_AOT_BASES");
+        if (config.dir.empty() || list.empty() || base_list.empty()) return config;
+        const auto parse_list = [](const std::string &text, int radix, auto &output) {
+            std::size_t at = 0;
+            while (at < text.size()) {
+                const std::size_t next = text.find(',', at);
+                const std::string token = text.substr(at, next == std::string::npos ? next : next - at);
+                char *end = nullptr;
+                const auto value = std::strtoull(token.c_str(), &end, radix);
+                if (end == token.c_str() || *end) { output.clear(); return false; }
+                output.push_back(value);
+                if (next == std::string::npos) break;
+                at = next + 1;
+            }
+            return !output.empty();
+        };
+        if (!parse_list(list, 10, config.frames)) {
+            std::fprintf(stderr, "[aot-capture] invalid PS2_CAPTURE_AOT_FRAMES list\n");
+            return config;
+        }
+        std::vector<std::uint64_t> parsed_bases;
+        if (!parse_list(base_list, 0, parsed_bases)) {
+            std::fprintf(stderr, "[aot-capture] invalid PS2_CAPTURE_AOT_BASES list\n");
+            config.frames.clear();
+            return config;
+        }
+        for (const auto base : parsed_bases) {
+            constexpr std::uint32_t unit = 0x4000u;
+            if (base == 0 || base > kRamSize - unit || base % unit != 0) {
+                std::fprintf(stderr, "[aot-capture] invalid EE RAM base: %llX\n",
+                             static_cast<unsigned long long>(base));
+                config.frames.clear();
+                config.bases.clear();
+                return config;
+            }
+            config.bases.push_back(static_cast<std::uint32_t>(base));
         }
         std::sort(config.frames.begin(), config.frames.end());
         config.frames.erase(std::unique(config.frames.begin(), config.frames.end()), config.frames.end());
+        std::sort(config.bases.begin(), config.bases.end());
+        config.bases.erase(std::unique(config.bases.begin(), config.bases.end()), config.bases.end());
         return config;
     }();
     if (!aot_capture.frames.empty() &&
@@ -316,7 +352,7 @@ void vblank() {
         std::error_code error;
         std::filesystem::create_directories(aot_capture.dir, error);
         if (error) std::fprintf(stderr, "[aot-capture] cannot create directory: %s\n", error.message().c_str());
-        else for (const std::uint32_t base : {0x00B2C000u, 0x00B5C000u, 0x00B90000u}) {
+        else for (const std::uint32_t base : aot_capture.bases) {
             constexpr std::uint32_t unit = 0x4000u, cap = 0x400000u;
             std::uint32_t size = 0;
             while (size < cap && base + size + unit <= kRamSize &&
@@ -346,7 +382,7 @@ void vblank() {
     if (g_options.on_vblank) g_options.on_vblank();
     iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
-    if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
+    if (!g_options.frames_dir.empty() && frame_capture_requested(g_frames)) dump_frame();
     hw::vblank_start();
     iop::vblank(true);
     schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });

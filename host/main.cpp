@@ -59,7 +59,7 @@ int usage() {
     std::fprintf(stderr,
                  "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
                  "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
-                 "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
+                 "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n] [--frame-at n]...\n"
                  "              [--press frame:button[+button][:frames]]... [--window] [--fullscreen]\n"
                  "              [--save-state frame:file] [--load-state file|newest] [--quick-dir dir] [--widescreen] [--patches file]\n"
                  "              [--record file] [--no-record] [--replay file [--replay-continue]] [--rtc seconds]\n");
@@ -497,7 +497,6 @@ static int run_threads_headless(const std::function<int()> &emulate) {
     ps2::init_graphics();
     ps2::g_options.on_vblank = [] { ps2::post_present(); };
     const std::string pictures = ps2::g_options.frames_dir;
-    const std::uint32_t every = ps2::g_options.frame_every ? ps2::g_options.frame_every : 1;
     ps2::g_options.frames_dir.clear();  // the emulation thread must not read the picture back itself
     ps2::g_options.sync_pictures = true;
     ps2::start_render_thread();
@@ -513,7 +512,7 @@ static int run_threads_headless(const std::function<int()> &emulate) {
         ps2::wake_render_thread();
     });
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> none, save = [&](const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height) {
-        if (ps2::picture_frame() % every) return;
+        if (!ps2::frame_capture_requested(ps2::picture_frame())) return;
         char name[48];
         std::snprintf(name, sizeof name, "/frame_%05u.ppm", ps2::picture_frame());
         if (std::FILE *f = ps2::os::open(pictures + name, "wb")) {
@@ -586,6 +585,7 @@ int main(int argc, char **argv) {
         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
         else if (a == "--frames-dir" && i + 1 < argc) ps2::g_options.frames_dir = argv[++i];
+        else if (a == "--frame-at" && i + 1 < argc) ps2::g_options.frame_capture_frames.push_back(std::strtoull(argv[++i], nullptr, 10));
         else if (a == "--press" && i + 1 < argc) {
             ps2::Press press;
             if (!ps2::parse_press(argv[++i], press)) return usage();
@@ -617,6 +617,10 @@ int main(int argc, char **argv) {
         else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
         else return usage();
     }
+    std::sort(ps2::g_options.frame_capture_frames.begin(), ps2::g_options.frame_capture_frames.end());
+    ps2::g_options.frame_capture_frames.erase(
+        std::unique(ps2::g_options.frame_capture_frames.begin(), ps2::g_options.frame_capture_frames.end()),
+        ps2::g_options.frame_capture_frames.end());
 
 #ifdef PS2_WINDOW
     // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way

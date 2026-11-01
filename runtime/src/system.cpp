@@ -288,6 +288,53 @@ void report_load() {
 
 void vblank() {
     ++g_frames;
+    // Offline EE cache preparation: capture only explicitly requested frames.
+    // Disabled for normal runs; the filenames retain the frame and address so
+    // a headless preparer can associate each image with the scripted input.
+    static const auto aot_capture = [] {
+        struct Config { std::string dir; std::vector<std::uint64_t> frames; } config;
+        config.dir = os::env("PS2_CAPTURE_AOT_DIR");
+        const std::string list = os::env("PS2_CAPTURE_AOT_FRAMES");
+        if (config.dir.empty() || list.empty()) return config;
+        std::size_t at = 0;
+        while (at < list.size()) {
+            const std::size_t next = list.find(',', at);
+            const std::string token = list.substr(at, next == std::string::npos ? next : next - at);
+            char *end = nullptr;
+            const auto frame = std::strtoull(token.c_str(), &end, 10);
+            if (end == token.c_str() || *end) { config.frames.clear(); break; }
+            config.frames.push_back(frame);
+            if (next == std::string::npos) break;
+            at = next + 1;
+        }
+        std::sort(config.frames.begin(), config.frames.end());
+        config.frames.erase(std::unique(config.frames.begin(), config.frames.end()), config.frames.end());
+        return config;
+    }();
+    if (!aot_capture.frames.empty() &&
+        std::binary_search(aot_capture.frames.begin(), aot_capture.frames.end(), g_frames)) {
+        std::error_code error;
+        std::filesystem::create_directories(aot_capture.dir, error);
+        if (error) std::fprintf(stderr, "[aot-capture] cannot create directory: %s\n", error.message().c_str());
+        else for (const std::uint32_t base : {0x00B2C000u, 0x00B5C000u, 0x00B90000u}) {
+            constexpr std::uint32_t unit = 0x4000u, cap = 0x400000u;
+            std::uint32_t size = 0;
+            while (size < cap && base + size + unit <= kRamSize &&
+                   std::any_of(g_ram + base + size, g_ram + base + size + unit,
+                               [](std::uint8_t byte) { return byte != 0; })) size += unit;
+            if (!size) continue;
+            char filename[80];
+            std::snprintf(filename, sizeof filename, "frame_%010llu_%08X.bin",
+                          static_cast<unsigned long long>(g_frames), base);
+            const auto path = (std::filesystem::path(aot_capture.dir) / filename).string();
+            if (std::FILE *file = os::open(path, "wb")) {
+                const auto written = std::fwrite(g_ram + base, 1, size, file);
+                std::fclose(file);
+                std::fprintf(stderr, "[aot-capture] frame %llu base %08X bytes %u written %zu\n",
+                             static_cast<unsigned long long>(g_frames), base, size, written);
+            } else std::fprintf(stderr, "[aot-capture] cannot write %s\n", path.c_str());
+        }
+    }
     report_load();
     time_frames();
     apply_presses();

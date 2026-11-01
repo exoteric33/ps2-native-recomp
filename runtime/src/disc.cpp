@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
 
 namespace ps2::disc {
 
@@ -32,8 +33,20 @@ std::string upper(std::string s) {
     return s;
 }
 
-void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::string &prefix, int depth) {
+// The image is untrusted (a damaged rip, or a crafted file): a directory that cannot be right is left out with one line, never
+// read past its buffer. No real directory is near this size (a record is at least 34 bytes: 16 MiB is half a million names).
+constexpr std::uint32_t kMaxDirectory = 16u << 20;
+
+void damaged(const std::string &prefix, std::uint32_t sector, const char *why) {
+    static int lines = 0;
+    if (lines++ < 20) std::fprintf(stderr, "[disc] damaged directory '%s' at sector %u: %s (left out)\n", prefix.c_str(), sector, why);
+}
+
+void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::string &prefix, int depth, std::set<std::uint64_t> &seen) {
     if (depth > 16) return;
+    // A directory that points back at itself or at a parent would be walked again and again: each extent is walked once.
+    if (!seen.insert(std::uint64_t{base} + lba).second) return;
+    if (size > kMaxDirectory) return damaged(prefix, base + lba, "too large");
     std::vector<std::uint8_t> data((size + kSector - 1) / kSector * kSector);
     if (!read(base + lba, static_cast<std::uint32_t>(data.size() / kSector), data.data())) return;
     std::size_t off = 0;
@@ -43,9 +56,15 @@ void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::
             off = (off / kSector + 1) * kSector;
             continue;
         }
+        // ISO 9660 (ECMA-119 9.1): a directory record is 33 bytes plus the name (at least one byte), all inside the directory.
+        if (length < 34 || off + length > data.size()) return damaged(prefix, base + lba, "a record runs past its end");
         const std::uint8_t *rec = &data[off];
         off += length;
         const std::uint8_t name_len = rec[32];
+        if (33u + name_len > length) {
+            damaged(prefix, base + lba, "a name runs past its record");
+            continue;
+        }
         std::string name(reinterpret_cast<const char *>(rec + 33), name_len);
         if (name_len == 1 && (name[0] == 0 || name[0] == 1)) continue;
         const auto semi = name.find(';');
@@ -54,14 +73,15 @@ void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::
         const bool dir = rec[25] & 2;
         const Entry entry{base + u32(rec + 2), u32(rec + 10), dir};
         g_index[path] = entry;
-        if (dir) walk(base, u32(rec + 2), u32(rec + 10), path + "/", depth + 1);
+        if (dir) walk(base, u32(rec + 2), u32(rec + 10), path + "/", depth + 1, seen);
     }
 }
 
 void index_layer(std::uint32_t pvd_sector, std::uint32_t base) {
     std::uint8_t pvd[kSector];
     if (!read(pvd_sector, 1, pvd) || std::memcmp(pvd, "\x01" "CD001", 6) != 0) return;
-    walk(base, u32(pvd + 158), u32(pvd + 166), "", 0);
+    std::set<std::uint64_t> seen;
+    walk(base, u32(pvd + 158), u32(pvd + 166), "", 0, seen);
 }
 
 void self_check();
@@ -69,30 +89,40 @@ void self_check();
 }
 
 bool open(const std::string &path) {
-    g_file = os::open(path, "rb");
-    if (!g_file) return false;
+    std::FILE *file = os::open(path, "rb");
+    if (!file) return false;
 #if defined(_WIN32)
-    _fseeki64(g_file, 0, SEEK_END);
-    const std::uint64_t size = static_cast<std::uint64_t>(_ftelli64(g_file));
+    const long long end = _fseeki64(file, 0, SEEK_END) == 0 ? _ftelli64(file) : -1;
 #else
-    fseeko(g_file, 0, SEEK_END);
-    const std::uint64_t size = static_cast<std::uint64_t>(ftello(g_file));
+    const long long end = fseeko(file, 0, SEEK_END) == 0 ? static_cast<long long>(ftello(file)) : -1;
 #endif
-    std::FILE *file = g_file;
-    return open(path, size, [file](std::uint64_t offset, void *out, std::size_t bytes) {
+    if (end < 0) {
+        std::fprintf(stderr, "[disc] %s: cannot find the size of the image\n", path.c_str());
+        std::fclose(file);
+        return false;
+    }
+    // A second image (a disc swap) replaces the first: its file is closed once the reader no longer uses it, so it is neither
+    // leaked nor kept locked.
+    std::FILE *previous = g_file;
+    g_file = file;
+    const bool opened = open(path, static_cast<std::uint64_t>(end), [file](std::uint64_t offset, void *out, std::size_t bytes) -> std::size_t {
+        // A failed seek reads nothing (read() then says "short read") instead of the sectors at the old position.
 #if defined(_WIN32)
-        _fseeki64(file, static_cast<long long>(offset), SEEK_SET);
+        if (_fseeki64(file, static_cast<long long>(offset), SEEK_SET) != 0) return 0;
 #else
-        fseeko(file, static_cast<off_t>(offset), SEEK_SET);
+        if (fseeko(file, static_cast<off_t>(offset), SEEK_SET) != 0) return 0;
 #endif
         return std::fread(out, 1, bytes, file);
     });
+    if (previous) std::fclose(previous);
+    return opened;
 }
 
 bool open(const std::string &name, std::uint64_t size, Reader reader, Probe probe) {
     g_reader = std::move(reader);
     g_probe = std::move(probe);
     g_size = size;
+    g_layer1 = 0;  // a second image without a second layer must not keep the first one's
     g_index.clear();
     g_indexed = false;
     index_layer(16, 0);

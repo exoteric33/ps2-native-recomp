@@ -5,6 +5,23 @@ import struct
 import sys
 
 SECTOR = 2048
+MAX_DIRECTORY = 16 << 20  # no real directory is near this (a record is at least 34 bytes); the runtime's disc.cpp uses the same
+
+
+def warn(message):
+    print('disc.py: ' + message, file=sys.stderr)
+
+
+def safe_name(name):
+    # An ISO 9660 name is raw bytes from the image: one that is "." or "..", or holds a path separator, a drive colon or a
+    # control byte, would make a path outside the destination folder. Real discs use only letters, digits, "_" and ".".
+    return name not in ('', '.', '..') and not any(c in '/\\:' or ord(c) < 32 for c in name)
+
+
+def inside(destination, path):
+    base = os.path.realpath(destination)
+    target = os.path.realpath(os.path.join(base, path))
+    return os.path.commonpath([base, target]) == base
 
 
 class Layer:
@@ -18,6 +35,7 @@ class Layer:
 
 class Image:
     def __init__(self, path):
+        self.path = path
         self.file = open(path, 'rb')
         self.size = os.path.getsize(path)
         self.layers = [Layer(0, 0, self.pvd(16))]
@@ -39,16 +57,30 @@ class Image:
 
     def files(self):
         for layer in self.layers:
-            yield from self.walk(layer, layer.root[0], layer.root[1], '')
+            yield from self.walk(layer, layer.root[0], layer.root[1], '', 0, set())
 
-    def walk(self, layer, lba, size, prefix):
+    def walk(self, layer, lba, size, prefix, depth, seen):
+        # A damaged or crafted image: a directory that points back at a parent is walked once, one that is too deep, too large or
+        # whose records run past its end is left out with a warning, and one past the end of the file stops with an error.
+        if depth > 16 or layer.base + lba in seen:
+            return
+        seen.add(layer.base + lba)
+        if size > MAX_DIRECTORY:
+            warn('damaged directory %r at sector %d: too large (left out)' % (prefix, layer.base + lba))
+            return
         data = self.read(layer.base + lba, (size + SECTOR - 1) // SECTOR)
+        if len(data) < size:
+            sys.exit('%s: the disc image ends early (truncated rip or copy?)' % self.path)
         offset = 0
         while offset < size:
             length = data[offset]
             if length == 0:
                 offset = (offset // SECTOR + 1) * SECTOR
                 continue
+            # ISO 9660 (ECMA-119 9.1): a directory record is 33 bytes plus the name, all inside the directory
+            if length < 34 or offset + length > len(data) or 33 + data[offset + 32] > length:
+                warn('damaged directory %r at sector %d: a record runs past its end (left out)' % (prefix, layer.base + lba))
+                return
             record = data[offset:offset + length]
             offset += length
             extent, extent_size = struct.unpack_from('<I', record, 2)[0], struct.unpack_from('<I', record, 10)[0]
@@ -56,9 +88,12 @@ class Image:
             if name in (b'\x00', b'\x01'):
                 continue
             name = name.decode('ascii', 'replace').split(';')[0]
+            if not safe_name(name):
+                warn('unsafe name %r in %r left out' % (name, prefix))
+                continue
             path = prefix + name
             if record[25] & 2:
-                yield from self.walk(layer, extent, extent_size, path + '/')
+                yield from self.walk(layer, extent, extent_size, path + '/', depth + 1, seen)
             else:
                 yield path, layer, layer.base + extent, extent_size
 
@@ -77,6 +112,10 @@ class Image:
             left = size
             while left:
                 chunk = self.file.read(min(left, 1 << 22))
+                if not chunk:
+                    out.close()
+                    os.remove(destination)
+                    sys.exit('%s: the disc image ends early (truncated rip or copy?) in %s' % (self.path, path))
                 out.write(chunk)
                 left -= len(chunk)
 
@@ -104,6 +143,8 @@ def extract(image, destination, patterns, limit):
         if not patterns and limit and size > limit:
             print('left in the image: %s (%d MiB)' % (path, size >> 20))
             continue
+        if not inside(destination, path):
+            sys.exit('refusing to write outside %s: %r' % (destination, path))
         image.copy(entry, os.path.join(destination, path))
         count += 1
     print('%d files extracted to %s' % (count, destination))
@@ -122,13 +163,15 @@ def modules(image, destination):
             found.append((path.replace('/', '_'), sector, 0, size))
         elif head[:4] == b'AFS\0':
             count = struct.unpack_from('<I', head, 4)[0]
-            table = read_at(image, sector, 8, count * 8)
-            for index in range(count):
+            table = read_at(image, sector, 8, min(count * 8, max(size - 8, 0)))
+            for index in range(len(table) // 8):
                 offset, length = struct.unpack_from('<II', table, index * 8)
                 if offset + 4 <= size and read_at(image, sector, offset, 4) == b'SNR2':
                     found.append(('%s_%04d' % (path.replace('/', '_'), index), sector, offset, length))
     os.makedirs(destination, exist_ok=True)
     for name, sector, offset, length in found:
+        if not inside(destination, name + '.snr'):
+            sys.exit('refusing to write outside %s: %r' % (destination, name))
         with open(os.path.join(destination, name + '.snr'), 'wb') as out:
             out.write(read_at(image, sector, offset, length))
     print('%d relocatable modules (SNR2, xff2) extracted to %s' % (len(found), destination))

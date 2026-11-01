@@ -6,12 +6,49 @@
 #include "ps2/system.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <map>
 #include <set>
 #include <vector>
+
+// Guest pointers and sizes that reach past the end of a memory. Real games never pass such values; a bad call or a damaged module
+// may. These helpers are shared by the IOP's files (sif.cpp, io.cpp, cdvd.cpp, cdvdfsv.cpp, spu2.cpp declare them where they use them).
+namespace ps2::iop {
+
+// The first few are said with what was done about them, so a game that does it in a loop does not flood the log.
+void bad_span(const char *what, std::uint32_t address, std::uint64_t size, const char *outcome) {
+    static std::atomic<unsigned> said{0};
+    const unsigned n = said.fetch_add(1, std::memory_order_relaxed);
+    if (n < 8)
+        std::fprintf(stderr, "[iop] %s: 0x%08X size 0x%llX reaches past the end of memory, %s%s\n", what, address,
+                     static_cast<unsigned long long>(size), outcome, n == 7 ? " (further ones are not shown)" : "");
+}
+
+namespace {
+bool ram_fits(std::uint32_t a, std::uint64_t n) { return (phys(a) & (kRamSize - 1)) + n <= kRamSize; }
+}
+
+// Writes n bytes into IOP memory at the masked address: one memcpy as before when they fit, else byte by byte round the 2 MiB
+// (the RAM is mirrored), so a string or a block near the end never lands past g_ram.
+void put_ram(const char *what, std::uint32_t dst, const void *data, std::size_t n) {
+    if (ram_fits(dst, n)) { std::memcpy(ram_ptr(dst), data, n); return; }
+    bad_span(what, dst, n, "written round to the start");
+    const auto *bytes = static_cast<const std::uint8_t *>(data);
+    for (std::size_t i = 0; i < n; ++i) *ram_ptr(dst + static_cast<std::uint32_t>(i)) = bytes[i];
+}
+
+// The same for a fill. More than the whole memory is cut to 2 MiB (after one round every byte has the value anyway).
+void fill_ram(const char *what, std::uint32_t dst, std::uint8_t value, std::uint64_t n) {
+    if (ram_fits(dst, n)) { std::memset(ram_ptr(dst), value, static_cast<std::size_t>(n)); return; }
+    bad_span(what, dst, n, "written round to the start");
+    n = std::min<std::uint64_t>(n, kRamSize);
+    for (std::uint32_t i = 0; i < n; ++i) *ram_ptr(dst + i) = value;
+}
+
+}
 
 namespace ps2::iop::kernel {
 
@@ -1016,32 +1053,44 @@ void install_sysclib() {
         }
         c.r[2] = 0;
     });
+    // The fast path's bounds are worked out in 64 bits (a size near 4 GiB wrapped the 32-bit sum and passed). The byte loop goes
+    // through write8, which stays inside the memory; more than the whole memory is cut to 2 MiB so it cannot run for minutes.
     auto copy = [](std::uint32_t dst, std::uint32_t src, std::uint32_t n) {
-        if (phys(dst) + n <= kRamSize && phys(src) + n <= kRamSize) std::memmove(ram_ptr(dst), ram_ptr(src), n);
-        else if (dst < src) for (std::uint32_t i = 0; i < n; ++i) write8(dst + i, read8(src + i));
+        if (std::uint64_t{phys(dst)} + n <= kRamSize && std::uint64_t{phys(src)} + n <= kRamSize) { std::memmove(ram_ptr(dst), ram_ptr(src), n); return; }
+        if (n > kRamSize) { bad_span("sysclib memcpy", dst, n, "cut to 2 MiB"); n = kRamSize; }
+        if (dst < src) for (std::uint32_t i = 0; i < n; ++i) write8(dst + i, read8(src + i));
         else for (std::uint32_t i = n; i-- > 0;) write8(dst + i, read8(src + i));
     };
     def("sysclib", 12, "memcpy", [copy](Cpu &c) { watch_copy("memcpy", arg(c, 0), arg(c, 1), arg(c, 2), c.r[31]); copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
     def("sysclib", 13, "memmove", [copy](Cpu &c) { watch_copy("memmove", arg(c, 0), arg(c, 1), arg(c, 2), c.r[31]); copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
     def("sysclib", 14, "memset", [](Cpu &c) {
         watch_copy("memset", arg(c, 0), arg(c, 1), arg(c, 2), c.r[31]);
-        if (phys(arg(c, 0)) + arg(c, 2) <= kRamSize) std::memset(ram_ptr(arg(c, 0)), static_cast<int>(arg(c, 1) & 0xFF), arg(c, 2));
-        else for (std::uint32_t i = 0; i < arg(c, 2); ++i) write8(arg(c, 0) + i, static_cast<std::uint8_t>(arg(c, 1)));
+        if (std::uint64_t{phys(arg(c, 0))} + arg(c, 2) <= kRamSize) std::memset(ram_ptr(arg(c, 0)), static_cast<int>(arg(c, 1) & 0xFF), arg(c, 2));
+        else {
+            std::uint32_t n = arg(c, 2);
+            if (n > kRamSize) { bad_span("sysclib memset", arg(c, 0), n, "cut to 2 MiB"); n = kRamSize; }
+            for (std::uint32_t i = 0; i < n; ++i) write8(arg(c, 0) + i, static_cast<std::uint8_t>(arg(c, 1)));
+        }
         c.r[2] = arg(c, 0);
     });
     def("sysclib", 15, "bcmp", [](Cpu &c) {
-        c.r[2] = std::memcmp(ram_ptr(arg(c, 0)), ram_ptr(arg(c, 1)), arg(c, 2)) ? 1u : 0u;
+        const std::uint32_t a = arg(c, 0), b = arg(c, 1), n = arg(c, 2);
+        if (ram_fits(a, n) && ram_fits(b, n)) { c.r[2] = std::memcmp(ram_ptr(a), ram_ptr(b), n) ? 1u : 0u; return; }
+        bad_span("sysclib bcmp", a, n, "compared round to the start");
+        c.r[2] = 0;
+        for (std::uint32_t i = 0; i < std::min(n, kRamSize); ++i)
+            if (*ram_ptr(a + i) != *ram_ptr(b + i)) { c.r[2] = 1; return; }
     });
     def("sysclib", 16, "bcopy", [copy](Cpu &c) { copy(arg(c, 1), arg(c, 0), arg(c, 2)); });
-    def("sysclib", 17, "bzero", [](Cpu &c) { std::memset(ram_ptr(arg(c, 0)), 0, arg(c, 1)); });
+    def("sysclib", 17, "bzero", [](Cpu &c) { fill_ram("sysclib bzero", arg(c, 0), 0, arg(c, 1)); });
     def("sysclib", 19, "sprintf", [](Cpu &c) {
         const std::string s = format(c, arg(c, 1), 2);
-        std::memcpy(ram_ptr(arg(c, 0)), s.c_str(), s.size() + 1);
+        put_ram("sysclib sprintf", arg(c, 0), s.c_str(), s.size() + 1);
         c.r[2] = static_cast<std::uint32_t>(s.size());
     });
     def("sysclib", 20, "strcat", [](Cpu &c) {
         const std::string a = ram_string(arg(c, 0), 4096), b = ram_string(arg(c, 1), 4096);
-        std::memcpy(ram_ptr(arg(c, 0) + static_cast<std::uint32_t>(a.size())), b.c_str(), b.size() + 1);
+        put_ram("sysclib strcat", arg(c, 0) + static_cast<std::uint32_t>(a.size()), b.c_str(), b.size() + 1);
         c.r[2] = arg(c, 0);
     });
     def("sysclib", 21, "strchr", [](Cpu &c) {
@@ -1057,7 +1106,7 @@ void install_sysclib() {
     });
     def("sysclib", 23, "strcpy", [](Cpu &c) {
         const std::string s = ram_string(arg(c, 1), 4096);
-        std::memcpy(ram_ptr(arg(c, 0)), s.c_str(), s.size() + 1);
+        put_ram("sysclib strcpy", arg(c, 0), s.c_str(), s.size() + 1);
         c.r[2] = arg(c, 0);
     });
     def("sysclib", 25, "index", [](Cpu &c) {
@@ -1068,7 +1117,7 @@ void install_sysclib() {
     def("sysclib", 27, "strlen", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(ram_string(arg(c, 0), 65536).size()); });
     def("sysclib", 28, "strncat", [](Cpu &c) {
         const std::string a = ram_string(arg(c, 0), 4096), b = ram_string(arg(c, 1), arg(c, 2));
-        std::memcpy(ram_ptr(arg(c, 0) + static_cast<std::uint32_t>(a.size())), b.c_str(), b.size() + 1);
+        put_ram("sysclib strncat", arg(c, 0) + static_cast<std::uint32_t>(a.size()), b.c_str(), b.size() + 1);
         c.r[2] = arg(c, 0);
     });
     def("sysclib", 29, "strncmp", [](Cpu &c) {
@@ -1077,7 +1126,9 @@ void install_sysclib() {
     });
     def("sysclib", 30, "strncpy", [](Cpu &c) {
         const std::string s = ram_string(arg(c, 1), arg(c, 2));
-        for (std::uint32_t i = 0; i < arg(c, 2); ++i) write8(arg(c, 0) + i, i < s.size() ? static_cast<std::uint8_t>(s[i]) : 0);
+        std::uint32_t n = arg(c, 2);
+        if (n > kRamSize) { bad_span("sysclib strncpy", arg(c, 0), n, "cut to 2 MiB"); n = kRamSize; }
+        for (std::uint32_t i = 0; i < n; ++i) write8(arg(c, 0) + i, i < s.size() ? static_cast<std::uint8_t>(s[i]) : 0);
         c.r[2] = arg(c, 0);
     });
     def("sysclib", 32, "strrchr", [](Cpu &c) {
@@ -1152,7 +1203,7 @@ void install_sysclib() {
             else std::snprintf(buf, sizeof buf, (spec + conv).c_str(), v);
             out += buf;
         }
-        std::memcpy(ram_ptr(arg(c, 0)), out.c_str(), out.size() + 1);
+        put_ram("sysclib vsprintf", arg(c, 0), out.c_str(), out.size() + 1);
         c.r[2] = static_cast<std::uint32_t>(out.size());
     });
 }
@@ -1201,8 +1252,8 @@ void install_modload() {
         auto it = modules().find(static_cast<int>(arg(c, 0)));
         if (it == modules().end()) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownModule); return; }
         const std::uint32_t p = arg(c, 1);
-        std::memset(ram_ptr(p), 0, 0x50);
-        std::memcpy(ram_ptr(p), it->second.name.c_str(), std::min<std::size_t>(it->second.name.size(), 55));
+        fill_ram("modload ReferModuleStatus", p, 0, 0x50);
+        put_ram("modload ReferModuleStatus", p, it->second.name.c_str(), std::min<std::size_t>(it->second.name.size(), 55));
         write32(p + 0x38, static_cast<std::uint32_t>(it->first));
         write32(p + 0x40, it->second.entry);
         write32(p + 0x44, it->second.gp);

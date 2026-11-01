@@ -6,6 +6,9 @@
     python scripts/autotests.py --list                show the tests and whether their files are in place
     python scripts/autotests.py --summary             rebuild summary.md from the results already on disk
 
+The exit code is 1 when a test HANGs, FAILs, has no result or DIFFs without being in KNOWN_DIFF (or --known-diff),
+so a script or CI can gate on it; --no-fail always exits 0.
+
 Every test goes through the same six steps as a game (disc, executable, translate, explore, vector units, build)
 with `port.sh at-<name> <image> --native-only --frames N`; the text its program prints is cut out of the exploring
 run's log (`-- TEST BEGIN` to `-- TEST END`) and diffed against the `.expected` file of the suite. See
@@ -309,6 +312,8 @@ def finish(out, result):
 # ---------------------------------------------------------------- summary
 
 ORDER = ['PASS', 'DIFF', 'HANG', 'FAIL']
+# Tests whose DIFF is known and does not fail the run (docs/autotests.md says why); --known-diff adds more.
+KNOWN_DIFF = {'vu/lower/efu'}
 
 
 def load_results(out_root, tests):
@@ -351,6 +356,24 @@ def summarize(out_root, tests, options):
     return text, counts
 
 
+def verdict(out_root, tests, options):
+    """The exit code: 1 when a test HANGs, FAILs, has no result or DIFFs without being a known DIFF."""
+    known = KNOWN_DIFF | {p.strip().strip('/') if '/' in p else p.strip().replace('-', '/') for p in options.known_diff}
+    results = {r['path']: r for r in load_results(out_root, tests)}
+    bad = []
+    for name, path in tests:
+        r = results.get(path)
+        if r is None:
+            bad.append('%s no result' % path)
+        elif r['status'] in ('HANG', 'FAIL') or (r['status'] == 'DIFF' and path not in known):
+            bad.append('%s %s' % (path, r['status']))
+        elif r['status'] == 'PASS' and path in KNOWN_DIFF:
+            say('note: %s passes now; take it out of KNOWN_DIFF in scripts/autotests.py' % path)
+    if bad:
+        say('not as expected (%d): %s' % (len(bad), ', '.join(bad)))
+    return 1 if bad and not options.no_fail else 0
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -369,6 +392,8 @@ def main():
     parser.add_argument('--fetch', action='store_true', help='only download the selected tests and exit')
     parser.add_argument('--reclassify', action='store_true', help='judge the logs of the last run again with the current rules (nothing is run), then rebuild summary.md')
     parser.add_argument('--summary', action='store_true', help='only rebuild summary.md from the results on disk')
+    parser.add_argument('--known-diff', action='append', default=[], metavar='PATH', help='a test (vu/lower/efu or vu-lower-efu) whose DIFF does not fail the run, repeatable; always known: %s' % ', '.join(sorted(KNOWN_DIFF)))
+    parser.add_argument('--no-fail', action='store_true', help='exit 0 whatever the results (by default a HANG, FAIL, missing result or unknown DIFF exits 1)')
     options = parser.parse_args()
 
     tests = listing(options)
@@ -385,7 +410,7 @@ def main():
         options.summary = True
     if options.summary:
         say(summarize(out_root, chosen, options)[0])
-        return 0
+        return verdict(out_root, chosen, options)
     fetch(options, chosen)
     if options.fetch:
         return 0
@@ -399,6 +424,7 @@ def main():
     global POOL
     tokens = options.tokens if options.tokens >= 0 else max(2, (os.cpu_count() or 4) - options.jobs)
     POOL = JobPool(tokens)
+    interrupted = False
 
     def job(item):
         nonlocal done
@@ -413,11 +439,13 @@ def main():
             list(pool.map(job, chosen))
     except KeyboardInterrupt:
         say('interrupted')
+        interrupted = True
     POOL.close()
     text, counts = summarize(out_root, chosen, options)
     say('')
     say('%s  (%d s wall clock; %s)' % (', '.join('%d %s' % (counts[s], s) for s in ORDER), time.time() - started, os.path.join(out_root, 'summary.md')))
-    return 0
+    code = verdict(out_root, chosen, options)
+    return 1 if interrupted and not options.no_fail else code  # results on disk may then be older ones
 
 
 if __name__ == '__main__':

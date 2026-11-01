@@ -14,9 +14,21 @@
 
 namespace ps2::iop {
 
+// libs.cpp: a guest size that reaches past the end of memory is said there (rate-limited).
+void bad_span(const char *what, std::uint32_t address, std::uint64_t size, const char *outcome);
+
 namespace kernel {
 
 namespace {
+
+// More sectors than fit in the IOP's 2 MiB are cut to 2 MiB: the memory is mirrored, so more would only write over the same bytes
+// again, and a bad count must not ask the host for a buffer of up to 8 TB.
+std::uint32_t iop_sectors(const char *what, std::uint32_t dst, std::uint32_t sectors) {
+    constexpr std::uint32_t kMost = kRamSize / disc::kSector;
+    if (sectors <= kMost) return sectors;
+    bad_span(what, dst, std::uint64_t{sectors} * disc::kSector, "cut to 2 MiB");
+    return kMost;
+}
 
 std::uint32_t arg(const Cpu &c, int i) { return i < 4 ? c.r[4 + i] : read32(c.r[29] + 16u + static_cast<std::uint32_t>(i - 4) * 4u); }
 
@@ -73,6 +85,13 @@ bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, 
 std::vector<std::uint8_t> read_disc_file(const std::string &path) {
     const auto entry = disc::find(path);
     if (!entry || entry->directory) return {};
+    // The size comes from the image: a damaged one can say almost 4 GiB, which would wrap the sector count below and then grow the
+    // vector to 4 GiB. What is read whole is a module or a small text file; the IOP has 2 MiB of memory.
+    constexpr std::uint32_t kMaxFile = 64u << 20;
+    if (entry->size > kMaxFile) {
+        std::fprintf(stderr, "[disc] %s: %u bytes is too large to load whole (damaged image?)\n", path.c_str(), entry->size);
+        return {};
+    }
     std::vector<std::uint8_t> data((entry->size + disc::kSector - 1) / disc::kSector * disc::kSector);
     disc::read(entry->sector, static_cast<std::uint32_t>(data.size() / disc::kSector), data.data());
     data.resize(entry->size);
@@ -83,6 +102,7 @@ namespace {
 
 bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, std::uint32_t, bool) {
     if (g_cd.busy) return false;
+    sectors = iop_sectors("sceCdRead", buffer, sectors);
     g_cd.busy = true;
     g_cd.error = 0;
     disc::ready(lsn, sectors);
@@ -170,7 +190,8 @@ void install_cdvd() {
     });
     def("cdvdman", 57, "sceCdStRead", [](Cpu &c) {
         // (sectors, destination in IOP memory, mode 0 = wait / 1 = do not wait, error out): returns the sectors delivered
-        const std::uint32_t sectors = arg(c, 0), dst = arg(c, 1), error = arg(c, 3);
+        const std::uint32_t dst = arg(c, 1), error = arg(c, 3);
+        const std::uint32_t sectors = iop_sectors("sceCdStRead", dst, arg(c, 0));
         if (trace_cd()) std::fprintf(stderr, "[cd] StRead %u sectors from %u to 0x%08X mode %u\n", sectors, g_st.position, dst, arg(c, 2));
         if (error) write32(error, 0);
         if (!g_st.active || sectors == 0 || (dst & 0x1FFFFFFFu) >= kRamSize) { c.r[2] = 0; return; }

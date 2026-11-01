@@ -124,6 +124,12 @@ void reset() { g_files.clear(); }
 
 }
 
+namespace ps2::iop {
+// libs.cpp: a guest size that reaches past the end of memory is said (rate-limited), and a fill stays inside the IOP's memory.
+void bad_span(const char *what, std::uint32_t address, std::uint64_t size, const char *outcome);
+void fill_ram(const char *what, std::uint32_t dst, std::uint8_t value, std::uint64_t n);
+}
+
 namespace ps2::iop::kernel {
 
 namespace {
@@ -145,8 +151,11 @@ void install_io() {
     def("ioman", 4, "open", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(io::open(ram_string(arg(c, 0)), arg(c, 1))); });
     def("ioman", 5, "close", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(io::close(static_cast<int>(arg(c, 0)))); });
     def("ioman", 6, "read", [](Cpu &c) {
-        std::vector<std::uint8_t> buffer(arg(c, 2));
-        const int n = io::read(static_cast<int>(arg(c, 0)), buffer.data(), arg(c, 2));
+        // More than the IOP's whole memory cannot land anywhere: cut, so a bad size does not ask the host for up to 4 GiB.
+        std::uint32_t size = arg(c, 2);
+        if (size > kRamSize) { bad_span("ioman read", arg(c, 1), size, "cut to 2 MiB"); size = kRamSize; }
+        std::vector<std::uint8_t> buffer(size);
+        const int n = io::read(static_cast<int>(arg(c, 0)), buffer.data(), size);
         for (int i = 0; i < n; ++i) write8(arg(c, 1) + static_cast<std::uint32_t>(i), buffer[static_cast<std::size_t>(i)]);
         c.r[2] = static_cast<std::uint32_t>(n);
     });
@@ -161,7 +170,7 @@ void install_io() {
         std::uint32_t mode = 0, size = 0;
         if (!io::stat(ram_string(arg(c, 0)), mode, size)) { c.r[2] = static_cast<std::uint32_t>(-2); return; }
         const std::uint32_t p = arg(c, 1);
-        std::memset(ram_ptr(p), 0, 40);
+        fill_ram("ioman getstat", p, 0, 40);
         write32(p, mode);
         write32(p + 8, size);
         c.r[2] = 0;

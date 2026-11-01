@@ -1,0 +1,114 @@
+name: ci
+
+# Builds the tools and the runtime on Linux and macOS and runs the tests that need no disc image and no GPU.
+# No warnings-as-errors: only a failed build or a failed test fails a run.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unix:
+    name: ${{ matrix.name }}
+    # A private copy of the repo has few free Actions minutes (macOS counts ten times), so there it runs only when started by hand;
+    # a public repo runs it on every push and pull request.
+    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-24.04 }
+          - { name: macos-arm64, os: macos-14 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      PS2_AVX2: '0'   # shared runners: no -mavx2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev ccache
+          clang++ --version | head -n 1
+
+      - name: Install tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash ninja sdl2 ccache
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22   # scripts/test_vu_codegen.py runs WebAssembly SIMD cases
+
+      - name: Cache wgpu-native
+        uses: actions/cache@v4
+        with:
+          path: third_party/wgpu-native
+          key: wgpu-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch_wgpu.sh') }}
+
+      - name: Cache compiler output
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.name }}-
+
+      - name: Tools (scripts/setup.sh)
+        run: |
+          bash --version | head -n 1
+          bash scripts/setup.sh --native-only
+
+      - name: Runtime and test programs
+        run: |
+          ROOT="$PWD"
+          . scripts/cxx.sh
+          cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release "${cxx_flags[@]}"
+          ninja -C build/ci ps2runtime vujit_dump ps2thbasetest ps2sifcmdtest ps2savetest ps2discinputtest ps2iopboundstest
+          ccache -s | head -n 5 || true
+          echo "CXX_BIN=$cxx_bin" >> "$GITHUB_ENV"
+
+      - name: Tests without a disc
+        run: |
+          build/ci/ps2thbasetest
+          build/ci/ps2sifcmdtest
+          build/ci/ps2savetest "$RUNNER_TEMP/savetest"
+          build/ci/ps2discinputtest
+          build/ci/ps2iopboundstest
+          "$CXX_BIN" -std=c++20 -O2 tests/stretch_test.cpp host/stretch.cpp -o build/ci/stretchtest
+          build/ci/stretchtest
+          for t in analysis_tailcall elf_bss codegen_fallthrough; do
+            python3 tests/$t.py --recompiler build/tools/eerecomp
+          done
+          python3 tests/fpu_half_damage.py "$CXX_BIN"
+          python3 scripts/test_vu_codegen.py "$CXX_BIN"
+
+      - name: Free test programs (ps2autotests), one on macOS
+        if: runner.os == 'macOS'
+        run: python3 scripts/autotests.py --jobs 1 --timeout 900 cpu/ee/alu
+
+      - name: Free test programs (ps2autotests), all on Linux
+        if: runner.os == 'Linux'
+        timeout-minutes: 25
+        run: python3 scripts/autotests.py --jobs 4 --timeout 900
+
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.name }}
+          path: games/_autotests/
+          if-no-files-found: ignore
+          retention-days: 3

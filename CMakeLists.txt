@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 project(ps2-native-recomp CXX)
 
+# Only clang builds the project (Clang, AppleClang, llvm-mingw; emcc is clang too): the vector units use clang builtins such as
+# __builtin_elementwise_min and __builtin_reduce_or (ps2/vu_ops.hpp) that GCC and MSVC lack. Stop here with a clear message
+# instead of hundreds of compile errors later. scripts/cxx.sh finds a clang++.
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "ps2-native-recomp needs clang++ (Clang, AppleClang, llvm-mingw or Emscripten's emcc), but the C++ compiler "
+        "is ${CMAKE_CXX_COMPILER_ID} (${CMAKE_CXX_COMPILER}). The code uses clang builtins that other compilers lack. "
+        "Install clang and configure again with -DCMAKE_CXX_COMPILER=clang++ in a new build folder (scripts/cxx.sh picks one).")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -111,6 +120,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2thbasetest PRIVATE synchronization)  # the GS queue's WaitOnAddress, which the wgpu line above adds only with wgpu
     endif()
+    # the memory card file and save state writes, no game needed: ninja ps2savetest
+    add_executable(ps2savetest EXCLUDE_FROM_ALL tests/save_files.cpp)
+    target_include_directories(ps2savetest PRIVATE runtime/src)
+    target_link_libraries(ps2savetest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2savetest PRIVATE synchronization)
+    endif()
 endif()
 
 set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
@@ -151,6 +167,20 @@ if(NOT EMSCRIPTEN)
     target_link_libraries(ps2sifcmdtest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2sifcmdtest PRIVATE synchronization)  # the GS queue's WaitOnAddress, which the wgpu line above adds only with wgpu
+    endif()
+    # damaged disc images, IOP modules and boot ELFs refused cleanly, no game needed: ninja ps2discinputtest
+    add_executable(ps2discinputtest EXCLUDE_FROM_ALL tests/disc_input.cpp)
+    target_include_directories(ps2discinputtest PRIVATE runtime/src)
+    target_link_libraries(ps2discinputtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2discinputtest PRIVATE synchronization)
+    endif()
+    # bad guest pointers and sizes at the IOP's libraries and the SIF cut or refused, no game needed: ninja ps2iopboundstest
+    add_executable(ps2iopboundstest EXCLUDE_FROM_ALL tests/iop_bounds.cpp)
+    target_include_directories(ps2iopboundstest PRIVATE runtime/src)
+    target_link_libraries(ps2iopboundstest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2iopboundstest PRIVATE synchronization)
     endif()
 endif()
 

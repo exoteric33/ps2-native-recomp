@@ -469,9 +469,9 @@ bool save_state(const std::string &path) {
     try {
         state::Writer w;
         machine_state(w);
-        std::ofstream out(os::path(path), std::ios::binary);
-        out.write(reinterpret_cast<const char *>(w.out.data()), static_cast<std::streamsize>(w.out.size()));
-        if (!out) throw std::runtime_error("cannot write " + path);
+        // temp file + rename: a crash, a kill or a full disk during the write keeps the state that was there before
+        std::string why;
+        if (!os::replace_file(path, w.out.data(), w.out.size(), &why)) throw std::runtime_error(why);
         std::fprintf(stderr, "[state] saved frame %llu to %s (%zu KB)\n", static_cast<unsigned long long>(g_frames), path.c_str(), w.out.size() >> 10);
         return true;
     } catch (const std::exception &e) {
@@ -544,10 +544,20 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
     // earlier one. Memory is zero at power-on, so this is what a loader that only copies the file contents gives.
     for (const bool copy : {false, true}) {
         for (std::uint32_t i = 0; i < u16(44); ++i) {
-            const std::size_t ph = phoff + i * u16(42);
+            const std::uint64_t ph = phoff + std::uint64_t{i} * u16(42);
+            // The ELF comes from the disc: a program header past the end of the file, or a segment whose sums wrap round 4 GiB,
+            // would read past the file or write past the 32 MiB of memory. ELF spec: p_offset + p_filesz lies inside the file and
+            // the segment (p_vaddr up to p_memsz, and the p_filesz bytes copied) inside memory.
+            if (ph > data.size() || data.size() - ph < 24) {
+                std::fprintf(stderr, "[elf] %s is damaged: program header %u lies past the end of the file\n", path.c_str(), i);
+                return false;
+            }
             if (u32(ph) != 1) continue;
             const std::uint32_t offset = u32(ph + 4), vaddr = physical(u32(ph + 8)), filesz = u32(ph + 16), memsz = u32(ph + 20);
-            if (vaddr + memsz > kRamSize || offset + filesz > data.size()) return false;
+            if (std::uint64_t{vaddr} + std::max(memsz, filesz) > kRamSize || std::uint64_t{offset} + filesz > data.size()) {
+                std::fprintf(stderr, "[elf] %s is damaged: segment %u does not fit in the file or in memory\n", path.c_str(), i);
+                return false;
+            }
             if (copy) {
                 std::memcpy(g_ram + vaddr, data.data() + offset, filesz);
                 watch_span(vaddr, filesz, "boot:load_exec");

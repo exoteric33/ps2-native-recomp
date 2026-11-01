@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# bash 4 or newer (port.sh, which runs this, needs it too); macOS ships bash 3.2 as /bin/bash
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO:-0}" -lt 4 ]; then
+  echo "this script needs bash 4 or newer, this is ${BASH_VERSION:-not bash} (macOS: brew install bash, then run it again)" >&2; exit 1
+fi
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EMSDK="${EMSDK:-$ROOT/tools/emsdk}"

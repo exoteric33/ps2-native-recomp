@@ -11,9 +11,41 @@
 #include <ctime>
 #include <vector>
 
+namespace ps2::iop {
+// libs.cpp: a guest size that reaches past the end of memory is said there (rate-limited).
+void bad_span(const char *what, std::uint32_t address, std::uint64_t size, const char *outcome);
+}
+
 namespace ps2::iop::kernel {
 
 namespace {
+
+// A read the EE asks for is cut to the sectors that reach the end of the memory it goes to (the last one may be partial, as before),
+// so a bad count does not ask the host for a buffer of up to 8 TB: up to the end of EE memory, or 2 MiB for the IOP (mirrored).
+std::uint32_t ee_sectors(std::uint32_t dst, std::uint32_t count) {
+    const std::uint32_t most = (ps2::kRamSize - (dst & (ps2::kRamSize - 1)) + disc::kSector - 1) / disc::kSector;
+    if (count <= most) return count;
+    bad_span("cdvdfsv read to EE", dst, std::uint64_t{count} * disc::kSector, "cut at the end of EE memory");
+    return most;
+}
+
+std::uint32_t iop_sectors(std::uint32_t dst, std::uint32_t count) {
+    constexpr std::uint32_t kMost = kRamSize / disc::kSector;
+    if (count <= kMost) return count;
+    bad_span("cdvdfsv read to IOP", dst, std::uint64_t{count} * disc::kSector, "cut to 2 MiB");
+    return kMost;
+}
+
+// A name in EE memory, read byte by byte round the 32 MiB and at most `limit` long, so one without its 0 cannot run past g_ram.
+std::string ee_text(std::uint32_t a, std::size_t limit) {
+    std::string s;
+    for (std::size_t i = 0; i < limit; ++i) {
+        const char ch = static_cast<char>(ps2::g_ram[(a + i) & (ps2::kRamSize - 1)]);
+        if (!ch) break;
+        s += ch;
+    }
+    return s;
+}
 
 std::uint32_t ee32(std::uint32_t a) { return load<std::uint32_t>(ps2::g_ram + (a & (ps2::kRamSize - 1))); }
 void set_ee32(std::uint32_t a, std::uint32_t v) { store<std::uint32_t>(ps2::g_ram + (a & (ps2::kRamSize - 1)), v); }
@@ -99,11 +131,13 @@ void install_cdvdfsv() {
         return true;
     });
     sif::register_hle_server(0x80000595u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t ret_size) {
-        const std::uint32_t sector = ee32(args), count = ee32(args + 4), dst = ee32(args + 8);
+        const std::uint32_t sector = ee32(args), dst = ee32(args + 8);
+        std::uint32_t count = ee32(args + 4);
         if (g_trace_hle) std::fprintf(stderr, "[cdvdfsv] N 0x%X sector %u count %u to 0x%08X\n", method, sector, count, dst);
         switch (method) {
         case 0x01:
             if (ret_size >= 4) set_ee32(ret, 0);
+            count = ee_sectors(dst, count);
             disc::ready(sector, count);
             schedule(now() + delay(count), Job{kJobFsvRead, sector, count, dst});
             return false;
@@ -118,6 +152,7 @@ void install_cdvdfsv() {
             switch (cmd) {
             case 1: g_stream_pos = sector; g_streaming = true; set_ee32(ret, 1); return true;
             case 2: {
+                count = ee_sectors(dst, count);
                 const std::uint32_t pos = g_stream_pos;
                 g_stream_pos += count;
                 set_ee32(ret, count);
@@ -134,6 +169,7 @@ void install_cdvdfsv() {
         }
         case 0x0D:
             if (ret_size >= 4) set_ee32(ret, 0);
+            count = iop_sectors(dst, count);
             disc::ready(sector, count);
             schedule(now() + delay(count), Job{kJobFsvIopRead, sector, count, dst});
             return false;
@@ -149,7 +185,7 @@ void install_cdvdfsv() {
     });
     sif::register_hle_server(0x80000597u, [](std::uint32_t, std::uint32_t args, std::uint32_t size, std::uint32_t ret, std::uint32_t) {
         const std::uint32_t offset = size == 0x124 ? 0x20u : 0x24u;
-        const std::string path(reinterpret_cast<const char *>(ps2::g_ram + (args & (ps2::kRamSize - 1)) + offset));
+        const std::string path = ee_text((args & (ps2::kRamSize - 1)) + offset, 1024);
         const auto entry = disc::find(path);
         if (entry) {
             set_ee32(args, entry->sector);

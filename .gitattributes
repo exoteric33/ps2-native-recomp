@@ -1,0 +1,8 @@
+# Line endings in a checkout, whatever core.autocrlf says (Git for Windows defaults to true, which gave the shell
+# scripts CRLF; bash then fails with $'\r': command not found). Files are stored with LF in git either way.
+# Files not named here (binaries included) keep git's default handling.
+*.sh  text eol=lf
+*.py  text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf

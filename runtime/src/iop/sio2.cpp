@@ -62,6 +62,9 @@ constexpr std::size_t kCardBytes = static_cast<std::size_t>(kPageBytes) * kPages
 
 struct Card {
     bool present = false;
+    bool looked = false;  // the card file was looked at (once per run: a game resets the IOP several times while it boots)
+    std::string file;     // the file this run reads and writes: the one given with --memcard, or the fresh card beside it
+    std::string crash_file;  // where the card goes after a crash (never over `file`)
     std::vector<std::uint8_t> data;
     std::size_t address = 0;
     std::uint8_t term = 0x55;
@@ -226,19 +229,93 @@ std::uint8_t xor_of(const std::uint8_t *p, std::size_t n) {
     return v;
 }
 
+// "<folder>/<name>.<tag><extension>" beside a card file: gow2.ps2 -> gow2.fresh.ps2
+std::string beside(const std::string &card, const char *tag) {
+    const std::filesystem::path p = os::path(card);
+    std::filesystem::path name = p.stem();
+    name += std::string(".") + tag;
+    name += p.extension();
+    return os::utf8(p.parent_path() / name);
+}
+
+bool exists(const std::string &file) {
+    std::error_code error;
+    return std::filesystem::exists(os::path(file), error);
+}
+
+enum class CardFile { missing, good, bad };
+
+// Reads a card file into `data` only when it is a whole card: 16384 pages of 512 bytes data + 16 bytes spare (ECC), 8650752 bytes.
+// `why` says what is wrong with a file that is there but cannot be used (a raw image without the spare bytes, a bigger card, a
+// folder, a file another program holds open).
+CardFile read_card_file(const std::string &file, std::vector<std::uint8_t> &data, std::string &why) {
+    namespace fs = std::filesystem;
+    const fs::path p = os::path(file);
+    std::error_code error;
+    const fs::file_status status = fs::status(p, error);
+    if (status.type() == fs::file_type::not_found) return CardFile::missing;
+    if (error) {
+        why = "it cannot be looked at (" + error.message() + ")";
+        return CardFile::bad;
+    }
+    if (!fs::is_regular_file(status)) {
+        why = "it is not a file (a folder card of another emulator?)";
+        return CardFile::bad;
+    }
+    const std::uintmax_t size = fs::file_size(p, error);
+    if (!error && size == 0) return CardFile::missing;  // an empty file holds no saves: it becomes a new card, as a missing one
+    if (error || size != kCardBytes) {
+        why = error ? "its size cannot be read (" + error.message() + ")"
+                    : "it has " + std::to_string(size) + " bytes, a card file has " + std::to_string(kCardBytes) +
+                          (size == static_cast<std::uintmax_t>(512) * kPages ? " (a raw image without the spare ECC bytes?)" : "");
+        return CardFile::bad;
+    }
+    std::vector<std::uint8_t> got(kCardBytes);
+    std::ifstream in(p, std::ios::binary);
+    if (in) in.read(reinterpret_cast<char *>(got.data()), static_cast<std::streamsize>(kCardBytes));
+    if (!in || in.gcount() != static_cast<std::streamsize>(kCardBytes)) {
+        why = "it cannot be read (does another program have it open, or is it not allowed?)";
+        return CardFile::bad;
+    }
+    data.swap(got);
+    return CardFile::good;
+}
+
+// A card file that is there but cannot be used is never taken as a blank card: the game would offer to format it, and the
+// formatted card would then be written over the file and the saves in it would be gone. Such a file is left exactly as it is,
+// and the run uses a fresh card beside it ("<name>.fresh.ps2", loaded if an earlier run made it), so the game can still save.
 void load_card() {
-    if (g_card.present || g_options.memcard_path.empty()) return;
-    std::lock_guard<std::mutex> hold(g_card.lock);
-    g_card.data.assign(kCardBytes, 0xFF);
-    std::ifstream in(os::path(g_options.memcard_path), std::ios::binary);
-    if (in) in.read(reinterpret_cast<char *>(g_card.data.data()), static_cast<std::streamsize>(kCardBytes));
-    const std::streamsize got = in ? in.gcount() : 0;
-    g_card.present = true;
-    std::fprintf(stderr, "[mc] card in slot 1: %s%s\n", g_options.memcard_path.c_str(), in || got ? "" : " (new, unformatted)");
-    // a card file is 16384 pages of 512 bytes data + 16 bytes spare (ECC): 8650752 bytes. A shorter or longer file (a raw image
-    // without the spare bytes, say) is read as far as it goes and the rest counts as erased, which the game sees as a damaged card.
-    if (got && got != static_cast<std::streamsize>(kCardBytes))
-        std::fprintf(stderr, "[mc] warning: the card file has %lld bytes, a card with ECC has %zu; is it a raw image without spare bytes?\n", static_cast<long long>(got), kCardBytes);
+    Card &c = g_card;
+    if (c.present || c.looked || g_options.memcard_path.empty()) return;
+    std::lock_guard<std::mutex> hold(c.lock);
+    c.looked = true;
+    const std::string &named = g_options.memcard_path;
+    const std::string fresh = beside(named, "fresh");
+    std::vector<std::uint8_t> data;
+    std::string why;
+    c.file = named;
+    CardFile got = read_card_file(named, data, why);
+    if (got == CardFile::bad) {
+        std::fprintf(stderr, "[mc] warning: %s cannot be used as a memory card: %s.\n", named.c_str(), why.c_str());
+        std::fprintf(stderr, "[mc]          It is left exactly as it is. This run uses the card %s instead, so saves go there.\n", fresh.c_str());
+        c.file = fresh;
+        got = read_card_file(fresh, data, why);
+        if (got == CardFile::bad) {
+            std::fprintf(stderr, "[mc] warning: %s cannot be used either: %s. No card is in slot 1; nothing is written.\n", fresh.c_str(), why.c_str());
+            return;
+        }
+    } else if (exists(fresh)) {
+        std::fprintf(stderr, "[mc] note: there is also %s, a card made on a run when %s could not be used; its saves are not on this card.\n", fresh.c_str(),
+                     named.c_str());
+    }
+    c.crash_file = beside(c.file, "crash");
+    if (exists(c.crash_file))
+        std::fprintf(stderr, "[mc] note: %s holds the card as it was when the program crashed on an earlier run; %s is the last card written normally.\n",
+                     c.crash_file.c_str(), c.file.c_str());
+    if (got == CardFile::good) c.data.swap(data);
+    else c.data.assign(kCardBytes, 0xFF);
+    c.present = true;
+    std::fprintf(stderr, "[mc] card in slot 1: %s%s\n", c.file.c_str(), got == CardFile::missing ? " (new, unformatted)" : "");
 }
 
 void memory_card(std::size_t at, std::uint32_t out_size) {
@@ -404,28 +481,9 @@ void reset() {
 namespace {
 
 // Writes the card to its file so that the file is always a whole card, the old one or the new one: the bytes go to
-// "<file>.tmp", are forced to the disk, and the finished file then replaces the old one in one step. A crash, a kill or a full
-// disk in the middle leaves the old card where it was (and a stray .tmp file that the next write overwrites).
-bool write_card_file(const Card &c) {
-    const std::string temp = g_options.memcard_path + ".tmp";
-    std::FILE *f = os::open(temp, "wb");
-    if (!f) return false;
-    bool ok = std::fwrite(c.data.data(), 1, c.data.size(), f) == c.data.size();
-    ok = std::fflush(f) == 0 && ok;
-#ifdef _WIN32
-    ok = _commit(_fileno(f)) == 0 && ok;
-#elif !defined(__EMSCRIPTEN__)
-    ok = fsync(fileno(f)) == 0 && ok;
-#endif
-    ok = std::fclose(f) == 0 && ok;
-    std::error_code error;
-    if (ok) {
-        std::filesystem::rename(os::path(temp), os::path(g_options.memcard_path), error);  // replaces an existing file, also on Windows
-        ok = !error;
-    }
-    if (!ok) std::filesystem::remove(os::path(temp), error);
-    return ok;
-}
+// "<file>.tmp", are forced to the disk, and the finished file then replaces the old one in one step (os::replace_file). A crash,
+// a kill or a full disk in the middle leaves the old card where it was (and a stray .tmp file that the next write overwrites).
+bool write_card_file(const Card &c) { return os::replace_file(c.file, c.data.data(), c.data.size()); }
 
 // PS2_TEST_CARD_DIRTY=<frame>[,stop][,hold][,crash] is a switch for scripts/test_memcard.py, not for players. At that frame a marker text is
 // put into page 4000 of the card, which counts as changed as if the game had just written it. With ",stop" the run ends in the same
@@ -455,25 +513,30 @@ void test_hook(Card &c) {
     }
 }
 
-// Writes the card file if the game changed the card since the last write. In a hurry (Ctrl+C, a crash) the card lock is waited for
-// only a moment, since the thread that holds it may be the one that is crashing; then the card is written as it is.
+// Writes the card file if the game changed the card since the last write. In a hurry (Ctrl+C, the console or terminal closing)
+// the card lock is waited for only a moment; a card command that still holds it is in the middle of changing a page, so then
+// the file is not written at all and keeps the last whole card.
 void write_card(bool hurry) {
     Card &c = g_card;
-    if (!c.present || !c.dirty || g_options.memcard_path.empty()) return;
+    if (!c.present || !c.dirty || c.file.empty()) return;
     std::unique_lock<std::mutex> hold(c.lock, std::defer_lock);
     if (!hurry) hold.lock();
     else
         for (int i = 0; i < 100 && !hold.try_lock(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (!hold.owns_lock()) {
+        std::fprintf(stderr, "[mc] the card is busy, so %s is not written now; it keeps the card written last\n", c.file.c_str());
+        return;
+    }
     if (!c.dirty.exchange(false)) return;  // another thread wrote it in the meantime
     c.quiet = 0;
     if (!write_card_file(c)) {
         static bool complained = false;
-        if (!complained) std::fprintf(stderr, "[mc] cannot write %s (the card stays in memory and is tried again)\n", g_options.memcard_path.c_str());
+        if (!complained) std::fprintf(stderr, "[mc] cannot write %s (the card stays in memory and is tried again)\n", c.file.c_str());
         complained = true;
         c.dirty = true;
         return;
     }
-    std::fprintf(stderr, "[mc] card file written: %s\n", g_options.memcard_path.c_str());
+    std::fprintf(stderr, "[mc] card file written: %s\n", c.file.c_str());
     if (g_options.on_memcard_saved) g_options.on_memcard_saved();
 }
 
@@ -498,6 +561,24 @@ void flush_cards_now(bool hurry) {
         std::fprintf(stderr, "[mc] card use so far: %llu page reads, %llu page writes, %llu block erases\n", static_cast<unsigned long long>(c.reads),
                      static_cast<unsigned long long>(c.writes), static_cast<unsigned long long>(c.erases));
     }
+}
+
+// After a crash. The card file is written 50 frames (under a second) after the game's last card write, so a card that changed
+// since then may be half of a save, or damaged along with the rest of the program's memory: it never goes over the card file,
+// which keeps the last whole card. It goes to "<name>.crash.ps2" beside it instead, which a player can try (copy it over the
+// card file) if the newest save is missing. The card lock is waited for only a moment (the crashed thread may hold it, in the
+// middle of a page), and nothing is written without it. Nothing is printed here (the crashed thread may hold the lock of stderr):
+// returns 0 when the card had not changed, 1 when the copy was written (`where` is its name), 2 when the card was busy, 3 when
+// the copy could not be written.
+int save_card_after_crash(const char **where) {
+    Card &c = g_card;
+    if (!c.present || !c.dirty || c.crash_file.empty()) return 0;
+    std::unique_lock<std::mutex> hold(c.lock, std::defer_lock);
+    for (int i = 0; i < 100 && !hold.try_lock(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if (!hold.owns_lock()) return 2;
+    if (!os::replace_file(c.crash_file, c.data.data(), c.data.size())) return 3;
+    if (where) *where = c.crash_file.c_str();
+    return 1;
 }
 
 // A copy of the card as the game sees it now: the file is written 50 frames after a change, so it can be behind. With wait false the
@@ -623,5 +704,8 @@ namespace ps2 {
 void flush_memory_card(bool hurry) { iop::sio2::flush_cards_now(hurry); }
 
 bool memory_card_image(std::vector<std::uint8_t> &out, bool wait) { return iop::sio2::card_image(out, wait); }
+
+// The crash path of the host (host/main.cpp declares it; see save_card_after_crash above for what it does and returns).
+int save_memory_card_after_crash(const char **where) { return iop::sio2::save_card_after_crash(where); }
 
 }

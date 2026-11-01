@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# bash 4 or newer (${x,,} and more below); macOS ships bash 3.2 as /bin/bash
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO:-0}" -lt 4 ]; then
+  echo "this script needs bash 4 or newer, this is ${BASH_VERSION:-not bash} (macOS: brew install bash, then run it again)" >&2; exit 1
+fi
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 here="$ROOT/scripts"
@@ -34,6 +38,10 @@ EOF
 
 [ $# -ge 2 ] || { usage; exit 2; }
 name="$1"; source_path="$2"; shift 2
+# the name becomes folder names that are deleted and rebuilt (games/<name>/patched, build/native-<name>), so no / or ..
+if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$name" == .* ]]; then
+  echo "game name '$name': use letters, digits, . _ and - only, not starting with a dot" >&2; exit 2
+fi
 frames=3600; rounds=8; explore=1; web=1; presses=(); pnach=(); wide=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -111,6 +119,13 @@ boot=$(sed -n 's/^BOOT2 *= *//p' "$game/disc/SYSTEM.CNF" | tr -d '\r')
 program=${boot#*\\}
 program=${program%;*}
 [ -n "$program" ] || { echo "SYSTEM.CNF names no BOOT2 program" >&2; exit 1; }
+# A real BOOT2 line is "cdrom0:\SLUS_212.00;1": the program is a file in the disc's top folder. Its name is used below as a
+# pattern for disc.py extract and as a file name, so a damaged or made-up SYSTEM.CNF must not bring wildcards or folders in.
+case "$program" in
+  *'*'* | *'?'* | *'['* | */* | *'\'*)
+    echo "SYSTEM.CNF names the boot program \"$boot\": a name with * ? [ / or \\ in it is not a program in the disc's top folder, so this image is not used (damaged or not a PS2 game disc?)" >&2
+    exit 1 ;;
+esac
 "${py[@]}" -I "$here/disc.py" extract "$iso" "$game/disc" "$program" > /dev/null
 echo "boots $boot"
 crc=$("${py[@]}" -I "$here/pnach.py" crc "$game/disc/$program")
@@ -120,7 +135,9 @@ echo "== [2/6] executable"
 elf="$game/disc/$program"
 if [ -f "$game/core.elf" ]; then
   elf="$game/core.elf"
-elif "${py[@]}" -I "$here/disc.py" list "$iso" | awk '{print $4}' | grep -qx CORE.GT4; then
+# awk reads the whole listing: "grep -q" would end the pipe at the first match, and under pipefail the writer's SIGPIPE
+# then made the test fail at random (GT4 translated without core.elf)
+elif "${py[@]}" -I "$here/disc.py" list "$iso" | awk '$4 == "CORE.GT4" { found = 1 } END { exit !found }'; then
   "${py[@]}" -I "$here/disc.py" extract "$iso" "$game/disc" CORE.GT4 > /dev/null
   "${py[@]}" -I "$here/gt4_core.py" "$game/disc/CORE.GT4" "$game/core.elf" > /dev/null
   elf="$game/core.elf"

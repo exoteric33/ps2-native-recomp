@@ -1,25 +1,39 @@
 # Sourced by setup.sh and port.sh: sets cxx_flags to the CMake arguments for a
-# C++ compiler that has <format>. $CXX wins when it works; otherwise the newest
-# clang++ (with its own libc++ if the system libstdc++ predates GCC 13), then g++.
+# clang C++ compiler that has <format>. $CXX wins when it works; otherwise the
+# newest clang++ (with its own libc++ if the system libstdc++ predates GCC 13).
+# Only clang (Clang, AppleClang, llvm-mingw) builds the project: the vector units
+# use clang's __builtin_elementwise_min and __builtin_reduce_or (vu_ops.hpp),
+# which GCC lacks, so the probe uses them too and g++ is not tried.
 # The choice is kept in build/cxx_flags and reused while $CXX and the compiler
 # file are unchanged (delete the file to probe again), which saves the 4 s probe.
 cxx_flags=()
 cxx_stamp=
 cxx_cache="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/build/cxx_flags"
 cxx_stat() { stat -c '%s %Y' "$1" 2> /dev/null || stat -f '%z %m' "$1" 2> /dev/null; }
-cached_env=; cached_cxx=; cached_stamp=; cached_stdlib=
-[ ! -f "$cxx_cache" ] || { IFS= read -r cached_env; IFS= read -r cached_cxx; IFS= read -r cached_stamp; IFS= read -r cached_stdlib; } < "$cxx_cache" || true
-if [ -n "$cached_cxx" ] && [ "$cached_env" = "${CXX:-}" ] && [ -f "$cached_cxx" ] && [ "$(cxx_stat "$cached_cxx")" = "$cached_stamp" ]; then
+cached_env=; cached_cxx=; cached_stamp=; cached_stdlib=; cached_probe=
+[ ! -f "$cxx_cache" ] || { IFS= read -r cached_env; IFS= read -r cached_cxx; IFS= read -r cached_stamp; IFS= read -r cached_stdlib; IFS= read -r cached_probe; } < "$cxx_cache" || true
+# the fifth line names the probe; a file the older probe wrote (it also took g++) means probing again
+if [ -n "$cached_cxx" ] && [ "$cached_probe" = clang-vector ] && [ "$cached_env" = "${CXX:-}" ] && [ -f "$cached_cxx" ] && [ "$(cxx_stat "$cached_cxx")" = "$cached_stamp" ]; then
   cxx_flags=(-DCMAKE_CXX_COMPILER="$cached_cxx")
   cxx_bin=$cached_cxx
   cxx_stdlib=$cached_stdlib
   cxx_stamp=$cached_stamp
 else
   cxx_probe=$(mktemp -d)
-  printf '#include <format>\nint main() { return std::format("{}", 1).size() != 1; }\n' > "$cxx_probe/t.cpp"
+  cat > "$cxx_probe/t.cpp" << 'PROBE'
+#ifndef __clang__
+#error not clang
+#endif
+#include <format>
+typedef int v4i __attribute__((vector_size(16)));
+int main() {
+  v4i a = {1, 2, 3, 4};
+  return __builtin_reduce_or(__builtin_elementwise_min(a, a)) != 7 || std::format("{}", 1).size() != 1;
+}
+PROBE
   cxx_candidates=()
   [ -n "${CXX:-}" ] && cxx_candidates+=("$CXX")
-  cxx_candidates+=($(compgen -c clang++- | grep -E '^clang\+\+-[0-9]+$' | sort -t- -k2 -rn | uniq || true) clang++ g++)
+  cxx_candidates+=($(compgen -c clang++- | grep -E '^clang\+\+-[0-9]+$' | sort -t- -k2 -rn | uniq || true) clang++)
   for cxx in "${cxx_candidates[@]}"; do
     command -v "$cxx" > /dev/null || continue
     for stdlib in "" -stdlib=libc++; do
@@ -34,13 +48,17 @@ else
     done
   done
   rm -rf "$cxx_probe"
+  if [ -n "${CXX:-}" ] && [ ${#cxx_flags[@]} -gt 0 ] && [ "$cxx_bin" != "$(command -v "$CXX" 2> /dev/null)" ] && [ "$cxx_bin" != "$(command -v "$CXX" 2> /dev/null).exe" ]; then
+    echo "CXX=$CXX is not a working clang (GCC lacks the vector builtins the project uses), so $cxx_bin builds instead" >&2
+  fi
   if [ ${#cxx_flags[@]} -eq 0 ]; then
-    echo "no C++ compiler here has <format>: install clang 17+ with libc++ (e.g. clang-19 libc++-19-dev) or GCC 13+, or point CXX at one" >&2
+    [ -z "${CXX:-}" ] || echo "CXX=$CXX does not work here: it must be clang (GCC lacks the vector builtins the project uses)" >&2
+    echo "no clang C++ compiler with <format> found: install clang 17+ with libc++ (e.g. clang-19 libc++-19-dev; macOS: Xcode's clang), or point CXX at one" >&2
     exit 1
   fi
   cxx_stamp=$(cxx_stat "$cxx")
   if [ -n "$cxx_stamp" ] && mkdir -p "$(dirname "$cxx_cache")" 2> /dev/null; then
-    printf '%s\n%s\n%s\n%s\n' "${CXX:-}" "$cxx" "$cxx_stamp" "$stdlib" > "$cxx_cache.$$" 2> /dev/null && mv -f "$cxx_cache.$$" "$cxx_cache" 2> /dev/null || rm -f "$cxx_cache.$$"
+    printf '%s\n%s\n%s\n%s\nclang-vector\n' "${CXX:-}" "$cxx" "$cxx_stamp" "$stdlib" > "$cxx_cache.$$" 2> /dev/null && mv -f "$cxx_cache.$$" "$cxx_cache" 2> /dev/null || rm -f "$cxx_cache.$$"
   fi
 fi
 # Compile flags: the user's $CXXFLAGS, the standard library choice and, for the game and the runtime (not the tools,

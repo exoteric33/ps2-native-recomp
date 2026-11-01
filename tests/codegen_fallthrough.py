@@ -16,9 +16,10 @@ root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--recompiler', type=Path, default=root / 'build/tools/eerecomp')
 args = parser.parse_args()
-compiler = shutil.which('clang++') or shutil.which('g++')
+# clang only, like scripts/cxx.sh: the runtime headers use clang builtins that GCC lacks
+compiler = shutil.which('clang++')
 if not compiler:
-    raise SystemExit('C++ compiler required')
+    raise SystemExit('clang++ required (the runtime headers use clang builtins; GCC cannot compile them)')
 with tempfile.TemporaryDirectory(prefix='ps2-codegen-test-') as temp:
     work = Path(temp)
     data = bytearray(0x114)

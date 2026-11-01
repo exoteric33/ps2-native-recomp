@@ -39,6 +39,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #else
+#include <cerrno>
 #include <csignal>
 #include <unistd.h>
 #ifdef __GLIBC__
@@ -296,13 +297,31 @@ private:
 LogTee g_log;
 #endif
 
+// After a crash the card is never written over the card file (the card in memory may be half of a save, or damaged): the newest
+// card, if it changed since the file was last written, goes to "<card>.crash.ps2" beside it. This saves it and puts the line about
+// it into `line` (snprintf only: no allocation, no stream lock), returning the line's length, 0 for none.
+int crash_card_line(char *line, std::size_t size) {
+    const char *where = nullptr;
+    int length = 0;
+    switch (ps2::save_memory_card_after_crash(&where)) {
+    case 1:
+        length = std::snprintf(line, size, "[mc] the card changed less than a second before the crash; that newest card is kept in %s (the card file keeps the last card written normally)\n", where);
+        break;
+    case 2: length = std::snprintf(line, size, "[mc] the card was being changed when the program crashed; the card file keeps the last card written normally\n"); break;
+    case 3: length = std::snprintf(line, size, "[mc] the card changed before the crash, but no copy could be written; the card file keeps the last card written normally\n"); break;
+    default: break;
+    }
+    return length < 0 ? 0 : std::min<int>(length, static_cast<int>(size) - 1);
+}
+
 #ifdef _WIN32
 // The memory card file is written when the game saves (50 frames after its last write) and again whenever the game ends. These
-// two cover the ways a Windows program can be ended from outside while it is running, so a save made a moment ago is not lost:
-//   - Ctrl+C, Ctrl+Break or closing the console window the program was started from (it is told, then given a few seconds);
-//   - a crash (an unhandled exception in the program itself).
-// Both write the card in a hurry (they do not wait long for the thread that may be the one that crashed) and then let the
-// system do what it would have done anyway: the program ends.
+// two cover the ways a Windows program can be ended from outside while it is running:
+//   - Ctrl+C, Ctrl+Break or closing the console window the program was started from (it is told, then given a few seconds):
+//     the card file is written, as when the window is closed (unless a card command is in the middle of a page right then);
+//   - a crash (an unhandled exception in the program itself): the newest card goes beside the card file, never over it
+//     (crash_card_line).
+// Both then let the system do what it would have done anyway: the program ends.
 BOOL WINAPI on_console_event(DWORD) {
     ps2::flush_memory_card(true);
     return FALSE;
@@ -311,19 +330,22 @@ BOOL WINAPI on_console_event(DWORD) {
 LONG WINAPI on_crash(EXCEPTION_POINTERS *info) {
     static volatile LONG running = 0;
     if (InterlockedExchange(&running, 1) == 0) {  // not twice if the writing itself crashes
+        // written to the handle directly: another thread may hold the lock of the C stream
+        char line[640];
+        DWORD written = 0;
 #ifdef PS2_WINDOW
         // the last thing in the log file, so a player who sends it shows what happened
-        // written to the handle directly: another thread may hold the lock of the C stream
-        char line[160];
         const int length = std::snprintf(line, sizeof line, "[crash] the program crashed: exception %08lX at address %p\n", static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode),
                                          info->ExceptionRecord->ExceptionAddress);
-        DWORD written = 0;
         if (length > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(length), &written, nullptr);
-        g_log.flush(300);
 #else
         (void)info;
 #endif
-        ps2::flush_memory_card(true);
+        const int card = crash_card_line(line, sizeof line);
+        if (card > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(card), &written, nullptr);
+#ifdef PS2_WINDOW
+        g_log.flush(300);
+#endif
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -336,6 +358,35 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS *info) {
 // signal, gives the log copy and the memory card a moment to reach the disk, and then lets the signal do what it would have done (a core
 // dump, if the system makes one). SIGINT and SIGTERM are SDL's: it turns them into "window closed" (window/poll). SIGKILL, which the
 // compositor's "not responding" window and `hyprctl kill` send, cannot be caught; a run that ends with neither line has had one.
+//
+// The memory card is not written inside the handler: almost nothing is safe there (an abort from a damaged heap comes while the
+// allocator's lock is held, and the first allocation would hang the program instead of ending it). A helper thread, started with
+// the handlers, waits on a pipe; the handler wakes it with one byte (write() is safe in a handler) and waits up to two seconds for
+// it. After SIGHUP (the terminal was closed, as Ctrl+C) the helper writes the card file as usual; after a crash or an abort it puts
+// the newest card beside the card file, never over it (crash_card_line).
+int g_card_wake[2] = {-1, -1};
+std::atomic<int> g_card_done{0};  // lock-free, so the handler may read it
+
+void card_helper() {
+    char what = 0;
+    for (;;) {
+        const ssize_t got = read(g_card_wake[0], &what, 1);
+        if (got == 1) break;
+        if (got < 0 && errno == EINTR) continue;
+        return;
+    }
+    if (what == 'h') ps2::flush_memory_card(true);
+    else {
+        char line[640];
+        const int length = crash_card_line(line, sizeof line);
+        if (length > 0) {
+            ssize_t ignored = write(2, line, static_cast<std::size_t>(length));
+            (void)ignored;
+        }
+    }
+    g_card_done.store(1);
+}
+
 void on_fatal_signal(int sig) {
     static volatile std::sig_atomic_t running = 0;
     if (!running) {
@@ -352,10 +403,15 @@ void on_fatal_signal(int sig) {
         const int count = backtrace(frames, 64);
         backtrace_symbols_fd(frames, count, 2);
 #endif
+        const char what = sig == SIGHUP ? 'h' : 'c';
+        if (g_card_wake[1] >= 0 && write(g_card_wake[1], &what, 1) == 1)
+            for (int i = 0; i < 200 && !g_card_done.load(); ++i) {
+                struct timespec pause = {0, 10 * 1000 * 1000};
+                nanosleep(&pause, nullptr);
+            }
 #ifdef PS2_WINDOW
         g_log.flush(300);
 #endif
-        ps2::flush_memory_card(true);
     }
     std::signal(sig, SIG_DFL);
     std::raise(sig);
@@ -366,6 +422,8 @@ void install_signal_handlers() {
     void *warm[2];
     backtrace(warm, 2);  // the first call loads the unwinder (and may allocate): not in the handler
 #endif
+    if (pipe(g_card_wake) == 0) std::thread(card_helper).detach();
+    else g_card_wake[0] = g_card_wake[1] = -1;
     for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGHUP}) std::signal(sig, on_fatal_signal);
     std::signal(SIGPIPE, SIG_IGN);  // a log pipe whose reader went away makes a write fail instead of ending the run without a word
 }

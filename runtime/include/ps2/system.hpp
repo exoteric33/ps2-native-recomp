@@ -168,6 +168,10 @@ void flush_memory_card(bool hurry = false);
 // A copy of the memory card as the game sees it now (the file may be up to 50 frames behind). false when no card is in use. With
 // wait false the card is given up after a moment if a card command holds it.
 bool memory_card_image(std::vector<std::uint8_t> &out, bool wait);
+// For a crash handler (runtime/src/iop/sio2.cpp): the newest card goes to "<card>.crash.ps2" beside the card file, never over it.
+// Returns 0 when the card had not changed since it was last written, 1 when the copy was written (`where`, if not null, names it),
+// 2 when the card was busy, 3 when the copy could not be written. It prints nothing.
+int save_memory_card_after_crash(const char **where);
 
 // --- Keys of a window run (docs/play-keys.md): F5 quick save, F8 quick load, F9 problem report ---
 enum class QuickKey { save, load, report };

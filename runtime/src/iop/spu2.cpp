@@ -15,6 +15,11 @@
 #include <deque>
 #include <vector>
 
+namespace ps2::iop {
+// libs.cpp: a guest address that reaches past the end of memory is said there (rate-limited).
+void bad_span(const char *what, std::uint32_t address, std::uint64_t size, const char *outcome);
+}
+
 namespace ps2::iop::spu2 {
 
 namespace {
@@ -302,6 +307,14 @@ void feed_input(int core) {
         const std::uint32_t chunk = std::min<std::uint32_t>(t.bytes, 1024);
         const std::uint32_t frames = std::max<std::uint32_t>(chunk / 4, 1);
         const std::uint8_t *src = ram_ptr(t.madr);
+        // A block that runs over the end of the IOP's memory (only a bad address does that): read round to the start, as the
+        // mirrored memory would, instead of up to 1 KiB past the array (its padding is 16 bytes).
+        std::uint8_t wrapped[1024];
+        if ((phys(t.madr) & (iop::kRamSize - 1)) + chunk > iop::kRamSize) {
+            bad_span("ADMA sound input", t.madr, chunk, "read round to the start");
+            for (std::uint32_t i = 0; i < chunk; ++i) wrapped[i] = *ram_ptr(t.madr + i);
+            src = wrapped;
+        }
         static const char *const trace_pieces = std::getenv("PS2_TRACE_ADMA");  // "2": every piece the chip takes in, with the time (see dma())
         if (trace_pieces && trace_pieces[0] == '2')
             std::fprintf(stderr, "[adma-piece] %.5f s core %d reads 0x%06X (%u bytes), %u bytes of the block left, %u frames waiting\n",

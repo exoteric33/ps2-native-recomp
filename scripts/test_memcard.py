@@ -17,7 +17,8 @@ and at the order of the log lines. Each case runs the game headless for 60 to 13
   5. the normal write 50 frames after a change still happens, before the run ends
   6. (Windows) the window is closed some time after the card changed                   -> the file is written
   7. (Windows) Ctrl+Break reaches the program some time after the card changed         -> the file is written
-  8. (Windows) the program crashes right after the card changed                        -> the file is written
+  8. (Windows) the program crashes right after the card changed                        -> the newest card goes to <card>.crash.ps2,
+     the card file keeps the last card written normally
   9. (no game needed; alone with --checker-only) the card checker mcformat.py check accepts a root directory of two clusters and
      still fails on a damaged page, a looping chain, a chain through a free cluster, a too-short root chain, a shared cluster
 Cases 6 and 7 open the game window (and a console for case 7, if this script has none) for a few seconds; --no-window leaves them out.
@@ -211,11 +212,13 @@ def case_ctrl_break(exe, program, disc, card):
             kernel.FreeConsole()
 
 
-def case_crash(exe, program, disc, card):
+def case_crash(exe, program, disc, card, before):
     import ctypes
-    print("8. the program crashes right after a change")
-    if card.exists():
-        card.unlink()
+    print("8. the program crashes right after a change: the newest card goes to card.crash.ps2, the card file stays")
+    crash_copy = card.with_name(card.stem + ".crash" + card.suffix)
+    card.write_bytes(before)  # the last card written normally
+    if crash_copy.exists():
+        crash_copy.unlink()
     # no "has stopped working" window: the child inherits this error mode (SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)
     old_mode = ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)
     try:
@@ -223,8 +226,13 @@ def case_crash(exe, program, disc, card):
     finally:
         ctypes.windll.kernel32.SetErrorMode(old_mode)
     check("the program crashed", code != 0 and index_of(log, CHANGED) is not None, f"exit code {code}")
-    data = card.read_bytes() if card.exists() else b""
-    check("the file has the marker", data[MARKER_AT:MARKER_AT + len(MARKER)] == MARKER and len(data) == CARD_BYTES, f"{len(data)} bytes")
+    data = crash_copy.read_bytes() if crash_copy.exists() else b""
+    check("card.crash.ps2 is a whole card with the new marker",
+          len(data) == CARD_BYTES and data[MARKER_AT:MARKER_AT + len(MARKER)] == MARKER and b"frame 70" in data[MARKER_AT:MARKER_AT + 64],
+          f"{len(data)} bytes")
+    check("the runner says where the newest card went", index_of(log, crash_copy.name) is not None)
+    check("the card file is unchanged", card.read_bytes() == before if card.exists() else False)
+    check("no temporary file left", not card.with_name(card.name + ".tmp").exists() and not crash_copy.with_name(crash_copy.name + ".tmp").exists())
 
 
 # --- the card checker (scripts/mcformat.py check), no game needed ----------------------------------------------------------
@@ -406,7 +414,7 @@ def main():
             case_window_closed(exe, program, disc, card, work)
             case_ctrl_break(exe, program, disc, card)
         if os.name == "nt":
-            case_crash(exe, program, disc, card)
+            case_crash(exe, program, disc, card, first_card)
         checker_cases()
     finally:
         shutil.rmtree(work, ignore_errors=True)

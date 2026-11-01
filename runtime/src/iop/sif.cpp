@@ -20,9 +20,50 @@
 #include <map>
 #include <vector>
 
+namespace ps2::iop {
+// libs.cpp: a guest size that reaches past the end of memory is said there (rate-limited).
+void bad_span(const char *what, std::uint32_t address, std::uint64_t size, const char *outcome);
+}
+
 namespace ps2::sif {
 
 namespace {
+
+// A copy between the two memories with a size the game chose, cut so it neither reads nor writes past either one (EE 32 MiB at
+// `ee`, IOP 2 MiB at `iop_address`). Real games never reach the end, so for them the size comes back unchanged.
+std::uint32_t fit_copy(const char *what, std::uint32_t ee, std::uint32_t iop_address, std::uint64_t size) {
+    const std::uint64_t room = std::min<std::uint64_t>(kRamSize - (ee & (kRamSize - 1)),
+                                                       iop::kRamSize - (iop::phys(iop_address) & (iop::kRamSize - 1)));
+    if (size <= room) return static_cast<std::uint32_t>(size);
+    iop::bad_span(what, ee, size, "cut to fit");
+    return static_cast<std::uint32_t>(room);
+}
+
+// The same for a copy into EE memory only (a file read the EE asked for): cut at the end of the 32 MiB.
+std::uint32_t fit_ee(const char *what, std::uint32_t ee, std::uint32_t size) {
+    const std::uint32_t room = kRamSize - (ee & (kRamSize - 1));
+    if (size <= room) return size;
+    iop::bad_span(what, ee, size, "cut at the end of EE memory");
+    return room;
+}
+
+// Text and bytes the EE hands over in its memory, read round the 32 MiB: a name without its 0 at the end of memory (or a size
+// past it) cannot read past g_ram. `limit` is far above any real name, so real games read exactly what they did before.
+std::string ee_text(std::uint32_t a, std::size_t limit = 4096) {
+    std::string s;
+    for (std::size_t i = 0; i < limit; ++i) {
+        const char ch = static_cast<char>(g_ram[(a + i) & (kRamSize - 1)]);
+        if (!ch) break;
+        s += ch;
+    }
+    return s;
+}
+
+std::string ee_bytes(std::uint32_t a, std::size_t n) {
+    std::string s(n, '\0');
+    for (std::size_t i = 0; i < n; ++i) s[i] = static_cast<char>(g_ram[(a + i) & (kRamSize - 1)]);
+    return s;
+}
 
 constexpr std::uint32_t kRpcRecvAddr = 0xDEADBEF0u;
 constexpr std::uint32_t kServerXor = 0xACACACACu;
@@ -341,6 +382,7 @@ void other_data(const std::uint8_t *packet) {
     std::memcpy(&src, packet + 32, 4);
     std::memcpy(&dst, packet + 36, 4);
     std::memcpy(&size, packet + 40, 4);
+    size = fit_copy("SIF other data", dst, src, size);
     std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), size);
     watch_span(dst, size, "sif:other_data");
     Rend r = make_rend(*reinterpret_cast<const Header *>(packet), record, paddr, rpc, receive, 0x8000000Cu);
@@ -511,8 +553,9 @@ void finish_request(iop::Cpu &c, iop::kernel::Thread &t) {
         std::fprintf(stderr, "\n");
     }
     if (call.recv && result && call.recv_size) {
-        std::memcpy(g_ram + (call.recv & (kRamSize - 1)), iop::ram_ptr(result), (call.recv_size + 3u) & ~3u);
-        watch_span(call.recv, (call.recv_size + 3u) & ~3u, "sif:rpc_finish");
+        const std::uint32_t n = fit_copy("SIF RPC reply", call.recv, result, (std::uint64_t{call.recv_size} + 3u) & ~std::uint64_t{3});
+        std::memcpy(g_ram + (call.recv & (kRamSize - 1)), iop::ram_ptr(result), n);
+        watch_span(call.recv, n, "sif:rpc_finish");
     }
     reply_call(call);
 }
@@ -578,12 +621,13 @@ void install_iop_side() {
             const std::uint32_t src = iop::read32(list + i * 16), dst = iop::read32(list + i * 16 + 4), size = iop::read32(list + i * 16 + 8);
             if (g_options.trace_iop_hle) {
                 std::uint32_t nonzero = 0;
-                for (std::uint32_t k = 0; k < size; ++k) nonzero += iop::ram_ptr(src)[k] != 0;
+                for (std::uint32_t k = 0; k < std::min(size, iop::kRamSize); ++k) nonzero += *iop::ram_ptr(src + k) != 0;
                 std::fprintf(stderr, "[sif] iop dma 0x%08X -> ee 0x%08X size 0x%X nonzero %u words %08X %08X %08X %08X\n", src, dst, size, nonzero,
                              iop::read32(src), iop::read32(src + 4), iop::read32(src + 8), iop::read32(src + 12));
             }
-            std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), std::min(size, kRamSize - (dst & (kRamSize - 1))));
-            watch_span(dst, std::min(size, kRamSize - (dst & (kRamSize - 1))), "sif:iop_dma");
+            const std::uint32_t n = fit_copy("sceSifSetDma", dst, src, size);
+            std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), n);
+            watch_span(dst, n, "sif:iop_dma");
         }
         c.r[2] = g_iop_dma_id++;
         if (callback) iop::kernel::schedule(iop::kernel::now() + 32, iop::kernel::Job{iop::kernel::kJobSifDmaCallback, callback, data});
@@ -606,9 +650,16 @@ void install_iop_side() {
     });
     def("sifcmd", 11, "sceSifRemoveCmdHandler", [](iop::Cpu &c) { g_cmd_handlers.erase(arg(c, 0)); c.r[2] = 0; });
     auto send_cmd = [](iop::Cpu &c) {
-        const std::uint32_t cid = arg(c, 0), packet = arg(c, 1), size = arg(c, 2);
+        const std::uint32_t cid = arg(c, 0), packet = arg(c, 1);
         const std::uint32_t src = arg(c, 3), dst = arg(c, 4), extra = arg(c, 5);
-        if (extra) { std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), extra); watch_span(dst, extra, "sif:send_cmd"); }
+        // A packet starts with its 16-byte header (written below) and lies in the IOP's memory; anything else is refused or cut.
+        if (arg(c, 2) < 16) { iop::bad_span("sceSifSendCmd packet", packet, arg(c, 2), "refused (shorter than its header)"); c.r[2] = 0; return; }
+        const std::uint32_t size = fit_copy("sceSifSendCmd packet", 0, packet, arg(c, 2));
+        if (extra) {
+            const std::uint32_t n = fit_copy("sceSifSendCmd data", dst, src, extra);
+            std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), n);
+            watch_span(dst, n, "sif:send_cmd");
+        }
         std::vector<std::uint8_t> bytes(size);
         std::memcpy(bytes.data(), iop::ram_ptr(packet), size);
         const std::uint32_t words[2] = {(size & 0xFFu) | (extra << 8), dst};
@@ -775,7 +826,7 @@ void install_iop_side() {
     def("sifcmd", 23, "sceSifGetOtherData", [](iop::Cpu &c) {
         const std::uint32_t src = arg(c, 1), dst = arg(c, 2), size = arg(c, 3);
         iop::watch_copy("sceSifGetOtherData", dst, src, size, c.r[31]);
-        std::memcpy(iop::ram_ptr(dst), g_ram + (src & (kRamSize - 1)), size);
+        std::memcpy(iop::ram_ptr(dst), g_ram + (src & (kRamSize - 1)), fit_copy("sceSifGetOtherData", src, dst, size));
         c.r[2] = 0;
     });
     def("sifcmd", 24, "sceSifRemoveRpc", [](iop::Cpu &c) {
@@ -834,7 +885,7 @@ void fileio_reply(std::uint32_t args, std::uint32_t command, const std::vector<s
 
 bool fileio_async(std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
     const auto word = [args](std::uint32_t offset) { return ee_read<std::uint32_t>(args + offset); };
-    const auto text = [args](std::uint32_t offset) { return std::string(reinterpret_cast<const char *>(g_ram + args + offset)); };
+    const auto text = [args](std::uint32_t offset) { return ee_text(args + offset); };
     store<std::uint32_t>(g_ram + ret, 1);
     switch (method) {
     case 255:
@@ -852,7 +903,8 @@ bool fileio_async(std::uint32_t method, std::uint32_t args, std::uint32_t, std::
         fileio_reply(args, 1, {static_cast<std::uint32_t>(iop::io::close(static_cast<int>(word(12)))), 0, 0, 0});
         return true;
     case 2: {
-        const std::uint32_t size = word(20);
+        // Cut to what fits in EE memory from the destination, so a bad size does not ask the host for up to 4 GiB.
+        const std::uint32_t size = fit_ee("fileio read", word(16), word(20));
         std::vector<std::uint8_t> buffer(size);
         const int n = iop::io::read(static_cast<int>(word(12)), buffer.data(), size);
         if (n > 0) { std::memcpy(g_ram + (word(16) & (kRamSize - 1)), buffer.data(), static_cast<std::size_t>(n)); watch_span(word(16), static_cast<std::uint32_t>(n), "sif:file_read"); }
@@ -900,9 +952,9 @@ bool fileio_async(std::uint32_t method, std::uint32_t args, std::uint32_t, std::
 void install_servers() {
     register_hle_server(0x80000006u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
         if (method == 0x00) {
-            const std::string path(reinterpret_cast<const char *>(g_ram + args + 8));
+            const std::string path = ee_text(args + 8);
             const std::uint32_t arg_len = ee_read<std::uint32_t>(args);
-            const std::string margs(reinterpret_cast<const char *>(g_ram + args + 8 + 252), std::min<std::uint32_t>(arg_len, 252));
+            const std::string margs = ee_bytes(args + 8 + 252, std::min<std::uint32_t>(arg_len, 252));
             std::fprintf(stderr, "[loadfile] %s\n", path.c_str());
             const std::int32_t id = iop::load_module(path, margs, [ret](int module, int result) {
                 store<std::int32_t>(g_ram + ret, module);
@@ -919,23 +971,38 @@ void install_servers() {
         if (method == 0x06) {
             const std::uint32_t ptr = ee_read<std::uint32_t>(args) & (iop::kRamSize - 1);
             const std::uint32_t arg_len = ee_read<std::uint32_t>(args + 4);
-            const std::string margs(reinterpret_cast<const char *>(g_ram + args + 8 + 252), std::min<std::uint32_t>(arg_len, 252));
+            const std::string margs = ee_bytes(args + 8 + 252, std::min<std::uint32_t>(arg_len, 252));
             const std::uint8_t *elf = iop::ram_ptr(ptr);
-            std::uint32_t size = 0;
-            if (std::memcmp(elf, "\x7F" "ELF", 4) == 0) {
-                const auto u16 = [elf](std::uint32_t o) { return static_cast<std::uint32_t>(elf[o] | (elf[o + 1] << 8)); };
-                const auto u32 = [elf](std::uint32_t o) { return static_cast<std::uint32_t>(elf[o] | (elf[o + 1] << 8) | (elf[o + 2] << 16) | (elf[o + 3] << 24)); };
-                size = u32(0x20) + u16(0x30) * u16(0x2E);
-                for (std::uint32_t i = 0; i < u16(0x2C); ++i) {
-                    const std::uint32_t ph = u32(0x1C) + i * u16(0x2A);
-                    size = std::max(size, u32(ph + 4) + u32(ph + 16));
+            // The module's length is worked out from its own headers (the end of the section headers, of each program segment and of
+            // each section that has file contents). They come from the game's memory, so every read is checked against the end of
+            // the IOP's memory, in 64 bits: a header that lies past it gives 0 and the module is refused, as the disc loader does.
+            const std::uint64_t room = iop::kRamSize - ptr;
+            bool bad = false;
+            const auto u16 = [elf, room, &bad](std::uint64_t o) -> std::uint64_t {
+                if (o + 2 > room) { bad = true; return 0; }
+                return static_cast<std::uint32_t>(elf[o] | (elf[o + 1] << 8));
+            };
+            const auto u32 = [elf, room, &bad](std::uint64_t o) -> std::uint64_t {
+                if (o + 4 > room) { bad = true; return 0; }
+                return static_cast<std::uint32_t>(elf[o] | (elf[o + 1] << 8) | (elf[o + 2] << 16) | (elf[o + 3] << 24));
+            };
+            std::uint64_t whole = 0;
+            if (room >= 4 && std::memcmp(elf, "\x7F" "ELF", 4) == 0) {
+                whole = u32(0x20) + u16(0x30) * u16(0x2E);
+                for (std::uint32_t i = 0; i < u16(0x2C) && !bad; ++i) {
+                    const std::uint64_t ph = u32(0x1C) + i * u16(0x2A);
+                    whole = std::max(whole, u32(ph + 4) + u32(ph + 16));
                 }
-                for (std::uint32_t i = 0; i < u16(0x30); ++i) {
-                    const std::uint32_t sh = u32(0x20) + i * u16(0x2E);
-                    if (u32(sh + 4) != 8u) size = std::max(size, u32(sh + 16) + u32(sh + 20));
+                for (std::uint32_t i = 0; i < u16(0x30) && !bad; ++i) {
+                    const std::uint64_t sh = u32(0x20) + i * u16(0x2E);
+                    if (u32(sh + 4) != 8u) whole = std::max(whole, u32(sh + 16) + u32(sh + 20));
                 }
             }
-            size = std::min(size, iop::kRamSize - ptr);
+            if (bad) {
+                iop::bad_span("loadfile module headers", ptr, whole, "module refused");
+                whole = 0;
+            }
+            const std::uint32_t size = static_cast<std::uint32_t>(std::min(whole, room));
             std::fprintf(stderr, "[loadfile] buffer at 0x%X, %u bytes\n", ptr, size);
             const std::int32_t id = size ? iop::load_module_buffer(std::vector<std::uint8_t>(elf, elf + size), "buffer", margs, [ret](int module, int result) {
                 store<std::int32_t>(g_ram + ret, module);
@@ -951,7 +1018,7 @@ void install_servers() {
         }
         // SearchModuleByName: the id of a module that is loaded (the name sits after two words), else "unknown module".
         if (method == 0x09) {
-            const std::string name(reinterpret_cast<const char *>(g_ram + args + 8), strnlen(reinterpret_cast<const char *>(g_ram + args + 8), 252));
+            const std::string name = ee_text(args + 8, 252);
             std::int32_t found = -202;
             for (const auto &[id, m] : iop::kernel::modules()) {
                 if (m.name.size() != name.size()) continue;
@@ -975,7 +1042,7 @@ void install_servers() {
     register_hle_server(0x80000001u, [](std::uint32_t method, std::uint32_t args, std::uint32_t size, std::uint32_t ret, std::uint32_t ret_size) {
         if (g_fileio_async) return fileio_async(method, args, size, ret, ret_size);
         const auto word = [args](int i) { return ee_read<std::uint32_t>(args + 4u * static_cast<std::uint32_t>(i)); };
-        const auto text = [args](int i) { return std::string(reinterpret_cast<const char *>(g_ram + args + 4u * static_cast<std::uint32_t>(i))); };
+        const auto text = [args](int i) { return ee_text(args + 4u * static_cast<std::uint32_t>(i)); };
         std::int32_t result = 0;
         switch (method) {
         case 0:
@@ -984,8 +1051,10 @@ void install_servers() {
             break;
         case 1: result = iop::io::close(static_cast<int>(word(0))); break;
         case 2: {
-            std::vector<std::uint8_t> buffer(word(2));
-            result = iop::io::read(static_cast<int>(word(0)), buffer.data(), word(2));
+            // Cut to what fits in EE memory from the destination, so a bad size does not ask the host for up to 4 GiB.
+            const std::uint32_t size = fit_ee("fileio read", word(1), word(2));
+            std::vector<std::uint8_t> buffer(size);
+            result = iop::io::read(static_cast<int>(word(0)), buffer.data(), size);
             if (result > 0) { std::memcpy(g_ram + (word(1) & (kRamSize - 1)), buffer.data(), static_cast<std::size_t>(result)); watch_span(word(1), static_cast<std::uint32_t>(result), "sif:file_read"); }
             break;
         }
@@ -1114,7 +1183,7 @@ std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {
         else if (dst == kCmdBuffer) command(src, size);
         else {
             iop::watch_copy("EE DMA (sceSifSetDma)", dst, src, size, 0);
-            std::memcpy(iop::ram_ptr(dst), g_ram + src, std::min(size, iop::kRamSize - (iop::phys(dst) & (iop::kRamSize - 1))));
+            std::memcpy(iop::ram_ptr(dst), g_ram + src, fit_copy("EE sceSifSetDma", src, dst, size));
             release_iop_rpc_packet(dst);
         }
     }
@@ -1162,8 +1231,11 @@ void pump() {
     }
     const std::vector<std::uint8_t> packet = std::move(g_outgoing.front());
     g_outgoing.pop_front();
-    std::memcpy(g_ram + g_ee_recv, packet.data(), packet.size());
-    watch_span(g_ee_recv, static_cast<std::uint32_t>(packet.size()), "sif:pump");
+    const std::uint32_t at = g_ee_recv & (kRamSize - 1);
+    const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(packet.size(), kRamSize - at));
+    if (n < packet.size()) iop::bad_span("SIF packet to EE", at, packet.size(), "cut at the end of EE memory");
+    std::memcpy(g_ram + at, packet.data(), n);
+    watch_span(at, n, "sif:pump");
     g_processed = false;
     hw::dmac_raise(5);
 }

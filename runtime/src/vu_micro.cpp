@@ -686,6 +686,83 @@ void set_tops(std::uint32_t top, std::uint32_t itop) {
 void run_fast(int n, std::uint32_t address);
 
 std::unordered_map<std::uint64_t, ProgramFn> g_programs;
+std::unordered_map<std::uint64_t, ProgramFn> g_vu0_programs;
+void run_reference(int n, std::uint32_t address);
+struct Vu0Entry {
+    std::uint32_t generation = 0;
+    std::uint64_t key = 0;
+    ProgramFn function = nullptr;
+};
+Vu0Entry g_vu0_entries[512];
+std::unordered_set<std::uint64_t> g_vu0_rejected;
+std::uint64_t g_vu0_compiled = 0, g_vu0_interpreted = 0, g_vu0_checked = 0, g_vu0_mismatches = 0;
+
+ProgramFn lookup_vu0(std::uint32_t address) {
+    address &= 4095u;
+    Vu0Entry &e = g_vu0_entries[address >> 3];
+    if (e.generation == g_generation[0]) return e.function;
+    e.generation = g_generation[0];
+    e.key = program_key(g_vu0_code, reachable(g_vu0_code, 4095u, address), address);
+    const auto it = g_vu0_programs.find(e.key);
+    e.function = it == g_vu0_programs.end() || g_vu0_rejected.count(e.key) ? nullptr : it->second;
+    static const std::string record = ps2::os::env("PS2_VU0_RECORD");
+    if (!e.function && !record.empty()) {
+        char name[64];
+        std::snprintf(name, sizeof name, "%016llX_%04X.bin", static_cast<unsigned long long>(e.key), address);
+        const auto path = ps2::os::path(record) / name;
+        if (!std::filesystem::exists(path)) {
+            std::filesystem::create_directories(ps2::os::path(record));
+            std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu0_code), 4096);
+        }
+    }
+    return e.function;
+}
+
+bool same_vu0_regs(const Vu0Regs &a, const Vu0Regs &b) {
+    // Compare architectural state, excluding compiler/ABI-dependent padding.
+    return std::memcmp(a.vf, b.vf, sizeof a.vf) == 0 && std::memcmp(&a.acc, &b.acc, sizeof a.acc) == 0 &&
+           std::memcmp(a.vi, b.vi, sizeof a.vi) == 0 && a.q == b.q && a.p == b.p && a.i == b.i && a.r == b.r &&
+           a.mac == b.mac && a.status == b.status && a.clip == b.clip && a.cmsar0 == b.cmsar0 && a.tpc == b.tpc;
+}
+
+bool stopped() { return ps2::halted(); }
+
+bool run_compiled_vu0(std::uint32_t address) {
+    const ProgramFn fn = lookup_vu0(address);
+    static const bool interpret_only = std::getenv("PS2_VU0_INTERPRET") != nullptr;
+    if (!fn || interpret_only) return false;
+    static const bool verify = std::getenv("PS2_VU0_VERIFY") != nullptr;
+    if (!verify) { fn(g_cpu.vu0, g_vu0_mem); return true; }
+    // Both executions start from identical state. Retain the exact result on a
+    // mismatch and blacklist the program, so verification never installs bad state.
+    const Vu0Regs before = g_cpu.vu0;
+    std::uint8_t memory[4096], after_memory[4096];
+    std::memcpy(memory, g_vu0_mem, sizeof memory);
+    fn(g_cpu.vu0, g_vu0_mem);
+    const Vu0Regs after = g_cpu.vu0;
+    std::memcpy(after_memory, g_vu0_mem, sizeof after_memory);
+    g_cpu.vu0 = before;
+    std::memcpy(g_vu0_mem, memory, sizeof memory);
+    run_reference(0, address);
+    auto &checked = g_vu0_checked;
+    auto &mismatches = g_vu0_mismatches;
+    ++checked;
+    const bool registers_match = same_vu0_regs(after, g_cpu.vu0);
+    if (!registers_match || std::memcmp(after_memory, g_vu0_mem, sizeof after_memory)) {
+        ++mismatches;
+        Vu0Entry &e = g_vu0_entries[(address & 4095u) >> 3];
+        std::fprintf(stderr, "[vu0-check] key %016llX entry %04X mismatch: regs %d mem %d; using reference\n",
+                     static_cast<unsigned long long>(e.key), address,
+                     !registers_match,
+                     std::memcmp(after_memory, g_vu0_mem, sizeof after_memory) != 0);
+        g_vu0_rejected.insert(e.key);
+        for (Vu0Entry &entry : g_vu0_entries) entry.generation = 0;
+    }
+    if (checked == 1 || checked % 10000 == 0)
+        std::fprintf(stderr, "[vu0-check-summary] %llu calls, %llu mismatches\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(mismatches));
+    return true;
+}
+
 
 struct Candidate {
     std::vector<std::uint32_t> runs;
@@ -745,9 +822,16 @@ void code_changed(int unit) {
 }
 
 void register_programs(const Program *programs, std::uint32_t count) {
-    for (std::uint32_t i = 0; i < count; ++i)
-        if (programs[i].function) g_programs[programs[i].key] = programs[i].function;
-    if (count > 0) std::fprintf(stderr, "[vu1] Statically registered %u compiled vector programs\n", count);
+    std::uint32_t registered[2] = {};
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (!programs[i].function) continue;
+        const int unit = programs[i].unit == 0 ? 0 : 1;
+        (unit == 0 ? g_vu0_programs : g_programs)[programs[i].key] = programs[i].function;
+        ++registered[unit];
+    }
+    for (int unit = 0; unit < 2; ++unit)
+        if (registered[unit]) std::fprintf(stderr, "[vu%d] Statically registered %u compiled vector programs\n", unit, registered[unit]);
+    for (Vu0Entry &entry : g_vu0_entries) entry.generation = 0;
 }
 
 // Programs the background thread compiled and loaded (vu_live.cpp) join the table of built-in ones. A program the build knew keeps
@@ -769,6 +853,7 @@ void kick(int unit, std::uint32_t address) {
 
 std::uint32_t top() { return g_top; }
 std::uint32_t itop() { return g_itop; }
+std::uint32_t itop(int unit) { return unit == 0 ? vif::itop(0) : g_itop; }
 
 ProgramFn lookup(std::uint32_t address);
 
@@ -830,7 +915,7 @@ void interpret(int unit, std::uint32_t pc) {
         return;
     }
     if (unit != 1) {
-        run_entry(unit, pc);
+        run_reference(unit, pc);
         return;
     }
     if (g_chaining) {
@@ -1137,11 +1222,29 @@ void run_fast(int n, std::uint32_t address) {
 }
 
 void run(int n, std::uint32_t address) {
-    static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
-    if (n == 1 && !exact) {
-        interpret(n, address);
-        return;
+    if (n == 0) {
+        static const bool report = [] {
+            if (std::getenv("PS2_VU0_STATS") || std::getenv("PS2_VU0_VERIFY")) std::atexit([] {
+                std::fprintf(stderr, "[vu0] compiled %llu interpreted %llu checked %llu mismatches %llu\n",
+                    static_cast<unsigned long long>(g_vu0_compiled), static_cast<unsigned long long>(g_vu0_interpreted),
+                    static_cast<unsigned long long>(g_vu0_checked), static_cast<unsigned long long>(g_vu0_mismatches));
+            });
+            return true;
+        }();
+        (void)report;
+        const bool compiled = run_compiled_vu0(address);
+        if (compiled) ++g_vu0_compiled; else ++g_vu0_interpreted;
+        static const bool stats = std::getenv("PS2_VU0_STATS") != nullptr;
+        if (stats && (g_vu0_compiled + g_vu0_interpreted) % 1000000 == 0)
+            std::fprintf(stderr, "[vu0] compiled %llu interpreted %llu\n", static_cast<unsigned long long>(g_vu0_compiled), static_cast<unsigned long long>(g_vu0_interpreted));
+        if (compiled) return;
     }
+    static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
+    if (n == 1 && !exact) { interpret(n, address); return; }
+    run_reference(n, address);
+}
+
+void run_reference(int n, std::uint32_t address) {
     Unit u = unit_of(n);
     Vu0Regs &r = *u.regs;
     if (g_scan[n]) scan_flags(n, u.code, u.code_mask + 1);

@@ -24,13 +24,17 @@ namespace ps2::vu {
 void kick(int unit, std::uint32_t address);
 std::uint32_t top();
 std::uint32_t itop();
+std::uint32_t itop(int unit);  // VU0 reads VIF0; the no-argument form retains the VU1 live-library ABI.
 void interpret(int unit, std::uint32_t pc);
+// AOT VU0 checks for a host stop at the same interval as the reference loop.
+bool stopped();
 
 using ProgramFn = void (*)(Vu0Regs &r, std::uint8_t *mem);
 
 struct Program {
     std::uint64_t key;
     ProgramFn function;
+    int unit = 1;
 };
 
 void register_programs(const Program *programs, std::uint32_t count);
@@ -807,7 +811,8 @@ struct FlagPipe {
     }
 };
 
-PS2_VU_INLINE std::uint8_t *qword(std::uint8_t *mem, std::uint32_t index) { return mem + (index & 1023u) * 16u; }
+template <std::uint32_t Mask = 1023u>
+PS2_VU_INLINE std::uint8_t *qword(std::uint8_t *mem, std::uint32_t index) { return mem + (index & Mask) * 16u; }
 PS2_VU_INLINE void set_vi(Vu0Regs &r, unsigned i, std::uint32_t v) {
     if (i) r.vi[i] = static_cast<std::uint16_t>(v);
 }

@@ -306,26 +306,33 @@ void vblank() {
         const std::string list = os::env("PS2_CAPTURE_AOT_FRAMES");
         const std::string base_list = os::env("PS2_CAPTURE_AOT_BASES");
         if (config.dir.empty() || list.empty() || base_list.empty()) return config;
-        const auto parse_list = [](const std::string &text, int radix, auto &output) {
+        const auto parse_list = [](const std::string &text, bool addresses, auto &output) {
             std::size_t at = 0;
             while (at < text.size()) {
                 const std::size_t next = text.find(',', at);
                 const std::string token = text.substr(at, next == std::string::npos ? next : next - at);
+                const char *digits = token.c_str();
+                int radix = 10;
+                if (addresses && token.size() > 2 && token[0] == '0' &&
+                    (token[1] == 'x' || token[1] == 'X')) {
+                    digits += 2;
+                    radix = 16;
+                }
                 char *end = nullptr;
-                const auto value = std::strtoull(token.c_str(), &end, radix);
-                if (end == token.c_str() || *end) { output.clear(); return false; }
+                const auto value = std::strtoull(digits, &end, radix);
+                if (end == digits || *end) { output.clear(); return false; }
                 output.push_back(value);
                 if (next == std::string::npos) break;
                 at = next + 1;
             }
             return !output.empty();
         };
-        if (!parse_list(list, 10, config.frames)) {
+        if (!parse_list(list, false, config.frames)) {
             std::fprintf(stderr, "[aot-capture] invalid PS2_CAPTURE_AOT_FRAMES list\n");
             return config;
         }
         std::vector<std::uint64_t> parsed_bases;
-        if (!parse_list(base_list, 0, parsed_bases)) {
+        if (!parse_list(base_list, true, parsed_bases)) {
             std::fprintf(stderr, "[aot-capture] invalid PS2_CAPTURE_AOT_BASES list\n");
             config.frames.clear();
             return config;

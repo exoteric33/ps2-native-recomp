@@ -31,5 +31,29 @@ build/native-mygame/ps2run.exe games/mygame/disc/BOOT.ELF --disc game.iso --fram
 ```
 
 The environment variables select passive capture points only. They do not
-compile the captured image or prove that a cached native library is correct;
-the separate recompiler/loader validation must establish that.
+compile the captured image or prove that a cached native library is correct.
+
+## Translate a captured image offline
+
+`eerecomp --live-image` sends a raw captured window through the same analysis
+and C++ generation path used for live EE recompilation. Pass the image base and
+a nonzero library stamp. Give one or more absolute guest entry addresses when
+the capture contains known call targets. `--expect-name` can pin the input to
+the `<base>_<CRC-32>` name used by the live cache, and `--dense-checks` asks the
+generated library to compare the complete window before loading.
+
+```powershell
+build/tools/eerecomp.exe --live-image capture/windows/frame_0000001200_00100000.bin `
+  --base 00100000 --stamp 0000000000000042 --entry 00100000 `
+  --expect-name 00100000_12345678 --out capture/generated --dense-checks
+```
+
+The command reports accepted and rejected entries and fails if none of the
+requested entries is code in the image. The resulting C++ still has to be
+compiled, registered, and loaded by the matching runner. A successful
+translation alone is not proof that the cache covers all runtime code or that
+its entry checks match the game state.
+
+Run `python scripts/test_live_image.py <path-to-eerecomp>` for a synthetic
+smoke test of successful translation and rejection of a wrong image name. It
+uses no disc, BIOS, saved game, or captured title data.

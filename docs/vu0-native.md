@@ -4,6 +4,8 @@ The shared vector code generator can compile recorded VU0 entries into the gener
 
 VU0 uses the reference interpreter's truncating arithmetic, 4 KiB code/data masks and final MAC/status flags visible to the EE. VU1 retains its existing vector arithmetic. VU0 checks host-stop requests every 256 instructions and has the same one-million-instruction budget as the reference interpreter. Unknown entries and entries with unsupported lower instructions, register jumps, XGKICK or unsupported pipeline plans execute entirely in the exact interpreter.
 
+VU0 `XTOP` returns zero and `XITOP` reads the current VIF0 ITOP, matching the reference interpreter. VU1 continues to read its own latched TOP/ITOP; its no-argument helper functions and live-library ABI are retained.
+
 ## Record and build
 
 `port.sh <name> <disc> ...` creates `games/<name>/vu0` and `vu1`, records unknown entries during native exploration, and compiles both sets. When playing a native window build, the host discovers either recording directory beside the extracted executable or disc image. Explicit `PS2_VU0_RECORD=<directory>` and `PS2_VU_RECORD=<directory>` settings take precedence independently. Use separate directories for the two units.
@@ -26,6 +28,8 @@ The original `vurecomp <vu1-directory> <generated-directory>` invocation remains
 Run `python3 scripts/test_vu0_codegen.py` with a C++20 compiler supporting `std::format` (`CXX` selects it). No disc, recorded game code, graphics device or game configuration is required. It reuses the synthetic instruction fixtures from `scripts/test_vu_codegen.py`: 150 random programs, pipeline cases, code/data wrapping, externally visible flags, zero destination masks, per-unit key isolation, code replacement, unknown-entry fallback, host stop and nonterminating code budgets. A negative control injects a wrong function and checks blacklisting, while padding-only changes must not reject a correct result. It also exercises recording/deduplication and the CLI with synthetic VU0-only, VU1-only, mixed-unit and malformed inputs.
 
 `scripts/test_vu_codegen.py` retains the existing native VU1 and Wasm JIT regressions.
+
+The VU0 suite also compiles the same synthetic `XTOP`/`XITOP` programs for both units. It compares full register/data state with the interpreter while varying VIF0 ITOP and VU1's latched TOP/ITOP independently, without changing the cached program. Cases cover VI0, conditional branches and addressed loads/stores; no game program or diagnostic memory dump is used.
 
 ## Draft boundaries
 

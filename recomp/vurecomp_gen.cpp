@@ -301,7 +301,7 @@ struct Lower {
     bool supported = true;
 };
 
-Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask) {
+Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, bool unit0 = false) {
     const std::uint32_t kMask = code_mask;
     Lower l;
     const unsigned dest = (w >> 21) & 15u, it = (w >> 16) & 15u, is = (w >> 11) & 15u, id = (w >> 6) & 15u;
@@ -394,8 +394,10 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask) 
         case 0x64:
             if (ft) l.writes = static_cast<int>(ft);
             if (ft) for (int i = 0; i < 4; ++i) if (lane(dest, i)) c += std::format("r.vf[{}].w[{}] = r.p; ", ft, i); break;
-        case 0x68: c = std::format("set_vi(r, {}, vu::top()); ", it); break;
-        case 0x69: c = std::format("set_vi(r, {}, vu::itop()); ", it); break;
+        // Match the interpreter's lower(): VU0 has no TOP and reads ITOP from
+        // VIF0; the no-argument helpers expose VU1's latched values.
+        case 0x68: c = std::format("set_vi(r, {}, {}); ", it, unit0 ? "0u" : "vu::top()"); break;
+        case 0x69: c = std::format("set_vi(r, {}, {}); ", it, unit0 ? "vu::itop(0)" : "vu::itop()"); break;
         case 0x6C: c = std::format("vu::kick(1, r.vi[{}]); ", is); break;
         case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x78: case 0x79: case 0x7A: case 0x7C: case 0x7D: case 0x7E:
             c = std::format("efu(r, {}u, {}u, {}u); ", index, fs, fsf);
@@ -506,7 +508,7 @@ std::string generate(const Program &p, std::string &name) {
     for (std::uint32_t pc : pcs) {
         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
         Lower l;
-        if (!(hi & 0x80000000u)) l = lower(lo, pc, kMask);
+        if (!(hi & 0x80000000u)) l = lower(lo, pc, kMask, p.unit == 0);
         any_status = any_status || l.reads_status;
         any_flags = any_flags || l.reads_flags;
         any_q = any_q || l.code.find("fl.end_q(") != std::string::npos;
@@ -686,7 +688,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp).
-const char *const kGeneratorVersion = "vurecomp 3";
+const char *const kGeneratorVersion = "vurecomp 4";
 
 Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
     std::vector<Program> programs;

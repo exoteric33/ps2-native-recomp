@@ -853,6 +853,7 @@ void kick(int unit, std::uint32_t address) {
 
 std::uint32_t top() { return g_top; }
 std::uint32_t itop() { return g_itop; }
+std::uint32_t itop(int unit) { return unit == 0 ? vif::itop(0) : g_itop; }
 
 ProgramFn lookup(std::uint32_t address);
 

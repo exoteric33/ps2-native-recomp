@@ -18,17 +18,36 @@ module = ast.parse((ROOT / 'scripts/test_vu_codegen.py').read_text())
 fixtures = {n.targets[0].id: ast.literal_eval(n.value) for n in module.body
             if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
             and isinstance(n.value.value, str)}
+TOP_CASES = r'''
+#pragma once
+#include "cases.h"
+inline std::vector<std::vector<tc::Pair>> top_cases() {
+    using namespace tc;
+    const auto xtop = [](unsigned vi) { return lower_special(0x68, 0, vi, 0); };
+    const auto xitop = [](unsigned vi) { return lower_special(0x69, 0, vi, 0); };
+    return {
+        finish({{xtop(7), kUnop}, {xitop(8), kUnop}, {xtop(0), kUnop}, {xitop(0), kUnop}}),
+        finish({{xitop(1), kUnop}, {xtop(2), kUnop}, {lq(15, 3, 1, 0), kUnop},
+                {sq(15, 4, 1, 1), kUnop}, {lq(15, 5, 2, 0), kUnop}, {sq(15, 6, 2, 1), kUnop}}),
+        finish({{xitop(1), kUnop}, kNop, {branch(0x28, 1, 0, 16, 40), kUnop}, kNop,
+                {iaddiu(2, 0, 11), kUnop}, {iaddiu(3, 0, 22), kUnop}}),
+    };
+}
+'''
 GENERATOR = r'''
 #include "recomp/vurecomp_gen.cpp"
 #include "cases.h"
+#include "tops.h"
 int main(int argc, char **argv) {
     std::vector<ps2::vurecomp::Input> inputs;
-    const auto add = [&](const std::vector<tc::Pair> &pairs, unsigned entry = 0) {
-        ps2::vurecomp::Input p{0, entry, std::vector<std::uint8_t>(4096), 0};
-        for (unsigned i = 0; i < pairs.size(); ++i) std::memcpy(p.code.data() + ((entry + i * 8) & 4095), pairs[i].data(), 8);
-        p.key = ps2::vu::program_key(p.code.data(), ps2::vu::reachable(p.code.data(), 4095, entry), entry);
+    const auto add = [&](const std::vector<tc::Pair> &pairs, unsigned entry = 0, int unit = 0) {
+        const unsigned mask = unit ? 16383u : 4095u;
+        ps2::vurecomp::Input p{0, entry, std::vector<std::uint8_t>(mask + 1), unit};
+        for (unsigned i = 0; i < pairs.size(); ++i) std::memcpy(p.code.data() + ((entry + i * 8) & mask), pairs[i].data(), 8);
+        p.key = ps2::vu::program_key(p.code.data(), ps2::vu::reachable(p.code.data(), mask, entry), entry);
         inputs.push_back(p);
     };
+    for (int unit : {0, 1}) for (const auto &pairs : top_cases()) add(pairs, 0, unit);
     for (const auto &c : tc::cases()) add(c.pairs);
     for (unsigned i = 0; i < 150; ++i) add(tc::random_program(i));
     // Code wrap and 4 KiB data wrap, plus final flags with no microcode reader.
@@ -60,7 +79,10 @@ STUBS = r'''
 #include "ps2/vu_live.hpp"
 namespace ps2 {
 std::uint64_t frame_count() { return 0; } bool test_halted = false; bool halted() { return test_halted; }
-namespace vif { std::uint32_t itop(int) { return 0; } }
+namespace vif {
+std::uint32_t test_itop[2] = {};
+std::uint32_t itop(int unit) { return test_itop[unit]; }
+}
 namespace vu::live {
 std::atomic<bool> g_ready{false}; bool active() { return false; }
 void note_call(std::uint64_t) {} std::vector<Program> take() { return {}; }
@@ -69,6 +91,7 @@ void unknown(std::uint64_t, std::uint32_t, const std::uint8_t *) {}
 '''
 DRIVER = r'''
 #include <cstddef>
+#include "tops.h"
 void register_generated_vu();
 static unsigned padding_calls = 0;
 static void padding_only(Vu0Regs &r, std::uint8_t *) {
@@ -80,29 +103,54 @@ static void padding_only(Vu0Regs &r, std::uint8_t *) {
 static unsigned calls = 0, equivalent_calls = 0;
 static void equivalent(Vu0Regs &, std::uint8_t *) { ++equivalent_calls; ps2::vu::interpret(0, 0); }
 static void wrong(Vu0Regs &r, std::uint8_t *) { ++calls; r.vi[7] = 0xBAD; }
-static void compare(const std::vector<tc::Pair> &pairs, unsigned seed, unsigned entry = 0) {
-    std::memset(g_vu0_code, 0, 4096);
-    for (unsigned i = 0; i < pairs.size(); ++i) std::memcpy(g_vu0_code + ((entry + i * 8) & 4095), pairs[i].data(), 8);
-    vu::code_changed(0);
-    auto &r = vu::regs(0);
-    tc::random_init(r, g_vu0_mem, seed);
+static void compare(const std::vector<tc::Pair> &pairs, unsigned seed, unsigned entry = 0,
+                    int unit = 0, bool replace_code = true) {
+    const unsigned size = unit ? 16384u : 4096u;
+    auto *code = unit ? g_vu1_code : g_vu0_code;
+    auto *data = unit ? g_vu1_mem : g_vu0_mem;
+    if (replace_code) {
+        std::memset(code, 0, size);
+        for (unsigned i = 0; i < pairs.size(); ++i) std::memcpy(code + ((entry + i * 8) & (size - 1)), pairs[i].data(), 8);
+        vu::code_changed(unit);
+    }
+    auto &r = vu::regs(unit);
+    std::memset(data, 0, size);
+    tc::random_init(r, data, seed);
     const auto before = r;
-    std::uint8_t memory[4096]; std::memcpy(memory, g_vu0_mem, 4096);
-    vu::run(0, entry);
+    const std::vector<std::uint8_t> memory(data, data + size);
+    vu::run(unit, entry);
     const auto actual = r;
-    std::uint8_t after[4096]; std::memcpy(after, g_vu0_mem, 4096);
-    r = before; std::memcpy(g_vu0_mem, memory, 4096);
-    // interpret(0) is the exact reference, never the compiled dispatch.
-    vu::interpret(0, entry);
-    if (std::memcmp(&actual, &r, sizeof r) || std::memcmp(after, g_vu0_mem, 4096)) {
-        std::fprintf(stderr, "VU0 differential mismatch seed %u entry %u tpc %u/%u\n", seed, entry, actual.tpc, r.tpc);
-        std::fputs(tc::describe(actual, after).c_str(), stderr);
-        std::fputs(tc::describe(r, g_vu0_mem).c_str(), stderr);
+    const std::vector<std::uint8_t> after(data, data + size);
+    r = before; std::memcpy(data, memory.data(), size);
+    // interpret() bypasses compiled dispatch; VU0 uses the exact reference.
+    vu::interpret(unit, entry);
+    if (std::memcmp(&actual, &r, sizeof r) || std::memcmp(after.data(), data, size)) {
+        std::fprintf(stderr, "VU%d differential mismatch seed %u entry %u tpc %u/%u\n", unit, seed, entry, actual.tpc, r.tpc);
+        std::fputs(tc::describe(actual, after.data()).c_str(), stderr);
+        std::fputs(tc::describe(r, data).c_str(), stderr);
         std::exit(1);
     }
 }
+static void check_tops() {
+    for (int unit : {0, 1}) for (const auto &pairs : top_cases()) {
+        bool replace_code = true;
+        for (unsigned itop : {0u, 1u, 0x2Bu, 0xFFu, 0x100u, 0x3FFu}) {
+            vif::test_itop[0] = itop;
+            const unsigned vu1_itop = (itop + 0x2AAu) & 0x3FFu;
+            vif::test_itop[1] = (vu1_itop + 1u) & 0x3FFu;  // also differs from VU1's latched value
+            vu::set_tops((itop + 0x155u) & 0x3FFu, vu1_itop);
+            // Keep the program and its cached entry while the VIF values change.
+            compare(pairs, itop, 0, unit, replace_code);
+            replace_code = false;
+        }
+    }
+    vif::test_itop[0] = vif::test_itop[1] = 0;
+    vu::set_tops(0, 0);
+    std::puts("TOP/ITOP unit isolation, cached value updates, branches and addressed memory passed");
+}
 int main(int argc, char **argv) {
     register_generated_vu();
+    check_tops();
     for (unsigned i = 0; i < 150; ++i) compare(tc::random_program(i), i);
     unsigned i = 0;
     for (const auto &c : tc::cases()) compare(c.pairs, ++i);
@@ -149,6 +197,7 @@ def run(args, **kw):
 with tempfile.TemporaryDirectory(prefix='vu0-codegen-') as tmp:
     tmp = Path(tmp)
     (tmp / 'cases.h').write_text(fixtures['CASES_H'])
+    (tmp / 'tops.h').write_text(TOP_CASES)
     (tmp / 'generator.cpp').write_text(GENERATOR)
     (tmp / 'driver.cpp').write_text('#define RANDOM_PROGRAMS 150\n' + STUBS + INTERP + DRIVER)
     base = [CXX, '-std=c++20', '-O1', '-I.', '-Iruntime/include', '-Iruntime/src', '-I' + str(tmp)]

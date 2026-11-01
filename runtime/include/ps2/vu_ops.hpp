@@ -24,6 +24,7 @@ namespace ps2::vu {
 void kick(int unit, std::uint32_t address);
 std::uint32_t top();
 std::uint32_t itop();
+std::uint32_t itop(int unit);  // VU0 reads VIF0; the no-argument form retains the VU1 live-library ABI.
 void interpret(int unit, std::uint32_t pc);
 // AOT VU0 checks for a host stop at the same interval as the reference loop.
 bool stopped();

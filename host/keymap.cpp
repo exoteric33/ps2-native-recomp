@@ -45,7 +45,8 @@ constexpr Info kInfo[ActionCount] = {
     {"select", ""},
     {"roll", "roll: while it is held, the walk keys push the right stick as well, which is God of War's evade roll"},
     {"rage", "one key that presses L3 and R3 together (God of War's rage)"},
-    {"help", "the key card (F1 shows it as well)"},
+    {"help", "a key that shows the key card at once (none by default: F1 opens the quick menu, whose Keys entry shows the card)"},
+    {"menu", "another key for the quick menu (none by default: F1 opens it; on a controller: hold Select, then press Start, or press the Guide button)"},
 };
 
 constexpr int kScancodes = SDL_NUM_SCANCODES;
@@ -117,8 +118,9 @@ const char *look_word(int look) {
     return words[look < 0 || look >= kLookCount ? 0 : look];
 }
 
-std::string with_look(const std::string &file_text, int look) {
-    const std::string line = std::string("look = ") + look_word(look);
+namespace {
+// keys.ini text with its `name` line set to `line` (other lines untouched; the line is added at the end when missing)
+std::string with_line(const std::string &file_text, const std::string &name, const std::string &line) {
     std::string out;
     bool done = false;
     std::size_t pos = 0;
@@ -127,7 +129,7 @@ std::string with_look(const std::string &file_text, int look) {
         const bool last = end == std::string::npos;
         std::string row = file_text.substr(pos, last ? std::string::npos : end - pos);
         const std::size_t eq = row.find('=');
-        if (!done && eq != std::string::npos && row[0] != '#' && row[0] != ';' && squash(row.substr(0, eq)) == "look") {
+        if (!done && eq != std::string::npos && row[0] != '#' && row[0] != ';' && squash(row.substr(0, eq)) == name) {
             row = line + (!row.empty() && row.back() == '\r' ? "\r" : "");
             done = true;
         }
@@ -138,6 +140,12 @@ std::string with_look(const std::string &file_text, int look) {
     if (!done) out += std::string(out.empty() || out.back() == '\n' ? "" : "\n") + line + "\n";
     return out;
 }
+
+}  // namespace
+
+std::string with_look(const std::string &file_text, int look) { return with_line(file_text, "look", std::string("look = ") + look_word(look)); }
+
+std::string with_scale(const std::string &file_text, int scale) { return with_line(file_text, "scale", "scale = " + std::to_string(scale)); }
 
 bool is_reserved(int input) {
     return input == SDL_SCANCODE_F1 || input == SDL_SCANCODE_F2 || input == SDL_SCANCODE_F5 || input == SDL_SCANCODE_F8 || input == SDL_SCANCODE_F9 || input == SDL_SCANCODE_F11;
@@ -163,7 +171,8 @@ Config defaults() {
     set(Select, {SDL_SCANCODE_TAB, SDL_SCANCODE_BACKSPACE});
     set(Roll, {SDL_SCANCODE_LCTRL, kMouseX1});
     set(Rage, {SDL_SCANCODE_V});
-    set(Help, {SDL_SCANCODE_H});
+    set(Help, {});  // H used to be the key card; it was easy to hit by mistake, F1 opens the quick menu now
+    set(Menu, {});
     return c;
 }
 
@@ -247,6 +256,12 @@ void parse(const std::string &text, Config &config, std::vector<std::string> &pr
             else config.look = found;
             continue;
         }
+        if (name == "scale") {
+            const std::string v = squash(value);
+            if (v == "1" || v == "2" || v == "3") config.scale = v[0] - '0';
+            else bad("scale is 1, 2 or 3, ignored");
+            continue;
+        }
         if (name == "mousespeed") {
             char *tail = nullptr;
             const double v = std::strtod(value.c_str(), &tail);
@@ -261,6 +276,10 @@ void parse(const std::string &text, Config &config, std::vector<std::string> &pr
             continue;
         }
         std::vector<int> inputs;
+        // 'help = H' and 'menu = M' were the keys of earlier versions (H showed the key card and was easy to hit by mistake): files
+        // that still have them from the old default are not honoured; any other key written there is
+        if (squash(value) == "h" && it->second == Help) continue;
+        if (squash(value) == "m" && it->second == Menu) continue;
         const bool none = squash(value) == "none" || value.empty();
         std::size_t from = 0;
         while (!none && from <= value.size()) {
@@ -308,7 +327,8 @@ std::string default_file_text() {
         "# Keys are written the English way: Space, Enter, Esc, Tab, Left Shift, Left Ctrl, Backspace, Up, Down, A, B, 1, 2, ...\n"
         "# and mean the place on the keyboard, whatever is printed there: on a German keyboard 'Z' is the key labelled Y.\n"
         "# Mouse: Left Mouse, Right Mouse, Middle Mouse, Mouse X1 and Mouse X2 (the two side buttons), Wheel Up, Wheel Down.\n"
-        "# F1, F2, F5, F8, F9 and F11 belong to the program (key card, picture look, quick save, quick load, problem report, full screen).\n"
+        "# F1, F2, F5, F8, F9 and F11 belong to the program (quick menu, picture look, quick save, quick load, problem report,\n"
+        "# full screen). On some laptops they need the Fn key: Fn + F1 opens the quick menu.\n"
         "# A line that cannot be read is ignored and written to the log (logs folder); the rest still works.\n"
         "\n";
     for (int a = 0; a < ActionCount; ++a) {
@@ -331,7 +351,10 @@ std::string default_file_text() {
         "#   crisp_edges   crisp, and the jagged stairs along edges are smoothed\n"
         "#   soft          a smooth blend, like an old TV\n"
         "#   soft_edges    soft, and the jagged stairs along edges are smoothed\n"
-        "look = " + std::string(look_word(kDefaultLook)) + "\n";
+        "look = " + std::string(look_word(kDefaultLook)) + "\n"
+        "\n# The inner resolution: 1, 2 or 3 times the console's (sharper, and more work for the graphics chip). Used when the game\n"
+        "# starts; the quick menu (F1) writes it here. The environment variable PS2_SCALE, when it is set, wins over this line.\n"
+        "# scale = 1\n";
     return t;
 }
 
@@ -355,9 +378,13 @@ std::string card_text(const Config &c) {
     line("Select", list(c, Select));
     line("D-pad (menus)", list(c, DpadUp) + ", " + list(c, DpadDown) + ", " + list(c, DpadLeft) + ", " + list(c, DpadRight));
     line("L3, R3 (sticks pressed in)", list(c, L3) + ", " + list(c, R3));
-    t += "\nF5 quick save   F8 quick load   F9 something is wrong   F11 full screen\n";
+    t += "\nF1: the quick menu (save, load, picture look, resolution, full screen, this card, quit)";
+    if (!c.inputs[Menu].empty()) t += "; also " + list(c, Menu);
+    t += "\nOn a controller: hold Select, then press Start (or press the Guide button)\n";
+    t += "F5 quick save   F8 quick load   F9 something is wrong   F11 full screen\n";
     t += "F2 picture look, now: " + std::string(look_name(c.look < 0 ? kDefaultLook : c.look)) + " (sharp + smooth edges, sharp, crisp, crisp + smooth edges, soft, soft + smooth edges)\n";
-    t += "This card: F1 or " + list(c, Help) + ". On some laptops the F keys need Fn held down; the buttons below work without it.\n";
+    t += "On some laptops the F keys need the Fn key held down: Fn + F1 opens the quick menu. The buttons below work without Fn.\n";
+    if (!c.inputs[Help].empty()) t += "This card at once: " + list(c, Help) + "\n";
     return t;
 }
 

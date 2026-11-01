@@ -1,4 +1,5 @@
 #include "gpu.hpp"
+#include "overlay.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
 #include "ps2/system.hpp"
@@ -58,6 +59,17 @@ std::uint32_t g_surface_width = 0, g_surface_height = 0;
 WGPURenderPipeline g_blit = nullptr;
 WGPUBindGroup g_blit_group = nullptr;
 WGPUBuffer g_blit_params = nullptr;
+// The overlay (overlay.hpp): the quick menu's panel, drawn over the game's picture in the present pass with alpha blending. Its pixels
+// sit in a storage buffer like everything else here (no texture: the same code on every backend and in the browser build).
+struct Overlay {
+    WGPURenderPipeline pipeline = nullptr;
+    WGPUBindGroupLayout layout = nullptr;
+    WGPUBindGroup group = nullptr;
+    WGPUBuffer pixels = nullptr, rect = nullptr;
+    std::uint64_t capacity = 0;  // bytes of `pixels`
+    std::uint32_t x = 0, y = 0, width = 0, height = 0;
+    bool on = false;
+} g_overlay;
 std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
 bool g_have_previous = false;
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
@@ -1043,6 +1055,15 @@ void submit(WGPUTextureView present_view = nullptr) {
         wgpuRenderPassEncoderSetPipeline(rp, g_blit);
         wgpuRenderPassEncoderSetBindGroup(rp, 0, g_blit_group, 0, nullptr);
         wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+        if (g_overlay.on && g_overlay.group && g_surface_width && g_surface_height) {
+            // the panel's own rectangle, cut to the window (a window made smaller than the panel shows its top left part)
+            const std::uint32_t ox = std::min(g_overlay.x, g_surface_width - 1), oy = std::min(g_overlay.y, g_surface_height - 1);
+            const std::uint32_t ow = std::min(g_overlay.width, g_surface_width - ox), oh = std::min(g_overlay.height, g_surface_height - oy);
+            wgpuRenderPassEncoderSetViewport(rp, static_cast<float>(ox), static_cast<float>(oy), static_cast<float>(ow), static_cast<float>(oh), 0.0f, 1.0f);
+            wgpuRenderPassEncoderSetPipeline(rp, g_overlay.pipeline);
+            wgpuRenderPassEncoderSetBindGroup(rp, 0, g_overlay.group, 0, nullptr);
+            wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+        }
         wgpuRenderPassEncoderEnd(rp);
         wgpuRenderPassEncoderRelease(rp);
     }
@@ -2560,6 +2581,138 @@ bool present(const DisplaySource &src) {
         g_hitch_now = HitchWork{};
     }
     log.picture();
+    return true;
+}
+
+namespace {
+
+// The overlay's shader: a triangle that covers the viewport (set to the panel's rectangle), each pixel read from the buffer.
+constexpr const char *kOverlayShader = R"(
+struct Rect { x: u32, y: u32, width: u32, height: u32 };
+@group(0) @binding(0) var<storage, read> pixels: array<u32>;
+@group(0) @binding(1) var<uniform> rect: Rect;
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment
+fn fs(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {
+    let x = min(u32(max(at.x - f32(rect.x), 0.0)), rect.width - 1u);
+    let y = min(u32(max(at.y - f32(rect.y), 0.0)), rect.height - 1u);
+    return unpack4x8unorm(pixels[y * rect.width + x]);
+}
+)";
+
+bool make_overlay_pipeline() {
+    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+    source.code = view(kOverlayShader);
+    WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    md.nextInChain = &source.chain;
+    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
+    WGPUBindGroupLayoutEntry le[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+    le[0].binding = 0;
+    le[0].visibility = WGPUShaderStage_Fragment;
+    le[0].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    le[1].binding = 1;
+    le[1].visibility = WGPUShaderStage_Fragment;
+    le[1].buffer.type = WGPUBufferBindingType_Uniform;
+    WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    ld.entryCount = 2;
+    ld.entries = le;
+    g_overlay.layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    pld.bindGroupLayoutCount = 1;
+    pld.bindGroupLayouts = &g_overlay.layout;
+    WGPUPipelineLayout pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    WGPUBlendState blend = WGPU_BLEND_STATE_INIT;
+    blend.color.operation = WGPUBlendOperation_Add;
+    blend.color.srcFactor = WGPUBlendFactor_SrcAlpha;
+    blend.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+    blend.alpha.operation = WGPUBlendOperation_Add;
+    blend.alpha.srcFactor = WGPUBlendFactor_One;
+    blend.alpha.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+    WGPUColorTargetState color = WGPU_COLOR_TARGET_STATE_INIT;
+    color.format = g_surface_format;
+    color.blend = &blend;
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = module;
+    fragment.entryPoint = view("fs");
+    fragment.targetCount = 1;
+    fragment.targets = &color;
+    WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    rd.layout = pipeline_layout;
+    rd.vertex.module = module;
+    rd.vertex.entryPoint = view("vs");
+    rd.fragment = &fragment;
+    g_overlay.pipeline = wgpuDeviceCreateRenderPipeline(g_device, &rd);
+    wgpuShaderModuleRelease(module);
+    wgpuPipelineLayoutRelease(pipeline_layout);
+    g_overlay.rect = make_buffer(16, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
+    if (!g_overlay.pipeline) std::fprintf(stderr, "[gpu] cannot make the overlay's pipeline: the quick menu is not shown\n");
+    return g_overlay.pipeline != nullptr;
+}
+
+}  // namespace
+
+void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height, std::uint32_t x, std::uint32_t y) {
+    if (!rgba || !width || !height || !g_surface) {
+        g_overlay.on = false;
+        return;
+    }
+    if (!g_overlay.pipeline && !make_overlay_pipeline()) return;
+    const std::uint64_t bytes = static_cast<std::uint64_t>(width) * height * 4;
+    if (bytes > g_overlay.capacity) {
+        if (g_overlay.group) wgpuBindGroupRelease(g_overlay.group);
+        if (g_overlay.pixels) wgpuBufferRelease(g_overlay.pixels);
+        g_overlay.capacity = std::max<std::uint64_t>(bytes, 1u << 20);
+        g_overlay.pixels = make_buffer(g_overlay.capacity, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+        WGPUBindGroupEntry be[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+        be[0].binding = 0;
+        be[0].buffer = g_overlay.pixels;
+        be[0].size = WGPU_WHOLE_SIZE;
+        be[1].binding = 1;
+        be[1].buffer = g_overlay.rect;
+        be[1].size = 16;
+        WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        bd.layout = g_overlay.layout;
+        bd.entryCount = 2;
+        bd.entries = be;
+        g_overlay.group = wgpuDeviceCreateBindGroup(g_device, &bd);
+    }
+    wgpuQueueWriteBuffer(g_queue, g_overlay.pixels, 0, rgba, bytes);
+    const std::uint32_t rect[4] = {x, y, width, height};
+    wgpuQueueWriteBuffer(g_queue, g_overlay.rect, 0, rect, sizeof rect);
+    g_overlay.x = x;
+    g_overlay.y = y;
+    g_overlay.width = width;
+    g_overlay.height = height;
+    g_overlay.on = g_overlay.group != nullptr;
+}
+
+bool present_again() {
+    if (!g_surface || !g_have_previous) return false;
+    // the same picture as the last present (its fields are still in the scratch buffer: the game draws nothing while it waits), with the
+    // window's size and the picture look of now
+    const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
+    const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
+    const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
+    const std::uint32_t tail[3] = {static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), ps2::video_options()};
+    wgpuQueueWriteBuffer(g_queue, g_blit_params, 20, tail, sizeof tail);
+    WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
+    wgpuSurfaceGetCurrentTexture(g_surface, &st);
+    if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
+        if (st.texture) wgpuTextureRelease(st.texture);
+        if (st.status == WGPUSurfaceGetCurrentTextureStatus_Outdated || st.status == WGPUSurfaceGetCurrentTextureStatus_Lost) configure_surface();
+        return false;
+    }
+    WGPUTextureView target = wgpuTextureCreateView(st.texture, nullptr);
+    submit(target);
+#ifndef __EMSCRIPTEN__
+    wgpuSurfacePresent(g_surface);
+#endif
+    wgpuTextureViewRelease(target);
+    wgpuTextureRelease(st.texture);
     return true;
 }
 

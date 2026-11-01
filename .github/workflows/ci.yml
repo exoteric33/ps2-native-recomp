@@ -28,7 +28,7 @@ jobs:
       matrix:
         include:
           - { name: linux-x86_64, os: ubuntu-24.04 }
-          - { name: macos-arm64, os: macos-14 }
+          - { name: macos-arm64, os: macos-15 }   # macos-14 images are retired on 2026-11-02
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     env:

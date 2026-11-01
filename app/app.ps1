@@ -1053,7 +1053,7 @@ $U.fasterBox.Visible = $false
 [void](Add-Label $U.fasterBox 'FasterText' 'Was the game slow in places you saw for the first time? Make it faster (takes a few minutes at most).' 16 6 470 46 (New-Font 11) $C.Ink)
 $U.fasterCount = Add-Label $U.fasterBox 'FasterCount' '' 16 54 470 22 (New-Font 10) $C.Muted
 $U.faster = Add-Button $U.fasterBox 'MakeFaster' 'Make it faster' 496 15 208 50 'secondary' 14
-[void](Add-Label $w 'doneTip' 'Tip: in the game window, F1 shows the keys and F11 switches full screen on and off.' 40 470 720 22 (New-Font 10) $C.Muted 'TopCenter')
+[void](Add-Label $w 'doneTip' 'Tip: in the game window, F1 opens the menu (saves, keys, picture) and F11 switches full screen on and off.' 40 470 720 22 (New-Font 10) $C.Muted 'TopCenter')
 $U.another = Add-Button $w 'BuildAnother' 'Add another game' 40 512 210 48 'secondary' 12
 $U.changeExtras = Add-Button $w 'ChangeExtras' 'Change extras...' 262 512 210 48 'secondary' 12
 $U.close = Add-Button $w 'Close' 'Close' 620 512 140 48 'secondary' 12

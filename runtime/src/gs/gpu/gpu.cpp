@@ -1536,7 +1536,7 @@ static std::string find_dxc() {
     const std::filesystem::path dir = std::filesystem::path(std::wstring(buf, n)).parent_path();
     std::error_code ec;
     if (std::filesystem::exists(dir / "dxcompiler.dll", ec) && std::filesystem::exists(dir / "dxil.dll", ec)) return os::utf8(dir / "dxcompiler.dll");
-    if (want == "dxc") std::fprintf(stderr, "[gpu] PS2_DX12_COMPILER=dxc: dxcompiler.dll and dxil.dll are not next to the program (scripts/fetch_dxc.sh): using FXC\n");
+    if (want == "dxc") std::fprintf(stderr, "[gpu] PS2_DX12_COMPILER=dxc: dxcompiler.dll and dxil.dll are not next to the program (scripts/fetch_dxc.sh): DXC unavailable\n");
 #endif
     return {};
 }
@@ -1596,8 +1596,10 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
         std::fprintf(stderr, "[gpu] no adapter for %s\n", name);
         return give_up();
     }
+    bool selected_dx12 = false;
     WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
     if (wgpuAdapterGetInfo(adapter, &info) == WGPUStatus_Success) {
+        selected_dx12 = info.backendType == WGPUBackendType_D3D12;
         const char *api = info.backendType == WGPUBackendType_Vulkan ? "Vulkan" : info.backendType == WGPUBackendType_D3D12 ? "Direct3D 12" : info.backendType == WGPUBackendType_Metal ? "Metal" : "other";
         const bool software = info.adapterType == WGPUAdapterType_CPU;
         if (software && !software_ok)
@@ -1638,6 +1640,8 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
         return give_up();
     }
     g_adapter = adapter;
+    // The requested backend mask may include DX12 even when wgpu selects Metal or Vulkan.
+    g_dx12_compiler = selected_dx12 ? (dxc_dll.empty() ? "FXC" : "DXC") : nullptr;
     return true;
 }
 
@@ -1682,11 +1686,9 @@ bool init(Mode m) {
 #endif
             // DXC where Direct3D 12 may run; if that cannot start with it, the same API is tried again with FXC before the next API.
             bool opened = dx12 && !dxc.empty() && open_backend(t.backends, t.name, round == 1 || order.size() == 1, dxc);
-            if (opened) g_dx12_compiler = "DXC";
-            else {
+            if (!opened) {
                 if (dx12 && !dxc.empty()) std::fprintf(stderr, "[gpu] Direct3D 12 could not start with DXC: trying FXC\n");
                 opened = open_backend(t.backends, t.name, round == 1 || order.size() == 1, std::string());
-                if (opened && dx12) g_dx12_compiler = "FXC";
             }
             if (opened) {
                 chosen = &t;
@@ -1774,8 +1776,14 @@ bool init(Mode m) {
         if (std::FILE *f = os::open(path.c_str(), "rb")) {
             char buffer[65536];
             for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, f)) > 0;) shader_text.append(buffer, n);
+            const bool read_error = std::ferror(f) != 0;
             std::fclose(f);
-            std::fprintf(stderr, "[gpu] shader from %s (%zu bytes)\n", path.c_str(), shader_text.size());
+            if (read_error || shader_text.empty()) {
+                std::fprintf(stderr, "[gpu] PS2_GS_SHADER: %s %s, using the built-in shader\n", read_error ? "cannot finish reading" : "empty file", path.c_str());
+                shader_text.clear();
+            } else {
+                std::fprintf(stderr, "[gpu] shader from %s (%zu bytes)\n", path.c_str(), shader_text.size());
+            }
         } else {
             std::fprintf(stderr, "[gpu] PS2_GS_SHADER: cannot read %s, using the built-in shader\n", path.c_str());
         }

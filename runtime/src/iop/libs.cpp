@@ -257,6 +257,33 @@ std::uint64_t timer_cycles(const HardTimer &t, std::uint32_t ticks) {
 
 void arm_hard_timer(std::uint32_t id);
 
+// A hardware timer a game sets up with the low-level calls (AllocHardTimer, SetTimerCompare, SetTimerMode, then an interrupt handler
+// on the timer's line) counts at once and raises its interrupt when the counter reaches the compare value (mode bit 4), again and
+// again with the repeat bit (bit 6). Lines: the 16-bit timers use 4 to 6, the 32-bit ones 14 to 16 (the IOP's root counters).
+// The call numbers and mode bits are those of ps2sdk's timrman (iop/kernel/include/timrman.h, AFL-2.0); Zone of the Enders' IOP_MAIN.IRX
+// uses a 5 ms timer this way (compare 0x2D000, mode 0x158) to wake its worker thread.
+struct IrqTimer {
+    std::uint32_t compare = 0, mode = 0, source = 1, prescale = 1, line = 14;
+    std::uint64_t generation = 0;
+};
+std::map<std::uint32_t, IrqTimer> g_irq_timers;
+std::uint32_t g_irq_timers_16 = 0, g_irq_timers_32 = 0;
+
+void arm_irq_timer(std::uint32_t id) {
+    IrqTimer &t = g_irq_timers[id];
+    const std::uint64_t generation = ++t.generation;
+    if (!(t.mode & 0x10u) || !t.compare) return;
+    const std::uint64_t per_tick = (t.source & 4u) ? 2343u : std::max<std::uint32_t>(t.prescale, 1u);
+    schedule(now() + static_cast<std::uint64_t>(t.compare) * per_tick, Job{kJobHardTimer, id | 0x80000000u, static_cast<std::uint32_t>(generation), static_cast<std::uint32_t>(generation >> 32)});
+}
+
+void fire_irq_timer(std::uint32_t id, std::uint64_t generation) {
+    const auto it = g_irq_timers.find(id);
+    if (it == g_irq_timers.end() || it->second.generation != generation) return;
+    hw::raise_interrupt(it->second.line);
+    if (it->second.mode & 0x40u) arm_irq_timer(id);
+}
+
 std::uint32_t hard_timer_counter(std::uint32_t id) {
     const auto it = g_hard_timers.find(id);
     if (it == g_hard_timers.end()) return 0;
@@ -265,6 +292,10 @@ std::uint32_t hard_timer_counter(std::uint32_t id) {
 }
 
 void fire_hard_timer(std::uint32_t id, std::uint64_t generation) {
+    if (id & 0x80000000u) {
+        fire_irq_timer(id & 0x7FFFFFFFu, generation);
+        return;
+    }
     auto it = g_hard_timers.find(id);
     if (it == g_hard_timers.end() || !it->second.running || it->second.generation != generation || !it->second.handler) return;
     const std::uint32_t next = call_guest(it->second.handler, it->second.common);
@@ -1313,18 +1344,40 @@ void install_vblank() {
 
 void install_timrman() {
     register_hle_library("timrman", 0x0101);
-    def("timrman", 4, "AllocHardTimer", [](Cpu &c) { c.r[2] = g_next_hard_timer++; });
+    def("timrman", 4, "AllocHardTimer", [](Cpu &c) {
+        IrqTimer &t = g_irq_timers[g_next_hard_timer];
+        t.source = arg(c, 0);
+        t.prescale = arg(c, 2);
+        t.line = arg(c, 1) == 16 ? 4 + (g_irq_timers_16++ % 3) : 14 + (g_irq_timers_32++ % 3);
+        c.r[2] = g_next_hard_timer++;
+    });
     def("timrman", 5, "ReferHardTimer", [](Cpu &c) { c.r[2] = 1; });
     def("timrman", 6, "FreeHardTimer", [](Cpu &c) { c.r[2] = 0; });
-    def("timrman", 7, "SetTimerMode", [](Cpu &c) { c.r[2] = 0; });
+    def("timrman", 7, "SetTimerMode", [](Cpu &c) {
+        if (const auto it = g_irq_timers.find(arg(c, 0)); it != g_irq_timers.end()) {
+            it->second.mode = arg(c, 1);
+            g_hard_timer_start[arg(c, 0)] = now();
+            arm_irq_timer(arg(c, 0));
+        }
+        c.r[2] = 0;
+    });
     def("timrman", 9, "SetTimerCounter", [](Cpu &c) {
         const auto it = g_hard_timers.find(arg(c, 0));
         if (it != g_hard_timers.end()) g_hard_timer_start[arg(c, 0)] = now() - std::min<std::uint64_t>(now(), static_cast<std::uint64_t>(arg(c, 1)) * timer_cycles(it->second, 1));
         c.r[2] = 0;
     });
     def("timrman", 10, "GetTimerCounter", [](Cpu &c) { c.r[2] = hard_timer_counter(arg(c, 0)); });
-    def("timrman", 11, "SetTimerCompare", [](Cpu &c) { c.r[2] = 0; });
-    def("timrman", 16, "GetHardTimerIntrCode", [](Cpu &c) { c.r[2] = 14; });
+    def("timrman", 11, "SetTimerCompare", [](Cpu &c) {
+        if (const auto it = g_irq_timers.find(arg(c, 0)); it != g_irq_timers.end()) {
+            it->second.compare = arg(c, 1);
+            arm_irq_timer(arg(c, 0));
+        }
+        c.r[2] = 0;
+    });
+    def("timrman", 16, "GetHardTimerIntrCode", [](Cpu &c) {
+        const auto it = g_irq_timers.find(arg(c, 0));
+        c.r[2] = it == g_irq_timers.end() ? 14u : it->second.line;
+    });
     def("timrman", 20, "SetTimerHandler", [](Cpu &c) {
         HardTimer &t = g_hard_timers[arg(c, 0)];
         t.compare = arg(c, 1);
@@ -1434,6 +1487,8 @@ void install_libraries() {
     g_vblank_end_waiters.clear();
     g_alarms.clear();
     g_hard_timers.clear();
+    g_irq_timers.clear();
+    g_irq_timers_16 = g_irq_timers_32 = 0;
     g_hard_timer_start.clear();
     g_vpls.clear();
     g_next_object = 1;
@@ -1522,6 +1577,17 @@ void libs_state(ps2::state::Stream &s) {
     s.pod(g_strtok_next);
     s.pod(g_next_hard_timer);
     s.pod(g_dma_direction);
+    // The low-level hardware timers (state version 8). The job that raises their interrupt is part of the IOP's event queue and names
+    // the timer and its generation, so the generation is kept too. A state older than 8 has no such timers: the game that loads it
+    // sets them up again when it asks for them; a timer already armed in the running program is dropped.
+    if (s.version() >= 8) {
+        s.map(g_irq_timers);
+        s.pod(g_irq_timers_16);
+        s.pod(g_irq_timers_32);
+    } else if (s.loading()) {
+        g_irq_timers.clear();
+        g_irq_timers_16 = g_irq_timers_32 = 0;
+    }
 }
 
 }

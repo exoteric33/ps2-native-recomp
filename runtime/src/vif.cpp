@@ -488,11 +488,21 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
         break;
     case 0x10:
         if (value & 1u) {
-            // A reset leaves the filling registers alone, as in PCSX2: Downhill
-            // Domination sets ROW once and resets the VIF before every frame.
+            // A reset stops the unit and clears its status, error and mark and the command it was decoding. The registers that
+            // VIF commands set (the write cycle, the add-row mode, the mask, ROW and COL, ITOPS, BASE and OFFSET) keep their values:
+            // Downhill Domination sets ROW once and resets the VIF before every frame, and Zone of the Enders sets the write
+            // cycle (STCYCL 4,4) once at start-up, resets the VIF later without sending it again, and then unpacks with it. A cycle
+            // that a reset had cleared to 0 makes every UNPACK take no data, so the vectors that follow are read as commands.
             Unit fresh{};
             std::memcpy(fresh.row, u.row, sizeof fresh.row);
             std::memcpy(fresh.col, u.col, sizeof fresh.col);
+            fresh.cycle = u.cycle;
+            fresh.mode = u.mode;
+            fresh.mask = u.mask;
+            fresh.itops = u.itops;
+            fresh.base = u.base;
+            fresh.ofst = u.ofst;
+            fresh.tops = u.base;  // the double-buffer flag is clear again, so the next buffer is at BASE
             u = fresh;
         }
         if (value & 8u) {

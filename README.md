@@ -54,20 +54,8 @@ the PS2's main processor into C++ and compiles it into a normal program. That gi
 ### Not faster than PCSX2 yet
 
 I measured both on the same laptop (Intel Core 5 120U with its built-in Intel graphics, Windows 11, November 2026), in
-the same scenes, at the PS2's own resolution. **PCSX2 was faster in every scene.** Frames per second; 60 is full speed:
-
-| Scene | PCSX2 | This project | PCSX2, speed limit off | This project, speed limit off |
-|---|---|---|---|---|
-| God of War II, first fight | 60 | 43 | 78 | 43 |
-| God of War II, opening film | 60 | 60 | 126 | 78 |
-| God of War, fight on the ship | 60 | 43 | 118 | 42 |
-| Silent Hill 2, the restroom at the start | 60 | 58 | 171 | 125 |
-
-Why: translating the main processor's code is only a small part of the work. Most of it is the rest of the console, and
-above all the graphics chip. This project draws every pixel with its own program on the graphics card, while PCSX2 hands
-the triangles to the card's built-in drawing hardware, which is much quicker on built-in laptop graphics. On a strong
-graphics card the difference matters less: God of War II runs at 60 fps there. Beating PCSX2 is the goal I'm working
-toward, but it isn't reached.
+the same scenes, at the PS2's own resolution. **PCSX2 was faster in every scene.** But the goal still is to beat PCSX2
+performance-wise.
 
 PCSX2 also runs far more games today and has many years of work behind it. If your game doesn't run here yet, or runs too
 slowly, PCSX2 is the better choice for now.

@@ -24,7 +24,8 @@ struct SurfaceTarget {
     std::uint32_t width, height;
 };
 
-Mode mode();
+extern Mode g_current_mode;  // set by init(); read through mode() on every shape, so it is not a call
+inline Mode mode() { return g_current_mode; }
 bool init(Mode m);
 void draw(const State &s, const Vertex *v, int count);
 void image_begin(const State &s);

@@ -435,28 +435,40 @@ void store_vi(Vu0Regs &r, unsigned index, std::uint32_t value) {
     if (index) r.vi[index] = static_cast<std::uint16_t>(value);
 }
 
+// A packet that runs past the end of the data memory goes on at its start; the queue wants it in one piece.
+__attribute__((noinline)) void xgkick_wrapped(Unit &u, std::uint32_t first, std::uint32_t count) {
+    std::uint8_t buffer[16 * 1024 + 16];
+    const std::uint32_t head = u.data_qwords - first;
+    std::memcpy(buffer, u.data + first * 16, head * 16);
+    std::memcpy(buffer + head * 16, u.data, (count - head) * 16);
+    gif::transfer(1, buffer, count);
+}
+
+// The packet is only measured here (one 8-byte read per GIF tag); the bytes are handed over where they lie in the data memory,
+// which gif::transfer copies before it returns, so nothing is copied twice and no 16 KiB buffer is set up for each kick.
 void xgkick(Unit &u, std::uint32_t address) {
     if (g_reference_dry) return;
-    std::uint8_t buffer[16 * 1024 + 16];
-    std::uint32_t q = address & (u.data_qwords - 1), count = 0;
+    const std::uint32_t qwords = u.data_qwords, first = address & (qwords - 1);
+    std::uint32_t q = first, count = 0;
     bool done = false;
-    while (!done && count < u.data_qwords) {
-        Reg128 tag;
-        std::memcpy(&tag, qword(u, q), 16);
-        std::memcpy(buffer + count * 16, &tag, 16);
+    while (!done && count < qwords) {
+        std::uint64_t tag;
+        std::memcpy(&tag, qword(u, q), 8);
         ++q;
         ++count;
-        const std::uint32_t nloop = static_cast<std::uint32_t>(tag.d[0]) & 0x7FFFu;
-        const bool eop = (tag.d[0] >> 15) & 1u;
-        const std::uint32_t flg = static_cast<std::uint32_t>(tag.d[0] >> 58) & 3u;
-        std::uint32_t nreg = static_cast<std::uint32_t>(tag.d[0] >> 60) & 0xFu;
+        const std::uint32_t nloop = static_cast<std::uint32_t>(tag) & 0x7FFFu;
+        const bool eop = (tag >> 15) & 1u;
+        const std::uint32_t flg = static_cast<std::uint32_t>(tag >> 58) & 3u;
+        std::uint32_t nreg = static_cast<std::uint32_t>(tag >> 60) & 0xFu;
         if (!nreg) nreg = 16;
-        std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
-        for (std::uint32_t i = 0; i < body && count < u.data_qwords; ++i, ++q, ++count)
-            std::memcpy(buffer + count * 16, qword(u, q), 16);
+        const std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+        const std::uint32_t take = std::min(body, qwords - count);
+        q += take;
+        count += take;
         done = eop;
     }
-    gif::transfer(1, buffer, count);
+    if (first + count <= qwords) gif::transfer(1, u.data + first * 16, count);
+    else xgkick_wrapped(u, first, count);
 }
 
 // A VU branch that reads an integer register the instruction right before it
@@ -838,8 +850,23 @@ void interpret(int unit, std::uint32_t pc) {
         return;
     }
     g_chaining = true;
+    // The plain case (no checking, timing, counting or tracing switch, no JIT) goes straight to the program the entry cache already knows:
+    // what run_entry and lookup would do for it, without their set-up. Anything else (a new program, a changed code memory, a program
+    // that is not compiled) takes the long way.
+    static const bool plain = std::getenv("PS2_VU_INTERPRET") == nullptr && std::getenv("PS2_VU_COUNT") == nullptr && std::getenv("PS2_VU_CHECK") == nullptr &&
+                              std::getenv("PS2_VU_TIME") == nullptr && std::getenv("PS2_TRACE_VU1RUN") == nullptr && jit::mode() == 0;
     for (;;) {
-        run_entry(1, pc);
+        if (plain && !live::ready()) {
+            const EntryCache &e = g_entries[(pc & 16383u) >> 3];
+            if (e.generation == g_generation[1] && e.function) {
+                g_trace_vu1_pc = pc;
+                e.function(g_vu1, g_vu1_mem);
+            } else {
+                run_entry(1, pc);
+            }
+        } else {
+            run_entry(1, pc);
+        }
         if (g_chained < 0) break;
         pc = static_cast<std::uint32_t>(g_chained);
         g_chained = -1;
@@ -891,7 +918,8 @@ void time_report() {
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - time_start()).count();
     std::fprintf(stderr, "[vu-time] %zu programs, %llu calls, %llu ticks in compiled programs (%.3f ticks per nanosecond of run time)\n", sorted.size(), static_cast<unsigned long long>(calls),
                  static_cast<unsigned long long>(ticks), static_cast<double>(time_first_stamp()) > 0 ? static_cast<double>(time_last_stamp() - time_first_stamp()) / (seconds * 1e9) : 0.0);
-    for (std::size_t i = 0; i < sorted.size() && i < 12; ++i)
+    static const std::size_t rows = std::max<long>(12, std::atol(std::getenv("PS2_VU_TIME")));  // PS2_VU_TIME=1 lists 12 programs, PS2_VU_TIME=9999 all of them
+    for (std::size_t i = 0; i < sorted.size() && i < rows; ++i)
         std::fprintf(stderr, "[vu-time] %016llX calls %llu ticks %llu (%llu per call)\n", static_cast<unsigned long long>(sorted[i].first),
                      static_cast<unsigned long long>(sorted[i].second.calls), static_cast<unsigned long long>(sorted[i].second.ticks),
                      static_cast<unsigned long long>(sorted[i].second.ticks / std::max<std::uint64_t>(1, sorted[i].second.calls)));

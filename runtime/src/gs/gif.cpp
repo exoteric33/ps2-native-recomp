@@ -46,13 +46,29 @@ void walk(Path &p, const std::uint8_t *data, std::uint32_t qwc, Sink &sink) {
             continue;
         }
         switch (p.flg) {
-        case 0:
-            sink.packed(static_cast<std::uint32_t>(p.regs >> (p.reg * 4)) & 0xFu, q);
-            if (++p.reg >= p.nreg) {
-                p.reg = 0;
-                if (++p.loop >= p.nloop) p.active = false;
+        case 0: {
+            // PACKED data is nearly all of a draw: take the qwords one after another with the loop counters in registers (the sink is a call
+            // the compiler cannot see into, so with `p` in memory it would load and store them for every qword) and write them back at the end.
+            std::uint32_t reg = p.reg, loop = p.loop;
+            const std::uint32_t nreg = p.nreg, nloop = p.nloop;
+            const std::uint64_t regs = p.regs;
+            for (;;) {
+                sink.packed(static_cast<std::uint32_t>(regs >> (reg * 4)) & 0xFu, q);
+                if (++reg >= nreg) {
+                    reg = 0;
+                    if (++loop >= nloop) {
+                        p.active = false;
+                        break;
+                    }
+                }
+                if (i + 1 >= qwc) break;
+                ++i;
+                std::memcpy(&q, data + static_cast<std::size_t>(i) * 16, 16);
             }
+            p.reg = reg;
+            p.loop = loop;
             break;
+        }
         case 1:
             for (int half = 0; half < 2 && p.active; ++half) {
                 sink.reglist(static_cast<std::uint32_t>(p.regs >> (p.reg * 4)) & 0xFu, q.d[half]);

@@ -13,6 +13,10 @@
 #include <cstring>
 #include <vector>
 
+#if defined(__SSE4_1__)
+#include <immintrin.h>
+#endif
+
 namespace ps2::vif {
 
 namespace {
@@ -141,14 +145,22 @@ std::uint32_t unpack_words(std::uint32_t cmd, const Unit &u, std::uint32_t num) 
     return (data * bits + 31) / 32;
 }
 
-void run_vu(int unit, std::uint32_t address) {
-    Unit &u = state(unit);
+// What run() works out once per call instead of once per command: which copy of the unit it is (the vector thread keeps its own,
+// g_vu_side) and whether it is the emulation thread only following VIF1 (shadow). Each of the two asks a function in another file.
+struct Ctx {
+    Unit &u;
+    bool vu_thread;
+    bool dry;
+};
+
+void run_vu(int unit, std::uint32_t address, const Ctx &c) {
+    Unit &u = c.u;
     if (unit == 1) {
         u.top = u.tops;
         u.itop = u.itops;
         u.dbf = !u.dbf;
         u.tops = u.base + (u.dbf ? u.ofst : 0);
-        if (shadow(unit)) return;
+        if (c.dry) return;
         vu::set_tops(u.top, u.itop);
     } else {
         u.itop = u.itops;  // VU0 reads it from here (vif::itop); VU1's TOP and ITOP are not VU0's to change
@@ -156,6 +168,92 @@ void run_vu(int unit, std::uint32_t address) {
     vu::run(unit, address);
 }
 
+#if defined(__SSE4_1__)
+// One element of an UNPACK as the four words it becomes in the vector unit's memory: sign or zero extended, a one-component element
+// repeated, a two-component element as x y x y, a three-component one with w = 0. Reads exactly the bytes of the element (the last
+// element of a command may end the data), so it never looks past them.
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
+__attribute__((always_inline)) inline __m128i unpack_element(const std::uint8_t *p) {
+    if constexpr (Bits == 32) {
+        if constexpr (Components == 4) {
+            return _mm_loadu_si128(reinterpret_cast<const __m128i *>(p));
+        } else if constexpr (Components == 3) {
+            std::uint32_t c;
+            std::memcpy(&c, p + 8, 4);
+            return _mm_insert_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(p)), static_cast<int>(c), 2);
+        } else if constexpr (Components == 2) {
+            return _mm_shuffle_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(p)), 0x44);
+        } else {
+            std::uint32_t a;
+            std::memcpy(&a, p, 4);
+            return _mm_set1_epi32(static_cast<int>(a));
+        }
+    } else if constexpr (Bits == 16) {
+        if constexpr (Components == 1) {
+            std::uint16_t h;
+            std::memcpy(&h, p, 2);
+            return _mm_set1_epi32(Usn ? static_cast<int>(h) : static_cast<int>(static_cast<std::int16_t>(h)));
+        } else {
+            __m128i x;
+            if constexpr (Components == 4) {
+                x = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(p));
+            } else {
+                std::uint32_t a;
+                std::memcpy(&a, p, 4);
+                x = _mm_cvtsi32_si128(static_cast<int>(a));
+                if constexpr (Components == 3) {
+                    std::uint16_t c;
+                    std::memcpy(&c, p + 4, 2);
+                    x = _mm_insert_epi16(x, c, 2);
+                }
+            }
+            const __m128i wide = Usn ? _mm_cvtepu16_epi32(x) : _mm_cvtepi16_epi32(x);
+            if constexpr (Components == 2) return _mm_shuffle_epi32(wide, 0x44);
+            else return wide;
+        }
+    } else {
+        if constexpr (Components == 1) {
+            return _mm_set1_epi32(Usn ? static_cast<int>(p[0]) : static_cast<int>(static_cast<std::int8_t>(p[0])));
+        } else {
+            std::uint32_t a;
+            if constexpr (Components == 4) {
+                std::memcpy(&a, p, 4);
+            } else if constexpr (Components == 3) {
+                std::uint16_t h;
+                std::memcpy(&h, p, 2);
+                a = h | (static_cast<std::uint32_t>(p[2]) << 16);
+            } else {
+                std::uint16_t h;
+                std::memcpy(&h, p, 2);
+                a = h;
+            }
+            const __m128i x = _mm_cvtsi32_si128(static_cast<int>(a));
+            const __m128i wide = Usn ? _mm_cvtepu8_epi32(x) : _mm_cvtepi8_epi32(x);
+            if constexpr (Components == 2) return _mm_shuffle_epi32(wide, 0x44);
+            else return wide;
+        }
+    }
+}
+
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
+    constexpr std::size_t stride = static_cast<std::size_t>(Components) * Bits / 8;
+    if (skip == 0) {
+        for (std::uint32_t n = 0; n < num; ++n)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>((addr + n) & mask) * 16), unpack_element<Bits, Components, Usn>(bytes + n * stride));
+        return;
+    }
+    std::uint32_t cycle = 0;
+    for (std::uint32_t n = 0; n < num; ++n) {
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>(addr & mask) * 16), unpack_element<Bits, Components, Usn>(bytes + n * stride));
+        ++addr;
+        if (++cycle >= wl) {
+            addr += skip;
+            cycle = 0;
+        }
+    }
+}
+#else
 template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
 void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
     std::uint32_t cycle = 0;
@@ -190,6 +288,8 @@ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std:
     }
 }
 
+#endif
+
 using FastUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t);
 
 template <std::uint32_t Bits>
@@ -209,9 +309,9 @@ constexpr FastUnpack kFastUnpack[4][4][2] = {
     {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
 };
 
-void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
-    Unit &u = state(unit);
-    const bool dry = shadow(unit);
+void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c) {
+    Unit &u = c.u;
+    const bool dry = c.dry;
     if (dry && u.mode < 2) {
         u.num = 0;
         return;
@@ -289,8 +389,7 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     u.num = 0;
 }
 
-std::uint32_t data_words(int unit, std::uint32_t cmd) {
-    const Unit &u = state(unit);
+std::uint32_t data_words(std::uint32_t cmd, const Unit &u) {
     const std::uint32_t op = (cmd >> 24) & 0x7Fu;
     const std::uint32_t num = (cmd >> 16) & 0xFFu;
     switch (op) {
@@ -304,11 +403,11 @@ std::uint32_t data_words(int unit, std::uint32_t cmd) {
     }
 }
 
-void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
-    Unit &u = state(unit);
+void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c) {
+    Unit &u = c.u;
     const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
     u.code = cmd;
-    if (!on_vu_thread()) ++g_commands[unit][op];
+    if (!c.vu_thread) ++g_commands[unit][op];
     switch (op) {
     case 0x00: break;
     case 0x01: u.cycle = imm; break;
@@ -319,13 +418,13 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     case 0x06: gif::set_path3_masked((imm >> 15) & 1u); break;
     case 0x07: u.mark = imm; u.stat |= kStatMrk; break;
     case 0x10: case 0x11: case 0x13: break;
-    case 0x14: case 0x15: run_vu(unit, imm * 8u); break;
-    case 0x17: run_vu(unit, shadow(unit) ? 0u : vu::tpc(unit)); break;
+    case 0x14: case 0x15: run_vu(unit, imm * 8u, c); break;
+    case 0x17: run_vu(unit, c.dry ? 0u : vu::tpc(unit), c); break;
     case 0x20: u.mask = data[0]; break;
     case 0x30: std::memcpy(u.row, data, 16); break;
     case 0x31: std::memcpy(u.col, data, 16); break;
     case 0x4A: {
-        if (shadow(unit)) break;
+        if (c.dry) break;
         std::uint8_t *code = unit ? g_vu1_code : g_vu0_code;
         const std::uint32_t size = unit ? 16384u : 4096u;
         const std::uint32_t count = num ? num : 256u;
@@ -340,11 +439,11 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
         break;
     }
     case 0x50: case 0x51:
-        if (shadow(unit)) gif::scan_signals(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
+        if (c.dry) gif::scan_signals(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
         else gif::transfer(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
         break;
     default:
-        if ((op & 0x60u) == 0x60u) unpack(unit, cmd, data);
+        if ((op & 0x60u) == 0x60u) unpack(unit, cmd, data, c);
         else note_unknown(unit, cmd);
         break;
     }
@@ -355,7 +454,7 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
             u.stat |= kStatVis;
             u.stalled = true;
         }
-        if (!on_vu_thread()) hw::intc_raise(4u + static_cast<unsigned>(unit));
+        if (!c.vu_thread) hw::intc_raise(4u + static_cast<unsigned>(unit));
     }
 }
 
@@ -371,19 +470,22 @@ void decode(int unit, std::uint32_t cmd) {
 
 // `base` is the stream position of words[0], for the history.
 std::size_t run(int unit, const std::uint32_t *words, std::size_t count, std::uint64_t base) {
-    Unit &u = state(unit);
-    History &h = g_hist[hist_index(unit)];
+    const bool vu_thread = on_vu_thread();
+    const bool side = unit == 1 && vu_thread;  // the vector thread's own copy of VIF1
+    const Ctx c{side ? g_vu_side : g_units[unit], vu_thread, unit == 1 && gs::queue::vu_active() && !vu_thread};
+    Unit &u = c.u;
+    History &h = g_hist[side ? 2 : unit];
     std::size_t pos = 0;
     while (pos < count && !u.stalled) {
         const std::uint32_t cmd = words[pos];
         const std::size_t start = pos + 1;
-        const std::uint32_t need = data_words(unit, cmd);
+        const std::uint32_t need = data_words(cmd, u);
         if (start + need > count) {
             decode(unit, cmd);
             break;
         }
         h.last[h.head++ & 7u] = {cmd, need, base + pos};
-        execute(unit, cmd, words + start);
+        execute(unit, cmd, words + start, c);
         pos = start + need;
     }
     return pos;

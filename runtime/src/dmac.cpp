@@ -426,10 +426,33 @@ bool ipu_push(const std::uint8_t *qword) {
     Channel &c = g_ch[3];
     if (!(c.chcr & 0x100u) || !c.qwc) return false;
     std::memcpy(target(c.madr), qword, 16);
-    watch_span(c.madr, 16, "dma:ipu_push");
+    if (g_watch_on) watch_span(c.madr, 16, "dma:ipu_push");
     c.madr += 16;
     if (!--c.qwc) finish(3);
     return true;
+}
+
+// Up to `count` quadwords in a row, the same as that many ipu_push calls (it stops where one would return false). A run that lies
+// whole in the first 32 MB of main memory is copied in one piece; anything else (the scratchpad, a vector unit window, a wrap-around
+// of the address, a watched range) goes one quadword at a time.
+std::size_t ipu_push_many(const std::uint8_t *qwords, std::size_t count) {
+    Channel &c = g_ch[3];
+    std::size_t done = 0;
+    while (done < count) {
+        if (!(c.chcr & 0x100u) || !c.qwc) break;
+        const std::size_t n = std::min<std::size_t>(count - done, c.qwc);
+        if (!g_watch_on && static_cast<std::uint64_t>(c.madr) + n * 16 <= kRamSize) {
+            std::memcpy(g_ram + (c.madr & (kRamSize - 16)), qwords + done * 16, n * 16);
+            c.madr += static_cast<std::uint32_t>(n * 16);
+            c.qwc -= static_cast<std::uint32_t>(n);
+            done += n;
+            if (!c.qwc) finish(3);
+        } else {
+            if (!ipu_push(qwords + done * 16)) break;
+            ++done;
+        }
+    }
+    return done;
 }
 
 void reset() {

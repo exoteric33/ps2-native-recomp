@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ps2::state {
@@ -19,5 +20,6 @@ void write(std::uint32_t a, std::uint32_t v);
 void resume(int ch);
 bool ipu_pull(std::uint8_t *qword);
 bool ipu_push(const std::uint8_t *qword);
+std::size_t ipu_push_many(const std::uint8_t *qwords, std::size_t count);
 
 }

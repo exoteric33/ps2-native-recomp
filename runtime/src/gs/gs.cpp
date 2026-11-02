@@ -32,6 +32,7 @@ namespace ps2::gs {
 namespace trace {  // defined further down (PS2_TRACE_DRAWS)
 extern std::uint64_t g_frame, g_number;
 bool traced(std::uint64_t frame);
+extern const bool g_any;  // PS2_TRACE_DRAWS is set: kick() looks at this flag instead of calling into the trace code for every shape
 }
 
 State g_state;
@@ -553,6 +554,8 @@ const char *spec() {
     return value;
 }
 
+extern const bool g_any = std::getenv("PS2_TRACE_DRAWS") != nullptr;
+
 std::uint64_t g_frame = 0;  // frame of the draws the render side is doing now
 std::uint64_t g_number = 0; // primitives so far in this frame
 std::string g_state;        // registers of the line being collected
@@ -700,13 +703,13 @@ void transfer(const State &s, std::uint64_t dir) {
 
 }
 
-void kick(bool draw) {
+static void kick(bool draw) {
     State &s = g_state;
     const std::uint32_t prim = static_cast<std::uint32_t>(s.prim) & 7u;
     const int needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
     if (s.count < needed) return;
     if (draw) {
-        if (trace::draw(s, needed)) {
+        if (!trace::g_any || trace::draw(s, needed)) {
             if (cpu_raster()) raster::draw(s, s.queue, needed);
 #ifdef PS2_GPU
             if (gpu_on()) gpu::draw(s, s.queue, needed);
@@ -734,7 +737,7 @@ void kick(bool draw) {
     }
 }
 
-void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, bool draw) {
+[[gnu::always_inline]] static inline void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, bool draw) {
     State &s = g_state;
     if (s.count >= 3) s.count = 2;
     Vertex &v = s.queue[s.count++];
@@ -755,14 +758,15 @@ void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, b
     kick(draw);
 }
 
+static const char *const g_gsseq = std::getenv("PS2_TRACE_GSSEQ");
+
 void write(std::uint32_t reg, std::uint64_t value) {
     State &s = g_state;
     ++g_writes[reg & 127u];
     constexpr std::uint64_t kVertexRegs = (1ull << 0x01) | (1ull << 0x02) | (1ull << 0x03) | (1ull << 0x04) | (1ull << 0x05) | (1ull << 0x0A) | (1ull << 0x0C) | (1ull << 0x0D);
     if (reg >= 64 || !((kVertexRegs >> reg) & 1u)) ++g_setup_generation;
-    static const char *seq = std::getenv("PS2_TRACE_GSSEQ");
-    if (seq) {
-        static std::uint64_t n = 0, start = std::strtoull(seq, nullptr, 10);
+    if (g_gsseq) [[unlikely]] {
+        static std::uint64_t n = 0, start = std::strtoull(g_gsseq, nullptr, 10);
         if (++n >= start && n < start + 100000) std::fprintf(stderr, "[gs] w %02X %016llX\n", reg, static_cast<unsigned long long>(value));
     }
     switch (reg) {
@@ -877,7 +881,48 @@ void signal(std::uint32_t reg, std::uint64_t value) {
     }
 }
 
+static void write_packed_generic(std::uint32_t reg, const Reg128 &q);
+
+// The register writes of the PACKED mode that make up almost every shape (colour, texture coordinates, vertices) go straight to the code that
+// stores them; write() would unpack the vertex words into one 64-bit value just for vertex() to take them apart again. It counts the register
+// in g_writes (statistics) and does not change g_setup_generation for these registers, as write() does. The rest, and everything while
+// PS2_TRACE_GSSEQ prints the writes, goes the old way.
 void write_packed(std::uint32_t reg, const Reg128 &q) {
+    if (g_gsseq) [[unlikely]] {
+        write_packed_generic(reg, q);
+        return;
+    }
+    State &s = g_state;
+    switch (reg) {
+    case 0x1: {
+        std::uint32_t qbits;
+        std::memcpy(&qbits, &s.q, 4);
+        s.rgbaq = (q.w[0] & 0xFFu) | ((q.w[1] & 0xFFu) << 8) | ((q.w[2] & 0xFFu) << 16) | ((q.w[3] & 0xFFu) << 24) |
+                  (static_cast<std::uint64_t>(qbits) << 32);
+        break;
+    }
+    case 0x2:
+        s.st = q.d[0];
+        std::memcpy(&s.q, &q.w[2], 4);
+        break;
+    case 0x3: s.uv = (q.w[0] & 0x3FFFu) | ((q.w[1] & 0x3FFFu) << 16); break;
+    case 0x4: {
+        const bool adc = (q.d[1] >> 47) & 1u;
+        ++g_writes[adc ? 0x0C : 0x04];
+        vertex(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, (q.w[2] >> 4) & 0xFFFFFFu, static_cast<std::uint8_t>((q.w[3] >> 4) & 0xFFu), !adc);
+        break;
+    }
+    case 0x5: {
+        const bool adc = (q.d[1] >> 47) & 1u;
+        ++g_writes[adc ? 0x0D : 0x05];
+        vertex(q.w[0] & 0xFFFFu, q.w[1] & 0xFFFFu, q.w[2], static_cast<std::uint8_t>(s.fog >> 56), !adc);
+        break;
+    }
+    default: write_packed_generic(reg, q); break;
+    }
+}
+
+static void write_packed_generic(std::uint32_t reg, const Reg128 &q) {
     State &s = g_state;
     static const char *const seq = std::getenv("PS2_TRACE_GSSEQ");
     if (seq) [[unlikely]] {

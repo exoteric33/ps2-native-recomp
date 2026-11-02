@@ -46,6 +46,7 @@ constexpr std::uint32_t kSetupWords = 40;  // 25 fields, then the texture, frame
 constexpr std::uint32_t kDecodedWords = 4u << 20;
 constexpr std::uint32_t kDecodePrims = 64;
 
+
 Mode g_mode = Mode::off;
 std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
 
@@ -177,6 +178,7 @@ struct Arena {
     std::uint32_t &operator[](std::size_t i) { return words[i]; }
 } g_arena;
 std::uint32_t g_clut_slot = 0, g_clut_loads = 0, g_texflushes = 0;
+std::uint32_t g_setup_serials = 0;  // numbers the rebuilds of g_setup_cache
 
 struct Image {
     bool active = false;
@@ -194,10 +196,38 @@ struct Range {
     }
 };
 
+// A growing array of 32-bit words for the shape records of the open batch. std::vector's insert costs more than the copy it makes
+// (it runs once per shape, about 50,000 times a frame), and growing it by hand does not zero the new words first.
+struct Words {
+    std::unique_ptr<std::uint32_t[]> words;
+    std::size_t used = 0, capacity = 0;
+
+    void append(const std::uint32_t *from, std::size_t count) {
+        if (used + count > capacity) grow(used + count);
+        std::memcpy(words.get() + used, from, count * 4);
+        used += count;
+    }
+    void grow(std::size_t need) {
+        std::size_t next = std::max<std::size_t>(capacity * 2, 1u << 16);
+        while (next < need) next *= 2;
+        auto bigger = std::make_unique_for_overwrite<std::uint32_t[]>(next);
+        if (used) std::memcpy(bigger.get(), words.get(), used * 4);
+        words = std::move(bigger);
+        capacity = next;
+    }
+    std::size_t size() const { return used; }
+    bool empty() const { return !used; }
+    void clear() { used = 0; }
+    std::uint32_t *data() { return words.get(); }
+    const std::uint32_t *data() const { return words.get(); }
+    std::uint32_t &operator[](std::size_t i) { return words[i]; }
+    const std::uint32_t &operator[](std::size_t i) const { return words[i]; }
+};
+
 struct Batch {
-    std::vector<std::uint32_t> prims;
+    Words prims;
     std::vector<std::uint32_t> setups;
-    std::vector<std::uint32_t> boxes;
+    std::uint32_t setup_serial = 0;  // the cache serial of the setup that is the last one of `setups`; 0: none (see draw)
     std::uint64_t key = ~0ull;
     int minx = 1 << 30, miny = 1 << 30, maxx = -1, maxy = -1;
     std::uint32_t fbp = 0, fbw = 0, fpsm = 0, zbp = 0, zpsm = 0;
@@ -208,7 +238,7 @@ struct Batch {
 } g_batch;
 
 struct SetupCache {
-    std::uint32_t generation = ~0u, clut = ~0u;
+    std::uint32_t generation = ~0u, clut = ~0u, serial = 0;
     std::uint64_t attr = ~0ull;
     std::uint32_t setup[kSetupWords] = {};
     std::uint32_t flags = 0;
@@ -236,8 +266,8 @@ std::vector<Range> g_batch_reads;
 
 int g_tile = 8;  // pixels along one side of a screen tile (one workgroup of the raster program): 8 was the cheaper of 16, 8 and 4 on the arena and hall test frames; PS2_TILE=4, 8 or 16 to try others
 int g_tiles_per_row = 128;
-std::vector<std::uint32_t> g_tile_count(128 * 128), g_tile_fill(128 * 128);
-std::vector<std::uint32_t> g_touched;
+std::vector<std::uint32_t> g_tile_count(128 * 128 + 8), g_tile_fill(128 * 128 + 8);
+std::vector<std::uint32_t> g_touched(128 * 128 + 16);
 
 WGPUStringView view(const char *s) { return WGPUStringView{s, WGPU_STRLEN}; }
 
@@ -400,54 +430,84 @@ float u2f(std::uint32_t u) {
 
 struct Span {
     std::int16_t ty, tx0, tx1;
+    std::uint16_t prim;  // index of the shape in the batch (a batch has at most 65536 shapes)
 };
-std::vector<Span> g_spans;
-std::vector<std::uint32_t> g_span_start;
+// The spans of the open batch's shapes, in order (add_spans). Filled by hand: the capacity is made sure of once per shape, not checked at every push.
+struct SpanBuf {
+    std::unique_ptr<Span[]> spans;
+    std::size_t used = 0, capacity = 0;
 
-void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi) {
+    void ensure(std::size_t extra) {
+        if (used + extra <= capacity) return;
+        std::size_t next = std::max<std::size_t>(capacity * 2, 1u << 14);
+        while (next < used + extra) next *= 2;
+        auto bigger = std::make_unique_for_overwrite<Span[]>(next);
+        if (used) std::memcpy(bigger.get(), spans.get(), used * sizeof(Span));
+        spans = std::move(bigger);
+        capacity = next;
+    }
+    void push_back(Span s) { spans[used++] = s; }
+    std::size_t size() const { return used; }
+    void clear() { used = 0; }
+    Span &operator[](std::size_t i) { return spans[i]; }
+} g_spans;
+
+void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi, std::uint16_t prim) {
     const int sc = static_cast<int>(g_scale);
     const int tx0 = static_cast<int>(lo & 0xFFFFu) * sc / g_tile, ty0 = static_cast<int>(lo >> 16) * sc / g_tile;
     const int tx1 = (static_cast<int>(hi & 0xFFFFu) * sc + sc - 1) / g_tile, ty1 = (static_cast<int>(hi >> 16) * sc + sc - 1) / g_tile;
+    g_spans.ensure(static_cast<std::size_t>(std::max(ty1 - ty0 + 1, 0)));  // at most one span per tile row
     const auto whole = [&] {
-        for (int ty = ty0; ty <= ty1; ++ty) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(tx0), static_cast<std::int16_t>(tx1)});
+        for (int ty = ty0; ty <= ty1; ++ty) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(tx0), static_cast<std::int16_t>(tx1), prim});
     };
     if (rec[1] != 0 || tx1 - tx0 < 2) {
         whole();
         return;
     }
-    const double x[3] = {u2f(rec[4]), u2f(rec[6]), u2f(rec[8])}, y[3] = {u2f(rec[5]), u2f(rec[7]), u2f(rec[9])};
+    // The three edges of the triangle are the lanes of a vector (lane 3 repeats lane 0 and is not used). Every lane does the same double
+    // operations, in the same order and without fused multiply-add, as the scalar loop of the earlier versions did, so the spans are the same.
+    typedef double V4 __attribute__((vector_size(32)));
+    typedef long long M4 __attribute__((vector_size(32)));
+    const double px0 = u2f(rec[4]), px1 = u2f(rec[6]), px2 = u2f(rec[8]), py0 = u2f(rec[5]), py1 = u2f(rec[7]), py2 = u2f(rec[9]);
     const double inv = u2f(rec[10]);
-    static const int kEdges[3][2] = {{1, 2}, {2, 0}, {0, 1}};
-    double m[3], q[3];
-    int kind[3];
-    for (int e = 0; e < 3; ++e) {
-        const int a = kEdges[e][0], b = kEdges[e][1];
-        const double ca = (y[a] - y[b]) * inv, cb = (x[b] - x[a]) * inv, cc = (x[a] * y[b] - x[b] * y[a]) * inv;
-        if (!std::isfinite(ca) || !std::isfinite(cb) || !std::isfinite(cc)) {
-            whole();
-            return;
-        }
-        kind[e] = ca > 0.0 ? 1 : ca < 0.0 ? -1 : 0;
-        m[e] = kind[e] ? -cb / ca : cb;
-        q[e] = kind[e] ? -cc / ca : cc;
+    const V4 xa = {px1, px2, px0, px0}, xb = {px2, px0, px1, px0}, ya = {py1, py2, py0, py0}, yb = {py2, py0, py1, py0};  // edge e runs from point a to point b: {1, 2}, {2, 0}, {0, 1}
+    const V4 ca = (ya - yb) * inv, cb = (xb - xa) * inv, cc = (xa * yb - xb * ya) * inv;
+    const V4 limit = {1.7976931348623157e308, 1.7976931348623157e308, 1.7976931348623157e308, 1.7976931348623157e308};  // DBL_MAX: a value is finite when |v| <= it
+    const M4 finite = (__builtin_elementwise_abs(ca) <= limit) & (__builtin_elementwise_abs(cb) <= limit) & (__builtin_elementwise_abs(cc) <= limit);
+    if (!(finite[0] & finite[1] & finite[2])) {
+        whole();
+        return;
     }
+    const V4 zero = {0.0, 0.0, 0.0, 0.0};
+    const M4 positive = ca > zero, negative = ca < zero, slanted = positive | negative;
+    const V4 divided_m = (-cb) / ca, divided_q = (-cc) / ca;  // the lanes of a vertical edge (ca == 0) are not used
+    const V4 vm = (V4)(((M4)divided_m & slanted) | ((M4)cb & ~slanted)), vq = (V4)(((M4)divided_q & slanted) | ((M4)cc & ~slanted));
+    const M4 kind_v = negative - positive;  // +1 for an edge that bounds the triangle on the left, -1 on the right, 0 for a vertical one
+    const int kind[3] = {static_cast<int>(kind_v[0]), static_cast<int>(kind_v[1]), static_cast<int>(kind_v[2])};
     const double span = static_cast<double>(g_tile) / static_cast<double>(sc);
+    // x / span is exactly x * (1 / span) when span is a power of two (4, 8, 2, 16 ...: every scale but 3), and a multiplication is cheaper than a division
+    const bool span_pow2 = g_tile % sc == 0 && ((g_tile / sc) & (g_tile / sc - 1)) == 0;
+    const double span_inverse = 1.0 / span;
     for (int ty = ty0; ty <= ty1; ++ty) {
         const double y0 = ty * span - 1.0, y1 = (ty + 1) * span + 1.0;
+        const V4 a0 = vm * y0, a1 = vm * y1;
+        // std::min(a0, a1) is (a1 < a0 ? a1 : a0), std::max(a0, a1) is (a0 < a1 ? a1 : a0)
+        const M4 smaller = a1 < a0, larger = a0 < a1;
+        const V4 low = (V4)(((M4)a1 & smaller) | ((M4)a0 & ~smaller)) + vq, high = (V4)(((M4)a1 & larger) | ((M4)a0 & ~larger)) + vq;
         double left = -1e30, right = 1e30;
         bool empty = false;
         for (int e = 0; e < 3; ++e) {
-            const double a0 = m[e] * y0, a1 = m[e] * y1;
-            if (kind[e] == 0) empty = empty || std::max(a0, a1) + q[e] < 0.0;
-            else if (kind[e] > 0) left = std::max(left, std::min(a0, a1) + q[e]);
-            else right = std::min(right, std::max(a0, a1) + q[e]);
+            if (kind[e] == 0) empty = empty || high[e] < 0.0;
+            else if (kind[e] > 0) left = std::max(left, low[e]);
+            else right = std::min(right, high[e]);
         }
         left -= 1.0;
         right += 1.0;
         if (empty || left > right) continue;
-        const int rx0 = std::max(tx0, static_cast<int>(std::floor(std::max(left, -1.0) / span)));
-        const int rx1 = std::min(tx1, static_cast<int>(std::floor(std::min(right, 4096.0) / span)));
-        if (rx0 <= rx1) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(rx0), static_cast<std::int16_t>(rx1)});
+        const double lo_x = std::max(left, -1.0), hi_x = std::min(right, 4096.0);
+        const int rx0 = std::max(tx0, static_cast<int>(std::floor(span_pow2 ? lo_x * span_inverse : lo_x / span)));
+        const int rx1 = std::min(tx1, static_cast<int>(std::floor(span_pow2 ? hi_x * span_inverse : hi_x / span)));
+        if (rx0 <= rx1) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(rx0), static_cast<std::int16_t>(rx1), prim});
     }
 }
 
@@ -619,52 +679,84 @@ void flush_batch() {
         return;
     }
     const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
-    g_touched.clear();
+    // Count how many shapes touch each tile. `touched` lists the tiles in the order they are first touched. The tiles of a span are mostly one to four,
+    // so the first four are done without a branch per tile (the extra ones only read and write back their own count); the old loop left after a
+    // different number of rounds for every span, and that cost more than the tiles. g_tile_count, g_tile_fill and g_touched have 8 words to spare.
+    std::uint32_t *const count = g_tile_count.data();
+    std::uint32_t *const touched = g_touched.data();
+    std::uint32_t touched_n = 0;
+    const std::int32_t tiles_per_row = g_tiles_per_row;
     g_spans.clear();
-    g_span_start.resize(prims + 1);
-    for (std::uint32_t i = 0; i < prims; ++i) {
-        g_span_start[i] = static_cast<std::uint32_t>(g_spans.size());
-        add_spans(b.prims.data() + i * kPrimWords, b.boxes[i * 2], b.boxes[i * 2 + 1]);
-        for (std::size_t k = g_span_start[i]; k < g_spans.size(); ++k) {
-            const Span &sp = g_spans[k];
-            std::uint32_t t = static_cast<std::uint32_t>(sp.ty * g_tiles_per_row + sp.tx0);
-            for (int tx = sp.tx0; tx <= sp.tx1; ++tx, ++t)
-                if (!g_tile_count[t]++) g_touched.push_back(t);
+    for (std::uint32_t i = 0; i < prims; ++i)
+        add_spans(b.prims.data() + i * kPrimWords, b.prims[i * kPrimWords + 2], b.prims[i * kPrimWords + 3], static_cast<std::uint16_t>(i));
+    // One loop over all the spans of the batch (not one per shape): its exits are easy to predict.
+    const Span *const spans = g_spans.spans.get();
+    const std::size_t span_count = g_spans.size();
+    for (std::size_t k = 0; k < span_count; ++k) {
+        const Span sp = spans[k];
+        const std::uint32_t t = static_cast<std::uint32_t>(sp.ty * tiles_per_row + sp.tx0);
+        const std::int32_t len = sp.tx1 - sp.tx0 + 1;
+        for (std::int32_t j = 0; j < 4; ++j) {
+            const std::uint32_t valid = j < len ? 1u : 0u;
+            const std::uint32_t c = count[t + j];
+            touched[touched_n] = t + j;
+            touched_n += valid & (c == 0 ? 1u : 0u);
+            count[t + j] = c + valid;
+        }
+        for (std::int32_t j = 4; j < len; ++j) {
+            const std::uint32_t c = count[t + j];
+            touched[touched_n] = t + j;
+            touched_n += c == 0 ? 1u : 0u;
+            count[t + j] = c + 1;
         }
     }
-    g_span_start[prims] = static_cast<std::uint32_t>(g_spans.size());
     plan_decodes(prims);
     const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
     for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
     std::uint32_t total = 0;
-    for (std::uint32_t t : g_touched) total += g_tile_count[t];
-    const std::uint32_t tiles = static_cast<std::uint32_t>(g_touched.size());
+    for (std::uint32_t n = 0; n < touched_n; ++n) total += count[touched[n]];
+    const std::uint32_t tiles = touched_n;
     const std::uint32_t tile_offset = static_cast<std::uint32_t>(g_arena.size());
     const std::uint32_t list_offset = tile_offset + tiles * 2 + 2;
     const std::uint32_t list_words = (total + 1) / 2;
     std::uint32_t *grown = g_arena.grow(tiles * 2 + 2 + list_words);
     if (list_words) grown[tiles * 2 + 2 + list_words - 1] = 0;
     std::uint32_t cursor = 0;
+    std::uint32_t *const fill = g_tile_fill.data();
+    const std::uint32_t row_width = static_cast<std::uint32_t>(tiles_per_row);
+    const bool row_pow2 = (row_width & (row_width - 1)) == 0;
+    const std::uint32_t row_mask = row_width - 1, row_shift = static_cast<std::uint32_t>(__builtin_ctz(row_width));
     for (std::uint32_t i = 0; i < tiles; ++i) {
-        const std::uint32_t t = g_touched[i];
-        grown[i * 2] = (t % static_cast<std::uint32_t>(g_tiles_per_row)) | ((t / static_cast<std::uint32_t>(g_tiles_per_row)) << 16);
+        const std::uint32_t t = touched[i];
+        const std::uint32_t tx = row_pow2 ? (t & row_mask) : (t % row_width), ty = row_pow2 ? (t >> row_shift) : (t / row_width);
+        grown[i * 2] = tx | (ty << 16);
         grown[i * 2 + 1] = cursor;
-        g_tile_fill[t] = cursor;
-        cursor += g_tile_count[t];
+        fill[t] = cursor;
+        cursor += count[t];
     }
     grown[tiles * 2] = 0;
     grown[tiles * 2 + 1] = cursor;
     auto *halves = reinterpret_cast<unsigned char *>(grown + tiles * 2 + 2);
-    for (std::uint32_t i = 0; i < prims; ++i) {
-        const auto index = static_cast<std::uint16_t>(i);
-        for (std::uint32_t k = g_span_start[i]; k < g_span_start[i + 1]; ++k) {
-            const Span &sp = g_spans[k];
-            std::uint32_t t = static_cast<std::uint32_t>(sp.ty * g_tiles_per_row + sp.tx0);
-            for (int tx = sp.tx0; tx <= sp.tx1; ++tx, ++t) std::memcpy(halves + 2u * g_tile_fill[t]++, &index, 2);
+    unsigned char scratch[2];  // where the unused rounds of the unrolled part below put their index
+    for (std::size_t k = 0; k < span_count; ++k) {
+        const Span sp = spans[k];
+        const std::uint16_t index = sp.prim;
+        const std::uint32_t t = static_cast<std::uint32_t>(sp.ty * tiles_per_row + sp.tx0);
+        const std::int32_t len = sp.tx1 - sp.tx0 + 1;
+        for (std::int32_t j = 0; j < 4; ++j) {
+            const std::uint32_t valid = j < len ? 1u : 0u;
+            const std::uint32_t f = fill[t + j];
+            fill[t + j] = f + valid;
+            unsigned char *const to = valid ? halves + 2u * f : scratch;
+            std::memcpy(to, &index, 2);
+        }
+        for (std::int32_t j = 4; j < len; ++j) {
+            const std::uint32_t f = fill[t + j]++;
+            std::memcpy(halves + 2u * f, &index, 2);
         }
     }
-    for (std::uint32_t t : g_touched) g_tile_count[t] = 0;
+    for (std::uint32_t n = 0; n < touched_n; ++n) count[touched[n]] = 0;
     std::uint32_t snapshot_lo, snapshot_hi;
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
@@ -680,7 +772,7 @@ void flush_batch() {
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     b.prims.clear();
     b.setups.clear();
-    b.boxes.clear();
+    b.setup_serial = 0;
     g_batch_reads.clear();
     b.key = ~0ull;
     b.minx = b.miny = 1 << 30;
@@ -1507,10 +1599,10 @@ bool shares_frame(const std::uint32_t *setup, const Batch &b) {
 
 bool drawn_under(const Batch &b, const int rect[4]) {
     const auto hits = [&](int x0, int y0, int x1, int y1) { return rect[0] <= x1 && x0 <= rect[2] && rect[1] <= y1 && y0 <= rect[3]; };
-    const std::size_t prims = b.boxes.size() / 2;
+    const std::size_t prims = b.prims.size() / kPrimWords;
     if (prims > 64) return hits(b.minx, b.miny, b.maxx, b.maxy);
     for (std::size_t i = 0; i < prims; ++i) {
-        const std::uint32_t lo = b.boxes[i * 2], hi = b.boxes[i * 2 + 1];
+        const std::uint32_t lo = b.prims.data()[i * kPrimWords + 2], hi = b.prims.data()[i * kPrimWords + 3];
         if (hits(static_cast<int>(lo & 0xFFFFu), static_cast<int>(lo >> 16), static_cast<int>(hi & 0xFFFFu), static_cast<int>(hi >> 16))) return true;
     }
     return false;
@@ -1527,7 +1619,7 @@ void attrs(std::uint32_t *rec, int n, const Vertex &v, bool fst, const Vertex *c
 
 }
 
-Mode mode() { return g_mode; }
+Mode g_current_mode = Mode::off;
 
 #ifdef _WIN32
 extern "C" unsigned long __stdcall GetModuleFileNameW(void *module, wchar_t *name, unsigned long size);
@@ -1737,8 +1829,9 @@ bool init(Mode m) {
     g_copy_words = (1u << 20) * g_scale * g_scale;
     if (const int tile = std::atoi(os::env("PS2_TILE").c_str()); tile == 4 || tile == 8 || tile == 16) g_tile = tile;
     g_tiles_per_row = (2048 * static_cast<int>(g_scale) + g_tile - 1) / g_tile;
-    g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
-    g_tile_fill.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
+    g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row + 8, 0);
+    g_tile_fill.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row + 8, 0);
+    g_touched.assign(g_tile_count.size() + 8, 0);
     g_field_words = (1u << 19) * g_scale * g_scale;
     g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     std::vector<std::uint32_t> tables;
@@ -1827,6 +1920,7 @@ bool init(Mode m) {
     wgpuShaderModuleRelease(module);
     ensure_capacity();
     g_mode = m;
+    g_current_mode = m;
     return true;
 }
 
@@ -1841,6 +1935,7 @@ void draw(const State &st, const Vertex *v, int count) {
         cache.generation = g_setup_generation;
         cache.attr = attr;
         cache.clut = g_clut_slot;
+        cache.serial = ++g_setup_serials;
         const std::uint32_t *w = cache.setup;
         cache.flags = make_setup(st, attr, cache.setup);
         cache.key = static_cast<std::uint64_t>(w[1]) | (static_cast<std::uint64_t>(w[2]) << 14) | (static_cast<std::uint64_t>(w[3]) << 20) |
@@ -1987,12 +2082,12 @@ void draw(const State &st, const Vertex *v, int count) {
                     if (frame || (b.zwrite && !z_untouched && used.overlaps(b.z_range.lo, b.z_range.hi))) {
                         if (g_batch_log_frame > 1 && frame_count() == g_batch_log_frame) {
                             int hit = -1;
-                            const std::size_t n = b.boxes.size() / 2;
+                            const std::size_t n = b.prims.size() / kPrimWords;
                             for (std::size_t i = 0; i < n && hit < 0; ++i) {
-                                const std::uint32_t lo = b.boxes[i * 2], hi = b.boxes[i * 2 + 1];
+                                const std::uint32_t lo = b.prims.data()[i * kPrimWords + 2], hi = b.prims.data()[i * kPrimWords + 3];
                                 if (rect[0] <= static_cast<int>(hi & 0xFFFFu) && static_cast<int>(lo & 0xFFFFu) <= rect[2] && rect[1] <= static_cast<int>(hi >> 16) && static_cast<int>(lo >> 16) <= rect[3]) hit = static_cast<int>(i);
                             }
-                            const std::uint32_t hl = hit >= 0 ? b.boxes[hit * 2] : 0, hh = hit >= 0 ? b.boxes[hit * 2 + 1] : 0;
+                            const std::uint32_t hl = hit >= 0 ? b.prims.data()[hit * kPrimWords + 2] : 0, hh = hit >= 0 ? b.prims.data()[hit * kPrimWords + 3] : 0;
                             std::fprintf(stderr, "[why] prim %d of batch (%zu shapes) type %u: texel rect %d,%d-%d,%d tex bp %u psm %u fb bp %u psm %u same %d cached %d small %d hit shape %d box %u,%u-%u,%u zwrite %d\n", count, n, prim, rect[0], rect[1], rect[2], rect[3],
                                          setup[12], setup[14], setup[1], setup[3], same, cached, small, hit, hl & 0xFFFFu, hl >> 16, hh & 0xFFFFu, hh >> 16, b.zwrite);
                         }
@@ -2019,11 +2114,17 @@ void draw(const State &st, const Vertex *v, int count) {
     b.zwrite = b.zwrite || (zte && !(flags & 32u));
     const std::size_t setups = b.setups.size() / kSetupWords;
     std::uint32_t setup_index;
-    if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, kSetupWords * 4) == 0) {
+    if (setups && b.setup_serial == cache.serial) {
+        // the setup words did not change since the shape that wrote the last entry (the cache is only rebuilt in the block at the top)
         setup_index = static_cast<std::uint32_t>(setups - 1);
     } else {
-        setup_index = static_cast<std::uint32_t>(setups);
-        b.setups.insert(b.setups.end(), setup, setup + kSetupWords);
+        if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, kSetupWords * 4) == 0) {
+            setup_index = static_cast<std::uint32_t>(setups - 1);
+        } else {
+            setup_index = static_cast<std::uint32_t>(setups);
+            b.setups.insert(b.setups.end(), setup, setup + kSetupWords);
+        }
+        b.setup_serial = cache.serial;
     }
     if (flags & 2u) {
         if (g_batch_reads.empty() || g_batch_reads.back().lo != tex.lo || g_batch_reads.back().hi != tex.hi) {
@@ -2035,9 +2136,7 @@ void draw(const State &st, const Vertex *v, int count) {
     rec[0] = setup_index;
     rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
     rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
-    b.prims.insert(b.prims.end(), rec, rec + kPrimWords);
-    b.boxes.push_back(rec[2]);
-    b.boxes.push_back(rec[3]);
+    b.prims.append(rec, kPrimWords);
     b.minx = std::min(b.minx, minx);
     b.miny = std::min(b.miny, miny);
     b.maxx = std::max(b.maxx, maxx);

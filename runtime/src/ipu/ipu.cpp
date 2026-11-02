@@ -15,6 +15,10 @@
 #include <cstring>
 #include <vector>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 namespace ps2::ipu {
 
 namespace {
@@ -86,11 +90,14 @@ struct Tables {
     Lookup cbp = build(kCodedBlockPattern);
     DctLookup dct0 = build(kDctTable0), dct1 = build(kDctTable1);
     double cosines[8][8];
+    double cosines_t[8][8];  // the same values, indexed [u][x]: the inverse transform adds one coefficient to all eight outputs at a time
 
     Tables() {
         for (int x = 0; x < 8; ++x)
-            for (int u = 0; u < 8; ++u)
+            for (int u = 0; u < 8; ++u) {
                 cosines[x][u] = (u ? 0.5 : 0.5 / std::sqrt(2.0)) * std::cos((2 * x + 1) * u * 3.14159265358979323846 / 16.0);
+                cosines_t[u][x] = cosines[x][u];
+            }
     }
 };
 
@@ -141,15 +148,21 @@ bool pull() {
     return true;
 }
 
-bool have(std::size_t bits) {
+bool have_slow(std::size_t bits) {
     while (g_in.size() * 8 < g_bit + bits)
         if (!pull()) return false;
     return true;
 }
 
+// Read many times per macroblock: the check is inline, the refill from the DMA is not
+inline bool have(std::size_t bits) {
+    if (g_in.size() * 8 >= g_bit + bits) [[likely]] return true;
+    return have_slow(bits);
+}
+
 std::size_t available() { return g_in.size() * 8 > g_bit ? g_in.size() * 8 - g_bit : 0; }
 
-std::uint32_t bits_at(std::size_t bit, unsigned n) {
+__attribute__((always_inline)) inline std::uint32_t bits_at(std::size_t bit, unsigned n) {
     if (!n) return 0;
     std::uint64_t v = 0;
     const std::size_t byte = bit >> 3;
@@ -214,6 +227,7 @@ void dump_bits_to(std::size_t end) {
 
 void commit() {
     const std::size_t drop = std::min(g_bit / 128 * 16, g_in.size() / 16 * 16);
+    if (!drop) return;  // nothing to drop: the rest below would do nothing (most commands use only a few bits)
     if (!g_csc_active) dump_bits_to(drop);
     g_dump_pos = g_dump_pos > drop ? g_dump_pos - drop : 0;
     g_in.erase(g_in.begin(), g_in.begin() + static_cast<std::ptrdiff_t>(drop));
@@ -270,8 +284,10 @@ void idct(const int *in, std::int16_t *out) {
     // Same sums in the same order as the plain 8 x 8 x 8 version, but the terms whose coefficient is zero are left out: such a term adds
     // +0.0 or -0.0, and a sum that starts at +0.0 is never -0.0 (round to nearest), so the sum and the picture stay bit for bit the
     // same. A video block has few non-zero coefficients, so most of the 1024 multiplications are gone (docs/speed-cpu.md).
-    const auto &c = tables().cosines;
-    double rows[8][8];
+    // The eight outputs of a row are summed side by side (one coefficient added to all eight, in the order of the coefficients), which
+    // is the same sum for every output as one at a time, only the compiler can now do four or two of them in one instruction.
+    const Tables &t = tables();
+    alignas(32) double rows[8][8];
     int live[8], live_rows = 0;
     for (int v = 0; v < 8; ++v) {
         const int *row = in + v * 8;
@@ -280,34 +296,105 @@ void idct(const int *in, std::int16_t *out) {
             if (row[u]) at[count++] = u;
         if (!count) continue;  // an all-zero row adds nothing in the second pass either
         live[live_rows++] = v;
-        for (int x = 0; x < 8; ++x) {
-            double s = 0;
-            for (int k = 0; k < count; ++k) s += c[x][at[k]] * row[at[k]];
-            rows[v][x] = s;
+        double acc[8] = {};
+        for (int k = 0; k < count; ++k) {
+            const double w = row[at[k]];
+            const double *ct = t.cosines_t[at[k]];
+            for (int x = 0; x < 8; ++x) acc[x] += ct[x] * w;
         }
+        for (int x = 0; x < 8; ++x) rows[v][x] = acc[x];
     }
-    for (int y = 0; y < 8; ++y)
-        for (int x = 0; x < 8; ++x) {
-            double s = 0;
-            for (int k = 0; k < live_rows; ++k) s += c[y][live[k]] * rows[live[k]][x];
-            out[y * 8 + x] = static_cast<std::int16_t>(std::clamp(static_cast<int>(std::floor(s + 0.5)), -256, 255));
+    for (int y = 0; y < 8; ++y) {
+        double acc[8] = {};
+        for (int k = 0; k < live_rows; ++k) {
+            const double cy = t.cosines[y][live[k]];
+            const double *r = rows[live[k]];
+            for (int x = 0; x < 8; ++x) acc[x] += cy * r[x];
         }
+        for (int x = 0; x < 8; ++x) out[y * 8 + x] = static_cast<std::int16_t>(std::clamp(static_cast<int>(std::floor(acc[x] + 0.5)), -256, 255));
+    }
 }
+
+// The next 57 bits, most significant bit first, bits past the end of the input read as zero (the same bits as bits_at gives).
+inline std::uint64_t window(std::size_t bit) {
+    const std::size_t byte = bit >> 3;
+    std::uint64_t v;
+    if (byte + 8 <= g_in.size()) [[likely]] {
+        std::memcpy(&v, g_in.data() + byte, 8);
+        v = __builtin_bswap64(v);
+    } else {
+        v = 0;
+        for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | (byte + i < g_in.size() ? g_in[byte + i] : 0u);
+    }
+    return v << (bit & 7u);
+}
+
+// How the plain calls treat one symbol of a block: with as many bits left as the table's look-ahead (peek_soft asks for table.bits, 16
+// at the most) asking for the look-ahead fetches nothing, and a symbol that then turns out to need no more bits than are left is read without any further
+// question: the plain calls would not have fetched either. A symbol that needs more than is left (a long escape code near the end of
+// what has arrived) is handed to the plain calls, from the same start, so it fetches, waits for data or fails as it always did.
+inline std::size_t bits_left() { return g_in.size() * 8 > g_bit ? g_in.size() * 8 - g_bit : 0; }
 
 void decode_block(std::int16_t *out, int channel, bool intra, std::uint32_t qsc) {
     int coef[64] = {};
     int index = 0;
     const DctLookup &table = intra && intra_vlc_one() ? tables().dct1 : tables().dct0;
     const bool table_one = &table == &tables().dct1;
+    const bool mp1 = mpeg1();
     if (intra) {
         g_dc[channel] = static_cast<std::int16_t>(g_dc[channel] + read_dc_diff(channel));
         coef[0] = g_dc[channel];
         index = 1;
-    } else if (peek(1)) {
+    } else if (bits_left() >= 16 ? (window(g_bit) >> 63) != 0 : peek(1) != 0) {
         coef[0] = get(2) & 1u ? -1 : 1;
         index = 1;
     }
     for (;;) {
+        const std::size_t left = bits_left();
+        if (left >= std::max<std::size_t>(table.bits, 4)) {
+            const std::uint64_t w = window(g_bit);
+            if (index && (table_one ? (w >> 60) == 6u : (w >> 62) == 2u)) {
+                g_bit += table_one ? 4 : 2;
+                break;
+            }
+            const DctEntry &e = table.entries[w >> (64 - table.bits)];
+            if (!e.length) throw BadCode{};
+            unsigned used = e.length;
+            int run, level;
+            if (e.run == kEscape) {
+                run = static_cast<int>((w << used) >> 58);
+                used += 6;
+                if (mp1) {
+                    int v = static_cast<int>((w << used) >> 56);
+                    used += 8;
+                    if (v == 0) {
+                        v = static_cast<int>((w << used) >> 56);
+                        used += 8;
+                    } else if (v == 128) {
+                        v = static_cast<int>((w << used) >> 56) - 256;
+                        used += 8;
+                    } else if (v > 128) {
+                        v -= 256;
+                    }
+                    level = v;
+                } else {
+                    const int v = static_cast<int>((w << used) >> 52);
+                    used += 12;
+                    level = v & 0x800 ? v - 0x1000 : v;
+                }
+            } else {
+                run = e.run;
+                level = (w << used) >> 63 ? -e.level : e.level;
+                used += 1;
+            }
+            if (used <= left) {
+                g_bit += used;
+                index += run;
+                if (index >= 64) throw BadCode{};
+                coef[index++] = level;
+                continue;
+            }
+        }
         if (index) {
             if (table_one ? peek(4) == 6u : peek(2) == 2u) {
                 skip(table_one ? 4 : 2);
@@ -325,7 +412,8 @@ void decode_block(std::int16_t *out, int channel, bool intra, std::uint32_t qsc)
     const int scale = mpeg1() || !nonlinear_q() ? static_cast<int>(qsc) * 2 : kNonLinearScale[qsc & 31u];
     int f[64] = {};
     int sum = 0;
-    for (int k = 0; k < 64; ++k) {
+    // The coefficients are stored at rising positions, so everything from `index` on is zero (and a zero is skipped below anyway)
+    for (int k = 0; k < index; ++k) {
         const int v = coef[k];
         const int r = scan[k];
         int x;
@@ -396,11 +484,67 @@ void convert_block(const std::uint8_t *raw, std::uint8_t *dst) {
     }
 }
 
+#if defined(__AVX2__)
+// The same conversion eight pixels at a time (integer arithmetic only, so the same values in every pixel, checked against the plain
+// version above on random macroblocks and thresholds). One row of 16 pixels is two vectors; the chroma terms are shared by two pixels.
+template <bool Rgb16>
+void convert_block_avx2(const std::uint8_t *raw, std::uint8_t *dst) {
+    const __m256i th0 = _mm256_set1_epi32(g_th0), th1 = _mm256_set1_epi32(g_th1);
+    const __m256i zero = _mm256_setzero_si256(), c255 = _mm256_set1_epi32(255), c128 = _mm256_set1_epi32(128);
+    const __m256i first_four = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3), last_four = _mm256_setr_epi32(4, 4, 5, 5, 6, 6, 7, 7);
+    const __m256i a_full = _mm256_set1_epi32(0x80), a_half = _mm256_set1_epi32(0x40);
+    for (int y = 0; y < 16; ++y) {
+        const std::uint8_t *luma = raw + y * 16;
+        const __m256i cb8 = _mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(raw + 256 + (y / 2) * 8))), c128);
+        const __m256i cr8 = _mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(raw + 320 + (y / 2) * 8))), c128);
+        __m256i out[2];
+        for (int half = 0; half < 2; ++half) {
+            const __m256i pick = half ? last_four : first_four;
+            const __m256i cb = _mm256_permutevar8x32_epi32(cb8, pick), cr = _mm256_permutevar8x32_epi32(cr8, pick);
+            const __m256i sixty4 = _mm256_set1_epi32(64);
+            const __m256i add_r = _mm256_add_epi32(_mm256_mullo_epi32(cr, _mm256_set1_epi32(204)), sixty4);
+            const __m256i add_g = _mm256_add_epi32(_mm256_add_epi32(_mm256_mullo_epi32(cb, _mm256_set1_epi32(-50)), _mm256_mullo_epi32(cr, _mm256_set1_epi32(-104))), sixty4);
+            const __m256i add_b = _mm256_add_epi32(_mm256_mullo_epi32(cb, _mm256_set1_epi32(258)), sixty4);
+            const __m256i y8 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(luma + half * 8)));
+            const __m256i lum = _mm256_mullo_epi32(_mm256_max_epi32(_mm256_sub_epi32(y8, _mm256_set1_epi32(16)), zero), _mm256_set1_epi32(149));
+            const __m256i r = _mm256_min_epi32(_mm256_max_epi32(_mm256_srai_epi32(_mm256_add_epi32(lum, add_r), 7), zero), c255);
+            const __m256i g = _mm256_min_epi32(_mm256_max_epi32(_mm256_srai_epi32(_mm256_add_epi32(lum, add_g), 7), zero), c255);
+            const __m256i b = _mm256_min_epi32(_mm256_max_epi32(_mm256_srai_epi32(_mm256_add_epi32(lum, add_b), 7), zero), c255);
+            const __m256i below0 = _mm256_and_si256(_mm256_and_si256(_mm256_cmpgt_epi32(th0, r), _mm256_cmpgt_epi32(th0, g)), _mm256_cmpgt_epi32(th0, b));
+            const __m256i below1 = _mm256_and_si256(_mm256_and_si256(_mm256_cmpgt_epi32(th1, r), _mm256_cmpgt_epi32(th1, g)), _mm256_cmpgt_epi32(th1, b));
+            const __m256i a = _mm256_andnot_si256(below0, _mm256_blendv_epi8(a_full, a_half, below1));
+            if constexpr (Rgb16) {
+                const __m256i p = _mm256_or_si256(
+                    _mm256_or_si256(_mm256_srli_epi32(r, 3), _mm256_slli_epi32(_mm256_srli_epi32(g, 3), 5)),
+                    _mm256_or_si256(_mm256_slli_epi32(_mm256_srli_epi32(b, 3), 10), _mm256_slli_epi32(_mm256_and_si256(a, a_full), 8)));
+                out[half] = p;
+            } else {
+                out[half] = _mm256_or_si256(_mm256_or_si256(r, _mm256_slli_epi32(g, 8)), _mm256_or_si256(_mm256_slli_epi32(b, 16), _mm256_slli_epi32(a, 24)));
+            }
+        }
+        if constexpr (Rgb16) {
+            const __m256i packed = _mm256_permute4x64_epi64(_mm256_packus_epi32(out[0], out[1]), 0xD8);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), packed);
+            dst += 32;
+        } else {
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), out[0]);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + 32), out[1]);
+            dst += 64;
+        }
+    }
+}
+#endif
+
 void convert(const std::uint8_t *raw, bool rgb16) {
     const std::size_t at = g_out.size();
     g_out.resize(at + (rgb16 ? 512 : 1024));
+#if defined(__AVX2__)
+    if (rgb16) convert_block_avx2<true>(raw, g_out.data() + at);
+    else convert_block_avx2<false>(raw, g_out.data() + at);
+#else
     if (rgb16) convert_block<true>(raw, g_out.data() + at);
     else convert_block<false>(raw, g_out.data() + at);
+#endif
 }
 
 void emit_raw16(const std::int16_t *raw) {
@@ -614,9 +758,11 @@ bool run_command() {
 }
 
 void drain() {
-    while (g_out_pos + 16 <= g_out.size() && dmac::ipu_push(g_out.data() + g_out_pos)) {
-        g_out_pos += 16;
-        ++g_out_qwords;
+    while (g_out_pos + 16 <= g_out.size()) {
+        const std::size_t done = dmac::ipu_push_many(g_out.data() + g_out_pos, (g_out.size() - g_out_pos) / 16);
+        if (!done) break;
+        g_out_pos += done * 16;
+        g_out_qwords += done;
     }
     if (g_out_pos == g_out.size()) {
         g_out.clear();

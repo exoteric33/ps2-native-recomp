@@ -1376,7 +1376,21 @@ double queued_ms() { return g_pipe ? g_pipe->queued_ms() : 0.0; }  // the game's
 void write_audio_dumps();
 void note_audio();
 
+// PS2_NO_LIMIT=1 (docs/speed.md): a window run goes as fast as it can, with no wait for the sound device and no wait for the clock, to
+// measure what the processor threads and the graphics chip can do. The sound plays out of step (it is dropped when it runs too far
+// behind). Off unless set; "0" counts as off.
+bool no_limit() {
+    static const bool on = [] {
+        const std::string value = ps2::os::env("PS2_NO_LIMIT");
+        const bool set = !value.empty() && value != "0";
+        if (set) std::fprintf(stderr, "[pace] PS2_NO_LIMIT is set: the game runs with no speed limit; the sound plays out of step\n");
+        return set;
+    }();
+    return on;
+}
+
 void pace() {
+    if (no_limit()) return;
     static bool stuck = false;  // the device took no sound for a second; the clock paces the game until it takes some again
     if (g_audio && !(stuck && g_pipe->full())) {
         // The audio device clock paces emulation: wait while more than ~80 ms of sound is waiting. The pipe times the game between

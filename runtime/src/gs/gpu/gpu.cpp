@@ -1169,6 +1169,9 @@ struct BenchBuffers {
     WGPUBindGroup group = nullptr;
 };
 
+// Per submit and command: 1 for a drawing run of sprites only that spans a good part of the screen (the glow, blur and copy passes of lane glow), else 0.
+std::vector<std::vector<char>> g_bench_glow;
+
 // Encodes `reps` copies of the frame (restore memory, then every captured submit as one compute pass) minus the kinds of work in `skip`, submits them all at once and
 // returns the milliseconds per copy.
 double bench_time(const std::vector<BenchBuffers> &bufs, unsigned skip, unsigned reps, bool restore, int size_filter = 0) {
@@ -1180,9 +1183,11 @@ double bench_time(const std::vector<BenchBuffers> &bufs, unsigned skip, unsigned
         for (std::size_t i = 0; i < g_bench.subs.size(); ++i) {
             WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
             Pipeline current = kPipelines;
-            for (const Command &c : g_bench.subs[i].commands) {
+            for (std::size_t n = 0; n < g_bench.subs[i].commands.size(); ++n) {
+                const Command &c = g_bench.subs[i].commands[n];
                 if (skip & (1u << c.pipeline)) continue;
-                if (size_filter && c.pipeline == kRaster && ((c.x * c.y <= 8u) == (size_filter == 1))) continue;  // 1: leave out the small runs (8 tiles or fewer), 2: leave out the big ones
+                if (size_filter && size_filter <= 2 && c.pipeline == kRaster && ((c.x * c.y <= 8u) == (size_filter == 1))) continue;  // 1: leave out the small runs (8 tiles or fewer), 2: leave out the big ones
+                if (size_filter >= 3 && c.pipeline == kRaster && (g_bench_glow[i][n] != 0) == (size_filter == 3)) continue;  // 3: leave out the full-screen sprite passes (lane glow), 4: leave out all the others
                 if (c.pipeline != current) {
                     wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
                     current = c.pipeline;
@@ -1272,6 +1277,12 @@ void bench_run() {
         bool restore;
         int size_filter = 0;
     };
+    g_bench_glow.assign(g_bench.subs.size(), {});
+    for (std::size_t i = 0; i < g_bench.subs.size(); ++i) {
+        g_bench_glow[i].assign(g_bench.subs[i].commands.size(), 0);
+        for (const BenchInfo &b : g_bench.subs[i].info)
+            if (b.index < g_bench_glow[i].size() && b.prims && b.kinds[1] == b.prims && b.tiles >= 400) g_bench_glow[i][b.index] = 1;
+    }
     const Variant variants[] = {{"restore only", all, true},
                                 {"everything", 0, true},
                                 {"without raster", 1u << kRaster, true},
@@ -1285,7 +1296,10 @@ void bench_run() {
                                 {"upload and clut only", all & ~((1u << kUpload) | (1u << kLoadClut)), true},
                                 {"copy and display only", all & ~((1u << kCopyRead) | (1u << kCopyWrite) | (1u << kDisplay)), true},
                                 {"raster, big runs only (over 8 tiles)", all & ~(1u << kRaster), true, 1},
-                                {"raster, small runs only (8 tiles or fewer)", all & ~(1u << kRaster), true, 2}};
+                                {"raster, small runs only (8 tiles or fewer)", all & ~(1u << kRaster), true, 2},
+                                {"everything but the sprite-only runs", 0, true, 3},
+                                {"everything but the sprite-only runs, raster only", all & ~(1u << kRaster), true, 3},
+                                {"raster, sprite-only runs (glow) only", all & ~(1u << kRaster), true, 4}};
     bench_time(bufs, 0, 3, true);  // warm up
     for (const Variant &v : variants) {
         double best = 1e30;

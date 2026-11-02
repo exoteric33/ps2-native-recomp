@@ -32,7 +32,8 @@ Scenes for God of War II (save states from scripts/play.py in games/gow2/play; t
 Your own scene: `--from STATE --from-frame N --moves "0:square:3@14*100"` (the move syntax of scripts/play.py).
 
 More: `--backends default,vulkan,d3d12` (default means "whatever the runner picks"; the log says which), `--scale 2`, `--repeat N`,
-`--seconds` and `--warmup`, `--env KEY=VALUE` for the runner (`PS2_ONE_THREAD=1`, `PS2_PROFILE=file`, ...), `--frames N` to let the run
+`--seconds` and `--warmup`, `--no-limit` (no speed limit: the game goes as fast as it can, with the sound out of step; the same as `--env PS2_NO_LIMIT=1`),
+`--env KEY=VALUE` for the runner (`PS2_ONE_THREAD=1`, `PS2_PROFILE=file`, ...), `--frames N` to let the run
 end by itself (PS2_PROFILE writes its file only then), `--exe` to run another copy of ps2run.exe than the one in build/ (a copy keeps the
 build folder free while you measure), `--affinity` and `--priority` for experiments. Standard library only (Pillow is not needed).
 docs/speed.md has the results of the laptop and how to read them.
@@ -858,6 +859,7 @@ def main():
     ap.add_argument("--frames", type=int, help="end the run at this frame by itself instead of after --seconds (for PS2_PROFILE runs)")
     ap.add_argument("--repeat", type=int, default=1, help="times each run is taken")
     ap.add_argument("--env", action="append", default=[], help="extra environment variable KEY=VALUE for the runner (repeatable)")
+    ap.add_argument("--no-limit", action="store_true", help="PS2_NO_LIMIT=1: no speed limit (no wait for the sound device or the clock), to see what the game could do; the sound is out of step")
     ap.add_argument("--affinity", help="hex mask of the logical processors the game may use, for experiments (for example F = only the two fast cores)")
     ap.add_argument("--priority", choices=["above", "high"], help="run the game with a higher process priority, for experiments")
     ap.add_argument("--make-states", action="store_true", help="make the film state (power-on run, once) and stop")
@@ -869,6 +871,8 @@ def main():
     ap.add_argument("--sample-report", help="name the functions in such a file (with --exe, default build/native-<game>/ps2run.exe) and stop")
     ap.add_argument("extra", nargs="*")
     args = ap.parse_args()
+    if args.no_limit and "PS2_NO_LIMIT=1" not in args.env:
+        args.env.append("PS2_NO_LIMIT=1")  # goes into every result line's "env" as well, so a table shows which runs had no limit
     if args.table:
         return table(args.table)
     if args.profile_summary:

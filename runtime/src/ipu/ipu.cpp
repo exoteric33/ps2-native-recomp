@@ -153,7 +153,13 @@ std::uint32_t bits_at(std::size_t bit, unsigned n) {
     if (!n) return 0;
     std::uint64_t v = 0;
     const std::size_t byte = bit >> 3;
-    for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | (byte + i < g_in.size() ? g_in[byte + i] : 0u);
+    if (byte + 8 <= g_in.size()) {  // the usual case: eight bytes in one go (one load and a byte swap, the same value as the loop below)
+        const std::uint8_t *p = g_in.data() + byte;
+        v = (static_cast<std::uint64_t>(p[0]) << 56) | (static_cast<std::uint64_t>(p[1]) << 48) | (static_cast<std::uint64_t>(p[2]) << 40) | (static_cast<std::uint64_t>(p[3]) << 32) |
+            (static_cast<std::uint64_t>(p[4]) << 24) | (static_cast<std::uint64_t>(p[5]) << 16) | (static_cast<std::uint64_t>(p[6]) << 8) | static_cast<std::uint64_t>(p[7]);
+    } else {
+        for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | (byte + i < g_in.size() ? g_in[byte + i] : 0u);
+    }
     return static_cast<std::uint32_t>((v << (bit & 7u)) >> (64 - n));
 }
 
@@ -261,18 +267,29 @@ bool read_coefficient(const DctLookup &l, int &run, int &level) {
 }
 
 void idct(const int *in, std::int16_t *out) {
+    // Same sums in the same order as the plain 8 x 8 x 8 version, but the terms whose coefficient is zero are left out: such a term adds
+    // +0.0 or -0.0, and a sum that starts at +0.0 is never -0.0 (round to nearest), so the sum and the picture stay bit for bit the
+    // same. A video block has few non-zero coefficients, so most of the 1024 multiplications are gone (docs/speed-cpu.md).
     const auto &c = tables().cosines;
     double rows[8][8];
-    for (int v = 0; v < 8; ++v)
+    int live[8], live_rows = 0;
+    for (int v = 0; v < 8; ++v) {
+        const int *row = in + v * 8;
+        int at[8], count = 0;
+        for (int u = 0; u < 8; ++u)
+            if (row[u]) at[count++] = u;
+        if (!count) continue;  // an all-zero row adds nothing in the second pass either
+        live[live_rows++] = v;
         for (int x = 0; x < 8; ++x) {
             double s = 0;
-            for (int u = 0; u < 8; ++u) s += c[x][u] * in[v * 8 + u];
+            for (int k = 0; k < count; ++k) s += c[x][at[k]] * row[at[k]];
             rows[v][x] = s;
         }
+    }
     for (int y = 0; y < 8; ++y)
         for (int x = 0; x < 8; ++x) {
             double s = 0;
-            for (int v = 0; v < 8; ++v) s += c[y][v] * rows[v][x];
+            for (int k = 0; k < live_rows; ++k) s += c[y][live[k]] * rows[live[k]][x];
             out[y * 8 + x] = static_cast<std::int16_t>(std::clamp(static_cast<int>(std::floor(s + 0.5)), -256, 255));
         }
 }
@@ -345,30 +362,45 @@ void decode_macroblock(std::int16_t *raw, bool intra, bool field, bool dc_reset,
     std::memcpy(raw + 320, blocks[5], 128);
 }
 
-void convert(const std::uint8_t *raw, bool rgb16) {
-    std::uint8_t pixels[1024];
-    std::size_t size = 0;
-    for (int y = 0; y < 16; ++y)
-        for (int x = 0; x < 16; ++x) {
-            const int lum = 149 * std::max(0, raw[y * 16 + x] - 16);
-            const int cb = raw[256 + (y / 2) * 8 + x / 2] - 128, cr = raw[320 + (y / 2) * 8 + x / 2] - 128;
-            const int r = std::clamp((lum + 204 * cr + 64) >> 7, 0, 255);
-            const int g = std::clamp((lum - 50 * cb - 104 * cr + 64) >> 7, 0, 255);
-            const int b = std::clamp((lum + 258 * cb + 64) >> 7, 0, 255);
-            int a = 0x80;
-            if (r < g_th0 && g < g_th0 && b < g_th0) a = 0;
-            else if (r < g_th1 && g < g_th1 && b < g_th1) a = 0x40;
-            if (rgb16) {
-                const std::uint16_t p = static_cast<std::uint16_t>((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | (a & 0x80 ? 0x8000 : 0));
-                std::memcpy(pixels + size, &p, 2);
-                size += 2;
-            } else {
-                const std::uint8_t p[4] = {static_cast<std::uint8_t>(r), static_cast<std::uint8_t>(g), static_cast<std::uint8_t>(b), static_cast<std::uint8_t>(a)};
-                std::memcpy(pixels + size, p, 4);
-                size += 4;
+// The colour conversion of one 16 x 16 macroblock (4:2:0 in, RGB32 or RGB16 out), written straight to the output. The formulas are the
+// plain ones; the chroma terms are worked out once per chroma sample instead of once per pixel, and the output is a template choice.
+template <bool Rgb16>
+void convert_block(const std::uint8_t *raw, std::uint8_t *dst) {
+    const int th0 = g_th0, th1 = g_th1;
+    for (int y = 0; y < 16; ++y) {
+        const std::uint8_t *luma = raw + y * 16, *cb_row = raw + 256 + (y / 2) * 8, *cr_row = raw + 320 + (y / 2) * 8;
+        for (int x = 0; x < 16; x += 2) {
+            const int cb = cb_row[x / 2] - 128, cr = cr_row[x / 2] - 128;
+            const int add_r = 204 * cr + 64, add_g = -50 * cb - 104 * cr + 64, add_b = 258 * cb + 64;
+            for (int k = 0; k < 2; ++k) {
+                const int lum = 149 * std::max(0, luma[x + k] - 16);
+                const int r = std::clamp((lum + add_r) >> 7, 0, 255);
+                const int g = std::clamp((lum + add_g) >> 7, 0, 255);
+                const int b = std::clamp((lum + add_b) >> 7, 0, 255);
+                int a = 0x80;
+                if (r < th0 && g < th0 && b < th0) a = 0;
+                else if (r < th1 && g < th1 && b < th1) a = 0x40;
+                if constexpr (Rgb16) {
+                    const std::uint16_t p = static_cast<std::uint16_t>((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10) | (a & 0x80 ? 0x8000 : 0));
+                    std::memcpy(dst, &p, 2);
+                    dst += 2;
+                } else {
+                    dst[0] = static_cast<std::uint8_t>(r);
+                    dst[1] = static_cast<std::uint8_t>(g);
+                    dst[2] = static_cast<std::uint8_t>(b);
+                    dst[3] = static_cast<std::uint8_t>(a);
+                    dst += 4;
+                }
             }
         }
-    g_out.insert(g_out.end(), pixels, pixels + size);
+    }
+}
+
+void convert(const std::uint8_t *raw, bool rgb16) {
+    const std::size_t at = g_out.size();
+    g_out.resize(at + (rgb16 ? 512 : 1024));
+    if (rgb16) convert_block<true>(raw, g_out.data() + at);
+    else convert_block<false>(raw, g_out.data() + at);
 }
 
 void emit_raw16(const std::int16_t *raw) {

@@ -93,6 +93,7 @@ jobs:
           for t in analysis_tailcall elf_bss codegen_fallthrough; do
             python3 tests/$t.py --recompiler build/tools/eerecomp
           done
+          python3 tests/disc_boot.py --recompiler build/tools/eerecomp --runtime build/ci/libps2runtime.a --cxx "$CXX_BIN"
           python3 tests/fpu_half_damage.py "$CXX_BIN"
           python3 scripts/test_vu_codegen.py "$CXX_BIN"
           CXX="$CXX_BIN" python3 scripts/test_vu0_codegen.py

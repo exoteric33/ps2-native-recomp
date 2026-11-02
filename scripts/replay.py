@@ -118,7 +118,8 @@ def main():
     if not game:
         m = re.search(r"(?:games|program)[/\\]([^/\\]+)[/\\]", program_text)  # games\gow2\disc\... (the repo) or program\gow2\... (a game folder made for a player)
         game = m.group(1) if m else None
-    program = Path(args.program) if args.program else resolve(program_text, game, "program")
+    disc_boot = not args.program and head.get("disc-program") == "1"
+    program = None if disc_boot else (Path(args.program) if args.program else resolve(program_text, game, "program"))
     disc = Path(args.disc) if args.disc else resolve(head.get("disc", ""), game, "disc")
     exe = Path(args.exe) if args.exe else None
     if exe is None:
@@ -134,7 +135,7 @@ def main():
 
     work = Path(tempfile.mkdtemp(prefix="replay_"))
     try:
-        cmd = [str(exe), str(program), "--disc", str(disc), "--replay", str(inputs), "--quick-dir", str(work)]
+        cmd = [str(exe), *([] if disc_boot else [str(program)]), "--disc", str(disc), "--replay", str(inputs), "--quick-dir", str(work)]
         if args.go_on:
             cmd += ["--replay-continue"]
         if args.rtc:

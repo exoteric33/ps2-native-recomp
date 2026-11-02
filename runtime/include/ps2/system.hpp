@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <span>
 #include <vector>
 
 namespace ps2 {
@@ -62,6 +63,7 @@ struct Options {
     std::string save_state_path;
     std::uint64_t save_state_frame = 0;
     // for the keys of a window run (F5, F8, F9; docs/play-keys.md)
+    bool disc_program = false;                            // boots from SYSTEM.CNF in --disc; also written to input recordings
     std::string program_path;                                  // the game's program, set by the host
     std::string command_line;                                  // what the runner was started with, for reports
     std::string quick_dir;                                     // --quick-dir; default: the folder of the memory card, else of the program
@@ -108,6 +110,7 @@ void request_iop_sync();
 void sync_iop();
 
 bool load_elf(const std::string &path, std::uint32_t &entry);
+bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry);
 void boot(std::uint32_t entry, const std::vector<std::string> &args);
 int run();
 void halt(const std::string &reason);

@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <span>
 
 namespace ps2::ee::live {
 
@@ -18,6 +19,8 @@ namespace ps2::ee::live {
 // (entries.txt and overlays\ in it get what was found), or empty. Loads what earlier runs left in the cache. With no C++ compiler
 // found it logs one line and only the loaded libraries are used.
 void start(const std::string &program, const std::string &cache, const std::string &game_dir);
+// Copies the ELF bytes; the caller need not keep them alive. Uses the same cache stamp and analysis as file boot.
+void start(std::span<const std::uint8_t> program, const std::string &cache, const std::string &game_dir);
 
 bool active();
 

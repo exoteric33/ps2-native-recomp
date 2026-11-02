@@ -12,7 +12,7 @@ namespace recomp {
 namespace {
 
 template <typename T>
-T read(const std::vector<std::uint8_t> &data, std::size_t offset) {
+T read(std::span<const std::uint8_t> data, std::size_t offset) {
     if (offset + sizeof(T) > data.size()) throw std::runtime_error("truncated ELF file");
     T value;
     std::memcpy(&value, data.data() + offset, sizeof(T));
@@ -25,8 +25,12 @@ Image Image::load(const std::string &path) {
     std::ifstream file(ps2::os::path(path), std::ios::binary);
     if (!file) throw std::runtime_error("cannot open " + path);
     const std::vector<std::uint8_t> data{std::istreambuf_iterator<char>(file), {}};
+    return load(data);
+}
+
+Image Image::load(std::span<const std::uint8_t> data) {
     if (data.size() < 52 || std::memcmp(data.data(), "\x7f" "ELF\x01\x01", 6) != 0)
-        throw std::runtime_error(path + " is not a little endian ELF32 file");
+        throw std::runtime_error("not a little endian ELF32 file");
 
     Image image;
     image.entry_ = read<std::uint32_t>(data, 24);

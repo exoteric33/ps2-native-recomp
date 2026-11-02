@@ -626,6 +626,10 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
     std::ifstream file(os::path(path), std::ios::binary);
     if (!file) return false;
     const std::vector<std::uint8_t> data{std::istreambuf_iterator<char>(file), {}};
+    return load_elf(data, entry);
+}
+
+bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry) {
     if (data.size() < 52 || std::memcmp(data.data(), "\x7f" "ELF", 4) != 0) return false;
     const auto u32 = [&](std::size_t o) { std::uint32_t v; std::memcpy(&v, data.data() + o, 4); return v; };
     const auto u16 = [&](std::size_t o) { std::uint16_t v; std::memcpy(&v, data.data() + o, 2); return v; };
@@ -641,7 +645,7 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
             // would read past the file or write past the 32 MiB of memory. ELF spec: p_offset + p_filesz lies inside the file and
             // the segment (p_vaddr up to p_memsz, and the p_filesz bytes copied) inside memory.
             if (ph > data.size() || data.size() - ph < 24) {
-                std::fprintf(stderr, "[elf] %s is damaged: program header %u lies past the end of the file\n", path.c_str(), i);
+                std::fprintf(stderr, "[elf] damaged ELF: program header %u lies past the end of the file\n", i);
                 return false;
             }
             if (u32(ph) != 1) continue;
@@ -651,7 +655,7 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
                 const std::uint32_t offset = u32(ph + 4), filesz = u32(ph + 16), memsz = u32(ph + 20);
                 const std::uint32_t start = at & (kScratchpadSize - 1);
                 if (std::uint64_t{start} + std::max(memsz, filesz) > kScratchpadSize || std::uint64_t{offset} + filesz > data.size()) {
-                    std::fprintf(stderr, "[elf] %s is damaged: segment %u does not fit in the file or in the scratchpad\n", path.c_str(), i);
+                    std::fprintf(stderr, "[elf] damaged ELF: segment %u does not fit in the file or in the scratchpad\n", i);
                     return false;
                 }
                 if (copy) std::memcpy(g_spr + start, data.data() + offset, filesz);
@@ -660,7 +664,7 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
             }
             const std::uint32_t offset = u32(ph + 4), vaddr = physical(u32(ph + 8)), filesz = u32(ph + 16), memsz = u32(ph + 20);
             if (std::uint64_t{vaddr} + std::max(memsz, filesz) > kRamSize || std::uint64_t{offset} + filesz > data.size()) {
-                std::fprintf(stderr, "[elf] %s is damaged: segment %u does not fit in the file or in memory\n", path.c_str(), i);
+                std::fprintf(stderr, "[elf] damaged ELF: segment %u does not fit in the file or in memory\n", i);
                 return false;
             }
             if (copy) {
@@ -693,7 +697,7 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     init_watch();
     hw::reset();
     kernel::reset();
-    if (!g_options.disc_path.empty() && !disc::open(g_options.disc_path))
+    if (!g_options.disc_path.empty() && (!g_options.disc_program || !disc::is_open()) && !disc::open(g_options.disc_path))
         std::fprintf(stderr, "[ee] cannot open disc image %s\n", g_options.disc_path.c_str());
     iop::set_trace(g_options.trace_iop_modules, g_options.trace_iop_hle);
     iop::reset();

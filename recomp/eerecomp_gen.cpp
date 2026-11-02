@@ -215,7 +215,10 @@ std::string window_name(std::uint32_t base, const std::uint8_t *image, std::size
 
 // ---------------------------------------------------------------------------------------------------------------- live
 
-StaticProgram::StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries) : image_(Image::load(elf_path)) {
+StaticProgram::StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries)
+    : StaticProgram(Image::load(elf_path), entries) {}
+
+StaticProgram::StaticProgram(Image image, const std::vector<std::uint32_t> &entries) : image_(std::move(image)) {
     const Links imports = snr2_imports(image_);
     program_ = analyse(image_, entries, dynamic_sites(imports));
 }

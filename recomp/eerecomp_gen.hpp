@@ -79,6 +79,7 @@ std::string window_name(std::uint32_t base, const std::uint8_t *image, std::size
 class StaticProgram {
 public:
     StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries);
+    StaticProgram(Image image, const std::vector<std::uint32_t> &entries);
     std::vector<std::uint32_t> calls_into(std::uint32_t base, std::uint32_t size) const;
     // The stretch of the program that holds its code: from the first to the last instruction the analysis reached (and the `.text` section
     // when the file has one). The rest of an executable segment is data; {0, 0} when nothing was reached.

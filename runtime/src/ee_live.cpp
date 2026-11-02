@@ -5,6 +5,7 @@
 // The browser build has no compiler to call: code the build does not know still stops the game there.
 namespace ps2::ee::live {
 void start(const std::string &, const std::string &, const std::string &) {}
+void start(std::span<const std::uint8_t>, const std::string &, const std::string &) {}
 bool active() { return false; }
 bool translate_missing(std::uint32_t) { return false; }
 void frame_tick() {}
@@ -93,7 +94,7 @@ struct Watch {
 };
 
 struct State {
-    fs::path program;       // the game's executable
+    std::vector<std::uint8_t> program;  // ELF bytes, also available without an external boot file
     fs::path cache;         // ee-live: the libraries
     fs::path game_dir;      // the folder port.sh made, or empty (entries.txt, overlays\)
     fs::path compiler;
@@ -406,7 +407,7 @@ void ensure_analysis() {
     if (!g->game_dir.empty() && fs::is_regular_file(g->game_dir / "entries.txt", error))
         g->main_entries = recomp::read_entries(ps2::os::utf8(g->game_dir / "entries.txt")).main;
     try {
-        g->program_analysis = std::make_unique<recomp::StaticProgram>(ps2::os::utf8(g->program), g->main_entries);
+        g->program_analysis = std::make_unique<recomp::StaticProgram>(recomp::Image::load(g->program), g->main_entries);
     } catch (const std::exception &e) {
         say("cannot read the program for its calls into the window: %s", e.what());
     }
@@ -871,12 +872,17 @@ void frame_tick() {
 }
 
 void start(const std::string &program, const std::string &cache, const std::string &game_dir) {
+    const auto elf = read_file(ps2::os::path(program));
+    start(elf, cache, game_dir);
+}
+
+void start(std::span<const std::uint8_t> program, const std::string &cache, const std::string &game_dir) {
     if (g || cache.empty()) return;
     g = new State;
-    g->program = ps2::os::path(program);
+    g->program.assign(program.begin(), program.end());
     g->cache = ps2::os::path(cache);
     g->game_dir = ps2::os::path(game_dir);
-    const std::vector<std::uint8_t> elf = read_file(g->program);
+    const auto &elf = g->program;
     g->windows = recomp::code_windows(elf);
     g->segments = recomp::code_segments(elf);
     g->file_segments = recomp::file_segments(elf);

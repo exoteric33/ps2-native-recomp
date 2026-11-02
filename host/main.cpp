@@ -1,3 +1,4 @@
+#include "ps2/disc.hpp"
 #include "ps2/os.hpp"
 #include "ps2/system.hpp"
 #include "ps2/ee_live.hpp"
@@ -61,7 +62,7 @@ namespace {
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
+                 "usage: ps2run [elf] [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
                  "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n] [--frame-at n]...\n"
                  "              [--press frame:button[+button][:frames]]... [--window] [--fullscreen]\n"
@@ -742,6 +743,9 @@ int main(int argc, char **argv) {
     }
 #endif
     if (argc < 2) return usage();
+    const bool from_disc = argv[1][0] == '-';
+    std::string program = from_disc ? std::string() : argv[1];
+    std::vector<std::uint8_t> disc_elf;
 #ifdef PS2_WINDOW
     // The log copy starts before anything else that can fail (the arguments, the window, the translation set-up, the disc), so
     // whatever ends the run later leaves a log file behind: the app points a player at it ("Logs are not being created", public
@@ -749,13 +753,13 @@ int main(int argc, char **argv) {
     {
         // PS2_LOG_COPY=1 (a test aid): a headless run keeps the log copy too, so the log file can be tested without a window
         bool window_run = ps2::os::env("PS2_LOG_COPY") == "1";
-        for (int i = 2; i < argc; ++i) {
+        for (int i = from_disc ? 1 : 2; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--window" || a == "--fullscreen") window_run = true;
             else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
             else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
         }
-        ps2::g_options.program_path = argv[1];
+        if (!from_disc) ps2::g_options.program_path = argv[1];
         // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
         if (window_run && ps2::os::env("PS2_NO_LOG_COPY").empty() && g_log.start(ps2::os::path(ps2::quick_folder("logs")))) {
             ps2::g_options.recent_log = [](std::size_t lines) { return g_log.tail(lines); };
@@ -780,12 +784,12 @@ int main(int argc, char **argv) {
     [[maybe_unused]] bool window = false, fullscreen = false;
     std::string load_path;
     bool no_record = false;
-    ps2::g_options.program_path = argv[1];
+    ps2::g_options.disc_program = from_disc;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         ps2::g_options.command_line += (i ? " " : "") + (a.find_first_of(" \t") == std::string::npos ? a : "\"" + a + "\"");
     }
-    for (int i = 2; i < argc; ++i) {
+    for (int i = from_disc ? 1 : 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) ps2::g_options.max_frames = std::strtoull(argv[++i], nullptr, 10);
@@ -843,6 +847,28 @@ int main(int argc, char **argv) {
         std::unique(ps2::g_options.frame_capture_frames.begin(), ps2::g_options.frame_capture_frames.end()),
         ps2::g_options.frame_capture_frames.end());
 
+    std::string program_location = program;
+    if (from_disc) {
+        if (ps2::g_options.disc_path.empty()) return usage();
+        if (!ps2::disc::open(ps2::g_options.disc_path)) {
+            std::fprintf(stderr, "[elf] cannot open disc image %s\n", ps2::g_options.disc_path.c_str());
+            return 1;
+        }
+        std::string why;
+        if (!ps2::disc::read_boot_elf(program, disc_elf, why)) {
+            std::fprintf(stderr, "[elf] %s\n", why.c_str());
+            return 1;
+        }
+        args[0] = program;
+        // A location anchor for caches/reports; this path is never opened for disc boot.
+        std::string name = program;
+        std::replace(name.begin(), name.end(), '\\', '/');
+        name = name.substr(name.find_last_of("/:") + 1);
+        name = name.substr(0, name.find(';'));
+        program_location = ps2::os::utf8(ps2::os::path(ps2::g_options.disc_path).parent_path() / ps2::os::path(name));
+        std::fprintf(stderr, "[elf] read %s from disc (%zu bytes)\n", program.c_str(), disc_elf.size());
+    }
+    ps2::g_options.program_path = program_location;
 
 #ifdef PS2_WINDOW
     // Record unknown microprograms beside the game that port.sh prepared.
@@ -852,7 +878,7 @@ int main(int argc, char **argv) {
     if (window) {
         std::error_code error;
         std::vector<std::filesystem::path> places;
-        const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
+        const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(program_location), error);
         if (!error) places = {program.parent_path(), program.parent_path().parent_path()};
         if (!ps2::g_options.disc_path.empty()) {
             const auto disc = std::filesystem::absolute(ps2::os::path(ps2::g_options.disc_path), error);
@@ -882,7 +908,7 @@ int main(int argc, char **argv) {
             std::string cache = setting == "1" || setting == "on" ? std::string() : setting;
             if (cache.empty()) {
                 std::error_code error;
-                const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
+                const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(program_location), error);
                 std::filesystem::path place = program.parent_path();
                 for (const std::filesystem::path &candidate : {program.parent_path(), program.parent_path().parent_path()})
                     if (std::filesystem::is_directory(candidate / "vu1", error)) {
@@ -904,7 +930,7 @@ int main(int argc, char **argv) {
         const std::string setting = ps2::os::env("PS2_EE_LIVE");
         if (setting != "0" && setting != "off" && (window || !setting.empty())) {
             std::error_code error;
-            const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
+            const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(program_location), error);
             std::filesystem::path place = program.parent_path(), game_dir;
             for (const std::filesystem::path &candidate : {program.parent_path(), program.parent_path().parent_path()})
                 if (std::filesystem::is_directory(candidate / "vu1", error) || std::filesystem::is_regular_file(candidate / "entries.txt", error)) {
@@ -917,17 +943,21 @@ int main(int argc, char **argv) {
                     break;
                 }
             const std::string cache = setting.empty() || setting == "1" || setting == "on" ? ps2::os::utf8((place / "ee-live").lexically_normal()) : setting;
-            ps2::ee::live::start(argv[1], cache, ps2::os::utf8(game_dir));
+            if (from_disc) ps2::ee::live::start(disc_elf, cache, ps2::os::utf8(game_dir));
+            else ps2::ee::live::start(program, cache, ps2::os::utf8(game_dir));
         }
     }
     const auto emulate = [&]() -> int {
         name_thread(L"ps2 emulation");
         crash_test("emu");
         std::uint32_t entry = 0;
-        if (!ps2::load_elf(argv[1], entry)) {
-            std::fprintf(stderr, "cannot load %s\n", argv[1]);
+        const bool loaded = from_disc ? ps2::load_elf(disc_elf, entry) : ps2::load_elf(program, entry);
+        if (!loaded) {
+            std::fprintf(stderr, "cannot load %s\n", program.c_str());
             return 1;
         }
+        // Segments are in EE RAM and live analysis owns its ELF bytes; release the host boot buffer.
+        std::vector<std::uint8_t>().swap(disc_elf);
         ps2::boot(entry, args);
         if (load_path == "newest") {  // the newest quick save (F5) of this game
             load_path = ps2::quick_newest_state();

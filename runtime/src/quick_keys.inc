@@ -328,6 +328,7 @@ void record_start(const fs::path &file, const fs::path &state, CardAt card_at) {
     g_rec.buffer = "ps2-inputs 1\ncheck-every " + std::to_string(kCheckEvery) + " slices " + std::to_string(kSlices) + "\n";
     g_rec.buffer += std::string("pal ") + (g_options.pal ? "1" : "0") + "\n";
     if (!g_options.program_path.empty()) g_rec.buffer += "program " + g_options.program_path + "\n";
+    if (g_options.disc_program) g_rec.buffer += "disc-program 1\n";
     if (!g_options.disc_path.empty()) g_rec.buffer += "disc " + g_options.disc_path + "\n";
     if (state.empty()) g_rec.buffer += "start power-on frame 0\n";
     else g_rec.buffer += "start state " + os::utf8(state.filename()) + " frame " + std::to_string(g_frames) + "\n";

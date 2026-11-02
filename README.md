@@ -36,7 +36,8 @@ Still early: the project went public on 28 October 2026. God of War II has been 
 other games play well as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
-real console prints.
+real console prints. **It is not faster than PCSX2 yet:** on the same laptop PCSX2 is faster in every scene I measured (see
+[*Not faster than PCSX2 yet*](#not-faster-than-pcsx2-yet)).
 
 ## Why recompile instead of emulate
 
@@ -45,14 +46,31 @@ what each piece means. This project does the biggest part of that work once, bef
 the PS2's main processor into C++ and compiles it into a normal program. That gives you:
 
 - **A real PC program for each game**, with its own shortcut, instead of an emulator with a game loaded into it.
-- **Way faster:** the code is already translated when you play, so the PC spends its time running the game instead of
-  working out each piece of code first.
+- **No translating while you play:** the main processor's code is already translated, so the PC does not have to work
+  it out piece by piece. That part is fast, but it is only a small part of the work (see below).
 - **A game whose code can be changed:** fixes and improvements can go right into the game itself, not only around it.
   That is what opens the door to the ideas below.
 
-To be fair: an emulator like PCSX2 runs far more games today and has years of work behind it. It also translates code
-while you play; a side-by-side speed test against it is next. If your game doesn't run here yet, PCSX2 is the better
-choice for now.
+### Not faster than PCSX2 yet
+
+I measured both on the same laptop (Intel Core 5 120U with its built-in Intel graphics, Windows 11, November 2026), in
+the same scenes, at the PS2's own resolution. **PCSX2 was faster in every scene.** Frames per second; 60 is full speed:
+
+| Scene | PCSX2 | This project | PCSX2, speed limit off | This project, speed limit off |
+|---|---|---|---|---|
+| God of War II, first fight | 60 | 43 | 78 | 43 |
+| God of War II, opening film | 60 | 60 | 126 | 78 |
+| God of War, fight on the ship | 60 | 43 | 118 | 42 |
+| Silent Hill 2, the restroom at the start | 60 | 58 | 171 | 125 |
+
+Why: translating the main processor's code is only a small part of the work. Most of it is the rest of the console, and
+above all the graphics chip. This project draws every pixel with its own program on the graphics card, while PCSX2 hands
+the triangles to the card's built-in drawing hardware, which is much quicker on built-in laptop graphics. On a strong
+graphics card the difference matters less: God of War II runs at 60 fps there. Beating PCSX2 is the goal I'm working
+toward, but it isn't reached.
+
+PCSX2 also runs far more games today and has many years of work behind it. If your game doesn't run here yet, or runs too
+slowly, PCSX2 is the better choice for now.
 
 Under the hood, the rest of the console (graphics chip, vector units, sound, disc, controller, memory card) is rebuilt
 in a runtime that draws with WebGPU (wgpu-native, on Vulkan or Direct3D 12).
@@ -64,7 +82,7 @@ Not promises, just where this can go:
 - **An in-game menu** for resolution, picture look and 16:9.
 - **A folder you can move:** the game program and your disc image together, to take to another PC.
 - **60 fps** for games that run at 30, where the game allows it, and **mods** that change the game's code directly.
-- **Faster on weak laptops**, so more games reach full speed on built-in graphics.
+- **Faster than PCSX2**, so more games reach full speed on built-in laptop graphics (today it is slower, see above).
 - **The Steam Deck and other handhelds:** Linux already works; it needs testing there.
 - **More games:** every report shows me what to fix next.
 

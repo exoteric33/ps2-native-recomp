@@ -4,6 +4,8 @@ Turns the disc image of a PS2 game you own into a native program for Windows or 
 stage** and still changes a lot. God of War II has been played from start to end on Windows; a few more games run as far
 as they have been played.
 
+https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
+
 **13 games ran with no extra work at all:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
 Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
 Western, Thunder Force VI, Raiden III and Heavenly Guardian. *No extra work* means nobody changed anything for these games: the

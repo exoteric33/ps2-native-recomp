@@ -755,6 +755,10 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     case 0x4A: g_osd_config = ld32(arg(c, 0)); ret(c, 0); break;
     case 0x4B: st32(arg(c, 0), g_osd_config); ret(c, 0); break;
     case 0x64: case 0x68: ret(c, 0); break;
+    // KSeg0 (0x60), EnableCache (0x61), DisableCache (0x62): cache and segment controls. The numbers are those of
+    // ps2sdk's syscallnr.h (AFL-2.0); EnableCache/DisableCache take CPU_DATA_CACHE (1) and CPU_INSTRUCTION_CACHE (2) in
+    // their argument (ps2sdk kernel.h). The recompiled code has no caches to switch, so they do nothing and return 0.
+    case 0x60: case 0x61: case 0x62: ret(c, 0); break;
     // SetTLBEntry: ps2sdk's exit code writes all 48 entries back. The memory map is fixed here, so the entry is accepted and dropped.
     case 0x56: ret(c, 0); break;
     case 0x5B: case 0x6B: ret(c, 0); break;
@@ -866,6 +870,9 @@ const char *syscall_name(std::uint32_t n) {
     case 0x4B: return "GetOsdConfigParam";
     case 0x56: return "SetTLBEntry";
     case 0x5B: return "GetEntryAddress";
+    case 0x60: return "KSeg0";
+    case 0x61: return "EnableCache";
+    case 0x62: return "DisableCache";
     case 0x64: return "FlushCache";
     case 0x6B: return "SifStopDma";
     case 0x68: return "iFlushCache";

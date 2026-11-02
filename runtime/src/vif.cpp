@@ -8,6 +8,7 @@
 
 #include "ps2/state.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -36,6 +37,82 @@ std::uint8_t g_dry_run[16384];
 bool on_vu_thread() { return gs::queue::role() == gs::queue::Role::Vu; }
 bool shadow(int unit) { return unit == 1 && gs::queue::vu_active() && !on_vu_thread(); }
 Unit &state(int unit) { return unit == 1 && on_vu_thread() ? g_vu_side : g_units[unit]; }
+
+// The last 8 commands a unit decoded, for the log when a unit loses its place in the stream (a float or a vertex read as a command).
+// Three slots: VIF0, VIF1 and VIF1's copy on the VU thread. Not part of the save state. Per command the cost is three stores.
+struct Seen {
+    std::uint32_t cmd = 0, words = 0;
+    std::uint64_t at = 0;  // the command's place in the stream, counted in words from the last reset
+};
+struct History {
+    Seen last[8];
+    std::uint32_t head = 0;
+    std::uint64_t received = 0, unknown = 0;
+};
+History g_hist[3];
+constexpr const char *kLabel[3] = {"vif0", "vif1", "vif1/vu"};
+
+int hist_index(int unit) { return unit == 1 && on_vu_thread() ? 2 : unit; }
+
+const char *command_name(std::uint32_t cmd) {
+    const std::uint32_t op = (cmd >> 24) & 0x7Fu;
+    switch (op) {
+    case 0x00: return "NOP";
+    case 0x01: return "STCYCL";
+    case 0x02: return "OFFSET";
+    case 0x03: return "BASE";
+    case 0x04: return "ITOP";
+    case 0x05: return "STMOD";
+    case 0x06: return "MSKPATH3";
+    case 0x07: return "MARK";
+    case 0x10: return "FLUSHE";
+    case 0x11: return "FLUSH";
+    case 0x13: return "FLUSHA";
+    case 0x14: return "MSCAL";
+    case 0x15: return "MSCALF";
+    case 0x17: return "MSCNT";
+    case 0x20: return "STMASK";
+    case 0x30: return "STROW";
+    case 0x31: return "STCOL";
+    case 0x4A: return "MPG";
+    case 0x50: return "DIRECT";
+    case 0x51: return "DIRECTHL";
+    default: return (op & 0x60u) == 0x60u ? "UNPACK" : "unknown";
+    }
+}
+
+// The first unknown command of a unit prints the commands before it and the DMA channel's registers, a few more print short,
+// then only a count: a unit that lost its place reads every following word as a command, thousands of lines.
+void note_unknown(int unit, std::uint32_t cmd) {
+    const int idx = hist_index(unit);
+    History &h = g_hist[idx];
+    const char *who = kLabel[idx];
+    const std::uint64_t n = ++h.unknown;
+    const Seen &now = h.last[(h.head - 1) & 7u];
+    if (n == 1) {
+        float as_float;
+        std::memcpy(&as_float, &cmd, 4);
+        std::fprintf(stderr, "[%s] lost the stream at word %llu: 0x%08X is not a command (as a float: %g). The commands before it, oldest first:\n",
+                     who, static_cast<unsigned long long>(now.at), cmd, static_cast<double>(as_float));
+        const std::uint32_t before = std::min<std::uint32_t>(h.head - 1, 7u);
+        for (std::uint32_t i = before; i >= 1; --i) {
+            const Seen &s = h.last[(h.head - 1 - i) & 7u];
+            std::fprintf(stderr, "[%s]   word %llu: 0x%08X %s, %u data words\n", who, static_cast<unsigned long long>(s.at), s.cmd, command_name(s.cmd), s.words);
+        }
+        if (!before) std::fprintf(stderr, "[%s]   (none: it is the first command since the reset)\n", who);
+        if (idx < 2) {
+            const std::uint32_t base = idx ? 0x10009000u : 0x10008000u;
+            const std::uint32_t chcr = dmac::read(base);
+            std::fprintf(stderr, "[%s]   DMA channel %d now: CHCR 0x%08X (last tag id %u) MADR 0x%08X QWC %u TADR 0x%08X; the data may also have come through the direct FIFO port\n",
+                         who, idx, chcr, (chcr >> 28) & 7u, dmac::read(base + 0x10), dmac::read(base + 0x20), dmac::read(base + 0x30));
+        }
+    } else if (n <= 5) {
+        std::fprintf(stderr, "[%s] unknown command 0x%08X at word %llu\n", who, cmd, static_cast<unsigned long long>(now.at));
+        if (n == 5) std::fprintf(stderr, "[%s] more unknown commands are counted, not printed\n", who);
+    } else if (n == 100 || n == 10000 || n == 1000000 || n == 100000000) {
+        std::fprintf(stderr, "[%s] %llu unknown commands so far\n", who, static_cast<unsigned long long>(n));
+    }
+}
 
 std::uint8_t *vu_data(int unit) { return unit ? g_vu1_mem : g_vu0_mem; }
 std::uint32_t vu_qwords(int unit) { return unit ? 1024u : 256u; }
@@ -268,7 +345,7 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
         break;
     default:
         if ((op & 0x60u) == 0x60u) unpack(unit, cmd, data);
-        else std::fprintf(stderr, "[vif%d] unknown command 0x%08X\n", unit, cmd);
+        else note_unknown(unit, cmd);
         break;
     }
     if ((cmd & 0x80000000u) && !(u.err & 1u)) {
@@ -292,8 +369,10 @@ void decode(int unit, std::uint32_t cmd) {
     }
 }
 
-std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
+// `base` is the stream position of words[0], for the history.
+std::size_t run(int unit, const std::uint32_t *words, std::size_t count, std::uint64_t base) {
     Unit &u = state(unit);
+    History &h = g_hist[hist_index(unit)];
     std::size_t pos = 0;
     while (pos < count && !u.stalled) {
         const std::uint32_t cmd = words[pos];
@@ -303,6 +382,7 @@ std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
             decode(unit, cmd);
             break;
         }
+        h.last[h.head++ & 7u] = {cmd, need, base + pos};
         execute(unit, cmd, words + start);
         pos = start + need;
     }
@@ -311,7 +391,7 @@ std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
 
 void process(int unit) {
     Unit &u = state(unit);
-    const std::size_t pos = run(unit, u.pending.data(), u.pending.size());
+    const std::size_t pos = run(unit, u.pending.data(), u.pending.size(), g_hist[hist_index(unit)].received - u.pending.size());
     u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
 }
 
@@ -319,9 +399,13 @@ void process(int unit) {
 
 void reset() {
     for (Unit &u : g_units) u = Unit{};
+    for (History &h : g_hist) h = History{};
 }
 
-void reset_vu_side() { g_vu_side = Unit{}; }
+void reset_vu_side() {
+    g_vu_side = Unit{};
+    g_hist[2] = History{};
+}
 
 std::uint32_t itop(int unit) { return g_units[unit].itop; }
 
@@ -332,6 +416,8 @@ void stats() {
             if (g_commands[u][op]) std::fprintf(stderr, " %02X:%llu", op, static_cast<unsigned long long>(g_commands[u][op]));
         std::fprintf(stderr, "\n");
     }
+    for (int i = 0; i < 3; ++i)
+        if (g_hist[i].unknown) std::fprintf(stderr, "[%s] %llu unknown commands in this run\n", kLabel[i], static_cast<unsigned long long>(g_hist[i].unknown));
 }
 
 // `count` words, not quadwords: the 64 bits of a DMA tag that a chain with the tag transfer enabled sends ahead of its data are two
@@ -339,8 +425,9 @@ void stats() {
 void transfer_words(int unit, const std::uint32_t *words, std::uint32_t count) {
     if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, count, 0, words, count * 4);
     Unit &u = state(unit);
+    g_hist[hist_index(unit)].received += count;
     if (u.pending.empty() && !u.stalled) {
-        const std::size_t pos = run(unit, words, count);
+        const std::size_t pos = run(unit, words, count, g_hist[hist_index(unit)].received - count);
         if (pos < count) u.pending.assign(words + pos, words + count);
         return;
     }

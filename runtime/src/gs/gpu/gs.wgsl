@@ -396,7 +396,25 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (psm == PSMCT16 || psm == PSMCT16S) {
         c = ((c & 0x1Fu) << 3u) | ((c & 0x3E0u) << 6u) | ((c & 0x7C00u) << 9u);
     }
-    scratch[prm(8u) + gid.y * w + gid.x] = c | 0xFF000000u;
+    c = c | 0xFF000000u;
+    // The second read circuit (prm 9..18): its rectangle goes over the picture of the main one (PMODE ALP is 0xFF, all of it shows).
+    if (prm(9u) != 0u) {
+        let lx = i32(gid.x) - bitcast<i32>(prm(15u)) * i32(SCALE);
+        let ly = i32(gid.y) - bitcast<i32>(prm(16u)) * i32(SCALE);
+        if (lx >= 0 && ly >= 0 && u32(lx) < prm(17u) * SCALE && u32(ly) < prm(18u) * SCALE) {
+            var oy = u32(ly);
+            if (prm(7u) != 0u) {
+                oy = oy / 2u;
+            }
+            let opsm = prm(12u);
+            var o = read_sample(opsm, prm(10u), prm(11u), prm(13u) + u32(lx) / SCALE, prm(14u) + oy / SCALE, (oy % SCALE) * SCALE + u32(lx) % SCALE);
+            if (opsm == PSMCT16 || opsm == PSMCT16S) {
+                o = ((o & 0x1Fu) << 3u) | ((o & 0x3E0u) << 6u) | ((o & 0x7C00u) << 9u);
+            }
+            c = o | 0xFF000000u;
+        }
+    }
+    scratch[prm(8u) + gid.y * w + gid.x] = c;
 }
 
 struct Setup {

@@ -12,6 +12,7 @@ enum class Mode { off, mirror, primary };
 struct DisplaySource {
     std::uint32_t fbp, fbw, psm, dbx, dby, width, height;
     bool halved;
+    DisplayOverlay overlay;
 };
 
 struct SurfaceTarget {

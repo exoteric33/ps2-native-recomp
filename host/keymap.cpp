@@ -99,7 +99,17 @@ bool lookup(const std::string &text, int &input) {
     const std::string key = squash(text);
     if (key.empty()) return false;
     const auto it = names().find(key);
-    if (it == names().end()) return false;
+    if (it == names().end()) {
+        // "key 123": a key by its SDL scancode number, which is how keys.ini holds a key that has no name (written by the quick menu's Change keys)
+        if (key.size() > 3 && key.size() <= 6 && key.compare(0, 3, "key") == 0 && std::all_of(key.begin() + 3, key.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+            const int number = std::atoi(key.c_str() + 3);
+            if (number > 0 && number < kScancodes) {
+                input = number;
+                return true;
+            }
+        }
+        return false;
+    }
     input = it->second;
     return true;
 }
@@ -119,25 +129,27 @@ const char *look_word(int look) {
 }
 
 namespace {
-// keys.ini text with its `name` line set to `line` (other lines untouched; the line is added at the end when missing)
+// keys.ini text with its `name` line set to `line` (other lines untouched; the line is added at the end when missing). When the name
+// stands on several lines the last one is replaced, because the reader lets a later line win.
 std::string with_line(const std::string &file_text, const std::string &name, const std::string &line) {
-    std::string out;
-    bool done = false;
+    std::vector<std::string> rows;
     std::size_t pos = 0;
     while (pos < file_text.size()) {
-        std::size_t end = file_text.find('\n', pos);
-        const bool last = end == std::string::npos;
-        std::string row = file_text.substr(pos, last ? std::string::npos : end - pos);
-        const std::size_t eq = row.find('=');
-        if (!done && eq != std::string::npos && row[0] != '#' && row[0] != ';' && squash(row.substr(0, eq)) == name) {
-            row = line + (!row.empty() && row.back() == '\r' ? "\r" : "");
-            done = true;
-        }
-        out += row;
-        if (!last) out += '\n';
-        pos = last ? file_text.size() : end + 1;
+        const std::size_t end = file_text.find('\n', pos);
+        rows.push_back(file_text.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+        pos = end == std::string::npos ? file_text.size() : end + 1;
     }
-    if (!done) out += std::string(out.empty() || out.back() == '\n' ? "" : "\n") + line + "\n";
+    const bool final_newline = file_text.empty() || file_text.back() == '\n';
+    int found = -1;
+    for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+        const std::string t = trim(rows[i]);
+        const std::size_t eq = t.find('=');
+        if (eq != std::string::npos && t[0] != '#' && t[0] != ';' && squash(t.substr(0, eq)) == name) found = i;
+    }
+    if (found >= 0) rows[found] = line + (!rows[found].empty() && rows[found].back() == '\r' ? "\r" : "");
+    else rows.push_back(line);
+    std::string out;
+    for (std::size_t i = 0; i < rows.size(); ++i) out += rows[i] + (i + 1 < rows.size() || final_newline || found < 0 ? "\n" : "");
     return out;
 }
 
@@ -378,7 +390,7 @@ std::string card_text(const Config &c) {
     line("Select", list(c, Select));
     line("D-pad (menus)", list(c, DpadUp) + ", " + list(c, DpadDown) + ", " + list(c, DpadLeft) + ", " + list(c, DpadRight));
     line("L3, R3 (sticks pressed in)", list(c, L3) + ", " + list(c, R3));
-    t += "\nF1: the quick menu (save, load, picture look, resolution, full screen, this card, quit)";
+    t += "\nF1: the quick menu (save, load, picture look, resolution, full screen, show or change keys, quit)";
     if (!c.inputs[Menu].empty()) t += "; also " + list(c, Menu);
     t += "\nOn a controller: hold Select, then press Start (or press the Guide button)\n";
     t += "F5 quick save   F8 quick load   F9 something is wrong   F11 full screen\n";
@@ -386,6 +398,83 @@ std::string card_text(const Config &c) {
     t += "On some laptops the F keys need the Fn key held down: Fn + F1 opens the quick menu. The buttons below work without Fn.\n";
     if (!c.inputs[Help].empty()) t += "This card at once: " + list(c, Help) + "\n";
     return t;
+}
+
+const char *action_label(int action) {
+    static const char *const labels[kChangeableCount] = {
+        "D-pad Up", "D-pad Down", "D-pad Left", "D-pad Right", "Left stick Up", "Left stick Down", "Left stick Left", "Left stick Right",
+        "Right stick Up", "Right stick Down", "Right stick Left", "Right stick Right", "Cross", "Circle", "Square", "Triangle",
+        "L1", "R1", "L2", "R2", "L3", "R3", "Start", "Select", "Roll", "Rage (L3 + R3)"};
+    return action >= 0 && action < kChangeableCount ? labels[action] : action_name(action);
+}
+
+std::string keys_text(const Config &config, int action) { return list(config, action); }
+
+namespace {
+
+// the way a key is written in keys.ini: its name when reading that name gives the key back, else "key <scancode number>"
+std::string file_name(int input) {
+    const std::string name = input_name(input);
+    int back = 0;
+    if (lookup(name, back) && back == input) return name;
+    return "key " + std::to_string(input);
+}
+
+}  // namespace
+
+std::string with_inputs(const std::string &file_text, int action, const std::vector<int> &inputs) {
+    std::string keys;
+    for (int input : inputs) keys += (keys.empty() ? "" : ", ") + file_name(input);
+    if (keys.empty()) keys = "none";
+    const std::string name = kInfo[action].name;
+    return with_line(file_text, squash(name), name + std::string(12 - std::min<std::size_t>(11, name.size()), ' ') + "= " + keys);
+}
+
+bool assign_input(Config &config, int action, int input, std::vector<int> &changed, std::string &message) {
+    changed.clear();
+    if (action < 0 || action >= kChangeableCount) return false;
+    if (is_reserved(input)) {
+        message = input_name(input) + " belongs to the program. Press another key.";
+        return false;
+    }
+    const std::vector<int> old = config.inputs[action];
+    if (old.size() == 1 && old[0] == input) {
+        message = std::string(action_label(action)) + " already has " + input_name(input) + ".";
+        return true;
+    }
+    // what moves to the other button: the keys this line had (without the one it takes)
+    std::vector<int> moved;
+    for (int k : old)
+        if (k != input) moved.push_back(k);
+    config.inputs[action] = {input};
+    changed.push_back(action);
+    std::string swapped;
+    for (int other = 0; other < ActionCount; ++other) {
+        if (other == action) continue;
+        std::vector<int> &keys = config.inputs[other];
+        if (std::find(keys.begin(), keys.end(), input) == keys.end()) continue;
+        keys.erase(std::remove(keys.begin(), keys.end(), input), keys.end());
+        if (other < kChangeableCount)  // (help and menu only lose the key)
+            for (int k : moved)
+                if (std::find(keys.begin(), keys.end(), k) == keys.end()) keys.push_back(k);
+        changed.push_back(other);
+        std::string what;
+        for (int k : moved)
+            if (std::find(keys.begin(), keys.end(), k) != keys.end()) what += (what.empty() ? "" : ", ") + input_name(k);
+        swapped += std::string(" ") + action_label(other) + (what.empty() ? " lost it." : " got " + what + ".");
+    }
+    message = std::string(action_label(action)) + " now has " + input_name(input) + "." + swapped;
+    return true;
+}
+
+void restore_default_inputs(Config &config, std::vector<int> &changed) {
+    changed.clear();
+    const Config d = defaults();
+    for (int a = 0; a < kChangeableCount; ++a) {
+        if (config.inputs[a] == d.inputs[a]) continue;
+        config.inputs[a] = d.inputs[a];
+        changed.push_back(a);
+    }
 }
 
 }  // namespace keymap

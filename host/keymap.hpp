@@ -48,6 +48,20 @@ std::string with_look(const std::string &file_text, int look);
 std::string with_scale(const std::string &file_text, int scale);
 
 const char *action_name(int action);  // the word used in keys.ini
+
+// The quick menu's "Change keys" page (docs/keys.md): one line for every button of the controller and for roll and rage, in the order of
+// keys.ini (the actions 0 to kChangeableCount - 1; help and menu are left to the file).
+constexpr int kChangeableCount = Rage + 1;
+const char *action_label(int action);                      // "Square", "Left stick Up", "Rage (L3 + R3)"
+std::string keys_text(const Config &config, int action);   // "Left Mouse", "Space, Enter, Keypad Enter", "none"
+// keys.ini text with the line of `action` set to the keys in `config` (other lines, comments included, untouched; the line is added at the end when missing)
+std::string with_inputs(const std::string &file_text, int action, const std::vector<int> &inputs);
+// Gives `input` (a key or mouse button) to `action`, which loses the keys it had. A button that already had `input` swaps: it gets the keys
+// `action` had. Returns false and a reason in `message` when the input belongs to the program. Otherwise `message` says what happened and
+// `changed` holds every action whose keys are different now (the one asked for first).
+bool assign_input(Config &config, int action, int input, std::vector<int> &changed, std::string &message);
+// The keys of the controller's buttons, roll and rage back to the defaults (the mouse and picture lines are not touched). `changed` as above.
+void restore_default_inputs(Config &config, std::vector<int> &changed);
 Config defaults();
 
 // Reads the text of a key file on top of `config` (which starts as defaults()). Every problem becomes a line in `problems`; the

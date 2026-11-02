@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <functional>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -140,6 +141,7 @@ bool g_beep_on = true;
 // nothing until its buttons are all let go (the Enter or Cross that chose "Resume" must not reach the game).
 quickmenu::Menu g_menu;
 std::atomic<bool> g_menu_hold{false};
+std::string g_key_note;  // the keys page's message line: what the last change did
 bool g_menu_redraw = false;  // show the picture again: the panel changed while the game sends none
 quickmenu::Picture g_menu_picture;
 SDL_Texture *g_menu_texture = nullptr;  // the panel for the SDL renderer (PS2_SDL_RENDERER=1)
@@ -593,7 +595,8 @@ void show_key_card(const char *why) {
 #endif
     reload_keys_if_changed();
     g_card.text = keymap::card_text(g_keys);
-    if (!g_keys_path.empty()) g_card.text += "\nTo change keys, edit this file (the game reads it again when you come back):\n" + g_keys_path + "\n";
+    if (!g_keys_path.empty())
+        g_card.text += "\nTo change keys: \"Change keys\" in the quick menu, or edit this file (the game reads it again when you come back):\n" + g_keys_path + "\n";
     if (g_notice_text == kStartNotice) {
         g_notice_text.clear();
         refresh_title();
@@ -826,8 +829,8 @@ void poll_port(int port) {
     ps2::set_pad_axis(3, ly, port);
 }
 
-// keys.ini with one line changed (`change` is keymap::with_look or with_scale), the other lines as they are
-void rewrite_keys_file(std::string (*change)(const std::string &, int), int value, const char *what) {
+// keys.ini with some lines changed (`change` maps the file's text to the new text, e.g. with keymap::with_look), the other lines as they are
+void rewrite_keys_file(const std::function<std::string(const std::string &)> &change, const char *what) {
     if (g_keys_path.empty()) return;
     std::string text;
     if (std::FILE *f = ps2::os::open(g_keys_path, "rb")) {
@@ -838,7 +841,7 @@ void rewrite_keys_file(std::string (*change)(const std::string &, int), int valu
     } else {
         text = keymap::default_file_text();
     }
-    text = change(text, value);
+    text = change(text);
     if (std::FILE *out = ps2::os::open(g_keys_path, "wb")) {
         std::fwrite(text.data(), 1, text.size(), out);
         std::fclose(out);
@@ -859,7 +862,7 @@ void cycle_look(int step = 1) {
     refresh_title();
     std::fprintf(stderr, "[video] picture look %d: %s\n", g_look, keymap::look_name(g_look));
     if (g_look_forced) return;
-    rewrite_keys_file(keymap::with_look, g_look, "look");
+    rewrite_keys_file([](const std::string &t) { return keymap::with_look(t, g_look); }, "look");
 }
 
 // --- the quick menu ---
@@ -894,6 +897,10 @@ void menu_paint(bool show_again = true) {
         v.scale_next = g_scale_next;
         v.scale_locked = g_scale_locked;
         v.fullscreen = SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN;
+        if (g_menu.on_keys_page()) {
+            for (int a = 0; a < keymap::kChangeableCount; ++a) v.key_rows.push_back({keymap::action_label(a), keymap::keys_text(g_keys, a)});
+            v.key_note = g_key_note;
+        }
         g_menu.draw(w, h, v, g_menu_picture);
     } else {
         quickmenu::Menu::draw_note(w, h, g_note_text, g_menu_picture);
@@ -949,7 +956,9 @@ void open_menu(const char *why) {
     if (g_menu.is_open()) return;
     reload_keys_if_changed();
     g_note_text.clear();
+    g_key_note.clear();
     g_menu.open();
+    g_menu.set_key_rows(keymap::kChangeableCount);
     g_menu_hold.store(true, std::memory_order_release);
     g_menu_opened_ticks = SDL_GetTicks();
     SDL_SetRelativeMouseMode(SDL_FALSE);  // the pointer can click the entries
@@ -981,6 +990,71 @@ void set_notice(const std::string &text) {
     refresh_title();
 }
 
+// the lines of keys.ini for these buttons, written with the keys now in force (comments and every other line stay as they are)
+void write_key_lines(const std::vector<int> &actions) {
+    if (actions.empty()) return;
+    rewrite_keys_file(
+        [&](const std::string &text) {
+            std::string out = text;
+            for (int a : actions) out = keymap::with_inputs(out, a, g_keys.inputs[a]);
+            return out;
+        },
+        "new keys");
+}
+
+// the key card's and the menu's idea of a mouse button
+int mouse_input(Uint8 button) {
+    switch (button) {
+    case SDL_BUTTON_LEFT: return keymap::kMouseLeft;
+    case SDL_BUTTON_MIDDLE: return keymap::kMouseMiddle;
+    case SDL_BUTTON_RIGHT: return keymap::kMouseRight;
+    case SDL_BUTTON_X1: return keymap::kMouseX1;
+    case SDL_BUTTON_X2: return keymap::kMouseX2;
+    default: return 0;
+    }
+}
+
+// The keys page waits for a key: the next key or mouse button (wheel too) is the highlighted button's new key. Esc or a controller button
+// cancels. Always true for the events that belong to input (nothing reaches the game).
+bool capture_event(const SDL_Event &e) {
+    int input = 0;
+    switch (e.type) {
+    case SDL_KEYDOWN:
+        if (e.key.repeat) return true;
+        if (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
+            g_menu.stop_capture();
+            g_key_note = "Nothing changed.";
+            menu_paint();
+            return true;
+        }
+        input = e.key.keysym.scancode;
+        break;
+    case SDL_MOUSEBUTTONDOWN: input = mouse_input(e.button.button); break;
+    case SDL_MOUSEWHEEL: input = e.wheel.y > 0 ? keymap::kWheelUp : e.wheel.y < 0 ? keymap::kWheelDown : 0; break;
+    case SDL_CONTROLLERBUTTONDOWN:
+        g_menu.stop_capture();
+        g_key_note = "Nothing changed.";
+        menu_paint();
+        return true;
+    case SDL_KEYUP: case SDL_MOUSEBUTTONUP: case SDL_MOUSEMOTION: case SDL_CONTROLLERBUTTONUP: case SDL_CONTROLLERAXISMOTION: return true;
+    default: return false;
+    }
+    if (input == 0) return true;
+    std::vector<int> changed;
+    std::string message;
+    const int action = g_menu.key_row();
+    if (!keymap::assign_input(g_keys, action, input, changed, message)) {
+        g_key_note = message;  // (it stays waiting)
+    } else {
+        g_menu.stop_capture();
+        g_key_note = message;
+        write_key_lines(changed);
+        std::fprintf(stderr, "[menu] keys: %s\n", message.c_str());
+    }
+    menu_paint();
+    return true;
+}
+
 // what an entry does; step is -1 or 1 for left and right (Enter and a click go forward)
 void menu_command(quickmenu::Command c, int step) {
     using quickmenu::Command;
@@ -1005,11 +1079,21 @@ void menu_command(quickmenu::Command c, int step) {
         }
         g_scale_next = (g_scale_next - 1 + step + 3) % 3 + 1;
         g_keys.scale = g_scale_next;
-        rewrite_keys_file(keymap::with_scale, g_scale_next, "resolution");
+        rewrite_keys_file([](const std::string &t) { return keymap::with_scale(t, g_scale_next); }, "resolution");
         set_notice("Resolution " + std::to_string(g_scale_next) + "x" + (g_scale_next == g_scale_now ? "" : ": used when the game starts the next time"));
         std::fprintf(stderr, "[menu] resolution %dx for the next start (this run: %dx)\n", g_scale_next, g_scale_now);
         break;
     case Command::fullscreen: toggle_fullscreen(); break;
+    case Command::change_keys: g_key_note.clear(); break;  // (the menu has switched to its keys page)
+    case Command::key_edit: g_key_note.clear(); break;     // (the highlighted line waits for a key now)
+    case Command::key_defaults: {
+        std::vector<int> changed;
+        keymap::restore_default_inputs(g_keys, changed);
+        write_key_lines(changed);
+        g_key_note = changed.empty() ? "These are the default keys already." : "The default keys are back.";
+        std::fprintf(stderr, "[menu] the default keys are back (%zu button%s changed)\n", changed.size(), changed.size() == 1 ? "" : "s");
+        break;
+    }
     case Command::keys:
         // the menu stays open behind the card (the game keeps holding); the card's own buttons close it when they save or load
         show_key_card("Keys in the quick menu");
@@ -1068,6 +1152,12 @@ bool menu_event(const SDL_Event &e) {
         g_menu.move(step);
         menu_paint();
     };
+    // Esc, Circle, the right mouse button: one page back on the keys page, else the menu closes
+    const auto back = [](const char *why) {
+        if (g_menu.back()) menu_paint();
+        else close_menu(why);
+    };
+    if (g_menu.capturing()) return capture_event(e);
     switch (e.type) {
     case SDL_KEYDOWN: {
         const SDL_Scancode k = e.key.keysym.scancode;
@@ -1084,7 +1174,7 @@ bool menu_event(const SDL_Event &e) {
             if (!e.key.repeat) menu_command(g_menu.choose(), 1);
             break;
         case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_BACKSPACE:
-            if (!e.key.repeat) close_menu(k == SDL_SCANCODE_ESCAPE ? "Esc" : "Backspace");
+            if (!e.key.repeat) back(k == SDL_SCANCODE_ESCAPE ? "Esc" : "Backspace");
             break;
         // the program's keys keep working; those that need the game running close the menu first
         case SDL_SCANCODE_F2: if (!e.key.repeat) menu_command(Command::look, 1); break;
@@ -1111,7 +1201,7 @@ bool menu_event(const SDL_Event &e) {
         case SDL_CONTROLLER_BUTTON_DPAD_LEFT: side(-1); break;
         case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: side(1); break;
         case SDL_CONTROLLER_BUTTON_A: menu_command(g_menu.choose(), 1); break;  // Cross (the bottom button)
-        case SDL_CONTROLLER_BUTTON_B: close_menu("Circle"); break;              // Circle (the right one)
+        case SDL_CONTROLLER_BUTTON_B: back("Circle"); break;              // Circle (the right one)
         case SDL_CONTROLLER_BUTTON_GUIDE: close_menu("the Guide button"); break;
         case SDL_CONTROLLER_BUTTON_START: close_menu("Start"); break;
         default: break;
@@ -1132,7 +1222,7 @@ bool menu_event(const SDL_Event &e) {
         return true;
     case SDL_MOUSEBUTTONDOWN:
         if (e.button.button == SDL_BUTTON_LEFT && menu_pointer_select()) menu_command(g_menu.choose(), 1);
-        else if (e.button.button == SDL_BUTTON_RIGHT) close_menu("the right mouse button");
+        else if (e.button.button == SDL_BUTTON_RIGHT) back("the right mouse button");
         return true;
     case SDL_MOUSEBUTTONUP: return true;
     case SDL_MOUSEWHEEL:

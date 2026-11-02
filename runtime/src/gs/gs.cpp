@@ -70,6 +70,34 @@ std::uint32_t display_height(std::uint64_t disp, std::uint64_t smode2) {
     if ((smode2 & 3u) == 1u && h > 576) h /= 2;
     return h;
 }
+// The two read circuits of the display (PMODE bits EN1 and EN2). With both on, the picture is circuit 2's, and circuit 1 shows over its own
+// rectangle of it, blended by PMODE's fixed alpha ALP (MMOD set, bits 8-15). Devil May Cry shows its typed message windows this way: a
+// 512x32 strip with the text sits at the end of video memory, circuit 1 puts it at the bottom of the picture, ALP is 0xFF (all of circuit 1),
+// and nothing else of the picture shows the text. Positions come from DISPLAY1/DISPLAY2 (DX, DY: where the rectangle starts, in video
+// clocks and lines, so the offset between the two is the offset in the picture).
+// Only that case is merged: ALP 0xFF, SLBG clear (circuit 2 is the base, not the background colour), the same magnification. Other
+// blends stay as they were, circuit 2 alone. In particular God of War and Resident Evil 4 turn both circuits on with ALP 0x80 and
+// the same picture one line apart: the hardware's anti-flicker filter, a blur that emulators usually leave out as well.
+// Source: the PMODE and DISPLAYx register descriptions of the GS user's manual, and what Devil May Cry shows.
+DisplayOverlay display_overlay(std::uint64_t pmode, std::uint64_t smode2, std::uint64_t fb1, std::uint64_t disp1, std::uint64_t disp2) {
+    DisplayOverlay o;
+    if ((pmode & 3u) != 3u || !(pmode & 0x20u) || (pmode & 0x80u) || ((pmode >> 8) & 0xFFu) != 0xFFu) return o;
+    const std::uint32_t magh1 = (static_cast<std::uint32_t>(disp1 >> 23) & 0xFu) + 1, magh2 = (static_cast<std::uint32_t>(disp2 >> 23) & 0xFu) + 1;
+    const std::uint32_t magv1 = (static_cast<std::uint32_t>(disp1 >> 27) & 3u) + 1, magv2 = (static_cast<std::uint32_t>(disp2 >> 27) & 3u) + 1;
+    if (magh1 != magh2 || magv1 != magv2) return o;
+    o.width = ((static_cast<std::uint32_t>(disp1 >> 32) & 0xFFFu) + 1) / magh1;
+    o.height = display_height(disp1, smode2);
+    if (!o.width || !o.height || o.width > 2048 || o.height > 2048) return o;
+    o.x = (static_cast<std::int32_t>(disp1 & 0xFFFu) - static_cast<std::int32_t>(disp2 & 0xFFFu)) / static_cast<std::int32_t>(magh2);
+    o.y = (static_cast<std::int32_t>((disp1 >> 12) & 0x7FFu) - static_cast<std::int32_t>((disp2 >> 12) & 0x7FFu)) / static_cast<std::int32_t>(magv2);
+    o.fbp = (static_cast<std::uint32_t>(fb1) & 0x1FFu) * 32;
+    o.fbw = static_cast<std::uint32_t>(fb1 >> 9) & 0x3Fu;
+    o.psm = static_cast<std::uint32_t>(fb1 >> 15) & 0x1Fu;
+    o.dbx = static_cast<std::uint32_t>(fb1 >> 32) & 0x7FFu;
+    o.dby = static_cast<std::uint32_t>(fb1 >> 43) & 0x7FFu;
+    o.active = true;
+    return o;
+}
 std::uint64_t g_writes[128];
 std::vector<std::uint32_t> g_gpu_frame;
 bool g_odd_field = false;
@@ -1090,7 +1118,7 @@ bool present(const DisplayRegs &r) {
     const std::uint32_t width = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, height = display_height(disp, r.smode2);
     if (!width || !height || width > 2048 || height > 2048) return true;
     const gpu::DisplaySource src{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu, static_cast<std::uint32_t>(fb >> 15) & 0x1Fu,
-                                 static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, width, height, (r.smode2 & 3u) == 3u};
+                                 static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, width, height, (r.smode2 & 3u) == 3u, display_overlay(r.pmode, r.smode2, r.dispfb[0], r.display[0], r.display[1])};
     return gpu::present(src);
 #else
     return false;
@@ -1114,7 +1142,7 @@ bool display(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uint32
     const bool halved = (r.smode2 & 3u) == 3u;
 #ifdef PS2_GPU
     if (gpu_on()) {
-        const gpu::DisplaySource src{fbp * 32, fbw, psm, dbx, dby, width, height, halved};
+        const gpu::DisplaySource src{fbp * 32, fbw, psm, dbx, dby, width, height, halved, display_overlay(r.pmode, r.smode2, r.dispfb[0], r.display[0], r.display[1])};
         if (!cpu_raster()) return gpu::display(src, rgba, width, height);
         static const bool compare = std::getenv("PS2_GS_COMPARE") != nullptr;
         std::uint32_t gw = 0, gh = 0;
@@ -1129,6 +1157,20 @@ bool display(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uint32
                 c = ((c & 0x1Fu) << 3) | ((c & 0x3E0u) << 6) | ((c & 0x7C00u) << 9) | 0xFF000000u;
             rgba[static_cast<std::size_t>(y) * width + x] = c | 0xFF000000u;
         }
+    if (const DisplayOverlay o = display_overlay(r.pmode, r.smode2, r.dispfb[0], r.display[0], r.display[1]); o.active) {
+        const std::uint32_t ofbp = o.fbp, ofbw = o.fbw, opsm = o.psm;
+        for (std::uint32_t y = 0; y < o.height; ++y) {
+            const std::int32_t py = o.y + static_cast<std::int32_t>(y);
+            if (py < 0 || py >= static_cast<std::int32_t>(height)) continue;
+            for (std::uint32_t x = 0; x < o.width; ++x) {
+                const std::int32_t px = o.x + static_cast<std::int32_t>(x);
+                if (px < 0 || px >= static_cast<std::int32_t>(width)) continue;
+                std::uint32_t c = read_pixel(opsm, ofbp, ofbw, o.dbx + x, o.dby + (halved ? y / 2 : y));
+                if (opsm == PSMCT16 || opsm == PSMCT16S) c = ((c & 0x1Fu) << 3) | ((c & 0x3E0u) << 6) | ((c & 0x7C00u) << 9);
+                rgba[static_cast<std::size_t>(py) * width + static_cast<std::uint32_t>(px)] = c | 0xFF000000u;
+            }
+        }
+    }
 #ifdef PS2_GPU
     if (!g_gpu_frame.empty() && g_gpu_frame.size() == rgba.size()) {
         std::size_t differ = 0;
@@ -1161,7 +1203,7 @@ bool copy_frame(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uin
         const std::uint32_t w = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, h = display_height(disp, r.smode2);
         if (!w || !h || w > 2048 || h > 2048) return false;
         const gpu::DisplaySource src{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu, static_cast<std::uint32_t>(fb >> 15) & 0x1Fu,
-                                     static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, w, h, (r.smode2 & 3u) == 3u};
+                                     static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, w, h, (r.smode2 & 3u) == 3u, display_overlay(r.pmode, r.smode2, r.dispfb[0], r.display[0], r.display[1])};
         got = gpu::display_async(src, rgba, width, height);
     } else
 #endif

@@ -1,14 +1,17 @@
 # ps2-native-recomp
 
-Turns the disc image of a PS2 game you own into a native program for Windows or Linux. **This project is at an early
-stage** and still changes a lot. God of War II has been played from start to end on Windows; a few more games run as far
-as they have been played.
+Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 19 games work as far as they
+have been tested, 13 of them out of the box, with zero game-specific code. God of War II has been played from start to
+end. **This project is at an early stage** and still changes a lot.
+
+Built on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri (MIT).
 
 https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
 
-**13 games ran with no extra work at all:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
+**13 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
 Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
-Western, Thunder Force VI, Raiden III and Heavenly Guardian. *No extra work* means nobody changed anything for these games: the
+Western, Thunder Force VI, Raiden III and Heavenly Guardian. *Out of the box* means nobody changed anything for these games: the
 tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)).
 
 **The goal is a universal tool:** any PS2 game, recompiled the same way, with no work for each game. When a game doesn't run
@@ -34,7 +37,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. More than 15
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 18
 other games play well as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a

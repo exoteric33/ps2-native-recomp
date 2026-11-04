@@ -388,7 +388,8 @@ private:
     std::map<std::uint32_t, unsigned> vi_def_;
     std::map<std::uint32_t, int> delay_;
     StallPlan plan_;
-    std::set<std::uint32_t> keep_bk_, set_bi_;
+    std::map<std::uint32_t, unsigned> keep_bk_;
+    std::set<std::uint32_t> set_bi_;
     int delay_mode_ = 0;
     unsigned delay_reg_ = 0;
     bool any_status_ = false, any_flags_ = false;
@@ -1732,8 +1733,8 @@ void Translator::instruction(std::uint32_t pc, std::uint32_t following) {
     }
     upper_pre(u, flags_live);
     const unsigned def = vi_def_[pc];
-    if (keep_bk_.count(pc)) {
-        vi(def);
+    if (const auto kb = keep_bk_.find(pc); kb != keep_bk_.end()) {
+        vi(kb->second);
         c_.set(kBkNext);
     }
     const auto delay = delay_.find(pc);
@@ -1934,9 +1935,29 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
         if (!hit) continue;
         const bool dynamic = case_of_.count(pc) != 0;
         delay_[pc] = dynamic ? 2 : 1;
-        for (std::uint32_t p : preds[pc]) {
-            if (vi_def_[p]) keep_bk_.insert(p);
-            if (dynamic) set_bi_.insert(p);
+        for (std::uint32_t p0 : preds[pc]) {
+            const unsigned reg = vi_def_[p0];
+            if (dynamic) set_bi_.insert(p0);
+            if (!reg || !((reads >> reg) & 1u)) continue;
+            auto walk = [&](auto &self, std::uint32_t u, int depth) -> void {
+                bool extended = false;
+                if (depth < 3) {
+                    for (std::uint32_t pred : preds[u]) {
+                        if (vi_def_[pred] == reg) {
+                            extended = true;
+                            self(self, pred, depth + 1);
+                        }
+                    }
+                }
+                if (extended) {
+                    for (std::uint32_t pred : preds[u]) {
+                        if (vi_def_[pred] != reg) keep_bk_[pred] = reg;
+                    }
+                } else {
+                    keep_bk_[u] = reg;
+                }
+            };
+            walk(walk, p0, 0);
         }
     }
 

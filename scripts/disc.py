@@ -57,7 +57,12 @@ class Image:
 
     def files(self):
         for layer in self.layers:
-            yield from self.walk(layer, layer.root[0], layer.root[1], '', 0, set())
+            lba, size = layer.root
+            if size < 34:
+                sec = self.read(layer.base + lba, 1)
+                if len(sec) >= 34 and sec[0] >= 34 and struct.unpack_from('<I', sec, 2)[0] == lba:
+                    size = struct.unpack_from('<I', sec, 10)[0]
+            yield from self.walk(layer, lba, size, '', 0, set())
 
     def walk(self, layer, lba, size, prefix, depth, seen):
         # A damaged or crafted image: a directory that points back at a parent is walked once, one that is too deep, too large or

@@ -8,6 +8,7 @@ No game data or GPU is needed. All generated files live in a temporary directory
 import argparse
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -77,8 +78,42 @@ def main():
         assert 'loaded 1 translated code windows' in shared and 'switched in after' not in shared, shared
         replay = run([sys.executable, ROOT / 'scripts/replay.py', recording, '--exe', exe, '--disc', iso], cwd=cwd, env=env)
         assert 'RESULT: same to the end' in replay, replay
+        # A portable runner and an image outside the game folder must still use the game's caches and build inputs.
+        game = work / 'game folder ü'
+        portable = work / 'portable' / exe.name
+        portable.parent.mkdir()
+        shutil.copy2(exe, portable)
+        (game / 'vu1').mkdir(parents=True)
+        (game / 'overlays').mkdir()
+        (game / 'entries.txt').write_text('')
+        env.update(PS2_EE_LIVE='1', PS2_VU_LIVE='1')
+        game_recording = work / 'game-dir.inputs'
+        selected = run([portable, '--disc', iso, '--game-dir', game, '--frames', '30', '--record', game_recording], cwd=cwd, env=env)
+        assert 'stopped after 30 frames' in selected and 'switched in after' in selected, selected
+        assert str(game / 'ee-live') in selected and str(game / 'vu1-live') in selected, selected
+        assert list((game / 'ee-live').glob('*.*')), 'EE cache was not written in the game folder'
+        assert (game / 'entries.txt').read_text().strip(), 'live entries were not added to the game folder'
+        assert list((game / 'overlays').glob('*.bin')), 'live overlay was not captured in the game folder'
+        assert f'game-dir {game}\n' in game_recording.read_text(), game_recording.read_text()
+        selected_replay = run([sys.executable, ROOT / 'scripts/replay.py', game_recording, '--exe', portable,
+                              '--disc', iso, '--log', work / 'game-replay.log'], cwd=cwd, env=env)
+        assert 'RESULT: same to the end' in selected_replay, selected_replay
+        assert 'loaded 1 translated code windows' in (work / 'game-replay.log').read_text(), selected_replay
+        legacy = cwd / 'separate program.elf'
+        legacy.write_bytes(data)
+        legacy_run = run([portable, legacy, '--disc', iso, '--game-dir', game, '--frames', '30'], cwd=cwd, env=env)
+        assert 'loaded 1 translated code windows' in legacy_run and 'switched in after' not in legacy_run, legacy_run
+        legacy.unlink()
+        env.update(PS2_EE_LIVE=str(work / 'external-cache'), PS2_VU_LIVE=str(work / 'override-vu-cache'))
+        overrides = run([portable, '--disc', iso, '--game-dir', game, '--frames', '30'], cwd=cwd, env=env)
+        assert str(work / 'external-cache') in overrides and str(work / 'override-vu-cache') in overrides, overrides
+        assert not (work / 'ee-live').exists() and not (work / 'vu1-live').exists(), 'cache leaked into the ISO folder'
+        assert not (cwd / 'ee-live').exists() and not (cwd / 'vu1-live').exists(), 'cache leaked into the working folder'
+        invalid = run([exe, '--disc', iso, '--game-dir', work / 'missing', '--frames', '30'], expected=1, cwd=cwd, env=env)
+        assert 'not a directory' in invalid, invalid
+        run([exe, '--disc', iso, '--game-dir', iso, '--frames', '30'], expected=1, cwd=cwd, env=env)
         run([exe, '--frames', '30'], expected=2, cwd=cwd, env=env)
-    print('ISO boot: legacy ELF, absent-ELF boot, live analysis, warm/shared cache and replay passed')
+    print('ISO boot: legacy ELF, absent-ELF boot, live analysis, warm/shared cache, game directory and replay passed')
 
 
 if __name__ == '__main__':

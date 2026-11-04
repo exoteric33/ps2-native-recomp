@@ -265,6 +265,7 @@ if [ "$elf" = "$game/disc/$program" ]; then
 else
   play=$(printf '%q %q --disc %q --window' "build/native-$name/ps2run" "${elf#$ROOT/}" "${iso#$ROOT/}")
 fi
+play="$play --game-dir $(printf '%q' "games/$name")"
 [ ${#wide[@]} -eq 0 ] || play="$play --widescreen"
 [ ${#patches[@]} -eq 0 ] || play="$play --patches $(printf '%q' "games/$name/patches.txt")"
 echo "Play it natively:  $play"

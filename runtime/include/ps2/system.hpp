@@ -65,8 +65,9 @@ struct Options {
     // for the keys of a window run (F5, F8, F9; docs/play-keys.md)
     bool disc_program = false;                            // boots from SYSTEM.CNF in --disc; also written to input recordings
     std::string program_path;                                  // the game's program, set by the host
+    std::string game_dir;                                      // --game-dir or the game folder found by the host; caches and build inputs
     std::string command_line;                                  // what the runner was started with, for reports
-    std::string quick_dir;                                     // --quick-dir; default: the folder of the memory card, else of the program
+    std::string quick_dir;                                     // --quick-dir; default: memory card folder, game folder, then program folder
     std::function<std::string(std::size_t lines)> recent_log;  // the host's copy of the log: its last lines ...
     std::function<std::string(std::size_t lines)> first_log;   // ... and its first lines
     std::function<void()> on_exit;                             // the window run is about to end the process

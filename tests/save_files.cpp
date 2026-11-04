@@ -241,6 +241,21 @@ void file_cases() {
     check(!fs::exists(dir / "state.p2s.tmp"), "normal write: no temporary file is left");
 }
 
+void game_folders() {
+    auto &options = ps2::g_options;
+    const fs::path base = fs::absolute(g_work).lexically_normal();
+    const auto folder = [] { return ps2::os::path(ps2::quick_folder("states")); };
+    options.program_path = ps2::os::utf8(base / "disc" / "BOOT.ELF");
+    check(folder() == base / "disc" / "states", "without a game folder: states stay beside the program");
+    options.game_dir = ps2::os::utf8(base / "game");
+    check(folder() == base / "game" / "states", "game folder: states go there instead of beside the program");
+    options.memcard_path = ps2::os::utf8(base / "card" / "play.ps2");
+    check(folder() == base / "card" / "states", "memory card folder overrides the game folder for user files");
+    options.quick_dir = ps2::os::utf8(base / "quick");
+    check(folder() == base / "quick" / "states", "quick directory overrides both memory card and game folder");
+    options = {};
+}
+
 }
 
 int main(int argc, char **argv) {
@@ -254,6 +269,7 @@ int main(int argc, char **argv) {
     std::error_code error;
     fs::remove_all(g_work, error);
     fs::create_directories(g_work);
+    game_folders();
     card_cases();
     file_cases();
     std::printf("save files: %d of %d checks passed, %d failed\n", checks - failed, checks, failed);

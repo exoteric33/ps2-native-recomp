@@ -100,6 +100,7 @@ def main():
     ap.add_argument("recording", help="a quick save (.state) or a recording (.inputs)")
     ap.add_argument("--state", help="the state to start from, when it is not next to the recording")
     ap.add_argument("--game", help="game folder name under games/ (default: guessed from the program path)")
+    ap.add_argument("--game-dir", type=Path, help="game folder for caches and build inputs (default: from the recording)")
     ap.add_argument("--program", help="the game's program (default: from the recording)")
     ap.add_argument("--disc", help="the disc image (default: from the recording)")
     ap.add_argument("--exe", help="ps2run (default: build/native-<game>/ps2run)")
@@ -115,9 +116,22 @@ def main():
     inputs, state, head = find_inputs_and_state(args.recording, args.state)
     program_text = args.program or head.get("program", "")
     game = args.game
+    game_dir = args.game_dir
+    if game_dir is None:
+        recorded_dir = head.get("game-dir", "")
+        candidates = [ROOT / "games" / game] if game else []
+        if recorded_dir:
+            candidates += [Path(recorded_dir), ROOT / recorded_dir]
+        game_dir = next((p.resolve() for p in candidates if p.is_dir()), None)
+    elif not game_dir.is_dir():
+        sys.exit(f"replay: game folder is not a directory: {game_dir}")
+    else:
+        game_dir = game_dir.resolve()
     if not game:
         m = re.search(r"(?:games|program)[/\\]([^/\\]+)[/\\]", program_text)  # games\gow2\disc\... (the repo) or program\gow2\... (a game folder made for a player)
         game = m.group(1) if m else None
+        if not game and game_dir and game_dir.parent.name == "games":
+            game = game_dir.name
     disc_boot = not args.program and head.get("disc-program") == "1"
     program = None if disc_boot else (Path(args.program) if args.program else resolve(program_text, game, "program"))
     disc = Path(args.disc) if args.disc else resolve(head.get("disc", ""), game, "disc")
@@ -136,6 +150,8 @@ def main():
     work = Path(tempfile.mkdtemp(prefix="replay_"))
     try:
         cmd = [str(exe), *([] if disc_boot else [str(program)]), "--disc", str(disc), "--replay", str(inputs), "--quick-dir", str(work)]
+        if game_dir:
+            cmd += ["--game-dir", str(game_dir)]
         if args.go_on:
             cmd += ["--replay-continue"]
         if args.rtc:

@@ -478,16 +478,36 @@ void xgkick(Unit &u, std::uint32_t address) {
 // flag reading instruction (FMAND, FCAND...) writing the register does not
 // delay it. PCSX2 calls this the branch VI delay.
 struct BranchView {
-    std::uint16_t before[16] = {};
-    bool live = false;
+    struct Step {
+        std::uint16_t before[16] = {};
+        std::uint8_t def = 0;
+    };
+    Step hist[4] = {};
+    std::uint16_t view[16] = {};
 
     // Before an instruction runs: what its branch, if it is one, reads.
-    void arm(Unit &u) const { u.branch_vi = live ? before : nullptr; }
+    void arm(Unit &u, const Vu0Regs &r) {
+        const unsigned reg = hist[0].def;
+        if (reg == 0 || (reg & 0x80u)) {
+            u.branch_vi = nullptr;
+            return;
+        }
+        unsigned j = 0;
+        for (unsigned i = 0; i < 4; ++i) {
+            if (hist[i].def == reg) j = i;
+            else break;
+        }
+        std::memcpy(view, r.vi, sizeof view);
+        view[reg] = hist[j].before[reg];
+        u.branch_vi = view;
+    }
     // Keep the registers as they are before this instruction for the next one.
     void snapshot(const Vu0Regs &r, std::uint16_t (&now)[16]) const { std::memcpy(now, r.vi, sizeof now); }
-    void commit(const std::uint16_t (&was)[16], std::uint32_t lo, bool lower_ran) {
-        std::memcpy(before, was, sizeof before);
-        live = lower_ran && !branch_delay_exempt(lo);
+    void commit(const std::uint16_t (&was)[16], std::uint32_t lo, std::uint32_t hi) {
+        for (int i = 3; i > 0; --i) hist[i] = hist[i - 1];
+        std::memcpy(hist[0].before, was, sizeof hist[0].before);
+        const unsigned reg = vi_written_reg(lo, hi);
+        hist[0].def = static_cast<std::uint8_t>(reg == 0 ? 0 : branch_delay_exempt(lo) ? (0x80u | reg) : reg);
     }
 };
 
@@ -1112,7 +1132,7 @@ void run_fast(int n, std::uint32_t address) {
         fast_upper(r, d, out);
         std::uint16_t was[16];
         view.snapshot(r, was);
-        view.arm(u);
+        view.arm(u, r);
         if (hi & 0x80000000u) {
             r.i = lo;
         } else {
@@ -1123,7 +1143,7 @@ void run_fast(int n, std::uint32_t address) {
             if (branch && record_jumps && n == 1 && ((lo >> 25) == 0x24u || (lo >> 25) == 0x25u)) lookup(target);
         }
         u.branch_vi = nullptr;
-        view.commit(was, lo, !(hi & 0x80000000u));
+        view.commit(was, lo, hi);
         if (out.target > 0) {
             Reg128 &dst = out.target == kAcc ? r.acc : r.vf[out.target];
             for (int i = 0; i < 4; ++i)
@@ -1211,7 +1231,7 @@ void run(int n, std::uint32_t address) {
         bool branch = false;
         std::uint16_t was[16];
         view.snapshot(r, was);
-        view.arm(u);
+        view.arm(u, r);
         if (hi & 0x80000000u) {
             r.i = lo;
         } else {
@@ -1220,7 +1240,7 @@ void run(int n, std::uint32_t address) {
             if (branch) npc = target;
         }
         u.branch_vi = nullptr;
-        view.commit(was, lo, !(hi & 0x80000000u));
+        view.commit(was, lo, hi);
         commit(r, out);
         if (out.target >= 0 && out.flags) pipe.set_mac(r.mac, r.status);
         if (out.has_clip) {

@@ -110,6 +110,19 @@ inline std::vector<Case> cases() {
     c.push_back({"MAXi keeps a denormal operand", finish({L3, M, kNop, T}), 0, 2, 3, true});
     const Pair N = {kLnop, fmac(0x1F, 15, 3, 0, 0)};
     c.push_back({"MINIi keeps a denormal operand (vf0.x = 0 against 3: the smaller is 0)", finish({L3, N, kNop, T}), 0, 2, 0, true});
+    // Champions of Norrath: 4-instruction SQI (vi2++) write chain before IBNE vi3, vi2 reads vi2 from 4 cycles back (4*k - 1 == 251).
+    const std::vector<Pair> sqi4 = {
+        {0x10010040u, kUnop},
+        {0x10020000u, kUnop},
+        {0x100310FBu, kUnop},
+        {0x81E20B7Du, kUnop},
+        {0x81E2137Du, kUnop},
+        {0x81E21B7Du, kUnop},
+        {0x52021FFCu, kUnop},
+        {0x81E2237Du, kUnop},
+        kNop,
+    };
+    c.push_back({"Champions of Norrath: 4-cycle SQI (vi2++) chain before IBNE", finish(sqi4), 0, 2, 256, true});
     return c;
 }
 

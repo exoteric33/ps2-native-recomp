@@ -552,8 +552,8 @@ std::string generate(const Program &p, std::string &name) {
         for (std::int64_t s : successors(pc))
             if (s >= 0 && in.count(static_cast<std::uint32_t>(s))) preds[static_cast<std::uint32_t>(s)].push_back(pc);
     }
-    std::map<std::uint32_t, int> delay;
-    std::set<std::uint32_t> keep_bk, set_bi;
+    std::map<std::uint32_t, int> delay, keep_bk;
+    std::set<std::uint32_t> set_bi;
     for (std::uint32_t pc : pcs) {
         if (!lowers[pc].branch) continue;
         const std::uint32_t lo = word(p.code, pc), op = lo >> 25, it = (lo >> 16) & 15u, is = (lo >> 11) & 15u;
@@ -566,9 +566,29 @@ std::string generate(const Program &p, std::string &name) {
         if (!hit) continue;
         const bool dynamic = pc == (p.entry & kMask) || targets.count(pc) || !in.count((pc - 8u) & kMask);
         delay[pc] = dynamic ? 2 : 1;
-        for (std::uint32_t q : preds[pc]) {
-            if (def[q] > 0) keep_bk.insert(q);
-            if (dynamic) set_bi.insert(q);
+        for (std::uint32_t q0 : preds[pc]) {
+            const int reg = def[q0];
+            if (dynamic) set_bi.insert(q0);
+            if (reg <= 0 || !((reads >> reg) & 1u)) continue;
+            auto walk = [&](auto &self, std::uint32_t u, int depth) -> void {
+                bool extended = false;
+                if (depth < 3) {
+                    for (std::uint32_t pred : preds[u]) {
+                        if (def[pred] == reg) {
+                            extended = true;
+                            self(self, pred, depth + 1);
+                        }
+                    }
+                }
+                if (extended) {
+                    for (std::uint32_t pred : preds[u]) {
+                        if (def[pred] != reg) keep_bk[pred] = reg;
+                    }
+                } else {
+                    keep_bk[u] = reg;
+                }
+            };
+            walk(walk, q0, 0);
         }
     }
     std::set<int> shadowed;
@@ -600,7 +620,7 @@ std::string generate(const Program &p, std::string &name) {
         const Upper u = upper(hi, any_status ? true : (any_flags && out_live));
         const Lower &l = lowers[pc];
         std::string body;
-        if (keep_bk.count(pc)) body += std::format("next_bk = r.vi[{}]; ", def[pc]);
+        if (const auto kb = keep_bk.find(pc); kb != keep_bk.end()) body += std::format("next_bk = r.vi[{}]; ", kb->second);
         body += u.pre;
         std::string lcode = l.code;
         if (const auto d = delay.find(pc); d != delay.end()) {
@@ -670,7 +690,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp).
-const char *const kGeneratorVersion = "vurecomp 2";
+const char *const kGeneratorVersion = "vurecomp 3";
 
 Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
     std::vector<Program> programs;

@@ -45,12 +45,37 @@ struct LiveHost {
 };
 
 inline std::uint32_t lower_major(std::uint32_t lo) { return lo >> 25; }
-// Flag reads bypass the one-instruction VI delay seen by branch operands.
+// Flag reads, ILW/ILWR, and XTOP/XITOP bypass the VI delay seen by branch operands.
 inline bool branch_delay_exempt(std::uint32_t lo) {
-    switch (lower_major(lo)) {
+    const std::uint32_t op = lower_major(lo);
+    if (op == 0x40 && (lo & 0x3Cu) == 0x3Cu) {
+        const unsigned index = ((lo >> 6) & 31u) * 4u + (lo & 3u);
+        return index == 0x3E || index == 0x68 || index == 0x69;
+    }
+    switch (op) {
     case 0x04:  // ILW does not incur branch VI delay
     case 0x10: case 0x12: case 0x13: case 0x14: case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1B: case 0x1C: case 0x21: case 0x25: return true;
     default: return false;
+    }
+}
+inline unsigned vi_written_reg(std::uint32_t lo, std::uint32_t hi) {
+    if (hi & 0x80000000u) return 0;
+    const unsigned dest = (lo >> 21) & 15u, it = (lo >> 16) & 15u, is = (lo >> 11) & 15u, id = (lo >> 6) & 15u;
+    if ((lo >> 25) == 0x40u) {
+        const unsigned funct = lo & 63u;
+        if (funct < 0x3C) return funct == 0x32 ? it : (funct == 0x30 || funct == 0x31 || funct == 0x34 || funct == 0x35) ? id : 0;
+        switch (((lo >> 6) & 31u) * 4u + (funct & 3u)) {
+        case 0x34: case 0x36: return is;
+        case 0x35: case 0x37: case 0x3C: case 0x68: case 0x69: return it;
+        case 0x3E: return dest ? it : 0;
+        default: return 0;
+        }
+    }
+    switch (lo >> 25) {
+    case 0x04: return dest ? it : 0;
+    case 0x08: case 0x09: case 0x10: case 0x12: case 0x13: case 0x14: case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1B: case 0x1C: case 0x21: case 0x25: return it;
+    case 0x11: case 0x15: case 0x19: return 1u;
+    default: return 0;
     }
 }
 inline bool is_branch(std::uint32_t lo) {

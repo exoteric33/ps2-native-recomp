@@ -5,6 +5,8 @@ main processor is translated to C++ and compiled, and the rest of the console is
 have been tested, 13 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
+**How it works, from the disc to the picture: [read the explanation](#how-it-works).**
+
 Built on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nuri (MIT).
 
 https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
@@ -12,7 +14,8 @@ https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
 **13 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
 Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
 Western, Thunder Force VI, Raiden III and Heavenly Guardian. *Out of the box* means nobody changed anything for these games: the
-tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)).
+tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)). Gran Turismo 4 needs one small build step that
+unpacks its program; the runtime has no code for it.
 
 **The goal is a universal tool:** any PS2 game, recompiled the same way, with no work for each game. When a game doesn't run
 yet, the fix goes into the tool, so it helps every game.
@@ -66,7 +69,7 @@ PCSX2 also runs far more games today and has many years of work behind it. If yo
 slowly, PCSX2 is the better choice for now.
 
 Under the hood, the rest of the console (graphics chip, vector units, sound, disc, controller, memory card) is rebuilt
-in a runtime that draws with WebGPU (wgpu-native, on Vulkan or Direct3D 12).
+in a runtime that draws with WebGPU (wgpu-native, on Vulkan or Direct3D 12). [How that works](#the-graphics-chip).
 
 ## Ideas for later
 
@@ -182,6 +185,190 @@ extracted files, generated C++, built game programs, screenshots, recordings or 
 programs are translations of the game's own code and belong to the game's owners: keep them on your own machine and do
 not share them. Please do not ask for disc images here. There is no decryption or copy-protection code in this repo
 (PS2 discs need none).
+
+## How it works
+
+This explains the idea and what happens to a game, without going through the code. The basic design comes from the original
+project, [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp): a translator plus a runtime, and the graphics chip as
+programs on the graphics card. Windows, translating during play and most of the compatibility work came later.
+
+### The idea
+
+A PS2 game is machine code for the console's processors. Here the code of the main processor is translated to C++ once,
+before you play, and an ordinary compiler turns it into an ordinary program.
+
+Only the main processor works that way. The game still expects a whole PS2 around it, so the program also carries a
+*runtime*: C++ code that behaves like the rest of the console. The translated game writes to the graphics chip, starts
+transfers and calls the system as it would on a PS2, and the runtime answers.
+
+```mermaid
+flowchart LR
+    subgraph once["Once per game: the build"]
+        disc["Your disc image"] --> tr["Translator: game code to C++"]
+        tr --> cc["C++ compiler"]
+        cc --> game["A program of its own"]
+        game -.->|"test runs find missed code"| tr
+    end
+    subgraph play["While you play"]
+        ee["Main processor: the translated game"] -->|"3D data"| vu["Vector units"]
+        vu -->|"shapes"| gs["Graphics chip: programs on your graphics card"]
+        ee <-->|"requests"| iop["Second processor: sound, disc, pads, memory card"]
+    end
+    game --> play
+```
+
+| Part of the PS2 | Its job | Here |
+|---|---|---|
+| Emotion Engine (EE), the main processor | runs the game | translated to C++ ahead of time |
+| Vector units (VU0, VU1) | small processors for 3D maths, running short programs | programs translated ahead of time where they are known, otherwise interpreted (read and run one instruction at a time) |
+| Graphics Synthesizer (GS) | draws shapes into its own 4 MiB of memory | compute programs on your graphics card |
+| IOP, the second processor | runs driver programs from the game's disc | interpreted |
+| SPU2 and IPU | the sound chip and the film decoder | rebuilt in C++ |
+| Kernel (the BIOS system services) | threads, interrupts, starting programs | rebuilt in C++; no BIOS image is used |
+| Disc, memory card, pads | | the disc image is read directly, the card is a file, the pads are your keyboard, mouse or controller |
+
+### Building a game
+
+1. **Find the program.** A small text file on the disc names the game's main program, and the build extracts it. Patches
+   such as widescreen are applied to it now, because a change to the code has to be in the translation. Gran Turismo 4 needs
+   one step written just for it: its program is packed on the disc and is unpacked first.
+2. **Find the code.** A program file mixes code and data. The translator starts where the program starts and follows every
+   jump and call. Then it looks for what that cannot reach: addresses the code builds, jump tables, and places that look like
+   the start of a function. A guess only counts if what is there decodes as code up to a return.
+3. **Test runs.** Some code is only reached through addresses the game computes while running. So the build runs the game
+   without a window for up to 3,600 frames (a minute of game time), pressing Start and Cross on a timer. When the game jumps
+   somewhere with no translation, the run stops and notes the address, and the build translates again. This repeats up to 8
+   times, until a run finds nothing new. The same runs record the programs the game sends to its vector units.
+4. **Compile.** The generated C++ and the runtime become one program. This is the part that takes several minutes.
+
+### How game code becomes C++
+
+The game's memory is cut into blocks of 16 KiB, and each block with code becomes one C++ function that can be entered at any
+place the game may jump to.
+
+- **Registers** are a structure in memory, 128 bits each. An instruction such as an addition becomes one line of C++ on that
+  structure, and the compiler optimises the rest.
+- **Memory.** The PS2's 32 MiB of RAM is one array, so a normal load or store is a plain array access. Any other address
+  (a chip's registers, say) takes a slower route that works out what it means.
+- **Delay slots.** On this processor the instruction after a branch still runs before the branch happens. The translator
+  moves it into the code of the branch.
+- **Calls.** A function call in the game is a C++ function call. Afterwards the caller checks that the game came back where
+  it expected. If it did not (a thread switch, say), the C++ calls unwind to a central loop that goes on at the right address.
+- **Floating point.** The PS2's rules differ from the PC's: no infinity, different rounding. The runtime does that maths with
+  integer arithmetic, so the bits come out the same.
+- **Time.** Every instruction counts as one cycle. At the end of a loop the code checks whether its slice of time is used up,
+  and if so the runtime does whatever is due.
+
+### Code the build did not see
+
+Games load more code from the disc while they run, sometimes different code into the same memory. No build can have seen
+all of it. When the game jumps to code that has no translation, it waits while this happens:
+
+1. The program copies that code out of memory and translates it, with the same translator as the build.
+2. A real C++ compiler turns the result into a small library. (So a C++ compiler must be on the PC; the app brings its own.)
+3. The library is loaded into the running program, and the game goes on.
+
+That wait is the pause you may see the first time you reach a new place. A larger piece of code is built quickly first,
+and a better version is built in the background and takes over. Because memory can change, each translated piece keeps a few
+of the original instructions and is only used while those still match what is in memory. Everything is kept on disk, so the
+same place does not pause again.
+
+### The kernel and the second processor
+
+There is no BIOS. The system services a game calls (threads, semaphores, interrupt handlers, alarms) are rebuilt in C++. A
+game thread is a saved set of registers, and one runs at a time, as on the console.
+
+The game does not talk to the sound chip, pads, memory cards or disc itself. It loads driver programs onto the second
+processor, the IOP, and sends them requests. Those drivers come from the game's disc and really run, on an interpreter,
+talking to rebuilt hardware. What they expect from the IOP's own system (threads, timers, files) is rebuilt in C++, and a few
+services such as disc reads and module loading are answered directly.
+
+### The vector units
+
+These two small processors do the 3D maths. VU1 takes the game's 3D data, transforms it and sends finished shapes to the
+graphics chip. Games upload the programs for them while running.
+
+The test runs record every program a game uploads, and each one is translated to C++ that uses the PC's SIMD instructions
+(one instruction working on several numbers). The console's exact rules for rounding and flags stay in, and how long an
+instruction has to wait for an earlier result is worked out at translation time, so nothing has to simulate that while the
+game runs. While playing, a program is recognised by a fingerprint of its code. If it is known, the compiled version runs.
+If not, the interpreter runs it, and an unknown VU1 program is compiled in the background and switched in.
+
+### The graphics chip
+
+This is where most of the time goes. The GS keeps pictures and textures in the same 4 MiB of memory, in a scrambled layout of
+its own (pixels are not stored row by row), and games rely on that: they draw into memory and then read the same memory as a
+texture. So here that memory is one big buffer on your graphics card, in the console's own layout, and all drawing is done by
+compute programs, general programs that run on the graphics card:
+
+1. Shapes are collected into batches.
+2. The screen is cut into tiles of 8 by 8 pixels, and each tile gets a list of the shapes that touch it, in drawing order.
+3. One thread per pixel walks its tile's list in order and does what the chip does for each shape that covers it: texture
+   lookup, alpha test, depth test, blending, writing the result.
+
+Each pixel is handled by one thread, so the order stays right without any locking. When a batch reads memory it also writes
+(glow and blur effects do this), it reads a copy made first.
+
+The picture you see is read from that memory by another compute program, which works like the console's display circuit, and
+is then scaled to your window. The picture styles (F2) only touch that last step. At twice the resolution each PS2 pixel is
+stored as 4 samples, at three times as 9. There is also a version of the same drawing in plain C++, used for checking and when
+no graphics API can be opened.
+
+The gain is exactness: the program controls every bit of memory and every step of the arithmetic. The cost is that every pixel
+goes through a general-purpose program, with the scrambled address worked out before each read and write. That is the main
+reason it is [slower than PCSX2](#not-faster-than-pcsx2-yet) today.
+
+### Keeping everything in time
+
+On a real PS2 all of this runs side by side. Here everything follows one clock, the main processor's 294.912 MHz, and a list
+of what is due next: the next TV picture, a timer, the end of a disc read. The game runs until the next event is due, then the
+runtime handles it. The IOP runs at 1/8 of that clock and catches up whenever it needs to, and the sound chip makes 48,000
+samples per second of game time.
+
+Your PC runs three main threads, joined by queues:
+
+- **The emulation thread:** the game, the kernel, the IOP and the sound chip.
+- **The vector-unit thread:** VU1 and its data.
+- **The window thread:** the graphics chip's work, the window, keyboard, mouse and controllers.
+
+The game may run up to two pictures ahead of the drawing. The sound device sets the pace: the game waits when more than about
+80 ms of sound is queued. Input is taken once per frame, so the same input gives the same game, however fast your PC is.
+
+### Sound and films
+
+The sound chip has two cores of 24 voices each. A voice decodes compressed samples and applies its volume curve and pitch, and
+the cores mix the voices and add reverb. If the game runs slower than real time, the sound would be chopped, so it is played
+slower at the same pitch instead, down to a fifth of its speed. At full speed it passes through untouched. Films use the
+console's MPEG-2 decoder, which is rebuilt too: the game sends it the stream and gets pictures back.
+
+### Saves and checks
+
+A quick save is the whole machine in one file: memory, registers, all the chips. The game's own saves go to a memory card file,
+which is written through a temporary file, so it is always a whole card.
+
+Every window run records the pad and, every 15 frames, a fingerprint of the machine. Playing that recording again without a
+window shows whether the game goes exactly the same way, and where it first differs. That, and comparing the whole machine and
+the pictures before and after a change, is how a fix is checked against games that already work. The free
+[ps2autotests](https://github.com/unknownbrackets/ps2autotests) programs give a second check: 54 of 55 print exactly what a real
+console prints. GitHub builds every change on Linux and macOS; Windows I build and test on my own PCs.
+
+### What it stands on
+
+Drawing goes through [wgpu-native](https://github.com/gfx-rs/wgpu-native) (WebGPU), which uses Direct3D 12 or Vulkan, and Metal
+on a Mac. SDL2 gives the window, the input and the sound device. On Windows it is built with llvm-mingw (clang) instead of Visual
+Studio, because the code uses clang's vector features and llvm-mingw is a plain zip that the app can download by itself. The app
+runs the same build steps as the command line.
+
+### What it does not do
+
+- **Speed.** It is slower than PCSX2 in every scene I measured, mostly because of the graphics chip's programs.
+- **Exact timing.** One cycle per instruction, with no caches and no memory delays. Transfers, vector programs and drawing take no
+  game time at all. A game that races two processors against each other or measures such things can go wrong.
+- **Exact pictures.** The drawing follows the chip's rules as far as they are known and tested, but wrong pictures happen.
+- **Faults.** There is no memory protection or fault handling like on the console. A game that depends on it does not work.
+- **Patches written into memory while the game runs** have no effect on translated code.
+- **Some hardware.** There is nothing yet for the network adapter, USB devices, a multitap, light guns or the camera.
+- **Most games** have not been tried. A game is only known to work if somebody played it (see [*What runs*](#what-runs)).
 
 ## Credits and license
 

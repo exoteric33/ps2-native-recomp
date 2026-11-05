@@ -706,7 +706,7 @@ if (-not $created) {
 # ---------------------------------------------------------------------------------------------------------------------
 # Child processes
 
-$State = @{ Build = $null; Image = ''; Name = ''; Game = $null; Playing = $null; Seq = 0; Patch = $null; Newest = ''; UpdateJob = $null; Batch = $null; Restarting = $false }
+$State = @{ Build = $null; Image = ''; Name = ''; Game = $null; Playing = $null; PlayStarted = [datetime]::MinValue; Seq = 0; Patch = $null; Newest = ''; UpdateJob = $null; Batch = $null; Restarting = $false }
 
 # PCSX2 patches of the chosen game (optional). Status: idle (not asked yet), working, found, none (the collection has no file for
 # this game) or error. Chosen holds the ticked section names; Items the tick boxes (Key = section name, S = what pnach.py says).
@@ -1237,10 +1237,39 @@ function Start-Game([string]$name) {
     $psi.WorkingDirectory = $play.Dir
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
+    $State.PlayStarted = Get-Date
     $State.Playing = [Diagnostics.Process]::Start($psi)
     $State.PlayingName = $name
     $playTimer.Start()
     $true
+}
+
+# The log file the game wrote in this run, or $null. The game writes it first thing into games\<name>\logs (next to its memory card),
+# or into %TEMP%\ps2run-logs when it cannot write there. A program that Windows could not even start (a missing DLL, a file that
+# does not fit this Windows) never gets that far and leaves none.
+function Find-GameLog([string]$name, [datetime]$since) {
+    $found = @()
+    foreach ($folder in (Get-GameFile $name 'logs'), (Join-Path ([IO.Path]::GetTempPath()) 'ps2run-logs')) {
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
+        $found += @(Get-ChildItem -LiteralPath $folder -Filter 'ps2run_*.log' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since.AddSeconds(-5) })
+    }
+    $found | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+
+# What the exit code of a program that stopped means, in words (the codes are Windows' own).
+function Get-ExitCodeText([int]$code) {
+    $hex = '{0:X8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes($code), 0)
+    $why = switch ($hex) {
+        'C0000135' { 'Windows could not find a file the game program needs (a .dll)' }
+        'C000007B' { 'a file of the game program does not fit this Windows (32 and 64 bit mixed)' }
+        'C0000142' { 'a file of the game program could not start' }
+        'C0000005' { 'the program used a wrong memory address' }
+        'C00000FD' { 'the program ran out of stack memory' }
+        'C0000409' { 'the program stopped itself after a failed check' }
+        '00000003' { 'the program stopped itself after a failed check' }
+        default { '' }
+    }
+    if ($why) { "code $hex, $why" } else { "code $hex" }
 }
 
 # While a game that this app started is open: when it ends, look again whether it recorded vector programs (Make it faster). A game
@@ -1255,7 +1284,15 @@ $playTimer.Add_Tick({
             $State.Playing = $null; $playTimer.Stop(); Update-FasterOffers
             if ($code -ne 0) {
                 $logs = Get-GameFile $State.PlayingName 'logs'
-                [void][Windows.Forms.MessageBox]::Show("The game '$($State.PlayingName)' stopped with an error. If it keeps happening, the newest file in this folder says what went wrong:`n$logs", $AppTitle, 'OK', 'Information')
+                $meaning = Get-ExitCodeText $code
+                $log = Find-GameLog $State.PlayingName $State.PlayStarted
+                Write-AppLog "the game '$($State.PlayingName)' ended with $meaning; log: $(if ($log) { $log.FullName } else { 'none was written' })"
+                if ($log) {
+                    [void][Windows.Forms.MessageBox]::Show("The game '$($State.PlayingName)' stopped with an error ($meaning). If it keeps happening, the newest file in this folder says what went wrong:`n$($log.DirectoryName)", $AppTitle, 'OK', 'Information')
+                } else {
+                    # no log of this run: the program did not get as far as writing one, so the folder above would be empty or hold old files
+                    [void][Windows.Forms.MessageBox]::Show("The game '$($State.PlayingName)' stopped with an error ($meaning) before it could write a log, so there is no new file in:`n$logs`nPlease send this message with your report (and the file games\app.log in the program folder).", $AppTitle, 'OK', 'Information')
+                }
             }
         }
     } catch { $playTimer.Stop(); Write-AppLog $_.Exception.ToString() }

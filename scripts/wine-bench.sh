@@ -17,12 +17,15 @@
 #       --timeout SECONDS   stop the run after that long (default 600)
 #       --label NAME        log file name tag (default: a time stamp)
 #       --threads           headless run with the three threads of a window run (PS2_THREADS=1)
+#       --exe FILE          run this ps2run.exe (an older build, say) in its own run folder run/<game>-<file name> instead of the built one
+#       --pthread-dll       also put libwinpthread-1.dll next to the program (only for an --exe that imports it; a tester's PC has none)
 #     The ps2run arguments after -- are added to the standard ones (`<elf> --disc <iso> --memcard <card>`), e.g.
 #     `-- --frames 900 --press 360:start`. The log is tools/wine-bench/run/<game>/logs/<label>.log, its last line is
 #     "[bench] exit code N" (Windows codes: 0xC00000FD = stack overflow).
 #
 # Test aids passed through to ps2run.exe: PS2_STACK_REPORT=1 (stack use at the end, meaningless under Wine: it commits whole stacks),
-# PS2_STACK_EAT_KB=<n> (the emulation thread starts with n KB of its stack used: shows what a deeper game does with a 1 MB stack).
+# PS2_STACK_EAT_KB=<n> (the emulation thread starts with n KB of its stack used: shows what a deeper game does with a 1 MB stack),
+# PS2_CRASH_TEST=<where>:<what> (fail on purpose: start|main|emu|tee : access|stack|abort|throw|param; docs/nolog.md).
 # Environment: PS2_BENCH_PREFIX (Wine prefix), PS2_BENCH_WS (Hyprland workspace the window of --window is moved to, default 9; no
 # hyprctl means no move), PS2_JOBS (build jobs, default 3). Never kills processes by name: the wine process this script started is
 # stopped by its process ID, and `wineserver -k` is only ever run for the bench's own prefix.
@@ -132,7 +135,7 @@ cmd_build() {
 winpath() { printf 'Z:%s' "$(printf '%s' "$1" | sed 's|/|\\|g')"; }
 
 cmd_run() {
-  local game="${1:-}" window= cold= small= gpu= timeout=600 label= threads= extra=()
+  local game="${1:-}" window= cold= small= gpu= timeout=600 label= threads= exe= pthread_dll= extra=()
   [ -n "$game" ] || die "run: which game?"
   shift
   while [ $# -gt 0 ]; do
@@ -141,6 +144,8 @@ cmd_run() {
       --cold) cold=1 ;;
       --small-stack) small=small ;;
       --threads) threads=1 ;;
+      --exe) exe="$(readlink -f "$2")"; shift ;;
+      --pthread-dll) pthread_dll=1 ;;
       --gpu) gpu="$2"; shift ;;
       --timeout) timeout="$2"; shift ;;
       --label) label="$2"; shift ;;
@@ -151,18 +156,26 @@ cmd_run() {
   done
   check_setup; need wine
   local dir; dir="$(builddir "$game" "$small")"
-  [ -f "$dir/ps2run.exe" ] || die "no ${dir#$ROOT/}/ps2run.exe: run scripts/wine-bench.sh build $game${small:+ --small-stack}"
+  [ -n "$exe" ] || exe="$dir/ps2run.exe"
+  [ -f "$exe" ] || die "no ${exe#$ROOT/}: run scripts/wine-bench.sh build $game${small:+ --small-stack}"
   local gdir="$ROOT/games/$game"
   [ -d "$gdir/disc" ] || die "no games/$game/disc: run bash scripts/port.sh $game <iso> --native-only first"
   # The run folder looks like a tester's install: ps2run.exe and SDL2.dll next to a compiler\ folder (the Windows llvm-mingw),
   # and games\<game>\ with disc\, disc.iso, entries.txt, overlays\ and, after a run, ee-live\ and the memory card.
   local run="$BENCH/run/$game${small:+-small}" g
+  [ "$exe" = "$dir/ps2run.exe" ] || run="$BENCH/run/$game-$(basename "$exe" .exe)"
   g="$run/games/$game"
   mkdir -p "$run/logs" "$g"
-  cp -f "$dir/ps2run.exe" "$run/"
+  cp -f "$exe" "$run/ps2run.exe"
   cp -f "$SDL2_WIN/bin/SDL2.dll" "$run/"
-  # ps2run.exe imports this DLL (winpthreads); on a tester's PC it is found through the PATH of the llvm-mingw it was built with
-  cp -f "$MINGW_WIN/x86_64-w64-mingw32/bin/libwinpthread-1.dll" "$run/"
+  # A tester's PC has no llvm-mingw folder on its PATH, so every DLL ps2run.exe imports must be one the system has or one the build
+  # puts next to it (SDL2.dll, DXC). The bench therefore copies nothing else (libwinpthread-1.dll used to be copied here, which hid
+  # that a build importing it stops with "libwinpthread-1.dll was not found" on a tester's PC and writes no log: public issue 42).
+  rm -f "$run/libwinpthread-1.dll"
+  [ -z "$pthread_dll" ] || cp -f "$MINGW_WIN/x86_64-w64-mingw32/bin/libwinpthread-1.dll" "$run/"
+  if [ -z "$pthread_dll" ] && "$MINGW_LINUX/bin/llvm-objdump" -p "$run/ps2run.exe" 2> /dev/null | grep -qi 'DLL Name: *libwinpthread\|DLL Name: *libstdc++\|DLL Name: *libgcc\|DLL Name: *libc++'; then
+    die "ps2run.exe imports a DLL from the llvm-mingw folder (see: llvm-objdump -p): a tester's PC does not have it"
+  fi
   # DXC next to the program, like the real build's post-build step: Direct3D 12 then compiles its shaders with DXC (Wine's own
   # d3dcompiler cannot do the shader model they need). Without them wgpu falls back to FXC, which fails under Wine.
   cp -f "$BENCH/dxc/dxcompiler.dll" "$BENCH/dxc/dxil.dll" "$run/" 2> /dev/null || true

@@ -82,7 +82,7 @@ export EMSDK="${EMSDK:-$ROOT/tools/emsdk}"
 setup=()
 [ "$web" = 1 ] || setup=(--native-only)
 if { [ "$web" = 1 ] && [ ! -f "$EMSDK/emsdk_env.sh" ]; } || [ ! -x "$tools/eerecomp" ] || [ ! -x "$tools/vurecomp" ]; then "$here/setup.sh" "${setup[@]}"; fi
-mkdir -p "$game/disc" "$game/vu1" "$game/shots" "$generated"
+mkdir -p "$game/disc" "$game/vu1" "$game/vu0" "$game/shots" "$generated"
 
 echo "== [1/6] disc"
 iso="$game/disc.iso"
@@ -199,7 +199,7 @@ if [ "$explore" = 1 ]; then
     build_native
     rm -f "$game/misses.txt" "$game/explore.ps2" "$game/explore_ram.bin"
     code=0
-    PS2_DUMP="$game/explore_ram.bin" PS2_GPU_LOW_POWER=1 PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" --memcard "$game/explore.ps2" \
+    PS2_DUMP="$game/explore_ram.bin" PS2_GPU_LOW_POWER=1 PS2_VU0_RECORD="$game/vu0" PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" --memcard "$game/explore.ps2" \
       "${wide[@]}" "${patches[@]}" --frames "$frames" "${presses[@]}" --frames-dir "$game/shots" --frame-every 300 > "$game/explore.log" 2>&1 || code=$?
     [ "$code" = 0 ] || echo "[port] ps2run exited with code $code" | tee -a "$game/explore.log"
     captured=0
@@ -233,8 +233,8 @@ else
 fi
 
 echo "== [5/6] vector unit programs"
-if compgen -G "$game/vu1/*.bin" > /dev/null; then
-  "$tools/vurecomp" "$game/vu1" "$generated" | tail -1
+if compgen -G "$game/vu1/*.bin" > /dev/null || compgen -G "$game/vu0/*.bin" > /dev/null; then
+  "$tools/vurecomp" "$game/vu1" "$generated" --vu0-dir "$game/vu0" | tail -1
 else
   # vurecomp replaces the old files itself; with nothing recorded it never runs, so programs of an earlier run would stay in the build.
   rm -f "$generated"/vu1_*.cpp

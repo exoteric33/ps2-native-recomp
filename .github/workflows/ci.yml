@@ -95,6 +95,7 @@ jobs:
           done
           python3 tests/fpu_half_damage.py "$CXX_BIN"
           python3 scripts/test_vu_codegen.py "$CXX_BIN"
+          CXX="$CXX_BIN" python3 scripts/test_vu0_codegen.py
 
       - name: Free test programs (ps2autotests), one on macOS
         if: runner.os == 'macOS'

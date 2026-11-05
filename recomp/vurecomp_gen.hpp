@@ -12,12 +12,13 @@
 
 namespace ps2::vurecomp {
 
-// One program to compile: its key and entry (the file name of a recording is %016llX_%04X.bin) and the whole 16 KiB of
-// vector unit code memory it was recorded from.
+// One program to compile: its key, entry (recorded as %016llX_%04X.bin) and
+// the complete code memory: 4 KiB for VU0, 16 KiB for VU1.
 struct Input {
     std::uint64_t key = 0;
     std::uint32_t entry = 0;
     std::vector<std::uint8_t> code;
+    int unit = 1;
 };
 
 struct Result {

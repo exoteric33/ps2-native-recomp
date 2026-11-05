@@ -80,8 +80,15 @@ void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::
 void index_layer(std::uint32_t pvd_sector, std::uint32_t base) {
     std::uint8_t pvd[kSector];
     if (!read(pvd_sector, 1, pvd) || std::memcmp(pvd, "\x01" "CD001", 6) != 0) return;
+    const std::uint32_t root_lba = u32(pvd + 158);
+    std::uint32_t root_size = u32(pvd + 166);
+    if (root_size < 34) {
+        std::uint8_t sec[kSector];
+        if (read(base + root_lba, 1, sec) && sec[0] >= 34 && u32(sec + 2) == root_lba)
+            root_size = u32(sec + 10);
+    }
     std::set<std::uint64_t> seen;
-    walk(base, u32(pvd + 158), u32(pvd + 166), "", 0, seen);
+    walk(base, root_lba, root_size, "", 0, seen);
 }
 
 void self_check();

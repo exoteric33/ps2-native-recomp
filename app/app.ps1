@@ -245,30 +245,67 @@ function Get-InstallProblem {
     $null
 }
 
+# True when the file is a disc image: an .iso with 2048-byte sectors, or a CD dumped as .bin with 2352-byte sectors (a sync pattern
+# starts every sector). Either way the volume descriptor, "CD001", lies in sector 16.
+function Test-DiscBytes([string]$path) {
+    $stream = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+    try {
+        $head = New-Object byte[] 16
+        $got = $stream.Read($head, 0, 16)
+        $at = 0x8000
+        if ($got -eq 16 -and $head[0] -eq 0 -and $head[11] -eq 0 -and @($head[1..10] | Where-Object { $_ -ne 255 }).Count -eq 0) {
+            $at = 16 * 2352 + $(if ($head[15] -eq 1) { 16 } else { 24 })
+        }
+        $id = New-Object byte[] 6
+        [void]$stream.Seek($at, 'Begin')
+        $read = $stream.Read($id, 0, 6)
+    } finally { $stream.Dispose() }
+    return ($read -eq 6 -and $id[0] -eq 1 -and [Text.Encoding]::ASCII.GetString($id, 1, 5) -eq 'CD001')
+}
+
+# The .bin file a .cue sheet names (its first FILE line), next to the sheet; $null when there is none.
+function Get-CueTarget([string]$cue) {
+    foreach ($line in (Get-Content -LiteralPath $cue -TotalCount 40 -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*FILE\s+(?:"([^"]+)"|(\S+))') {
+            $name = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+            $target = Join-Path (Split-Path -Parent $cue) $name
+            if (Test-Path -LiteralPath $target -PathType Leaf) { return $target }
+            return $null
+        }
+    }
+    $null
+}
+
 function Test-DiscImage([string]$path) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return 'That file does not exist.' }
     switch ([IO.Path]::GetExtension($path).ToLower()) {
         '.iso' {
-            $stream = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
-            try { $head = New-Object byte[] 6; [void]$stream.Seek(0x8000, 'Begin'); $got = $stream.Read($head, 0, 6) } finally { $stream.Dispose() }
-            if ($got -ne 6 -or $head[0] -ne 1 -or [Text.Encoding]::ASCII.GetString($head, 1, 5) -ne 'CD001') {
+            if (-not (Test-DiscBytes $path)) {
                 return 'This does not look like a PS2 disc image. It has to be an .iso file with normal 2048-byte sectors, made from the DVD.'
             }
+        }
+        { $_ -in '.bin', '.img' } {
+            if (-not (Test-DiscBytes $path)) { return 'This does not look like a PS2 disc image. It has to be a .bin (with its .cue file) or an .iso made from the disc.' }
+        }
+        '.cue' {
+            $target = Get-CueTarget $path
+            if (-not $target) { return 'This .cue file names a .bin file that is not in the same folder.' }
+            if (-not (Test-DiscBytes $target)) { return 'The .bin file of this .cue does not look like a PS2 disc image.' }
         }
         '.zip' {
             Add-Type -AssemblyName System.IO.Compression.FileSystem
             try {
                 $zip = [IO.Compression.ZipFile]::OpenRead($path)
-                try { $hasIso = @($zip.Entries | Where-Object { $_.FullName -like '*.iso' }).Count -gt 0 } finally { $zip.Dispose() }
+                try { $hasIso = @($zip.Entries | Where-Object { $_.FullName -match '\.(iso|bin|img)$' }).Count -gt 0 } finally { $zip.Dispose() }
             } catch { return 'This .zip file cannot be opened.' }
-            if (-not $hasIso) { return 'There is no .iso file inside this .zip.' }
+            if (-not $hasIso) { return 'There is no .iso or .bin file inside this .zip.' }
         }
         '.7z' {
             if (-not (Test-Path -LiteralPath (Join-Path $env:ProgramFiles '7-Zip\7z.exe'))) {
                 return 'A .7z file needs the free program 7-Zip (7-zip.org). Install it, or unpack the .iso yourself and choose that.'
             }
         }
-        default { return 'Please choose an .iso file, or a .zip or .7z file with an .iso inside.' }
+        default { return 'Please choose an .iso file (or a .bin with its .cue file), or a .zip or .7z file with one inside.' }
     }
     $null
 }
@@ -903,7 +940,7 @@ $w = $P['welcome']
 [void](Add-Label $w 'title' $AppTitle 38 16 720 54 (New-Font 28 $false $TitleFont) $C.Ink)
 [void](Add-Label $w 'subtitle' 'Turn your own PlayStation 2 game into a program for this PC.' 41 70 720 26 (New-Font 12) $C.Muted)
 $steps = @(
-    @('1', 'Choose your disc', 'An .iso file ripped from a PS2 DVD you own (or a .zip or .7z with an .iso inside).'),
+    @('1', 'Choose your disc', 'An .iso file ripped from a PS2 disc you own (or a .bin with its .cue file, or a .zip or .7z with one inside).'),
     @('2', 'Press Build', "Free build tools are downloaded once (about $ToolsDownloadMb MB). Then the game becomes a PC program: 5 to 30 minutes."),
     @('3', 'Press Play', 'Start the game from here, or make a desktop shortcut and start it from there next time.')
 )
@@ -954,7 +991,7 @@ $card = New-Glass $w 'DiscCard' 40 108 720 238
 [void](Add-Label $card 'cardTitle1' 'Your disc image' 56 16 400 26 (New-Font 13 $true) $C.Ink)
 $U.choose = Add-Button $card 'ChooseImage' 'Choose disc image...' 16 54 250 50 'primary' 14
 $U.fileName = Add-Label $card 'fileName' 'No disc image chosen yet.' 284 52 420 26 (New-Font 12.5 $true) $C.Muted
-$U.filePath = Add-Label $card 'filePath' 'An .iso made from a PS2 DVD you own, or a .zip or .7z file that holds one.' 284 80 420 24 (New-Font 9.5) $C.Muted
+$U.filePath = Add-Label $card 'filePath' 'An .iso made from a PS2 disc you own (or a .bin with its .cue file), or a .zip or .7z file that holds one.' 284 80 420 24 (New-Font 9.5) $C.Muted
 $U.filePath.AutoEllipsis = $true
 $U.imageError = Add-Label $card 'imageError' '' 16 110 688 38 (New-Font 11 $true) $C.Danger
 [void](Add-Label $card 'nameLabel' 'Name of the game' 16 150 300 22 (New-Font 11 $true) $C.Ink)
@@ -1321,7 +1358,8 @@ function Set-Image([string]$path) {
         $U.name.Text = ''
     } else {
         $State.Image = $path
-        $U.fileName.Text = '{0}   ({1})' -f [IO.Path]::GetFileName($path), (Format-Size (Get-Item -LiteralPath $path).Length)
+        $sizeOf = if ($path -match '\.cue$') { Get-CueTarget $path } else { $path }  # a .cue sheet is tiny: show the size of its .bin
+        $U.fileName.Text = '{0}   ({1})' -f [IO.Path]::GetFileName($path), (Format-Size (Get-Item -LiteralPath $sizeOf).Length)
         $U.fileName.ForeColor = $C.Ink
         $U.filePath.Text = $path
         $U.name.Text = Get-FreeName (Get-SafeName $path) $path
@@ -1335,7 +1373,7 @@ $U.chooseBack.Add_Click({ Show-Screen 'welcome' })
 $U.choose.Add_Click({
     $dialog = New-Object Windows.Forms.OpenFileDialog
     $dialog.Title = 'Choose your PS2 disc image'
-    $dialog.Filter = 'PS2 disc images (*.iso, *.zip, *.7z)|*.iso;*.zip;*.7z'
+    $dialog.Filter = 'PS2 disc images (*.iso, *.cue, *.bin, *.zip, *.7z)|*.iso;*.cue;*.bin;*.zip;*.7z'
     $dialog.CheckFileExists = $true
     if (Test-Path -LiteralPath (Join-Path $Root 'isos')) { $dialog.InitialDirectory = Join-Path $Root 'isos' }
     if ($dialog.ShowDialog($form) -eq 'OK') { Set-Image $dialog.FileName }
@@ -1482,7 +1520,7 @@ function Start-PatchLookup {
     $p = $State.Patch
     if ($p.Run) { return }
     if (-not (Get-PatchImage)) {
-        Set-PatchError 'This disc image is an archive.' 'Looking for patches needs a plain .iso file. Unpack the .iso from the archive and choose that file instead.'
+        Set-PatchError 'This disc image is not a plain .iso file.' 'Looking for patches needs a plain .iso file. Unpack or convert the image to an .iso and choose that file instead.'
         Show-PatchState
         return
     }
@@ -2129,7 +2167,8 @@ function Get-FailureMessage($b) {
         'setup' { return 'The libraries or translator tools could not be prepared. If your internet connection was down, try again.' }
     }
     if ($tail -match 'not an ISO 9660 image') { return 'This file is not a PS2 disc image. It has to be an .iso made from the DVD.' }
-    if ($tail -match 'no \.iso inside the archive') { return 'There is no .iso file inside that archive.' }
+    if ($tail -match 'no \.iso, \.bin or \.img inside the archive') { return 'There is no disc image (.iso or .bin) inside that archive.' }
+    if ($tail -match 'cue sheet names') { return 'The .cue file names a .bin file that is not in the same folder.' }
     if ($tail -match '7z not found') { return 'A .7z file needs the free program 7-Zip (7-zip.org). Install it, or unpack the .iso yourself.' }
     if ($tail -match 'BOOT2') { return 'This disc has no PS2 game program that the app can start. Is it a PS2 game disc?' }
     switch ($b.Step) {

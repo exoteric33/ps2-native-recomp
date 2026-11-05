@@ -493,7 +493,7 @@ std::uint32_t video_options() { return g_video_options.load(std::memory_order_re
 namespace {
 
 constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr std::uint32_t kStateVersion = 8;
+constexpr std::uint32_t kStateVersion = 9;
 
 std::function<void()> event_action(int id, std::uint64_t at) {
     if (id == hw::kEventVblank) return vblank;
@@ -521,8 +521,9 @@ void machine_state(state::Stream &s) {
     // Our version 4 differs from upstream's 4 (Cpu and thread layouts); 5 adds upstream's waiting HLE RPC replies; 6 adds the disc stream
     // of the IOP (sceCdSt*, where it is and whether it runs), so a state saved while a film or a music stream plays goes on streaming;
     // 7 adds the SIF RPC endpoints kept per server (guest servers, their order) and the IOP-to-EE request packet ring (SIF RPC rework, PR #27);
-    // 8 adds the IOP's low-level hardware timers (AllocHardTimer, SetTimerCompare, SetTimerMode) that raise an interrupt.
-    if (version != kStateVersion && !(s.loading() && (version >= 4 && version <= 7))) throw std::runtime_error("state file from another version");
+    // 8 adds the IOP's low-level hardware timers (AllocHardTimer, SetTimerCompare, SetTimerMode) that raise an interrupt;
+    // 9 adds the count of GS FINISH events that wait until the game has cleared CSR.FINISH.
+    if (version != kStateVersion && !(s.loading() && (version >= 4 && version <= 8))) throw std::runtime_error("state file from another version");
     s.set_version(version);
     s.tag("ee");
     s.pod(g_cpu);
@@ -644,6 +645,19 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
                 return false;
             }
             if (u32(ph) != 1) continue;
+            // A segment placed in the scratchpad (0x70000000..0x70003FFF) loads there instead of into main memory
+            // (follows upstream 8ebb09b); the same checks apply, against the 16 KiB.
+            if (const std::uint32_t at = u32(ph + 8); (at >> 14) == (kScratchpadBase >> 14)) {
+                const std::uint32_t offset = u32(ph + 4), filesz = u32(ph + 16), memsz = u32(ph + 20);
+                const std::uint32_t start = at & (kScratchpadSize - 1);
+                if (std::uint64_t{start} + std::max(memsz, filesz) > kScratchpadSize || std::uint64_t{offset} + filesz > data.size()) {
+                    std::fprintf(stderr, "[elf] %s is damaged: segment %u does not fit in the file or in the scratchpad\n", path.c_str(), i);
+                    return false;
+                }
+                if (copy) std::memcpy(g_spr + start, data.data() + offset, filesz);
+                else if (memsz > filesz) std::memset(g_spr + start + filesz, 0, memsz - filesz);
+                continue;
+            }
             const std::uint32_t offset = u32(ph + 4), vaddr = physical(u32(ph + 8)), filesz = u32(ph + 16), memsz = u32(ph + 20);
             if (std::uint64_t{vaddr} + std::max(memsz, filesz) > kRamSize || std::uint64_t{offset} + filesz > data.size()) {
                 std::fprintf(stderr, "[elf] %s is damaged: segment %u does not fit in the file or in memory\n", path.c_str(), i);

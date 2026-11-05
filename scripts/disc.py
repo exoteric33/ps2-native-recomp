@@ -1,8 +1,10 @@
 import argparse
 import fnmatch
 import os
+import shutil
 import struct
 import sys
+import zipfile
 
 SECTOR = 2048
 MAX_DIRECTORY = 16 << 20  # no real directory is near this (a record is at least 34 bytes); the runtime's disc.cpp uses the same
@@ -182,15 +184,78 @@ def modules(image, destination):
     print('%d relocatable modules (SNR2, xff2) extracted to %s' % (len(found), destination))
 
 
+RAW_SECTOR = 2352  # a CD dumped as BIN: sync (12 bytes), header (4), [subheader (8) in mode 2], 2048 bytes of data, error codes
+SYNC = b'\x00' + b'\xff' * 10 + b'\x00'
+
+
+def open_source(source):
+    """The stream of the image that `source` stands for: an .iso/.bin/.img as it is, a .cue (the file its FILE line names), or the
+    biggest .iso (else .bin, else .img) inside a .zip."""
+    lower = source.lower()
+    if lower.endswith('.zip'):
+        archive = zipfile.ZipFile(source)
+        members = archive.infolist()
+        for ending in ('.iso', '.bin', '.img'):
+            found = [m for m in members if m.filename.lower().endswith(ending)]
+            if found:
+                return archive.open(max(found, key=lambda m: m.file_size))
+        sys.exit('no .iso, .bin or .img inside the archive')
+    if lower.endswith('.cue'):
+        with open(source, errors='replace') as cue:
+            for line in cue:
+                line = line.strip()
+                if not line.upper().startswith('FILE'):
+                    continue
+                parts = line.split('"')
+                # FILE "name with spaces.bin" BINARY, or FILE name.bin BINARY
+                name = parts[1] if len(parts) >= 3 else (line.split()[1] if len(line.split()) >= 2 else '')
+                path = os.path.join(os.path.dirname(source), name.replace('\\', os.sep))
+                if not name or not os.path.isfile(path):
+                    sys.exit('the cue sheet names a file that is not next to it: ' + name)
+                return open(path, 'rb')
+        sys.exit('the cue sheet names no file')
+    return open(source, 'rb')
+
+
+def to_iso(source, target):
+    """Write `source` as a plain .iso with 2048-byte sectors. A CD dumped with 2352-byte sectors has the data cut out of every
+    sector (the data track only: the copy ends at the first sector without the sync pattern, e.g. where audio tracks begin);
+    anything else is copied as it is. The file appears only when the whole copy worked."""
+    part = target + '.part'
+    try:
+        with open_source(source) as src, open(part, 'wb') as dst:
+            first = src.read(RAW_SECTOR)
+            if len(first) < RAW_SECTOR or first[:12] != SYNC:
+                dst.write(first)
+                shutil.copyfileobj(src, dst, 1 << 24)
+            else:
+                # the mode byte of the header: 1 = 2048 bytes follow the header, 2 (XA) = an 8-byte subheader comes first
+                start = 16 if first[15] == 1 else 24
+                sector = first
+                while len(sector) == RAW_SECTOR and sector[:12] == SYNC:
+                    dst.write(sector[start:start + SECTOR])
+                    sector = src.read(RAW_SECTOR)
+        os.replace(part, target)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+
+
 def main():
     sys.stdout.reconfigure(newline='\n')
     parser = argparse.ArgumentParser(description='Read files from PS2 CD and DVD images, including both layers of a DVD9.')
-    parser.add_argument('command', choices=['info', 'list', 'extract', 'modules'])
+    parser.add_argument('command', choices=['info', 'list', 'extract', 'modules', 'iso'])
     parser.add_argument('image')
     parser.add_argument('destination', nargs='?')
     parser.add_argument('patterns', nargs='*', help='paths or globs to extract, everything below --limit if omitted')
     parser.add_argument('--limit', type=int, default=64, help='MiB; larger files stay in the image unless named')
     args = parser.parse_args()
+    if args.command == 'iso':
+        # iso <source> <target.iso>: source is an .iso, .bin, .img, .cue or a .zip holding one (follows upstream 0d72093)
+        if not args.destination:
+            parser.error('iso needs the .iso file to write')
+        to_iso(args.image, args.destination)
+        return
     image = Image(args.image)
     if args.command == 'info':
         info(image)

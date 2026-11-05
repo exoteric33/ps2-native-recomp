@@ -79,6 +79,8 @@ struct Core {
     unsigned input_read = 0, input_count = 0;
     std::deque<Transfer> transfers;
     std::uint16_t regs[0x200] = {};
+    // reads of STATX that still say "not ready" after the core was just enabled (not part of a save state: it ends within moments)
+    std::uint32_t statx_settling = 0;
 };
 
 std::vector<std::uint16_t> g_ram(kRamWords);
@@ -616,7 +618,13 @@ std::uint32_t read_core(int core, std::uint32_t off) {
             if (k.voices[i].end) endx |= 1u << i;
         return off == 0x340 ? endx & 0xFFFFu : endx >> 16;
     }
-    case 0x344: return 0x80u;
+    case 0x344:
+        // right after the core is enabled the ready bit stays clear for a few reads; the sound driver waits for it (follows upstream fe2a4ef)
+        if (k.statx_settling) {
+            --k.statx_settling;
+            return 0;
+        }
+        return 0x80u;
     default: return k.regs[off >> 1];
     }
 }
@@ -634,6 +642,7 @@ void write_core(int core, std::uint32_t off, std::uint32_t value) {
     k.regs[off >> 1] = static_cast<std::uint16_t>(value);
     switch (off) {
     case 0x19A:
+        if ((value & 0x8000u) && !(k.attr & 0x8000u)) k.statx_settling = 16;
         k.attr = static_cast<std::uint16_t>(value);
         if (!(value & 0x40u)) k.irq = false;
         break;

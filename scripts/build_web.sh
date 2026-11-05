@@ -6,11 +6,12 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 game=${1:-gt4}
 emsdk=${2:-${EMSDK:-$here/tools/emsdk}}
 out="$here/build/web-$game"
-boot=$(sed -n 's/^BOOT2 *= *//p' "$here/games/$game/disc/SYSTEM.CNF" | tr -d '\r')
+boot=$(tr '\r' '\n' < "$here/games/$game/disc/SYSTEM.CNF" | awk -f "$here/scripts/boot2.awk")
 elf=$(ls "$here/games/$game/patched/"* 2>/dev/null | head -1)
 [ -n "$elf" ] || elf="$here/games/$game/core.elf"
 if [ ! -f "$elf" ]; then
-    name=${boot#*\\}
+    name=${boot#*:}
+    name=${name#"${name%%[!\\/]*}"}
     elf="$here/games/$game/disc/${name%;*}"
 fi
 mkdir -p "$out"

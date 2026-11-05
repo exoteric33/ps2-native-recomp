@@ -55,6 +55,39 @@ int main(int argc, char **argv) {
     add({{tc::kLnop, tc::fmac(0x28, 0, 3, 1, 2) | tc::kEnd}, tc::kNop});
     // A cycle without an end bit must stop at the reference interpreter's budget.
     add({{tc::iaddiu(1, 1, 1), tc::kUnop}, {tc::branch(0x20, 0, 0, 8, 0), tc::kUnop}, tc::kNop});
+    // The rules VU1 got from the original project (c243416, b7371e8) hold for compiled VU0 too: FSSET takes effect after the upper
+    // instruction of its pair (the code must contain the late flag write), and a branch with a branch in its delay slot is left to the
+    // interpreter (the whole VU0 program is refused, at the entry and further in).
+    unsigned fsset_cases = 0;
+    for (const auto &c : tc::cases()) {
+        if (std::string(c.name).rfind("FSSET", 0) != 0) continue;
+        ++fsset_cases;
+        Program p{1000u + fsset_cases, 0, std::vector<std::uint8_t>(4096), 0};
+        for (unsigned i = 0; i < c.pairs.size(); ++i) std::memcpy(p.code.data() + i * 8, c.pairs[i].data(), 8);
+        std::string fname;
+        const std::string text = generate(p, fname);
+        if (text.find("force_mac(") == std::string::npos) { std::fprintf(stderr, "VU0 FSSET case '%s' has no late flag write\n", c.name); return 6; }
+    }
+    if (fsset_cases < 2) { std::fprintf(stderr, "VU0 FSSET cases not found\n"); return 6; }
+    for (const bool at_entry : {true, false}) {
+        Program p{900u + at_entry, 0, std::vector<std::uint8_t>(4096), 0};
+        const unsigned at = at_entry ? 0 : 16;
+        const auto put = [&](unsigned pc, std::uint32_t lo, std::uint32_t hi = tc::kUnop) {
+            std::memcpy(p.code.data() + pc, &lo, 4);
+            std::memcpy(p.code.data() + pc + 4, &hi, 4);
+        };
+        for (unsigned pc = 0; pc < 128; pc += 8) put(pc, tc::kLnop);
+        put(at, tc::branch(0x28, 1, 0, at, 64));
+        put(at + 8, tc::branch(0x28, 1, 0, at + 8, 72));
+        put(at + 16, tc::kLnop, tc::kUnop | tc::kEnd);
+        put(64, tc::kLnop, tc::kUnop | tc::kEnd);
+        put(72, tc::kLnop, tc::kUnop | tc::kEnd);
+        p.key = ps2::vu::program_key(p.code.data(), ps2::vu::reachable(p.code.data(), 4095u, 0), 0);
+        std::string dname;
+        if (!generate(p, dname).empty()) { std::fprintf(stderr, "VU0 double branch at %u was compiled\n", at); return 7; }
+        const auto result = ps2::vurecomp::generate_files({ps2::vurecomp::Input{p.key, 0, p.code, 0}}, fs::path(argv[1]) / ("double" + std::to_string(at)), 0);
+        if (result.programs) { std::fprintf(stderr, "VU0 double branch at %u was written out\n", at); return 7; }
+    }
     // Dynamic jumps retain the interpreter's pipeline; reject the whole entry.
     Program jump{1, 0, std::vector<std::uint8_t>(4096), 0};
     const tc::Pair pair{(0x24u << 25) | (1u << 11), tc::kUnop | tc::kEnd};
@@ -158,6 +191,9 @@ int main(int argc, char **argv) {
     compare({{tc::kLnop, tc::fmac(0x28, 0, 3, 1, 2) | tc::kEnd}, tc::kNop}, 17);
     compare({{(0x24u << 25) | (1u << 11), tc::kUnop | tc::kEnd}, tc::kNop}, 17);
     compare({{tc::iaddiu(1, 1, 1), tc::kUnop}, {tc::branch(0x20, 0, 0, 8, 0), tc::kUnop}, tc::kNop}, 17);
+    // A branch in the delay slot of a branch: the interpreter runs it (compiled or not, the result must be the interpreter's).
+    compare({{tc::branch(0x28, 1, 0, 0, 32), tc::kUnop}, {tc::branch(0x28, 1, 0, 8, 40), tc::kUnop}, {tc::kLnop, tc::kUnop | tc::kEnd},
+             tc::kNop, {tc::kLnop, tc::kUnop | tc::kEnd}, {tc::kLnop, tc::kUnop | tc::kEnd}}, 23);
     test_halted = true;
     compare(tc::random_program(0), 0);
     test_halted = false;
@@ -211,7 +247,7 @@ with tempfile.TemporaryDirectory(prefix='vu0-codegen-') as tmp:
     normal = run([str(tmp / 'check')], env=environment)
     print(normal.stdout, end='')
     recordings = sorted(record.glob('*.bin'))
-    assert len(recordings) == 2, 'only the two intentional fallback entries should be recorded; compiled entries must execute'
+    assert len(recordings) == 3, 'only the three intentional fallback entries (the jump, the cycle, the double branch) should be recorded; compiled entries must execute'
     assert all(p.stat().st_size == 4096 for p in recordings)
     run([str(tmp / 'check')], env=environment)
     assert sorted(record.glob('*.bin')) == recordings, 'recordings must be deduplicated'

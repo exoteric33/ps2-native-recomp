@@ -9,7 +9,7 @@ here="$ROOT/scripts"
 
 usage() {
   cat <<'EOF'
-usage: scripts/port.sh <name> <game.iso | game.zip | game.7z> [options]
+usage: scripts/port.sh <name> <game.iso | game.bin | game.cue | game.zip | game.7z> [options]
 
 Turns a PS2 disc image you own into a browser build in build/web-<name> and a
 native one in build/native-<name>. It reads the boot program named in
@@ -90,22 +90,29 @@ if [ -e "$iso" ]; then
   echo "already in place"
 else
   case "${source_path,,}" in
-    *.zip)
-      "${py[@]}" -I - "$source_path" "$iso" <<'EOF'
-import shutil, sys, zipfile
-with zipfile.ZipFile(sys.argv[1]) as archive:
-    images = [m for m in archive.infolist() if m.filename.lower().endswith('.iso')]
-    if not images:
-        sys.exit('no .iso inside the archive')
-    with archive.open(max(images, key=lambda m: m.file_size)) as src, open(sys.argv[2], 'wb') as dst:
-        shutil.copyfileobj(src, dst, 1 << 24)
-EOF
-      ;;
+    # an archive with an image in it, or a CD dumped as BIN (with a CUE sheet): disc.py writes the .iso, cutting the 2048-byte
+    # sectors out of a 2352-byte-sector dump (follows upstream 0d72093)
+    *.zip|*.bin|*.cue|*.img) "${py[@]}" -I "$here/disc.py" iso "$source_path" "$iso" ;;
     *.7z)
       sevenzip=7z
       [ "$windows" = 0 ] || command -v 7z > /dev/null || sevenzip="${PROGRAMFILES:-/c/Program Files}/7-Zip/7z.exe"
       command -v "$sevenzip" > /dev/null || { echo "7z not found: install 7-Zip" >&2; exit 1; }
-      "$sevenzip" e -so -r "$source_path" '*.iso' > "$iso" ;;
+      "$sevenzip" e -so -r "$source_path" '*.iso' > "$iso" || true
+      if [ ! -s "$iso" ]; then
+        # no .iso inside: a CD dumped as BIN (and CUE) is unpacked next to the game and converted
+        rm -f "$iso"
+        unpack="$game/unpack"
+        rm -rf "$unpack"; mkdir -p "$unpack"
+        "$sevenzip" e -r -y -o"$unpack" "$source_path" '*.cue' '*.bin' '*.img' > /dev/null || true
+        image=
+        for ending in cue bin img; do
+          image=$(find "$unpack" -type f -iname "*.$ending" | head -1)
+          [ -z "$image" ] || break
+        done
+        if [ -z "$image" ]; then rm -rf "$unpack"; echo "no .iso, .bin or .img inside the archive" >&2; exit 1; fi
+        "${py[@]}" -I "$here/disc.py" iso "$image" "$iso" || { rm -rf "$unpack"; exit 1; }
+        rm -rf "$unpack"
+      fi ;;
     *)
       # No realpath in MinGit or old macOS. On Windows pwd -W gives D:/...: Git's shell leaves /d/... as it is for native
       # programs (ln is BusyBox's, Python, ps2run) when the name has [ ] ' * or ? in it, as in "Game [NTSC].iso"
@@ -115,9 +122,10 @@ EOF
   esac
 fi
 "${py[@]}" -I "$here/disc.py" extract "$iso" "$game/disc" SYSTEM.CNF > /dev/null
-boot=$(sed -n 's/^BOOT2 *= *//p' "$game/disc/SYSTEM.CNF" | tr -d '\r')
-program=${boot#*\\}
-program=${program%;*}
+boot=$(tr '\r' '\n' < "$game/disc/SYSTEM.CNF" | awk -f "$here/boot2.awk")  # the same reading as pnach.py (tabs, any case, BOM)
+program=${boot#*:}      # without "cdrom0:"
+program=${program#"${program%%[!\\/]*}"}  # without leading \ or /
+program=${program%;*}   # without ";1"
 [ -n "$program" ] || { echo "SYSTEM.CNF names no BOOT2 program" >&2; exit 1; }
 # A real BOOT2 line is "cdrom0:\SLUS_212.00;1": the program is a file in the disc's top folder. Its name is used below as a
 # pattern for disc.py extract and as a file name, so a damaged or made-up SYSTEM.CNF must not bring wildcards or folders in.
@@ -128,6 +136,7 @@ case "$program" in
 esac
 "${py[@]}" -I "$here/disc.py" extract "$iso" "$game/disc" "$program" > /dev/null
 echo "boots $boot"
+[ "${PS2_PORT_STOP:-}" != disc ] || exit 0  # tests/boot2_cases.py only checks this step
 crc=$("${py[@]}" -I "$here/pnach.py" crc "$game/disc/$program")
 echo "PCSX2 patch files for it end in _$crc.pnach"
 

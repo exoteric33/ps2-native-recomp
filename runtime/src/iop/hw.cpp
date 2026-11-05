@@ -210,6 +210,8 @@ void acknowledge_interrupt(unsigned line) {
 }
 
 void dma_done(unsigned ch) {
+    // a transfer the driver stopped by clearing the start bit never completes (follows upstream 8cb3a92)
+    if (!(g_dma[ch].chcr & 0x01000000u)) return;
     g_dma[ch].chcr &= ~0x01000000u;
     if (ch < 7) g_dicr |= 1u << (24 + ch);
     else g_dicr2 |= 1u << (24 + ch - 7);

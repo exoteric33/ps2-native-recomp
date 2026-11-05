@@ -47,6 +47,7 @@ alignas(64) std::uint8_t g_memory[kMemorySize];
 std::uint64_t g_pmode, g_smode1, g_smode2, g_srfsh, g_synch1, g_synch2, g_syncv;
 std::uint64_t g_dispfb[2], g_display[2], g_extbuf, g_extdata, g_extwrite, g_bgcolor;
 std::uint64_t g_csr = 0x551B4000ull, g_imr = 0x7F00ull, g_busdir, g_siglblid;
+std::uint32_t g_finish_pending = 0;  // FINISH events that arrived while CSR.FINISH was still set; raised as the game clears the bit
 std::uint64_t g_primitives = 0;
 constexpr std::uint64_t kFinishDelay = 1000; // EE cycles from the FINISH write to CSR.FINISH
 
@@ -62,14 +63,32 @@ bool trace_display() {
     static const bool enabled = std::getenv("PS2_TRACE_DISPLAY") != nullptr;
     return enabled;
 }
+// The lines of the picture the video mode displays: DH+1 lines at most, no more than the mode has (PAL 288 a field, NTSC 240; twice
+// that interlaced), and fewer when the game moves the display rectangle down. DY counts lines from the top of the frame and the mode's
+// first line is `top` (36 PAL, 25 NTSC; doubled interlaced): a rectangle that starts `below` lines under it loses that many lines at
+// the bottom of the TV picture. Follows upstream a75fcdd and fe11596 (snuri00/ps2-web-recomp).
+// Only the TV modes have those limits: NTSC (2) and PAL (3) of SetGsCrt, and 0 when it was never called. Progressive scan (480p 0x50),
+// 1080i, 720p and VGA (the mode values of ps2sdk's graph library) show DH+1 lines whatever DY says, so a game moved to 480p by a
+// no-interlacing patch is not cut to half of its height (upstream has this fault).
+std::uint32_t shown_lines(std::uint32_t dh, std::uint32_t dy, std::uint64_t smode2) {
+    const std::uint32_t mode = hw::crt_mode();
+    if (mode != 0u && mode != 2u && mode != 3u) return dh;
+    const std::uint32_t scale = (smode2 & 1u) ? 2u : 1u;
+    const std::uint32_t lines = (ps2::g_options.pal ? 288u : 240u) * scale;
+    const std::uint32_t top = (ps2::g_options.pal ? 36u : 25u) * scale, span = (ps2::g_options.pal ? 256u : 224u) * scale;
+    const std::uint32_t below = dy > top ? std::min(dy - top, span) : 0u;
+    return std::min({dh, lines, below ? span - below : lines});
+}
 // Height of the displayed picture in lines. The display rectangle's height DH+1 counts lines of the video frame, and a TV picture
 // cannot have more than 576 of them (PAL; NTSC has 480). A game in interlaced field mode (SMODE2 INT=1, FFMD=0) that still asks for
 // more (Silent Hill 2 sets 896 for a 448 line picture) counts the lines of both fields: the picture is half of it.
-std::uint32_t display_height(std::uint64_t disp, std::uint64_t smode2) {
+// `crop` is false for circuit 1 of the merged display: its rectangle sits where it sits to land in the picture, so its DY says nothing
+// about lines lost at the bottom (Devil May Cry's message strip).
+std::uint32_t display_height(std::uint64_t disp, std::uint64_t smode2, bool crop = true) {
     const std::uint32_t magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
-    std::uint32_t h = ((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / magv;
-    if ((smode2 & 3u) == 1u && h > 576) h /= 2;
-    return h;
+    std::uint32_t dh = (static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1;
+    if ((smode2 & 3u) == 1u && dh / magv > 576) dh /= 2;
+    return shown_lines(dh, crop ? static_cast<std::uint32_t>(disp >> 12) & 0x7FFu : 0u, smode2) / magv;
 }
 // The two read circuits of the display (PMODE bits EN1 and EN2). With both on, the picture is circuit 2's, and circuit 1 shows over its own
 // rectangle of it, blended by PMODE's fixed alpha ALP (MMOD set, bits 8-15). Devil May Cry shows its typed message windows this way: a
@@ -87,7 +106,7 @@ DisplayOverlay display_overlay(std::uint64_t pmode, std::uint64_t smode2, std::u
     const std::uint32_t magv1 = (static_cast<std::uint32_t>(disp1 >> 27) & 3u) + 1, magv2 = (static_cast<std::uint32_t>(disp2 >> 27) & 3u) + 1;
     if (magh1 != magh2 || magv1 != magv2) return o;
     o.width = ((static_cast<std::uint32_t>(disp1 >> 32) & 0xFFFu) + 1) / magh1;
-    o.height = display_height(disp1, smode2);
+    o.height = display_height(disp1, smode2, false);
     if (!o.width || !o.height || o.width > 2048 || o.height > 2048) return o;
     o.x = (static_cast<std::int32_t>(disp1 & 0xFFFu) - static_cast<std::int32_t>(disp2 & 0xFFFu)) / static_cast<std::int32_t>(magh2);
     o.y = (static_cast<std::int32_t>((disp1 >> 12) & 0x7FFu) - static_cast<std::int32_t>((disp2 >> 12) & 0x7FFu)) / static_cast<std::int32_t>(magv2);
@@ -532,6 +551,7 @@ void reset() {
     }
     g_csr = 0x551B4000ull;
     g_imr = 0x7F00ull;
+    g_finish_pending = 0;
     if (queue::active()) queue::post(queue::kReset, 0, 0, nullptr, 0);
     else render_reset();
 }
@@ -857,7 +877,13 @@ void write(std::uint32_t reg, std::uint64_t value) {
     }
 }
 
-void raise_finish() { raise(2); }
+// A game that counts FINISH events (Metal Gear Solid 3) would lose those that land while CSR.FINISH is still set from the one
+// before: they merge into one. So a FINISH that arrives with the bit set waits and is raised, one by one, as the game clears the
+// bit (follows upstream 75ccb0b, where the FINISH is raised at the write itself).
+void raise_finish() {
+    if (g_csr & 2u) ++g_finish_pending;
+    else raise(2);
+}
 
 void signal(std::uint32_t reg, std::uint64_t value) {
     const std::uint32_t mask = static_cast<std::uint32_t>(value >> 32), id = static_cast<std::uint32_t>(value);
@@ -1090,7 +1116,12 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
     case 0x00E0: g_bgcolor = value; break;
     case 0x1000:
         g_csr &= ~(value & 0x1Fu);
+        if ((value & 2u) && g_finish_pending) {
+            --g_finish_pending;
+            raise(2);
+        }
         if (value & 0x200u) {
+            g_finish_pending = 0;
             g_csr = 0x551B4000ull;
             if (queue::active()) queue::post(queue::kSoftReset, 0, 0, nullptr, 0);
             else soft_reset();
@@ -1419,8 +1450,23 @@ void dump_region(const char *spec) {
     std::fclose(f);
 }
 
+// PS2_DUMP_VRAM_RAW=<path>: the 4 MB of graphics memory as the program ends, and its hash on the log.
+void dump_raw(const char *path) {
+#ifdef PS2_GPU
+    if (gpu_on() && !cpu_raster()) gpu::download(g_memory);
+#endif
+    std::uint64_t h = 1469598103934665603ull;
+    for (std::uint32_t i = 0; i < kMemorySize; ++i) h = (h ^ g_memory[i]) * 1099511628211ull;
+    std::fprintf(stderr, "[gs] graphics memory hash %016llx\n", static_cast<unsigned long long>(h));
+    if (std::FILE *f = os::open(path, "wb")) {
+        std::fwrite(g_memory, 1, kMemorySize, f);
+        std::fclose(f);
+    }
+}
+
 void stats() {
     if (const std::string spec = os::env("PS2_DUMP_VRAM"); !spec.empty()) dump_region(spec.c_str());
+    if (const std::string raw = os::env("PS2_DUMP_VRAM_RAW"); !raw.empty()) dump_raw(raw.c_str());
 #ifdef PS2_GPU
     gpu::stats();
 #endif
@@ -1473,6 +1519,8 @@ void render_state(ps2::state::Stream &s) {
     s.pod(g_imr);
     s.pod(g_busdir);
     s.pod(g_siglblid);
+    if (s.version() >= 9) s.pod(g_finish_pending);
+    else g_finish_pending = 0;
     s.pod(g_primitives);
     s.pod(g_odd_field);
     s.pod(g_transfer);

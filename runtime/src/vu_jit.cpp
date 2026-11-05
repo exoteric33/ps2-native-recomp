@@ -937,6 +937,7 @@ private:
     void upper_pre(const Up &u, bool flags_live);
     void upper_post(const Up &u, bool flags_live);
     bool lower(std::uint32_t w, std::uint32_t pc);
+    void fsset(std::uint32_t w);
     void instruction(std::uint32_t pc, std::uint32_t following);
     void prologue();
 };
@@ -1606,18 +1607,7 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
             c_.op(kOpEq);
         });
         break;
-    case 0x15:
-        c_.get(kR);
-        status();
-        c_.i32c(0x3Fu);
-        c_.op(kOpAnd);
-        c_.i32c(imm12 & 0xFC0u);
-        c_.op(kOpOr);
-        c_.store(kOffStatus);
-        fl();
-        c_.get(kR);
-        c_.call(kForceMac);
-        break;
+    case 0x15: break; // fsset(), after the upper instruction
     case 0x16:
         set_vi(it, [&] {
             status();
@@ -1628,12 +1618,10 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
     case 0x17:
         set_vi(it, [&] {
             status();
-            c_.i32c(imm12);
-            c_.op(kOpOr);
             c_.i32c(0xFFFu);
             c_.op(kOpAnd);
-            c_.i32c(0xFFFu);
-            c_.op(kOpEq);
+            c_.i32c(imm12);
+            c_.op(kOpOr);
         });
         break;
     case 0x18:
@@ -1655,12 +1643,10 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
     case 0x1B:
         set_vi(it, [&] {
             mac();
-            vi(is);
-            c_.op(kOpOr);
             c_.i32c(0xFFFFu);
             c_.op(kOpAnd);
-            c_.i32c(0xFFFFu);
-            c_.op(kOpEq);
+            vi(is);
+            c_.op(kOpOr);
         });
         break;
     case 0x1C:
@@ -1712,6 +1698,23 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
     return true;
 }
 
+// FSSET waits for the upper instruction of its pair, whose status it replaces the sticky flags of (as in the
+// interpreters). Follows upstream b7371e8.
+void Translator::fsset(std::uint32_t w) {
+    const std::uint32_t imm12 = ((w >> 10) & 0x800u) | (w & 0x7FFu);
+    c_.get(kR);
+    c_.get(kR);
+    c_.load(kOffStatus);
+    c_.i32c(0x3Fu);
+    c_.op(kOpAnd);
+    c_.i32c(imm12 & 0xFC0u);
+    c_.op(kOpOr);
+    c_.store(kOffStatus);
+    fl();
+    c_.get(kR);
+    c_.call(kForceMac);
+}
+
 void Translator::instruction(std::uint32_t pc, std::uint32_t following) {
     const std::uint32_t lo = word(pc), hi = word(pc + 4);
     const Up u = decode_upper(hi);
@@ -1736,12 +1739,15 @@ void Translator::instruction(std::uint32_t pc, std::uint32_t following) {
     const auto delay = delay_.find(pc);
     delay_mode_ = delay == delay_.end() ? 0 : delay->second;
     delay_reg_ = delay_mode_ == 1 ? vi_def_[(pc - 8u) & kMask] : 0;
+    bool fsset_after = false;
     if (hi & 0x80000000u) {
         c_.get(kR);
         c_.i32c(lo);
         c_.store(kOffI);
     } else if (!li.supported || !lower(lo, pc)) {
         leave(pc);
+    } else {
+        fsset_after = (lo >> 25) == 0x15;
     }
     delay_mode_ = 0;
     if (keep_bk_.count(pc)) {
@@ -1753,6 +1759,7 @@ void Translator::instruction(std::uint32_t pc, std::uint32_t following) {
         c_.set(kBi);
     }
     upper_post(u, flags_live);
+    if (fsset_after) fsset(lo);
     const int written = lower_write(pc);
     const std::uint64_t live = shadow_out_[pc >> 3];
     if (written >= 0 && shadow_.count(written) && ((live >> written) & 1u)) {
@@ -1875,7 +1882,7 @@ void Translator::prologue() {
 
 bool Translator::run(std::vector<std::uint8_t> &out) {
     pcs_ = reachable(code_, kMask, entry_);
-    if (pcs_.empty()) return false;
+    if (pcs_.empty() || branch_in_delay_slot(code_, kMask, entry_)) return false;
     // Stalls that depend on the path taken are left to the interpreter, which counts them as they happen.
     plan_ = stall_plan(code_, kMask, pcs_, entry_);
     if (!plan_.ok || plan_.any_tracked) return false;
@@ -1883,6 +1890,7 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
     for (std::uint32_t pc : pcs_) {
         LowerInfo l;
         if (!(word(pc + 4) & 0x80000000u)) l = analyze_lower(word(pc), pc);
+        if (branch_in_delay_slot(code_, kMask, pc)) l.supported = false;
         any_status_ = any_status_ || l.reads_status;
         any_flags_ = any_flags_ || l.reads_flags;
         lowers_[pc] = l;

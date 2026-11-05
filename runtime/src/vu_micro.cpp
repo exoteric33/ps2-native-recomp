@@ -44,6 +44,11 @@ struct Unit {
     // What a branch reads of the integer registers: the values from before the
     // previous instruction when that one wrote them (see BranchView).
     const std::uint16_t *branch_vi = nullptr;
+    // FSSET waits for the upper instruction of its pair: the sticky flags it
+    // sets replace those of the status that instruction writes (Metal Gear
+    // Solid 3 clears them next to an OPMSUB before testing its collision
+    // triangles). Follows upstream b7371e8.
+    std::int32_t fsset = -1;
 };
 
 Vu0Regs g_vu1;
@@ -649,14 +654,17 @@ void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool 
     case 0x13: store_vi(r, 1, ((clip_flags() | w) & 0xFFFFFFu) == 0xFFFFFFu ? 1u : 0u); break;
     case 0x14: store_vi(r, it, (status_flags() & 0xFFFu) == ((((w >> 10) & 0x800u) | (w & 0x7FFu))) ? 1u : 0u); break;
     case 0x15:
+        if (u.pipe) {
+            u.fsset = static_cast<std::int32_t>((((w >> 10) & 0x800u) | (w & 0x7FFu)) & 0xFC0u);
+            break;
+        }
         r.status = (status_flags() & 0x3Fu) | ((((w >> 10) & 0x800u) | (w & 0x7FFu)) & 0xFC0u);
-        if (u.pipe) u.pipe->force_mac(r.mac, r.status);
         break;
     case 0x16: store_vi(r, it, status_flags() & (((w >> 10) & 0x800u) | (w & 0x7FFu))); break;
-    case 0x17: store_vi(r, it, ((status_flags() | (((w >> 10) & 0x800u) | (w & 0x7FFu))) & 0xFFFu) == 0xFFFu ? 1u : 0u); break;
+    case 0x17: store_vi(r, it, (status_flags() & 0xFFFu) | (((w >> 10) & 0x800u) | (w & 0x7FFu))); break;
     case 0x18: store_vi(r, it, (mac_flags_now() & 0xFFFFu) == r.vi[is] ? 1u : 0u); break;
     case 0x1A: store_vi(r, it, mac_flags_now() & r.vi[is]); break;
-    case 0x1B: store_vi(r, it, ((mac_flags_now() | r.vi[is]) & 0xFFFFu) == 0xFFFFu ? 1u : 0u); break;
+    case 0x1B: store_vi(r, it, (mac_flags_now() & 0xFFFFu) | r.vi[is]); break;
     case 0x1C: store_vi(r, it, clip_flags() & 0xFFFu); break;
     case 0x20: branch_to(target); break;
     case 0x21: store_vi(r, it, (pc + 16u) / 8u); branch_to(target); break;
@@ -834,16 +842,10 @@ void code_changed(int unit) {
 }
 
 void register_programs(const Program *programs, std::uint32_t count) {
-    std::uint32_t registered[2] = {};
-    for (std::uint32_t i = 0; i < count; ++i) {
-        if (!programs[i].function) continue;
-        const int unit = programs[i].unit == 0 ? 0 : 1;
-        (unit == 0 ? g_vu0_programs : g_programs)[programs[i].key] = programs[i].function;
-        ++registered[unit];
-    }
-    for (int unit = 0; unit < 2; ++unit)
-        if (registered[unit]) std::fprintf(stderr, "[vu%d] Statically registered %u compiled vector programs\n", unit, registered[unit]);
+    for (std::uint32_t i = 0; i < count; ++i)
+        if (programs[i].function) (programs[i].unit == 0 ? g_vu0_programs : g_programs)[programs[i].key] = programs[i].function;
     for (Vu0Entry &entry : g_vu0_entries) entry.generation = 0;
+    if (count > 0) std::fprintf(stderr, "[vu1] Statically registered %u compiled vector programs\n", count);
 }
 
 // Programs the background thread compiled and loaded (vu_live.cpp) join the table of built-in ones. A program the build knew keeps
@@ -1218,6 +1220,11 @@ void run_fast(int n, std::uint32_t address) {
             set_flags(r, out.value, out.dest);
             pipe.set_mac(r.mac, r.status);
         }
+        if (u.fsset >= 0) {
+            r.status = (r.status & 0x3Fu) | static_cast<std::uint32_t>(u.fsset);
+            pipe.force_mac(r.mac, r.status);
+            u.fsset = -1;
+        }
         if (out.has_clip) {
             r.clip = out.clip;
             pipe.set_clip(out.clip, pipe.t);
@@ -1326,6 +1333,11 @@ void run_reference(int n, std::uint32_t address) {
         view.commit(was, lo, !(hi & 0x80000000u));
         commit(r, out);
         if (out.target >= 0 && out.flags) pipe.set_mac(r.mac, r.status);
+        if (u.fsset >= 0) {
+            r.status = (r.status & 0x3Fu) | static_cast<std::uint32_t>(u.fsset);
+            pipe.force_mac(r.mac, r.status);
+            u.fsset = -1;
+        }
         if (out.has_clip) {
             r.clip = out.clip;
             pipe.set_clip(out.clip, pipe.t);

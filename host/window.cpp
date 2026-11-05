@@ -1,4 +1,5 @@
 #include "window.hpp"
+#include "big_stack_thread.hpp"
 
 #include "ps2/system.hpp"
 
@@ -1993,7 +1994,7 @@ int run_window(const std::function<int()> &emulate) {
 #endif
     std::atomic<bool> done{false};
     int result = 0;
-    std::thread emulation([&] {
+    ps2::host::BigStackThread emulation([&] {
         result = emulate();
         done.store(true);
         ps2::wake_render_thread();

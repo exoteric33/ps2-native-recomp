@@ -38,6 +38,7 @@ using Word = std::uint32_t;
 using Pair = std::array<Word, 2>;  // lower, upper
 constexpr Word kUnop = 0x000002FF, kLnop = 0x8000033C, kEnd = 0x40000000, kLoi = 0x80000000;
 constexpr Pair kNop = {kLnop, kUnop};
+constexpr unsigned kAny = 0xFFFFFFFFu;
 
 inline Word fmac(unsigned funct, unsigned dest, unsigned fd, unsigned fs, unsigned ft) { return (dest << 21) | (ft << 16) | (fs << 11) | (fd << 6) | funct; }
 inline Word special(unsigned index, unsigned dest, unsigned ft, unsigned fs) { return (dest << 21) | (ft << 16) | (fs << 11) | ((index >> 2) << 6) | (0x3Cu | (index & 3u)); }
@@ -79,6 +80,8 @@ struct Case {
     std::vector<Pair> pairs;
     unsigned vi1, check, want;
     bool jit;  // false: the pipeline state depends on the path, the Wasm translator leaves the program to the interpreter
+    // The MAC and status flags the program leaves in the registers (kAny: not checked), and what the Wasm run's flag stand-ins answer.
+    unsigned mac = kAny, status = kAny, stub_mac = 0, stub_status = 0;
 };
 
 inline std::vector<Pair> finish(std::vector<Pair> p) {
@@ -110,6 +113,25 @@ inline std::vector<Case> cases() {
     c.push_back({"MAXi keeps a denormal operand", finish({L3, M, kNop, T}), 0, 2, 3, true});
     const Pair N = {kLnop, fmac(0x1F, 15, 3, 0, 0)};
     c.push_back({"MINIi keeps a denormal operand (vf0.x = 0 against 3: the smaller is 0)", finish({L3, N, kNop, T}), 0, 2, 0, true});
+    // Upstream 701d64b (Metal Gear Solid 2 and 3): the clip flags arrive four cycles after CLIP with the cycles the vector unit
+    // waits counted. vf1 = {2, 2, 2, 2} gives the clip flags 0x15, vf2 = {-2, -2, -2, -2} gives 0x2A (against vf0.w = 1).
+    const Pair C1 = {kLnop, clip(1, 0)}, C2 = {kLnop, clip(2, 0)}, FIR = {lower_special(0x3D, 8, 5, 0), clip(1, 0)}, TIR = {lower_special(0x3C, 0, 4, 5), kUnop};
+    // The shape of upstream's own test: an MTIR waits two cycles for the MFIR before it, so the FCGET after it sees both CLIPs.
+    c.push_back({"an MTIR waits for an MFIR: the FCGET after it sees both CLIPs", finish({FIR, C2, TIR, G}), 0, 2, 0x56A, true});
+    c.push_back({"no wait before it: the FCGET sees the first CLIP only", finish({C1, C2, kNop, kNop, G}), 0, 2, 0xA95, true});
+    // Three CLIPs in a row and an FCGET four, five and six pairs later with no wait: each one sees one more.
+    c.push_back({"three CLIPs, FCGET four pairs after the first: one CLIP", finish({C1, C2, C2, kNop, G}), 0, 2, 0xA95, true});
+    c.push_back({"three CLIPs, FCGET five pairs after the first: two CLIPs", finish({C1, C2, C2, kNop, kNop, G}), 0, 2, 0x56A, true});
+    c.push_back({"three CLIPs, FCGET six pairs after the first: three CLIPs", finish({C1, C2, C2, kNop, kNop, kNop, G}), 0, 2, 0xAAA, true});
+    // FMOR and FSOR OR the flags into the register (they used to test for all ones). An ADD of -2 and -2 leaves MAC = 0xF0 and
+    // status = 0x82 once its four cycles are over.
+    const Pair S = {kLnop, add(6, 2, 2)};
+    c.push_back({"FMOR ORs the MAC flags into the register", finish({S, kNop, kNop, kNop, kNop, {fmflag(0x1B, 2, 1), kUnop}}), 0x1200, 2, 0x12F0, true, kAny, kAny, 0xF0, 0x82});
+    c.push_back({"FSOR ORs the status flags into the register", finish({S, kNop, kNop, kNop, kNop, {fsflag(0x17, 2, 0x100), kUnop}}), 0, 2, 0x182, true, kAny, kAny, 0xF0, 0x82});
+    // FSSET (Metal Gear Solid 3, upstream b7371e8): the sticky bits it sets take effect after the upper instruction of its pair has
+    // written its flags (the ADD gives MAC 0xF0 and the sign flag 0x02, and used to bring the sticky 0x80 back after the FSSET).
+    c.push_back({"FSSET clears the sticky flags the upper instruction of its pair set", finish({{fsflag(0x15, 0, 0), add(6, 2, 2)}, kNop}), 0, 2, 0, true, 0xF0, 0x02});
+    c.push_back({"FSSET sets sticky flags next to an upper instruction that wrote flags", finish({{fsflag(0x15, 0, 0x40), add(6, 2, 2)}, kNop}), 0, 2, 0, true, 0xF0, 0x42});
     return c;
 }
 
@@ -355,6 +377,29 @@ int main(int argc, char **argv) {
         std::ofstream(out / std::format("{}.wasm", test), std::ios::binary).write(reinterpret_cast<const char *>(wasm.data()), wasm.size());
     }
 
+    // A branch with a branch in its delay slot is left to the interpreter (upstream c243416): at the entry the program is not
+    // compiled at all, further in the compiled code hands that instruction to the interpreter.
+    for (const bool at_entry : {true, false}) {
+        Program p{900u + at_entry, 0, std::vector<std::uint8_t>(16384)};
+        const unsigned at = at_entry ? 0 : 16;
+        const auto put = [&](unsigned pc, std::uint32_t lo, std::uint32_t hi = unop) {
+            std::memcpy(p.code.data() + pc, &lo, 4);
+            std::memcpy(p.code.data() + pc + 4, &hi, 4);
+        };
+        for (unsigned pc = 0; pc < 128; pc += 8) put(pc, nop);
+        put(at, branch(0x28, 1, 0, at, 64));
+        put(at + 8, branch(0x28, 1, 0, at + 8, 72));
+        put(at + 16, nop, unop | end);
+        put(64, nop, unop | end);
+        put(72, nop, unop | end);
+        if (!ps2::vu::branch_in_delay_slot(p.code.data(), kMask, at)) { std::fprintf(stderr, "branch_in_delay_slot misses the double branch\n"); return 1; }
+        std::vector<std::uint8_t> wasm;
+        if (ps2::vu::jit::translate(p.code.data(), 0, {0x1000}, wasm) == at_entry) { std::fprintf(stderr, "Wasm translation of a double branch %s\n", at_entry ? "worked at the entry" : "failed further in"); return 1; }
+        std::string name;
+        const std::string text = generate(p, name);
+        if (text.find(std::format("vu::interpret(1, {}u)", at)) == std::string::npos) { std::fprintf(stderr, "the double branch at %u is not left to the interpreter\n", at); return 1; }
+    }
+
     // The pipeline stall cases: compiled here, run by the interpreter harness, the native main and node.
     const auto programs = [&](const std::vector<tc::Pair> &pairs, std::uint64_t key) {
         Program p{key, 0, std::vector<std::uint8_t>(16384)};
@@ -378,7 +423,7 @@ int main(int argc, char **argv) {
         const bool jit = ps2::vu::jit::translate(p.code.data(), 0, {0x1000}, wasm);
         if (jit != cases[i].jit) { std::fprintf(stderr, "case %zu: Wasm translation %d, expected %d\n", i, jit, cases[i].jit); return 1; }
         if (jit) std::ofstream(out / std::format("case{}.wasm", i), std::ios::binary).write(reinterpret_cast<const char *>(wasm.data()), wasm.size());
-        json << std::format("{}{{\"name\":\"{}\",\"jit\":{},\"vi1\":{},\"check\":{},\"want\":{},\"file\":\"case{}.wasm\"}}", i ? "," : "", cases[i].name, jit ? "true" : "false", cases[i].vi1, cases[i].check, cases[i].want, i);
+        json << std::format("{}{{\"name\":\"{}\",\"jit\":{},\"vi1\":{},\"check\":{},\"want\":{},\"mac\":{},\"status\":{},\"stub_mac\":{},\"stub_status\":{},\"file\":\"case{}.wasm\"}}", i ? "," : "", cases[i].name, jit ? "true" : "false", cases[i].vi1, cases[i].check, cases[i].want, cases[i].mac == tc::kAny ? -1 : static_cast<int>(cases[i].mac), cases[i].status == tc::kAny ? -1 : static_cast<int>(cases[i].status), cases[i].stub_mac, cases[i].stub_status, i);
     }
     json << "]";
     unsigned tracked = 0;
@@ -403,9 +448,9 @@ static int run_cases() {
         std::uint8_t mem[16384] = {};
         tc::init(r, cases[i].vi1);
         kCaseFns[i](r, mem);
-        const bool ok = r.vi[cases[i].check] == cases[i].want;
+        const bool ok = r.vi[cases[i].check] == cases[i].want && (cases[i].mac == tc::kAny || r.mac == cases[i].mac) && (cases[i].status == tc::kAny || r.status == cases[i].status);
         if (!ok) ++failures;
-        std::printf("%s compiled %s: vi%u = %04X, want %04X\n", ok ? "ok  " : "FAIL", cases[i].name, cases[i].check, r.vi[cases[i].check], cases[i].want);
+        std::printf("%s compiled %s: vi%u = %04X, want %04X, mac %04X status %03X\n", ok ? "ok  " : "FAIL", cases[i].name, cases[i].check, r.vi[cases[i].check], cases[i].want, r.mac, r.status);
     }
     return failures;
 }
@@ -552,9 +597,9 @@ int main(int argc, char **argv) {
             Vu0Regs r;
             std::uint8_t mem[4096];
             run(unit, cases[i].pairs, [](Vu0Regs &r, std::uint8_t *, unsigned vi1) { tc::init(r, vi1); }, cases[i].vi1, r, mem);
-            const bool ok = r.vi[cases[i].check] == cases[i].want;
+            const bool ok = r.vi[cases[i].check] == cases[i].want && (cases[i].mac == tc::kAny || r.mac == cases[i].mac) && (cases[i].status == tc::kAny || r.status == cases[i].status);
             if (!ok) ++failures;
-            std::printf("%s interpreter %d %s: vi%u = %04X, want %04X\n", ok ? "ok  " : "FAIL", unit, cases[i].name, cases[i].check, r.vi[cases[i].check], cases[i].want);
+            std::printf("%s interpreter %d %s: vi%u = %04X, want %04X, mac %04X status %03X\n", ok ? "ok  " : "FAIL", unit, cases[i].name, cases[i].check, r.vi[cases[i].check], cases[i].want, r.mac, r.status);
         }
     if (argc > 1) {
         for (unsigned i = 0; i < RANDOM_PROGRAMS; ++i)
@@ -630,10 +675,14 @@ for (const c of cases) {
     }
     return view.getUint32(p + off.fl_clip_v + 4 * ((ch - 8) & 7), true);
   };
-  env.status = () => 0;
+  env.status = () => c.stub_status;
+  env.mac = () => c.stub_mac;
+  env.force_mac = () => {};
   new WebAssembly.Instance(mod, {env}).exports.run(r, 0x4000);
   const got = view.getUint16(r + off.vi + 2 * c.check, true);
   if (got !== c.want) throw Error(`Wasm stall case "${c.name}": vi${c.check} = ${got.toString(16)}, want ${c.want.toString(16)}`);
+  if (c.mac >= 0 && view.getUint32(r + off.mac, true) !== c.mac) throw Error(`Wasm case "${c.name}": MAC flags ${view.getUint32(r + off.mac, true).toString(16)}, want ${c.mac.toString(16)}`);
+  if (c.status >= 0 && view.getUint32(r + off.status, true) !== c.status) throw Error(`Wasm case "${c.name}": status ${view.getUint32(r + off.status, true).toString(16)}, want ${c.status.toString(16)}`);
   ++ran;
 }
 console.log(`${ran} Wasm stall cases passed`);

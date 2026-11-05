@@ -9,6 +9,7 @@
 #include "ps2/state.hpp"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
@@ -74,6 +75,22 @@ struct Alarm {
 
 std::map<int, Thread> g_threads;
 std::map<int, Semaphore> g_semas;
+// The semaphores with an id below 256 (all that a game can create) by id, so signal and wait need no map lookup. The map's nodes
+// do not move, so the pointers hold until the map changes; every change calls index_semas() (follows upstream e2fdb49). Not part of
+// a save state: it is rebuilt from the map after a load.
+std::array<Semaphore *, 256> g_sema_index{};
+
+void index_semas() {
+    g_sema_index.fill(nullptr);
+    for (auto &[id, sema] : g_semas)
+        if (id >= 0 && id < 256) g_sema_index[static_cast<std::size_t>(id)] = &sema;
+}
+
+Semaphore *find_sema(int id) {
+    if (id >= 0 && id < 256) return g_sema_index[static_cast<std::size_t>(id)];
+    const auto it = g_semas.find(id);
+    return it == g_semas.end() ? nullptr : &it->second;
+}
 std::vector<Handler> g_intc_handlers;
 std::vector<Handler> g_dmac_handlers;
 std::map<int, Alarm> g_alarms;
@@ -356,12 +373,12 @@ void write_thread_status(int id, std::uint32_t p) {
 }
 
 void signal_sema(Cpu &c, int id, bool interrupt) {
-    auto it = g_semas.find(id);
-    if (it == g_semas.end()) {
+    Semaphore *found = find_sema(id);
+    if (!found) {
         ret(c, -1);
         return;
     }
-    Semaphore &s = it->second;
+    Semaphore &s = *found;
     ret(c, id);
     if (!s.waiters.empty()) {
         const int waiter = s.waiters.front();
@@ -374,12 +391,12 @@ void signal_sema(Cpu &c, int id, bool interrupt) {
 }
 
 void wait_sema(Cpu &c, int id) {
-    auto it = g_semas.find(id);
-    if (it == g_semas.end()) {
+    Semaphore *found = find_sema(id);
+    if (!found) {
         ret(c, -1);
         return;
     }
-    Semaphore &s = it->second;
+    Semaphore &s = *found;
     ret(c, id);
     if (s.count > 0) {
         --s.count;
@@ -400,6 +417,7 @@ const char *syscall_name(std::uint32_t n);
 void reset() {
     g_threads.clear();
     g_semas.clear();
+    index_semas();
     g_intc_handlers.clear();
     g_dmac_handlers.clear();
     g_alarms.clear();
@@ -613,7 +631,15 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         break;
     }
     case 0x2F: ret(c, g_current); break;
-    case 0x30: case 0x31: write_thread_status(static_cast<int>(arg(c, 0)), arg(c, 1)); ret(c, thread(static_cast<int>(arg(c, 0))) ? thread(static_cast<int>(arg(c, 0)))->status : -1); break;
+    case 0x30: case 0x31: {
+        const int id = static_cast<int>(arg(c, 0));
+        write_thread_status(id, arg(c, 1));
+        // The kernel returns the status of the thread slot, which is 0 once its thread is gone; a game that waits for a worker
+        // thread to disappear polls for that (follows upstream 507fe38). Ids outside the 256 slots still give -1.
+        const Thread *t = thread(id);
+        ret(c, t ? t->status : id >= 0 && id < 256 ? 0 : -1);
+        break;
+    }
     case 0x32: {
         Thread *t = current();
         ret(c, g_current);
@@ -716,6 +742,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         const int id = lowest_free(g_semas, 256, 0);
         if (id < 0) { ret(c, -1); break; }
         g_semas[id] = s;
+        index_semas();
         ret(c, id);
         break;
     }
@@ -725,6 +752,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         for (int waiter : it->second.waiters)
             if (Thread *t = thread(waiter)) release(*t, -425);
         g_semas.erase(it);
+        index_semas();
         ret(c, static_cast<std::int32_t>(arg(c, 0)));
         reschedule(c);
         break;
@@ -950,6 +978,7 @@ void state(ps2::state::Stream &s) {
         s.pod(v.option);
         s.deque(v.waiters);
     });
+    index_semas();
     s.vec(g_intc_handlers);
     s.vec(g_dmac_handlers);
     s.map(g_alarms);

@@ -49,6 +49,9 @@ std::uint64_t gs_imr();
 std::uint64_t gs_csr();
 void gs_set_imr(std::uint64_t value);
 void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field);
+// The video mode of the last SetGsCrt call (0 when it was never called): 2 NTSC, 3 PAL, 0x50 480p, 0x51 1080i, 0x52 720p, VGA modes
+// above. Safe to read from the window and render threads.
+std::uint32_t crt_mode();
 
 std::uint32_t read32(std::uint32_t a);
 // INTC_STAT read straight from the memory slow path (the game's waiting loops hammer it), with the waiting-loop skip of hw.cpp

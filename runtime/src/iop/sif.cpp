@@ -485,6 +485,15 @@ void read_reboot_image(const std::string &image_path) {
     if (image.empty() || !disc::read(entry->sector, static_cast<std::uint32_t>(image.size() / disc::kSector), image.data())) return;
     for (std::size_t at = 0; at + 16 <= image.size() && image[at]; at += 16)
         if (std::memcmp(&image[at], "FILEIO\0", 7) == 0) g_fileio_async = true;
+    // A FILEIO module older than 2.0 speaks the synchronous protocol, whatever else was found above (follows upstream 8ebb09b)
+    static const char kFileio[] = "PsIIfileio  ";
+    const auto fileio = std::search(image.begin(), image.end(), kFileio, kFileio + sizeof kFileio - 1);
+    if (image.end() - fileio >= static_cast<std::ptrdiff_t>(sizeof kFileio + 3)) {
+        const std::string version(fileio + sizeof kFileio - 1, fileio + sizeof kFileio + 3);
+        const bool digits = std::all_of(version.begin(), version.end(), [](char ch) { return ch >= '0' && ch <= '9'; });
+        if (digits && version < "2000") g_fileio_async = false;
+        std::fprintf(stderr, "[sif] FILEIO from %s reports %s, %s protocol\n", image_path.c_str(), version.c_str(), g_fileio_async ? "asynchronous" : "synchronous");
+    }
     static const char kTag[] = "PsIIloadfile";
     const auto it = std::search(image.begin(), image.end(), kTag, kTag + sizeof kTag - 1);
     if (image.end() - it < static_cast<std::ptrdiff_t>(sizeof kTag + 3)) return;
@@ -1183,7 +1192,14 @@ std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {
         else if (dst == kCmdBuffer) command(src, size);
         else {
             iop::watch_copy("EE DMA (sceSifSetDma)", dst, src, size, 0);
-            std::memcpy(iop::ram_ptr(dst), g_ram + src, fit_copy("EE sceSifSetDma", src, dst, size));
+            std::uint32_t moved = fit_copy("EE sceSifSetDma", src, dst, size);
+            // SIF DMA moves whole quadwords, so a size that is not a multiple of 16 still carries the rest of its last quadword
+            // (a sound driver keeps its ready flag there; follows upstream 857356a). Still cut at the end of either memory.
+            if (moved == size) {
+                const std::uint64_t room = std::min<std::uint64_t>(kRamSize - src, iop::kRamSize - (iop::phys(dst) & (iop::kRamSize - 1)));
+                moved = static_cast<std::uint32_t>(std::min<std::uint64_t>((std::uint64_t{size} + 15u) & ~std::uint64_t{15}, room));
+            }
+            std::memcpy(iop::ram_ptr(dst), g_ram + src, moved);
             release_iop_rpc_packet(dst);
         }
     }

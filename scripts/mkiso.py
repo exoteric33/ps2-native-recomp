@@ -23,10 +23,13 @@ def record(extent, size, name, directory, when):
             + bytes([len(name)]) + name.ljust(length - 33, bytes(1)))
 
 
-def build(boot, extras):
+def build(boot, extras, cnf=None):
     when = time.gmtime()
-    cnf = 'BOOT2 = cdrom0:\\%s;1\r\nVER = 1.00\r\nVMODE = NTSC\r\n' % os.path.basename(boot).upper()
-    files = {'SYSTEM.CNF': cnf.encode('ascii')}
+    if cnf is None:  # tests give a SYSTEM.CNF of their own (tabs, lower case, a BOM): bytes, with %s where the name goes
+        cnf = ('BOOT2 = cdrom0:\\%s;1\r\nVER = 1.00\r\nVMODE = NTSC\r\n' % os.path.basename(boot).upper()).encode('ascii')
+    else:
+        cnf = cnf.replace(b'%s', os.path.basename(boot).upper().encode('ascii'))
+    files = {'SYSTEM.CNF': cnf}
     for path in [boot] + extras:
         name = os.path.basename(path).upper()
         if not NAME.fullmatch(name):

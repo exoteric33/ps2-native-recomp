@@ -294,6 +294,8 @@ std::string lanes_store(unsigned dest, const std::string &qword_expr, const std:
 
 struct Lower {
     std::string code;
+    // Runs after the upper instruction of the pair has committed its flags (FSSET, upstream b7371e8)
+    std::string after_upper;
     int writes = -1;
     bool reads_flags = false, reads_status = false;
     bool branch = false, jump = false;
@@ -439,12 +441,12 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
     case 0x12: c = std::format("set_vi(r, 1, (fl.clip() & {}u) ? 1u : 0u); ", w & 0xFFFFFFu); break;
     case 0x13: c = std::format("set_vi(r, 1, ((fl.clip() | {}u) & 0xFFFFFFu) == 0xFFFFFFu ? 1u : 0u); ", w & 0xFFFFFFu); break;
     case 0x14: c = std::format("set_vi(r, {}, (fl.status() & 0xFFFu) == {}u ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
-    case 0x15: c = std::format("r.status = (fl.status() & 0x3Fu) | ({}u & 0xFC0u); fl.force_mac(r.mac, r.status); ", imm12); l.reads_flags = l.reads_status = true; break;
+    case 0x15: l.after_upper = std::format("r.status = (r.status & 0x3Fu) | {}u; fl.force_mac(r.mac, r.status); ", imm12 & 0xFC0u); l.reads_flags = l.reads_status = true; break;
     case 0x16: c = std::format("set_vi(r, {}, fl.status() & {}u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
-    case 0x17: c = std::format("set_vi(r, {}, ((fl.status() | {}u) & 0xFFFu) == 0xFFFu ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
+    case 0x17: c = std::format("set_vi(r, {}, (fl.status() & 0xFFFu) | {}u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
     case 0x18: c = std::format("set_vi(r, {}, (fl.mac() & 0xFFFFu) == r.vi[{}] ? 1u : 0u); ", it, is); l.reads_flags = true; break;
     case 0x1A: c = std::format("set_vi(r, {}, fl.mac() & r.vi[{}]); ", it, is); l.reads_flags = true; break;
-    case 0x1B: c = std::format("set_vi(r, {}, ((fl.mac() | r.vi[{}]) & 0xFFFFu) == 0xFFFFu ? 1u : 0u); ", it, is); l.reads_flags = true; break;
+    case 0x1B: c = std::format("set_vi(r, {}, (fl.mac() & 0xFFFFu) | r.vi[{}]); ", it, is); l.reads_flags = true; break;
     case 0x1C: c = std::format("set_vi(r, {}, fl.clip() & 0xFFFu); ", it); break;
     case 0x20: c = "pend = true; "; l.branch = true; l.target = target; break;
     case 0x21: c = std::format("set_vi(r, {}, {}u); pend = true; ", it, (pc + 16u) / 8u); l.branch = true; l.target = target; break;
@@ -509,6 +511,7 @@ std::string generate(const Program &p, std::string &name) {
         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
         Lower l;
         if (!(hi & 0x80000000u)) l = lower(lo, pc, kMask, p.unit == 0);
+        if (ps2::vu::branch_in_delay_slot(p.code.data(), kMask, pc)) l.supported = false;
         any_status = any_status || l.reads_status;
         any_flags = any_flags || l.reads_flags;
         any_q = any_q || l.code.find("fl.end_q(") != std::string::npos;
@@ -622,6 +625,7 @@ std::string generate(const Program &p, std::string &name) {
         if (keep_bk.count(pc)) body += "bk = next_bk; ";
         if (set_bi.count(pc)) body += std::format("bi = {}u; ", std::max(def[pc], 0));
         body += u.post;
+        if (!(hi & 0x80000000u) && l.supported) body += l.after_upper;
         std::string stop;
         if (p.unit == 0) {
             stop = std::format("if (steps >= 1000000u) {{ std::fprintf(stderr, \"[vu0] program at 0x{:04X} did not end\\n\"); return; }} ", p.entry);
@@ -688,7 +692,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp).
-const char *const kGeneratorVersion = "vurecomp 4";
+const char *const kGeneratorVersion = "vurecomp 5";
 
 Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
     std::vector<Program> programs;
@@ -705,6 +709,7 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
             std::fprintf(stderr, "%016llX_%04X: key mismatch, skipped\n", static_cast<unsigned long long>(p.key), p.entry);
             continue;
         }
+        if (ps2::vu::branch_in_delay_slot(p.code.data(), kMask, p.entry)) continue;
         if (recorded_keys.emplace(p.unit, p.key).second) programs.push_back(std::move(p));
     }
     std::set<std::pair<int, std::uint64_t>> keys;
@@ -723,6 +728,7 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
         }
         for (std::uint32_t target : targets) {
             const std::uint64_t key = ps2::vu::program_key(programs[i].code.data(), ps2::vu::reachable(programs[i].code.data(), kMask, target), target);
+            if (ps2::vu::branch_in_delay_slot(programs[i].code.data(), kMask, target)) continue;
             if (keys.emplace(programs[i].unit, key).second) programs.push_back(Program{key, target, programs[i].code, programs[i].unit});
         }
     }

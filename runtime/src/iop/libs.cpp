@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <deque>
 #include <map>
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -66,6 +67,7 @@ constexpr int kErrorEventCondition = -421;
 constexpr int kErrorMbxNone = -424;
 constexpr int kErrorNoMemory = -400;
 constexpr int kErrorUnknownModule = -202;
+constexpr int kErrorIllegalObject = -201;
 
 std::uint32_t arg(const Cpu &c, int i) { return i < 4 ? c.r[4 + i] : read32(c.r[29] + 16u + static_cast<std::uint32_t>(i - 4) * 4u); }
 
@@ -267,6 +269,9 @@ struct IrqTimer {
     std::uint64_t generation = 0;
 };
 std::map<std::uint32_t, IrqTimer> g_irq_timers;
+// The "compare value reached" flag (0x800) of the timers' mode register, which GetTimerStatus returns and clears. Kept apart from
+// IrqTimer so that struct, and with it the save-state layout, stays as it was; a flag that was set at the moment of a save is lost.
+std::map<std::uint32_t, std::uint32_t> g_irq_timer_reached;
 std::uint32_t g_irq_timers_16 = 0, g_irq_timers_32 = 0;
 
 void arm_irq_timer(std::uint32_t id) {
@@ -280,6 +285,7 @@ void arm_irq_timer(std::uint32_t id) {
 void fire_irq_timer(std::uint32_t id, std::uint64_t generation) {
     const auto it = g_irq_timers.find(id);
     if (it == g_irq_timers.end() || it->second.generation != generation) return;
+    g_irq_timer_reached[id] |= 0x800u;
     hw::raise_interrupt(it->second.line);
     if (it->second.mode & 0x40u) arm_irq_timer(id);
 }
@@ -1250,8 +1256,56 @@ void install_stdio() {
     def("stdio", 7, "puts", [](Cpu &c) { print(ram_string(arg(c, 0), 4096) + "\n"); c.r[2] = 0; });
 }
 
+// The start arguments a game hands over as (length, pointer); empty when they do not lie inside IOP memory.
+std::string module_args(std::uint32_t length, std::uint32_t at) {
+    if (!at || !length || std::uint64_t{phys(at)} + length > kRamSize) return {};
+    return std::string(reinterpret_cast<const char *>(ram_ptr(at)), length);
+}
+
 void install_modload() {
     register_hle_library("modload", 0x0102);
+    // LoadStartModule, StartModule and LoadModuleBuffer (follows upstream 5bcd5fe). The calling thread waits until the module's start
+    // routine returns; what it returned goes to *result. Modules handled natively finish at once, before there is anything to wait for.
+    def("modload", 7, "LoadStartModule", [](Cpu &c) {
+        Thread *caller = current();
+        if (!caller) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownModule); return; }
+        const std::uint32_t result_at = arg(c, 3);
+        const std::string text = module_args(arg(c, 1), arg(c, 2));
+        const int waiter = caller->id;
+        struct Wait { bool blocked = false, finished = false; };
+        const auto wait = std::make_shared<Wait>();
+        const std::int32_t id = load_module(ram_string(arg(c, 0), 256), text, [waiter, result_at, wait](int module, int result) {
+            if (result_at) write32(result_at, static_cast<std::uint32_t>(result));
+            wait->finished = true;
+            if (wait->blocked)
+                if (Thread *t = thread(waiter)) wake(*t, static_cast<std::uint32_t>(module));
+        });
+        if (id < 0) { c.r[2] = static_cast<std::uint32_t>(kErrorIllegalObject); return; }
+        if (wait->finished) { c.r[2] = static_cast<std::uint32_t>(id); return; }
+        wait->blocked = true;
+        block(c, kWaitHle, 0);
+    });
+    def("modload", 8, "StartModule", [](Cpu &c) {
+        Thread *caller = current();
+        if (!caller) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownModule); return; }
+        const int id = static_cast<int>(arg(c, 0));
+        const std::uint32_t result_at = arg(c, 4);
+        const std::string text = module_args(arg(c, 2), arg(c, 3));
+        const int waiter = caller->id;
+        const bool started = start_module(id, text, [waiter, result_at](int module, int result) {
+            if (result_at) write32(result_at, static_cast<std::uint32_t>(result));
+            if (Thread *t = thread(waiter)) wake(*t, static_cast<std::uint32_t>(module));
+        });
+        if (!started) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownModule); return; }
+        block(c, kWaitHle, 0);
+    });
+    def("modload", 10, "LoadModuleBuffer", [](Cpu &c) {
+        const std::uint32_t at = phys(arg(c, 0));
+        if (at >= kRamSize) { c.r[2] = static_cast<std::uint32_t>(kErrorIllegalObject); return; }
+        const std::uint8_t *p = ram_ptr(at);
+        const std::int32_t id = link_module(std::vector<std::uint8_t>(p, p + (kRamSize - at)), "buffer");
+        c.r[2] = static_cast<std::uint32_t>(id < 0 ? kErrorIllegalObject : id);
+    });
     def("modload", 13, "SetCheckKelfPathCallback", [](Cpu &c) { c.r[2] = 0; });
     // #30 takes a module id (from SearchModuleByName) and a flag word (Tekken 5's module 0x22B00 passes 0x40 for two modules); a call that
     // changes nothing here, since modules are never unloaded behind a game's back.
@@ -1360,6 +1414,13 @@ void install_timrman() {
             arm_irq_timer(arg(c, 0));
         }
         c.r[2] = 0;
+    });
+    // GetTimerStatus: the mode register, with the flag that the counter reached the compare value; reading clears the flag
+    // (follows upstream 309e03f; the mode bits are those of ps2sdk's timrman.h, AFL-2.0)
+    def("timrman", 8, "GetTimerStatus", [](Cpu &c) {
+        const auto it = g_irq_timers.find(arg(c, 0));
+        c.r[2] = it == g_irq_timers.end() ? 0u : it->second.mode | g_irq_timer_reached[arg(c, 0)];
+        g_irq_timer_reached[arg(c, 0)] = 0;
     });
     def("timrman", 9, "SetTimerCounter", [](Cpu &c) {
         const auto it = g_hard_timers.find(arg(c, 0));
@@ -1488,6 +1549,7 @@ void install_libraries() {
     g_alarms.clear();
     g_hard_timers.clear();
     g_irq_timers.clear();
+    g_irq_timer_reached.clear();
     g_irq_timers_16 = g_irq_timers_32 = 0;
     g_hard_timer_start.clear();
     g_vpls.clear();
@@ -1580,6 +1642,7 @@ void libs_state(ps2::state::Stream &s) {
     // The low-level hardware timers (state version 8). The job that raises their interrupt is part of the IOP's event queue and names
     // the timer and its generation, so the generation is kept too. A state older than 8 has no such timers: the game that loads it
     // sets them up again when it asks for them; a timer already armed in the running program is dropped.
+    if (s.loading()) g_irq_timer_reached.clear();  // the flag is not part of a state
     if (s.version() >= 8) {
         s.map(g_irq_timers);
         s.pod(g_irq_timers_16);

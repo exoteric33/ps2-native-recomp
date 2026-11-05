@@ -3,6 +3,7 @@
 #include "ps2/ee_live.hpp"
 #include "ps2/vu_live.hpp"
 
+#include "big_stack_thread.hpp"
 #ifdef PS2_WINDOW
 #include "window.hpp"
 #endif
@@ -507,7 +508,7 @@ static int run_threads_headless(const std::function<int()> &emulate) {
     }
     std::atomic<bool> done{false};
     int result = 0;
-    std::thread emulation([&] {
+    ps2::host::BigStackThread emulation([&] {
         result = emulate();
         done.store(true);
         ps2::wake_render_thread();

@@ -224,7 +224,7 @@ def read_program(path):
         if not entry:
             raise Problem('%s has no SYSTEM.CNF: it is not a PS2 game disc image' % path)
         image.file.seek(entry[2] * disc.SECTOR)
-        cnf = image.file.read(min(entry[3], 1 << 16)).decode('ascii', 'replace')
+        cnf = image.file.read(min(entry[3], 1 << 16)).decode('ascii', 'replace').replace('\r', '\n').lstrip('\ufffd')  # CR alone ends a line; a BOM is 3 bytes
         boot = re.search(r'^\s*BOOT2\s*=\s*(\S+)', cnf, re.M | re.I)
         if not boot:
             raise Problem('SYSTEM.CNF of %s has no BOOT2 line: it is not a PS2 game disc image' % path)

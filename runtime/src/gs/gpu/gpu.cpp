@@ -24,6 +24,7 @@
 #include <thread>
 #include <unordered_map>
 
+
 extern const char kGsShader[];
 extern const char kBlitShader[];
 
@@ -141,8 +142,10 @@ std::vector<BenchInfo> g_bench_info;
 std::uint64_t g_vblanks = 0;
 
 // PS2_BATCH_LOG=1: once per frame, why the drawing batches ended (docs/speed.md, "The arena dip")
-enum Why { kWhyKey, kWhyTexel, kWhyUnder, kWhyOverlap, kWhyZ, kWhyUpload, kWhyClut, kWhyCopy, kWhySize, kWhyFlush, kWhys };
-const char *const kWhyName[kWhys] = {"buffers", "texel", "drawn-under", "overlap", "depth", "upload", "palette", "copy", "size", "other"};
+enum Why { kWhyKey, kWhyTexel, kWhyUnder, kWhyOverlap, kWhyZ, kWhyUpload, kWhyClut, kWhyCopy, kWhySize, kWhyFlush,
+kWhys };
+const char *const kWhyName[kWhys] = {"buffers", "texel", "drawn-under", "overlap", "depth", "upload", "palette", "copy", "size", "other"
+};
 Why g_why = kWhyFlush;
 std::uint32_t g_why_runs[kWhys] = {}, g_why_prims[kWhys] = {};
 const bool g_batch_log = std::getenv("PS2_BATCH_LOG") != nullptr;
@@ -672,6 +675,17 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
     g_command_info.push_back({g_commands.size(), {prims, tiles, entries, snapshot, b.prims[1], first[3] | (first[14] << 8) | (first[6] << 16), first[0], textured}});
 }
 
+void reset_batch() {
+    Batch &b = g_batch;
+    b.prims.clear();
+    b.setups.clear();
+    b.setup_serial = 0;
+    g_batch_reads.clear();
+    b.key = ~0ull;
+    b.minx = b.miny = 1 << 30;
+    b.maxx = b.maxy = -1;
+}
+
 void flush_batch() {
     Batch &b = g_batch;
     if (b.prims.empty()) {
@@ -770,13 +784,7 @@ void flush_batch() {
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
-    b.prims.clear();
-    b.setups.clear();
-    b.setup_serial = 0;
-    g_batch_reads.clear();
-    b.key = ~0ull;
-    b.minx = b.miny = 1 << 30;
-    b.maxx = b.maxy = -1;
+    reset_batch();
 }
 
 void batch_ranges() {
@@ -1064,7 +1072,8 @@ void bench_capture() {
 
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
 void submit(WGPUTextureView present_view = nullptr) {
-    if (g_commands.empty() && !present_view) return;
+    if (g_commands.empty() && !present_view
+        ) return;
     if (g_bench.capturing) bench_capture();
     if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
         profile_submit();
@@ -1094,7 +1103,8 @@ void submit(WGPUTextureView present_view = nullptr) {
         wgpuBufferUnmap(g_query_read);
         g_query_ready = g_query_pending = false;
     }
-    const bool measure = g_timestamps && !g_query_pending;
+    const bool measure = g_timestamps && !g_query_pending
+        ;
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
     writes.querySet = g_queries;
@@ -1335,6 +1345,7 @@ std::uint64_t fnv_hash(const std::vector<std::uint32_t> &words, std::size_t firs
     return h;
 }
 
+
 void bench_run() {
     g_bench.capturing = false;
     g_bench.done = true;
@@ -1386,6 +1397,8 @@ void bench_run() {
                                 {"snapshot only", all & ~(1u << kSnapshot), true},
                                 {"decode only", all & ~(1u << kDecode), true},
                                 {"upload and clut only", all & ~((1u << kUpload) | (1u << kLoadClut)), true},
+                                {"upload only", all & ~(1u << kUpload), true},
+                                {"clut only", all & ~(1u << kLoadClut), true},
                                 {"copy and display only", all & ~((1u << kCopyRead) | (1u << kCopyWrite) | (1u << kDisplay)), true},
                                 {"raster, big runs only (over 8 tiles)", all & ~(1u << kRaster), true, 1},
                                 {"raster, small runs only (8 tiles or fewer)", all & ~(1u << kRaster), true, 2},
@@ -1722,12 +1735,10 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
     limits.maxBufferSize = supported.maxBufferSize;
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &limits;
-    const WGPUFeatureName timestamp_feature = WGPUFeatureName_TimestampQuery;
+    WGPUFeatureName features[2];
     g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
-    if (g_timestamps) {
-        dd.requiredFeatureCount = 1;
-        dd.requiredFeatures = &timestamp_feature;
-    }
+    if (g_timestamps) features[dd.requiredFeatureCount++] = WGPUFeatureName_TimestampQuery;
+    dd.requiredFeatures = features;
     dd.uncapturedErrorCallbackInfo.callback = on_error;
     bool device_done = false;
     WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
@@ -1773,8 +1784,10 @@ bool init(Mode m) {
     }
     if (order.empty()) {
 #ifdef _WIN32
-        order.push_back({WGPUInstanceBackend_DX12, "Direct3D 12"});
-        order.push_back({WGPUInstanceBackend_Vulkan, "Vulkan"});
+        {
+            order.push_back({WGPUInstanceBackend_DX12, "Direct3D 12"});
+            order.push_back({WGPUInstanceBackend_Vulkan, "Vulkan"});
+        }
 #else
         order.push_back({WGPUInstanceBackend_Primary, "the best API"});
 #endif
@@ -1805,7 +1818,8 @@ bool init(Mode m) {
     }
     if (!chosen) return false;
     if (forced) std::fprintf(stderr, "[gpu] graphics API: %s (asked for by PS2_GPU_BACKEND)\n", chosen->name);
-    else if (chosen == &order[0] && order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (the default on Windows; PS2_GPU_BACKEND=vulkan picks Vulkan)\n", chosen->name);
+    else if (chosen == &order[0] && order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (the default on Windows%s; PS2_GPU_BACKEND=vulkan or dx12 picks)\n", chosen->name,
+                 "");
     else if (order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (%s could not be used, see above)\n", chosen->name, order[0].name);
     if (g_dx12_compiler) std::fprintf(stderr, "[gpu] Direct3D 12 shader compiler: %s (PS2_DX12_COMPILER=fxc|dxc picks)\n", g_dx12_compiler);
     g_queue = wgpuDeviceGetQueue(g_device);
@@ -1939,7 +1953,8 @@ void draw(const State &st, const Vertex *v, int count) {
     const std::uint32_t prim = static_cast<std::uint32_t>(st.prim) & 7u;
     const Context &c = st.ctx[(attr >> 9) & 1u];
     SetupCache &cache = g_setup_cache;
-    if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot) {
+    if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot
+        ) {
         cache.generation = g_setup_generation;
         cache.attr = attr;
         cache.clut = g_clut_slot;
@@ -2625,6 +2640,10 @@ struct FakeStatus {
 
 // The parameters of the display kernel (gs.wgsl): the picture of the main read circuit, where to put it in the scratch buffer, and the
 // rectangle of the second read circuit that goes over it (all zero when there is none).
+void push_display(const DisplaySource &src, std::uint32_t scratch_at, std::uint32_t param) {
+    g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
+}
+
 std::uint32_t display_params(const DisplaySource &src, std::uint32_t scratch_at) {
     const DisplayOverlay &o = src.overlay;
     return push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, scratch_at,
@@ -2642,7 +2661,7 @@ bool present(const DisplaySource &src) {
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
     const std::uint32_t param = display_params(src, current);
-    g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
+    push_display(src, current, param);
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
     const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
     const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
@@ -2896,7 +2915,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
         }
         flush_all();
         const std::uint32_t param = display_params(src, 0);
-        g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
+        push_display(src, 0, param);
         submit();
         WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_scratch, 0, slot->buffer, 0, bytes);
@@ -2924,7 +2943,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
     flush_all();
     const std::uint32_t param = display_params(src, 0);
-    g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
+    push_display(src, 0, param);
     submit();
     width = src.width * g_scale;
     height = src.height * g_scale;

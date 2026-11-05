@@ -61,6 +61,7 @@ std::map<std::string, std::uint32_t> g_hle_versions;
 std::map<std::string, std::uint32_t> g_libraries;
 std::map<std::string, HleModuleStart> g_hle_modules;
 std::map<int, Module> g_modules;
+std::map<int, std::string> g_module_paths;  // the path a module was linked from (argv[0] of its start routine); not part of a save state
 int g_next_module = 1;
 
 std::map<int, Thread> g_threads;
@@ -555,6 +556,7 @@ void boot() {
     g_libraries.clear();
     g_hle_modules.clear();
     g_modules.clear();
+    g_module_paths.clear();
     g_threads.clear();
     g_used.clear();
     while (!g_events.empty()) g_events.pop();
@@ -693,6 +695,16 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
         if (done) done(id, 0);
         return id;
     }
+    const std::int32_t id = link_module(data, path);
+    if (id < 0) return id;
+    start_module(id, args, std::move(done));
+    return id;
+}
+
+// Link a module into IOP memory without running it (modload's LoadModuleBuffer links, StartModule runs it later); -1 when it is refused.
+std::int32_t link_module(const std::vector<std::uint8_t> &data, const std::string &path) {
+    using namespace kernel;
+    const std::string name = module_name_of(path);
     if (data.size() < 52 || std::memcmp(data.data(), "\x7f" "ELF", 4) != 0) {
         std::fprintf(stderr, "[iop] %s is not an ELF module\n", path.c_str());
         return -1;
@@ -751,9 +763,20 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
     }
     const int id = g_next_module++;
     g_modules[id] = Module{id, module_name, base, total, base + entry, base + gp};
+    g_module_paths[id] = path;
     if (g_trace_modules) std::fprintf(stderr, "[iop] module %d %s at 0x%08X size 0x%X entry 0x%08X\n", id, module_name.c_str(), base, total, base + entry);
+    return id;
+}
 
-    std::vector<std::string> argv{path};
+// Run the start routine of a linked module on a thread of its own; `done(module, result)` is called when it returns. False when there
+// is no such module or it has nothing to run (a module handled natively).
+bool start_module(int id, const std::string &args, std::function<void(int, int)> done) {
+    using namespace kernel;
+    const auto found = g_modules.find(id);
+    if (found == g_modules.end() || !found->second.entry) return false;
+    const std::uint32_t entry = found->second.entry, gp = found->second.gp;
+    const auto known = g_module_paths.find(id);
+    std::vector<std::string> argv{known != g_module_paths.end() ? known->second : found->second.name};
     std::size_t start = 0;
     while (start < args.size()) {
         const auto end = args.find('\0', start);
@@ -772,7 +795,7 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
     }
     set_ram32(argv_at + 4u * static_cast<std::uint32_t>(argv.size()), 0);
 
-    const int tid = create_thread(base + entry, 0x4000u, kDefaultModulePriority, base + gp, 0x02000000u, 0);
+    const int tid = create_thread(entry, 0x4000u, kDefaultModulePriority, gp, 0x02000000u, 0);
     Thread *t = thread(tid);
     t->on_exit = [id, tid, argv_at, done]() {
         const std::uint32_t result = thread(tid)->context.r[2];
@@ -785,7 +808,7 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
         }
     };
     start_thread(tid, static_cast<std::uint32_t>(argv.size()), argv_at);
-    return id;
+    return true;
 }
 
 void set_trace(bool modules_on, bool hle_on) {

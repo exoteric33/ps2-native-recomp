@@ -174,9 +174,11 @@ std::uint64_t gs_imr() { return gs::read_privileged(0x12001010u); }
 std::uint64_t gs_csr() { return gs::read_privileged(0x12001000u); }
 void gs_set_imr(std::uint64_t value) { gs::write_privileged(0x12001010u, value); }
 
+std::uint32_t crt_mode() { return __atomic_load_n(&g_crt[1], __ATOMIC_RELAXED); }
+
 void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field) {
     g_crt[0] = interlace;
-    g_crt[1] = mode;
+    __atomic_store_n(&g_crt[1], mode, __ATOMIC_RELAXED); // the window or render thread reads it (crt_mode)
     g_crt[2] = field;
     std::fprintf(stderr, "[gs] SetGsCrt interlace %u mode 0x%X field %u\n", interlace, mode, field);
     // The BIOS call programs the video output: SMODE2 gets INT (bit 0, interlace) and FFMD (bit 1, 1 = frame mode: both fields read the

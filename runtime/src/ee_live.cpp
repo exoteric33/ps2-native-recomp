@@ -1181,7 +1181,18 @@ bool translate_missing(std::uint32_t pc) {
     if (!found && loaded_run(pc, base, size)) found = flat = true;
     if (!found) {
         g->failed.insert(pc);
-        say("no translated code at 0x%08X, and it is in none of the %zu code windows, not in the code of the program and not in memory the game loaded: the game stops", pc, g->windows.size());
+        // Say why loaded_run turned it down (a log of a tester is all that is known of such a stop: Tekken 5, issue 42) and which
+        // translated modules know the address, whether in place or not.
+        std::uint32_t words = 0;
+        const std::uint32_t unit = pc & ~(recomp::kWindowUnit - 1);
+        if (pc < kRamSize && unit + recomp::kWindowUnit <= kRamSize)
+            for (std::uint32_t i = 0; i < recomp::kWindowUnit; i += 4) {
+                std::uint32_t word;
+                std::memcpy(&word, g_ram + unit + i, 4);
+                words += word != 0;
+            }
+        say("no translated code at 0x%08X, and it is in none of the %zu code windows, not in the code of the program and not in memory the game loaded: the game stops (%u of %u words of memory in the 16 KiB at 0x%08X are not zero; %s)", pc,
+            g->windows.size(), words, recomp::kWindowUnit / 4u, unit, ps2::module_report(pc).c_str());
         return false;
     }
     std::vector<std::uint8_t> image(g_ram + base, g_ram + base + size);

@@ -136,9 +136,19 @@ std::uint32_t write_length(const Unit &u) {
     return wl ? wl : 256u;
 }
 
+// CYCLE = 0 (the state after power-on, before any STCYCL, or an explicit STCYCL 0) acts like CL = WL: a normal write, every output
+// takes its own data and nothing is skipped. FIFA Street 2 sends an UNPACK there with its data behind it (Ridge Racer V's log shows
+// CL 0 but not WL), and the stream stays in step on the console. A cycle length of 0 with a write length above 0 is not that: Tekken 5 sends STCYCL 0x0500, a
+// STMASK and then several UNPACK headers back to back with no data, so that stays a filling write that takes none. What the console does
+// at CL 0 is not measured (dma/vif/stcycl shows only where the quadwords land, and no test unpacks with CL 0); see docs/vif-cycle.md.
+std::uint32_t cycle_length(const Unit &u, std::uint32_t wl) {
+    const std::uint32_t cl = u.cycle & 0xFFu;
+    return cl == 0 && (u.cycle & 0xFF00u) == 0 ? wl : cl;
+}
+
 std::uint32_t unpack_words(std::uint32_t cmd, const Unit &u, std::uint32_t num) {
     const std::uint32_t vn = (cmd >> 26) & 3u, vl = (cmd >> 24) & 3u;
-    const std::uint32_t cl = u.cycle & 0xFFu, wl = write_length(u);
+    const std::uint32_t wl = write_length(u), cl = cycle_length(u, wl);
     std::uint32_t data = num;
     if (wl > cl) data = (num / wl) * cl + std::min(num % wl, cl);
     const std::uint32_t bits = (vn == 3 && vl == 3) ? 16u : (vn + 1) * element_bits(vl);
@@ -323,7 +333,7 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c
     if (!num) num = 256;
     std::uint32_t addr = cmd & 0x3FFu;
     if (unit == 1 && ((cmd >> 15) & 1u)) addr += u.tops;
-    const std::uint32_t cl = u.cycle & 0xFFu, wl = write_length(u);
+    const std::uint32_t wl = write_length(u), cl = cycle_length(u, wl);
     const std::uint32_t components = vn + 1;
     const std::uint32_t bits = element_bits(vl);
     std::size_t bit_pos = 0;
@@ -594,7 +604,8 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
             // VIF commands set (the write cycle, the add-row mode, the mask, ROW and COL, ITOPS, BASE and OFFSET) keep their values:
             // Downhill Domination sets ROW once and resets the VIF before every frame, and Zone of the Enders sets the write
             // cycle (STCYCL 4,4) once at start-up, resets the VIF later without sending it again, and then unpacks with it. A cycle
-            // that a reset had cleared to 0 makes every UNPACK take no data, so the vectors that follow are read as commands.
+            // that a reset had cleared to 0 made every UNPACK take no data, so the vectors that follow were read as commands (CL 0
+            // is a normal write now, see cycle_length, but the cycle a game set is still the one it unpacks with).
             Unit fresh{};
             std::memcpy(fresh.row, u.row, sizeof fresh.row);
             std::memcpy(fresh.col, u.col, sizeof fresh.col);

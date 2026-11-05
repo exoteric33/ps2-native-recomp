@@ -75,6 +75,9 @@ void dump();
 std::int32_t load_module(const std::string &path, const std::string &args, std::function<void(int, int)> done = {});
 std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std::string &path, const std::string &args,
                                 std::function<void(int, int)> done = {});
+// modload's LoadModuleBuffer and StartModule: link a module without running it, then run its start routine later
+std::int32_t link_module(const std::vector<std::uint8_t> &data, const std::string &path);
+bool start_module(int id, const std::string &args, std::function<void(int, int)> done);
 void set_trace(bool modules, bool hle);
 
 }

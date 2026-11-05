@@ -120,12 +120,22 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2thbasetest PRIVATE synchronization)  # the GS queue's WaitOnAddress, which the wgpu line above adds only with wgpu
     endif()
+    # the emulation thread's big stack (host/big_stack_thread.hpp), no game and no runtime needed: ninja ps2bigstacktest
+    add_executable(ps2bigstacktest EXCLUDE_FROM_ALL tests/big_stack.cpp)
+    target_link_libraries(ps2bigstacktest PRIVATE pthread)
     # the memory card file and save state writes, no game needed: ninja ps2savetest
     add_executable(ps2savetest EXCLUDE_FROM_ALL tests/save_files.cpp)
     target_include_directories(ps2savetest PRIVATE runtime/src)
     target_link_libraries(ps2savetest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2savetest PRIVATE synchronization)
+    endif()
+    # the lines of the picture each video mode shows (480p must not be cut like a TV picture): ninja ps2displaylinestest
+    add_executable(ps2displaylinestest EXCLUDE_FROM_ALL tests/display_lines.cpp)
+    target_include_directories(ps2displaylinestest PRIVATE runtime/src)
+    target_link_libraries(ps2displaylinestest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2displaylinestest PRIVATE synchronization)
     endif()
 endif()
 
@@ -140,7 +150,8 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/blit.wgsl -DOUT=${PS2_BLIT_WGSL} -DNAME=kBlitShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         DEPENDS runtime/src/gs/gpu/blit.wgsl cmake/embed.cmake)
     if(NOT PS2_PREBUILT)
-        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}")
+        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}"
+            )
     endif()
     target_compile_definitions(ps2runtime ${PS2_API} PS2_GPU)
     if(EMSCRIPTEN)
@@ -160,6 +171,7 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
         endif()
     endif()
 endif()
+
 
 if(NOT EMSCRIPTEN)
     add_executable(ps2sifcmdtest EXCLUDE_FROM_ALL tests/sif_cmd_intr.cpp)
@@ -188,6 +200,13 @@ if(NOT EMSCRIPTEN)
     target_link_libraries(ps2iopboundstest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2iopboundstest PRIVATE synchronization)
+    endif()
+    # an UNPACK with CL 0 (or before any STCYCL) takes its data and the stream stays in step, no game needed: ninja ps2viftest
+    add_executable(ps2viftest EXCLUDE_FROM_ALL tests/vif_cycle.cpp)
+    target_include_directories(ps2viftest PRIVATE runtime/src)
+    target_link_libraries(ps2viftest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2viftest PRIVATE synchronization)
     endif()
 endif()
 
@@ -229,6 +248,17 @@ if(PS2_GENERATED)
         target_link_libraries(ps2run PRIVATE winmm)
     endif()
     if(WIN32)
+        # The main thread of a headless run (and the window thread) get 1 MB on Windows, 8 MB on Linux; the emulation thread's own
+        # size is set in host/big_stack_thread.hpp. Untested on Windows (no Windows build on the Linux PC): the llvm-mingw linker
+        # (lld) takes --stack,<bytes> as the stack reserve of the executable.
+        # PS2_WIN_SMALL_STACK=ON (scripts/wine-bench.sh build --small-stack) builds the old way, with Windows' default 1 MB stacks, to
+        # check that the test bench still sees the stack overflow of public issue 42 (docs/wine-bench.md).
+        option(PS2_WIN_SMALL_STACK "Windows: no big stacks (the behaviour before lane boot-stack), only for the test bench" OFF)
+        if(PS2_WIN_SMALL_STACK)
+            target_compile_definitions(ps2run PRIVATE PS2_SMALL_STACK)
+        else()
+            target_link_options(ps2run PRIVATE -Wl,--stack,16777216)
+        endif()
         list(APPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/third_party/sdl2")
         set(SDL2_NO_MWINDOWS ON)
     endif()

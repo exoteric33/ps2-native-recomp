@@ -61,6 +61,15 @@ inline bool is_branch(std::uint32_t lo) {
     const std::uint32_t op = lower_major(lo);
     return op == 0x20 || op == 0x21 || op == 0x24 || op == 0x25 || (op >= 0x28 && op <= 0x2F && op != 0x2A && op != 0x2B);
 }
+// A branch whose delay slot holds another branch: the compiled and the Wasm code leave it to the interpreter (upstream c243416).
+inline bool branch_in_delay_slot(const std::uint8_t *code, std::uint32_t mask, std::uint32_t pc) {
+    std::uint32_t lo, hi, next_lo, next_hi;
+    std::memcpy(&lo, code + (pc & mask), 4);
+    std::memcpy(&hi, code + ((pc + 4u) & mask), 4);
+    std::memcpy(&next_lo, code + ((pc + 8u) & mask), 4);
+    std::memcpy(&next_hi, code + ((pc + 12u) & mask), 4);
+    return !(hi & 0x80000000u) && is_branch(lo) && !(next_hi & 0x80000000u) && is_branch(next_lo);
+}
 inline bool is_jump_register(std::uint32_t lo) { return lower_major(lo) == 0x24 || lower_major(lo) == 0x25; }
 inline bool is_unconditional(std::uint32_t lo) { return lower_major(lo) == 0x20 || lower_major(lo) == 0x21; }
 inline bool links(std::uint32_t lo) { return lower_major(lo) == 0x21 || lower_major(lo) == 0x25; }

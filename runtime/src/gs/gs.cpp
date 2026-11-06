@@ -912,8 +912,11 @@ void signal(std::uint32_t reg, std::uint64_t value) {
         // The scheduler keeps one event per id, so a second FINISH written before the first has fired would replace it and one event
         // would be lost; a game that counts them (Metal Gear Solid 3 sends three in a row and waits for all three) then waits for ever.
         // The later ones wait in g_finish_queued and follow one kFinishDelay apart.
-        if (scheduled_at(hw::kEventGsFinish) != UINT64_MAX) ++g_finish_queued;
-        else schedule(hw::kEventGsFinish, now() + kFinishDelay, raise_finish);
+        if (scheduled_at(hw::kEventGsFinish) != UINT64_MAX) {
+            ++g_finish_queued;
+            if (trace_finish()) std::fprintf(stderr, "[gs] FINISH write f%llu queued behind an earlier one (%u waiting)\n",
+                                             static_cast<unsigned long long>(frame_count()), g_finish_queued);
+        } else schedule(hw::kEventGsFinish, now() + kFinishDelay, raise_finish);
         break;
     case 0x62: {
         const std::uint64_t label = (g_siglblid >> 32 & ~static_cast<std::uint64_t>(mask)) | (id & mask);

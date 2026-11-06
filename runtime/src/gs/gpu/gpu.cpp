@@ -326,7 +326,7 @@ std::uint32_t word_at(const std::uint32_t *f, std::uint32_t x, std::uint32_t y) 
 constexpr std::uint32_t kExactPixels = 1024;  // the largest sprite whose pixels are listed word by word, and the most texels one sprite is asked about
 
 // The whole texel coordinates (before the wrap mode, `lo` to `hi` on each axis) that the pixels of a sprite can read, worked out the way the draw program does it
-// (shade_at, sample in gs.wgsl): a pixel's position is x + j / SCALE, the texture coordinate is linear in it, a nearest read takes floor(u) and a bilinear one the
+// (shade_at, sample in gs.wgsl): a pixel's position is x + j / SCALE (upscaled, moved back by (1 - 1 / SCALE) / 2), the texture coordinate is linear in it, a nearest read takes floor(u) and a bilinear one the
 // four texels from floor(u - 0.5) on. A texel more on each side only where the 32-bit float arithmetic of the draw program may not give exactly the number worked out here: in
 // the plain case (texture coordinates in 12.4 fixed point, a sprite whose width in pixels is a power of two) every step is exact and a coordinate that lies on a texel edge
 // (the usual half-texel offset of a bilinear sprite) is not widened, so the sprite does not touch the row above it.
@@ -351,7 +351,9 @@ bool sprite_taps(const std::uint32_t *rec, const std::uint32_t *setup, int minx,
         int exponent;
         if (!(std::fabs(d) < 4096.0) || (d != 0.0 && std::frexp(std::fabs(d), &exponent) != 0.5) || to - from > 63 || !(std::fabs(a) < 32768.0) || !(std::fabs(b) < 32768.0) || (g_scale != 1 && g_scale != 2)) exact = false;
         const auto at = [&](double p) { return (a + (b - a) * (d != 0.0 ? (p - origin) / d : 0.0)) * k; };
-        double u0 = at(static_cast<double>(from)), u1 = at(static_cast<double>(to) + (samples - 1.0) / samples);
+        // upscaled, a sample stands for the centre of its place less half a pixel (shade_at), up to (1 - 1 / SCALE) / 2 before x
+        const double centre = g_scale > 1 ? 0.5 / samples - 0.5 : 0.0;
+        double u0 = at(static_cast<double>(from) + centre), u1 = at(static_cast<double>(to) + (samples - 1.0) / samples);
         if (u0 > u1) std::swap(u0, u1);
         const double m = exact ? 0.0 : 1.0 / 64.0;
         if (!(std::fabs(u0) < 1e6) || !(std::fabs(u1) < 1e6)) return false;
@@ -1155,9 +1157,12 @@ void finish_image_if_done() {
     if (psm != PSMCT32 && psm != PSMCT16 && psm != PSMCT16S && psm != PSMT8 && psm != PSMT4 && psm != PSMZ32 && psm != PSMZ16 && psm != PSMZ16S) return;
     std::uint32_t pw, ph;
     page_size(psm, pw, ph);
+    // every page the upload touches, even in part: a texture sheet smaller than a page (Urban Reign's 128 x 64 4-bit button icons, put
+    // where the fights draw their glow) must not be read as an upscaled picture (kUpscaledSource)
     const std::uint32_t per_row = std::max<std::uint32_t>(1, im.dbw * 64 / pw), rows = im.rrw ? im.total / im.rrw : 0;
-    for (std::uint32_t py = (im.dsay + ph - 1) / ph; py < (im.dsay + rows) / ph; ++py)
-        for (std::uint32_t px = (im.dsax + pw - 1) / pw; px < (im.dsax + im.rrw) / pw; ++px)
+    if (!rows) return;
+    for (std::uint32_t py = im.dsay / ph; py <= (im.dsay + rows - 1) / ph; ++py)
+        for (std::uint32_t px = im.dsax / pw; px <= (im.dsax + im.rrw - 1) / pw; ++px)
             g_rendered[((im.dbp * 256 + (px + py * per_row) * 8192) >> 13) & 511u] = false;
 }
 
@@ -1958,7 +1963,8 @@ void exact_selftest() {
                 const float origin = geometry[axis], d = geometry[2 + axis], a = uv[axis], bb = uv[3 + axis];
                 for (int p = axis ? miny : minx; p <= (axis ? maxy : maxx); ++p)
                     for (std::uint32_t j = 0; j <= g_scale; ++j) {
-                        const float position = j == g_scale ? static_cast<float>(p) : static_cast<float>(p) + static_cast<float>(j) / static_cast<float>(g_scale);
+                        const float centre = g_scale > 1 ? 0.5f / static_cast<float>(g_scale) - 0.5f : 0.0f;
+                        const float position = j == g_scale ? static_cast<float>(p) : static_cast<float>(p) + static_cast<float>(j) / static_cast<float>(g_scale) + centre;
                         const float t = d != 0.0f ? (position - origin) / d : 0.0f;
                         for (const bool fused : {false, true}) {
                             const float u = (fused ? std::fma(bb - a, t, a) : a + (bb - a) * t) / 16.0f;
@@ -2798,7 +2804,17 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     wait_idle();
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
-    std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
+    // A page counts as drawn by the GS when its samples differ within a texel; one that is the same in all of them was uploaded (or
+    // is flat, which reads the same either way).
+    std::fill(std::begin(g_rendered), std::end(g_rendered), false);
+    if (from == to && to > 1 && vram.size() == words * to)
+        for (std::size_t page = 0; page < 512; ++page)
+            for (std::size_t w = page * 2048; w < (page + 1) * 2048 && !g_rendered[page]; ++w)
+                for (std::uint32_t k = 1; k < to; ++k)
+                    if (vram[w * to + k] != vram[w * to]) {
+                        g_rendered[page] = true;
+                        break;
+                    }
     if (from == to && vram.size() == words * to) {
         wgpuQueueWriteBuffer(g_queue, g_vram, 0, vram.data(), vram.size() * 4);
     } else {

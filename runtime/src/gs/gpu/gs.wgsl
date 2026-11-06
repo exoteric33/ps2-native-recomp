@@ -1109,9 +1109,14 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
                 dv = dv / q * f32(1u << s.th);
             }
             // one texel to one pixel at the PS2's resolution (within 2 %): 2D art drawn at its own size
-            sharp_sprite = SHARP != 0u && SCALE > 1u && has(s, F_FST) && abs(abs(du) - abs(dx)) <= abs(dx) * 0.02 && abs(abs(dv) - abs(dy)) <= abs(dy) * 0.02;
-            var ux = px;
-            var uy = py;
+            sharp_sprite = SHARP != 0u && SCALE > 1u && abs(abs(du) - abs(dx)) <= abs(dx) * 0.02 && abs(abs(dv) - abs(dy)) <= abs(dy) * 0.02;
+            // The GS samples a pixel at its top left corner, and 2D art is laid out for that: a sprite from x.5 with texels from u.5
+            // puts every pixel on a texel centre. Upscaled, the samples x, x + 1/SCALE ... spread from that corner
+            // across the pixel, so half of them fell between two texels and blended them: text was soft and half a pixel off. Each
+            // sample stands for its own place in the pixel instead (its centre, less the half pixel the corner is from the middle).
+            let centre = select(0.0, 0.5 / f32(SCALE) - 0.5, SCALE > 1u);
+            var ux = px + centre;
+            var uy = py + centre;
             let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
             // (a bilinear read of an upscaled picture is exact one to one by itself: snapped, all its samples would read the same spot)
             let point = has(s, F_TME) && (!has(s, F_BILINEAR) || (direct && !upscaled_source));

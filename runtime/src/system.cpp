@@ -663,6 +663,13 @@ bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry) {
                 continue;
             }
             const std::uint32_t offset = u32(ph + 4), vaddr = physical(u32(ph + 8)), filesz = u32(ph + 16), memsz = u32(ph + 20);
+            // A segment with no file contents that starts wholly outside main memory has nothing to load and nothing to clear
+            // (Pro Evolution Soccer's boot ELFs end with an empty 0x800 byte entry at 0x03000000 or 0x04000000): it is left out,
+            // before any write. One that has contents, or one that starts inside memory and runs past its end, stays refused.
+            if (filesz == 0 && vaddr >= kRamSize) {
+                if (!copy) std::fprintf(stderr, "[elf] segment %u (empty, %u bytes at 0x%08X) lies outside main memory: ignored\n", i, memsz, vaddr);
+                continue;
+            }
             if (std::uint64_t{vaddr} + std::max(memsz, filesz) > kRamSize || std::uint64_t{offset} + filesz > data.size()) {
                 std::fprintf(stderr, "[elf] damaged ELF: segment %u does not fit in the file or in memory\n", i);
                 return false;

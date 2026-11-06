@@ -276,11 +276,14 @@ void boot_disc_tests() {
 
 struct Segment { std::uint32_t offset = 0x100, vaddr = 0x00100000, filesz = 0x10, memsz = 0x40; };
 
-bool boot(const Segment &s, std::uint32_t phoff, std::uint32_t &entry) {
+// The file holds the segment `s`, and after it `last` when given (a second program header at 84, like the empty entry that ends
+// some retail boot ELFs).
+bool boot(const Segment &s, std::uint32_t phoff, std::uint32_t &entry, const Segment *last = nullptr) {
     std::vector<std::uint8_t> elf(0x200);
     std::memcpy(elf.data(), "\177ELF\1\1\1", 7);
-    put(elf, 24, 0x00100008u); put(elf, 28, phoff); put(elf, 42, std::uint16_t{32}); put(elf, 44, std::uint16_t{1});
+    put(elf, 24, 0x00100008u); put(elf, 28, phoff); put(elf, 42, std::uint16_t{32}); put(elf, 44, static_cast<std::uint16_t>(last ? 2 : 1));
     put(elf, 52, 1u); put(elf, 56, s.offset); put(elf, 60, s.vaddr); put(elf, 68, s.filesz); put(elf, 72, s.memsz);
+    if (last) { put(elf, 84, 1u); put(elf, 88, last->offset); put(elf, 92, last->vaddr); put(elf, 100, last->filesz); put(elf, 104, last->memsz); }
     for (int i = 0; i < 16; ++i) elf[0x100 + i] = static_cast<std::uint8_t>(0xA0 + i);
     const auto path = std::filesystem::temp_directory_path() / "ps2-disc-input-test.elf";
     { std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(elf.data()), static_cast<std::streamsize>(elf.size())); }
@@ -300,6 +303,36 @@ void elf_tests() {
     { Segment s; s.offset = 0xFFFFFFF0u; s.filesz = 0x20; s.memsz = 0x20; check(!boot(s), "boot ELF file offset that wraps: refused"); }
     { Segment s; s.vaddr = ps2::kRamSize - 0x10; s.filesz = 0x100; s.memsz = 0x10; check(!boot(s), "boot ELF contents past the end of memory: refused"); }
     check(!boot({}, 0xFFFFFF00u), "boot ELF program headers past the end: refused");
+
+    // The empty entry that ends the boot ELFs of Pro Evolution Soccer 2 and 2008 (as the tester reported them): no contents,
+    // 0x800 bytes, wholly past the 32 MiB of memory. Built here without a disc.
+    for (const std::uint32_t at : {0x03000000u, 0x04000000u}) {
+        char name[96];
+        std::uint8_t *const guard = ps2::g_ram + ps2::kRamSize;    // the bytes just past the end of memory must stay as they are
+        std::memset(ps2::g_ram + 0x100000, 0xEE, 0x80);
+        std::memset(guard, 0x5A, 64);
+        Segment empty; empty.vaddr = at; empty.filesz = 0; empty.memsz = 0x800; empty.offset = 0;
+        entry = 0;
+        std::snprintf(name, sizeof name, "boot ELF with an empty segment at 0x%08X: loads", at);
+        check(boot({}, 52, entry, &empty) && entry == 0x00100008u, name);
+        std::snprintf(name, sizeof name, "boot ELF with an empty segment at 0x%08X: the real segment copied, nothing else touched", at);
+        bool guard_ok = true;
+        for (int i = 0; i < 64; ++i) guard_ok = guard_ok && guard[i] == 0x5A;
+        check(ps2::g_ram[0x100000] == 0xA0 && ps2::g_ram[0x10000F] == 0xAF && ps2::g_ram[0x100010] == 0 && ps2::g_ram[0x10003F] == 0 &&
+              ps2::g_ram[0x100040] == 0xEE && guard_ok, name);
+        Segment real = empty; real.filesz = 0x10;               // contents outside memory
+        std::snprintf(name, sizeof name, "boot ELF with contents at 0x%08X: refused", at);
+        check(!boot({}, 52, entry, &real), name);
+        real = empty; real.offset = 0x100; real.filesz = 0x10;
+        std::snprintf(name, sizeof name, "boot ELF with contents at 0x%08X listed first: refused", at);
+        check(!boot(real, 52, entry), name);
+    }
+    // Starting inside memory and running past its end stays refused, with or without contents.
+    { Segment e; e.vaddr = ps2::kRamSize - 0x400; e.filesz = 0; e.memsz = 0x800; check(!boot({}, 52, entry, &e), "boot ELF empty segment that straddles the end of memory: refused"); }
+    { Segment e; e.vaddr = ps2::kRamSize - 0x400; e.filesz = 0; e.memsz = 0xFFFFFFF0u; check(!boot({}, 52, entry, &e), "boot ELF empty segment from inside memory, size that wraps: refused"); }
+    // Wholly outside: nothing is written, whatever the size says.
+    { Segment e; e.vaddr = 0xFFFFFF00u; e.filesz = 0; e.memsz = 0x800; check(boot({}, 52, entry, &e), "boot ELF empty segment at the top of the address space: ignored"); }
+    { Segment e; e.vaddr = ps2::kRamSize; e.filesz = 0; e.memsz = 0x800; check(boot({}, 52, entry, &e), "boot ELF empty segment right at the end of memory: ignored"); }
 }
 
 }

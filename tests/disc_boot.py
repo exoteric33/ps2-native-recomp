@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def run(command, expected=0, **kwargs):
-    result = subprocess.run([str(arg) for arg in command], text=True, stdout=subprocess.PIPE,
+    result = subprocess.run([str(arg) for arg in command], text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, timeout=180, **kwargs)
     if result.returncode != expected:
         raise RuntimeError(f"{command[0]} exited {result.returncode}, wanted {expected}:\n{result.stdout[-8000:]}")
@@ -68,7 +68,7 @@ def main():
         disc = run([exe, '--disc', iso, '--frames', '30', '--record', recording], cwd=cwd, env=env)
         assert '[elf] read cdrom0:\\BOOT.ELF;1 from disc (288 bytes)' in disc, disc
         assert 'stopped after 30 frames' in disc and 'switched in after' in disc, disc
-        assert 'disc-program 1\n' in recording.read_text(), recording.read_text()
+        assert 'disc-program 1\n' in recording.read_text(encoding="utf-8"), recording.read_text(encoding="utf-8")
         assert not elf.exists() and not list(cwd.glob('*.ELF')), 'runner extracted a boot ELF'
         cached = run([exe, '--disc', iso, '--frames', '30'], cwd=cwd, env=env)
         assert 'stopped after 30 frames' in cached and 'loaded 1 translated code windows' in cached, cached
@@ -83,6 +83,8 @@ def main():
         portable = work / 'portable' / exe.name
         portable.parent.mkdir()
         shutil.copy2(exe, portable)
+        for dll in exe.parent.glob('*.dll'):  # Windows: the runner needs SDL2.dll (and the shader compiler DLLs) beside it
+            shutil.copy2(dll, portable.parent)
         (game / 'vu1').mkdir(parents=True)
         (game / 'overlays').mkdir()
         (game / 'entries.txt').write_text('')
@@ -92,13 +94,13 @@ def main():
         assert 'stopped after 30 frames' in selected and 'switched in after' in selected, selected
         assert str(game / 'ee-live') in selected and str(game / 'vu1-live') in selected, selected
         assert list((game / 'ee-live').glob('*.*')), 'EE cache was not written in the game folder'
-        assert (game / 'entries.txt').read_text().strip(), 'live entries were not added to the game folder'
+        assert (game / 'entries.txt').read_text(encoding="utf-8").strip(), 'live entries were not added to the game folder'
         assert list((game / 'overlays').glob('*.bin')), 'live overlay was not captured in the game folder'
-        assert f'game-dir {game}\n' in game_recording.read_text(), game_recording.read_text()
+        assert f'game-dir {game}\n' in game_recording.read_text(encoding="utf-8"), game_recording.read_text(encoding="utf-8")
         selected_replay = run([sys.executable, ROOT / 'scripts/replay.py', game_recording, '--exe', portable,
                               '--disc', iso, '--log', work / 'game-replay.log'], cwd=cwd, env=env)
         assert 'RESULT: same to the end' in selected_replay, selected_replay
-        assert 'loaded 1 translated code windows' in (work / 'game-replay.log').read_text(), selected_replay
+        assert 'loaded 1 translated code windows' in (work / 'game-replay.log').read_text(encoding="utf-8"), selected_replay
         legacy = cwd / 'separate program.elf'
         legacy.write_bytes(data)
         legacy_run = run([portable, legacy, '--disc', iso, '--game-dir', game, '--frames', '30'], cwd=cwd, env=env)

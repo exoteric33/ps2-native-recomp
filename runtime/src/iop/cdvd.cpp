@@ -44,6 +44,9 @@ struct CdState {
     std::uint32_t callback = 0;
     std::uint32_t error = 0;
     std::vector<int> sync_waiters;
+    // The running read, for sceCdGetReadPos only (not in save states: after loading one, the position of a read in flight reads as 0).
+    std::uint64_t read_start = 0;
+    std::uint32_t read_sectors = 0;
 } g_cd;
 
 // The disc stream of the IOP library (sceCdSt*). A game's own IOP module (Robotech: Battlecry's vcIOPFile) streams music and
@@ -67,6 +70,7 @@ std::uint8_t bcd(int v) { return static_cast<std::uint8_t>(((v / 10) << 4) | (v 
 
 void finish_read() {
     g_cd.busy = false;
+    g_cd.read_sectors = 0;
     for (int id : g_cd.sync_waiters)
         if (Thread *t = thread(id)) wake(*t, 0);
     if (!g_cd.sync_waiters.empty()) reschedule();
@@ -105,6 +109,8 @@ bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, 
     sectors = iop_sectors("sceCdRead", buffer, sectors);
     g_cd.busy = true;
     g_cd.error = 0;
+    g_cd.read_start = now();
+    g_cd.read_sectors = sectors;
     disc::ready(lsn, sectors);
     schedule(now() + read_cycles(sectors), Job{kJobCdRead, lsn, sectors, buffer});
     return true;
@@ -174,6 +180,16 @@ void install_cdvd() {
         write8(p + 6, bcd(tm->tm_mon + 1));
         write8(p + 7, bcd(tm->tm_year % 100));
         c.r[2] = 1;
+    });
+    // #44 sceCdGetReadPos (ps2sdk iop/cdvd/cdvdman/src/exports.tab and cdvdman.c, AFL-2.0): how many bytes of the running sceCdRead have
+    // reached memory; 0 when no read runs. The disc here is read in one piece when the read's time is up, so the answer grows evenly with
+    // the time the read takes (whole sectors of 0x800 bytes, always below the total while it runs).
+    def("cdvdman", 44, "sceCdGetReadPos", [](Cpu &c) {
+        c.r[2] = 0;
+        if (!g_cd.busy || !g_cd.read_sectors) return;
+        const std::uint64_t whole = read_cycles(g_cd.read_sectors), spent = now() > g_cd.read_start ? now() - g_cd.read_start : 0;
+        const std::uint64_t done = std::min<std::uint64_t>(g_cd.read_sectors - 1, spent * g_cd.read_sectors / std::max<std::uint64_t>(whole, 1));
+        c.r[2] = static_cast<std::uint32_t>(done * disc::kSector);
     });
     def("cdvdman", 28, "sceCdStatus", [](Cpu &c) { c.r[2] = g_cd.busy ? 0x06u : 0x0Au; });
     def("cdvdman", 37, "sceCdCallback", [](Cpu &c) { c.r[2] = g_cd.callback; g_cd.callback = arg(c, 0); });

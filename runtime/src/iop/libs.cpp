@@ -1299,13 +1299,23 @@ void install_modload() {
         if (!started) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownModule); return; }
         block(c, kWaitHle, 0);
     });
-    def("modload", 10, "LoadModuleBuffer", [](Cpu &c) {
-        const std::uint32_t at = phys(arg(c, 0));
+    // #9 and #10 (rules from ps2sdk's modload, AFL-2.0: iop/system/modload/src/exports.tab and modload.c): LoadModuleBufferAddress(buffer,
+    // addr, offset) links the module image that lies in IOP memory at `buffer` and returns its id; it does not start it (StartModule, #8,
+    // does). LoadModuleBuffer(buffer) is the same call with addr 0 and offset 0. A non-zero `addr` is a block the caller got from
+    // AllocLoadMemory (#28, not here) to place the module in; here a module is always linked into memory of its own, which a
+    // relocatable module cannot tell apart, so `addr` and `offset` are only noted in the log.
+    const auto load_buffer = [](Cpu &c, std::uint32_t buffer) {
+        const std::uint32_t at = phys(buffer);
         if (at >= kRamSize) { c.r[2] = static_cast<std::uint32_t>(kErrorIllegalObject); return; }
         const std::uint8_t *p = ram_ptr(at);
         const std::int32_t id = link_module(std::vector<std::uint8_t>(p, p + (kRamSize - at)), "buffer");
         c.r[2] = static_cast<std::uint32_t>(id < 0 ? kErrorIllegalObject : id);
+    };
+    def("modload", 9, "LoadModuleBufferAddress", [load_buffer](Cpu &c) {
+        if (arg(c, 1) || arg(c, 2)) std::fprintf(stderr, "[iop] modload LoadModuleBufferAddress: destination 0x%08X offset 0x%X ignored, the module is linked elsewhere\n", arg(c, 1), arg(c, 2));
+        load_buffer(c, arg(c, 0));
     });
+    def("modload", 10, "LoadModuleBuffer", [load_buffer](Cpu &c) { load_buffer(c, arg(c, 0)); });
     def("modload", 13, "SetCheckKelfPathCallback", [](Cpu &c) { c.r[2] = 0; });
     // #30 takes a module id (from SearchModuleByName) and a flag word (Tekken 5's module 0x22B00 passes 0x40 for two modules); a call that
     // changes nothing here, since modules are never unloaded behind a game's back.

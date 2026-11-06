@@ -201,6 +201,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2iopboundstest PRIVATE synchronization)
     endif()
+    # modload #9 and cdvdman #44 (Tales of Destiny 2 / Director's Cut, no game needed): ninja ps2talestest
+    add_executable(ps2talestest EXCLUDE_FROM_ALL tests/iop_tales.cpp)
+    target_include_directories(ps2talestest PRIVATE runtime/src)
+    target_link_libraries(ps2talestest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2talestest PRIVATE synchronization)
+    endif()
     # an UNPACK with CL 0 (or before any STCYCL) takes its data and the stream stays in step, no game needed: ninja ps2viftest
     add_executable(ps2viftest EXCLUDE_FROM_ALL tests/vif_cycle.cpp)
     target_include_directories(ps2viftest PRIVATE runtime/src)

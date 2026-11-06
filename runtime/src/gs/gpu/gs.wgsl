@@ -1079,6 +1079,16 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             if (SCALE > 1u && (cx < min(x0, x0 + dx) || cx >= max(x0, x0 + dx) || cy < min(y0, y0 + dy) || cy >= max(y0, y0 + dy))) {
                 return;
             }
+            // Upscaled, the extra samples of the last native pixel row and column sit past it (x + 1/3, x + 2/3 ...), so a bilinear
+            // sprite reads up to most of a texel beyond the ones it covers at native size: the neighbour in the texture shows as a
+            // line along that edge (button icons cut from a sheet get a dark line under them). Keep the sample within the native
+            // pixels the sprite covers: inside it still blends smoothly, at its edges it ends on its own texels as at native size.
+            if (SCALE > 1u) {
+                let ax = ceil(min(x0, x0 + dx));
+                let ay = ceil(min(y0, y0 + dy));
+                ux = clamp(ux, ax, max(ax, ceil(max(x0, x0 + dx)) - 1.0));
+                uy = clamp(uy, ay, max(ay, ceil(max(y0, y0 + dy)) - 1.0));
+            }
             var tx = 0.0;
             var ty = 0.0;
             if (dx != 0.0) {

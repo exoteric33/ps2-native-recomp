@@ -2208,6 +2208,7 @@ function Get-FailureMessage($b) {
     if ($tail -match 'cue sheet names') { return 'The .cue file names a .bin file that is not in the same folder.' }
     if ($tail -match '7z not found') { return 'A .7z file needs the free program 7-Zip (7-zip.org). Install it, or unpack the .iso yourself.' }
     if ($tail -match 'BOOT2') { return 'This disc has no PS2 game program that the app can start. Is it a PS2 game disc?' }
+    if ($tail -match 'crashes the compiler even at its lowest setting') { return 'The build tools'' compiler crashed on one part of this game and could not get past it, even with less optimisation. Please send the build log (Show details has it) when you report it.' }
     switch ($b.Step) {
         1 { return 'The disc image could not be read. Is it a complete .iso file made from a PS2 DVD?' }
         2 { return 'The disc has no program the app can start. Is it a PS2 game disc?' }

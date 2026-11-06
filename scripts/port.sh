@@ -190,6 +190,7 @@ if [ -n "${PS2_JOBS:-}" ]; then
   ninja_jobs="-j$PS2_JOBS"
 fi
 . "$here/runtime.sh"
+. "$here/build_units.sh"
 
 build_native() {
   . "$here/cxx.sh"
@@ -199,7 +200,8 @@ build_native() {
     cmake -S "$ROOT" -B "$native" -G Ninja -DCMAKE_BUILD_TYPE=$build_type "${cxx_flags[@]}" -DPS2_GENERATED="$generated" -DPS2_RUNTIME_LIB="$runtime_lib" > /dev/null
     echo "$config" > "$native/.port-config"
   fi
-  ninja -C "$native" $ninja_jobs ps2run > "$native/ninja.log" 2>&1 || { tail -30 "$native/ninja.log"; exit 1; }
+  # a unit that crashes the compiler is built again a step lower (scripts/build_units.sh); a real error stops here as before
+  ps2_ninja "$native" ps2run || exit 1
 }
 
 echo "== [4/6] exploring"

@@ -1,0 +1,33 @@
+# Lower optimisation for generated sources whose compile crashed the compiler (public issue 50: clang-23 died on one unit of
+# Chronicles of Narnia). scripts/build_units.sh writes <build folder>/lowopt.txt when a unit crashes the compiler, one line
+# per source file:  <file name> <compiler flags>   e.g.  unit_0096.cpp -O1
+# These flags go behind the usual ones (-O3 ...) for that one file; every other file is compiled exactly as before. The
+# file is a configure dependency: ninja runs CMake again on its own when scripts/build_units.sh changes it.
+function(ps2_lowopt_apply target)
+    set(list_file "${CMAKE_BINARY_DIR}/lowopt.txt")
+    if(NOT EXISTS "${list_file}")
+        file(WRITE "${list_file}" "")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${list_file}")
+    file(STRINGS "${list_file}" lines)
+    get_target_property(sources ${target} SOURCES)
+    foreach(line IN LISTS lines)
+        string(STRIP "${line}" line)
+        if(line STREQUAL "" OR line MATCHES "^#")
+            continue()
+        endif()
+        string(REGEX MATCH "^([^ \t]+)[ \t]+(.+)$" matched "${line}")
+        if(NOT matched)
+            continue()
+        endif()
+        set(file_name "${CMAKE_MATCH_1}")
+        separate_arguments(flags UNIX_COMMAND "${CMAKE_MATCH_2}")
+        foreach(source IN LISTS sources)
+            get_filename_component(source_name "${source}" NAME)
+            if(source_name STREQUAL file_name)
+                set_property(SOURCE "${source}" APPEND PROPERTY COMPILE_OPTIONS ${flags})
+                message(STATUS "lowopt: ${file_name} is compiled with ${flags}")
+            endif()
+        endforeach()
+    endforeach()
+endfunction()

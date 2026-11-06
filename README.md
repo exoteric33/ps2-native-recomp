@@ -1,8 +1,8 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 21 games work as far as they
-have been tested, 15 of them out of the box, with zero game-specific code. God of War II has been played from start to
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 31 games work as far as they
+have been tested, 19 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
 **How it works, from the disc to the picture: [read the explanation](#how-it-works).**
@@ -11,9 +11,9 @@ Built on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nu
 
 https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
 
-**15 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
+**19 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
 Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
-Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne and Persona 4. *Out of the box* means nobody changed anything for these games: the
+Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom and College Basketball 2K5. *Out of the box* means nobody changed anything for these games: the
 tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)). Gran Turismo 4 needs one small build step that
 unpacks its program; the runtime has no code for it.
 
@@ -40,8 +40,8 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 20
-other games play well as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 30
+other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
 real console prints. **It is not faster than PCSX2 yet:** on the same laptop PCSX2 is faster in every scene I measured (see
@@ -90,7 +90,7 @@ translated cache is complete or correct; the offline build and cache validation 
 
 ## What runs
 
-Tried with real discs (mine are US releases), as far as each was played (no known bugs):
+Tried with real discs (mine are US releases), as far as each was played; known problems are named in the row:
 
 | Game | How far | Tested by |
 |---|---|---|
@@ -115,6 +115,16 @@ Tried with real discs (mine are US releases), as far as each was played (no know
 | Ecco the Dolphin: Defender of the Future (USA) | plays well, not played through yet: the first level, smooth (Windows 11, a laptop with AMD graphics, a game controller; [#30](https://github.com/exoteric33/ps2-native-recomp/issues/30)) | Pacioso |
 | Shin Megami Tensei: Nocturne (USA) | plays well, not played through yet: through the opening films to the subway, where you take control, at 60 fps (Windows 11, an RTX 3080, keyboard and mouse and a game controller; [#54](https://github.com/exoteric33/ps2-native-recomp/issues/54)) | dguillot-gh |
 | Persona 4 (USA) | plays well, not played through yet: booted right in and played until you get home and take control, with a small hitch now and then (Windows 11, an RTX 3080, a game controller; [#52](https://github.com/exoteric33/ps2-native-recomp/issues/52)) | dguillot-gh |
+| Crash of the Titans (USA) | plays well, not played through yet: about 6 minutes from power-on; gameplay, a cutscene and saving work, the cutscene at 60 fps with good sound | me |
+| Devil May Cry | plays well, not played through yet: from power-on through New Game and the opening scenes into Mission 1, about 50 fps; fights, saving and later missions not tried ([#16](https://github.com/exoteric33/ps2-native-recomp/issues/16)) | me |
+| Zone of the Enders (USA) | plays well, not played through yet: from power-on through the film and the menus into the first battle ([#24](https://github.com/exoteric33/ps2-native-recomp/issues/24)) | Pacioso, me |
+| Robotech: Battlecry | plays, not played through yet: from power-on through the memory card save into the first mission; a tester saw sound stutter and frame drops when characters speak, which I could not reproduce ([#1](https://github.com/exoteric33/ps2-native-recomp/issues/1), [#7](https://github.com/exoteric33/ps2-native-recomp/issues/7)) | omegakatana92, me |
+| Gundam vs. Zeta Gundam | plays, not played through yet: menus at full speed, a fight at 45 to 55 fps, a short pause the first time a new part loads ([#2](https://github.com/exoteric33/ps2-native-recomp/issues/2)) | omegakatana92, me |
+| Tales of the Abyss (USA) | plays, not played through yet: the opening films, the title and exploration at about 30 fps like the PS2, menus at 60 fps; battles not tried; at 2x resolution a dashed line shows along the bottom of the picture (SteamOS on a ROG Ally X, a DualShock 3; [#59](https://github.com/exoteric33/ps2-native-recomp/issues/59)) | Kush Peshin |
+| Final Fantasy X International (Japan) | plays in a tester's own copy, not played through yet: to Besaid Village, with fights, a boss and saving, generally at full speed, some graphics errors; that copy has three fixes that are not in this project yet, so here it may stop sooner (Windows 11, an RTX 4070 Ti Super, an Xbox controller) | a tester, by mail |
+| Digimon World Data Squad | plays, not played through yet: the opening film, menus, gameplay and a battle look and sound right; about 80 % of full speed on a very weak PC (Windows, Intel N100, 4 GB, 1x resolution, an Xbox 360 controller) | a tester, by mail |
+| Football Kingdom | plays, not played through yet: no crashes; the crowd sometimes goes black for a moment and the free kick aiming arrow is half as wide as it should be | a tester, by mail |
+| College Basketball 2K5 | plays, not played through yet: no glitches except one small sound stutter | a tester, by mail |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

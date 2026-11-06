@@ -86,6 +86,18 @@ unsigned language_number(const std::string &text) {
     return n >= 1 && n <= 7 ? n : 0;
 }
 
+// The disc's serial from the name of its boot program (SCES_536.88 -> SCES-53688), or "" when the name is not one.
+std::string disc_serial(const std::string &path) {
+    std::string name = path.substr(path.find_last_of("/\\:") + 1);
+    name = name.substr(0, name.find(';'));
+    if (name.size() != 11 || name[4] != '_' || name[8] != '.') return {};
+    for (int i : {0, 1, 2, 3})
+        if (name[i] < 'A' || name[i] > 'Z') return {};
+    for (int i : {5, 6, 7, 9, 10})
+        if (name[i] < '0' || name[i] > '9') return {};
+    return name.substr(0, 4) + "-" + name.substr(5, 3) + name.substr(9, 2);
+}
+
 int usage() {
     std::fprintf(stderr,
                  "usage: ps2run [elf] [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
@@ -941,6 +953,9 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "[vu%d] recording vector programs that are not compiled yet into %s\n", unit, ps2::os::env(setting).c_str());
         }
     }
+    // The window says which game runs: PS2_WINDOW_TITLE when a launcher sets it, else the disc's serial.
+    if (window && ps2::os::env("PS2_WINDOW_TITLE").empty())
+        if (const std::string serial = disc_serial(program_location); !serial.empty()) ps2::os::set_env("PS2_WINDOW_TITLE", serial);
     if (window && !open_window(fullscreen)) return 1;
     if (window) name_thread(L"ps2 window");
 #endif

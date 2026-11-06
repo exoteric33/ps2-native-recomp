@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <span>
 #include <vector>
 
 namespace ps2 {
@@ -62,9 +63,11 @@ struct Options {
     std::string save_state_path;
     std::uint64_t save_state_frame = 0;
     // for the keys of a window run (F5, F8, F9; docs/play-keys.md)
+    bool disc_program = false;                            // boots from SYSTEM.CNF in --disc; also written to input recordings
     std::string program_path;                                  // the game's program, set by the host
+    std::string game_dir;                                      // --game-dir or the game folder found by the host; caches and build inputs
     std::string command_line;                                  // what the runner was started with, for reports
-    std::string quick_dir;                                     // --quick-dir; default: the folder of the memory card, else of the program
+    std::string quick_dir;                                     // --quick-dir; default: memory card folder, game folder, then program folder
     std::function<std::string(std::size_t lines)> recent_log;  // the host's copy of the log: its last lines ...
     std::function<std::string(std::size_t lines)> first_log;   // ... and its first lines
     std::function<void()> on_exit;                             // the window run is about to end the process
@@ -108,6 +111,7 @@ void request_iop_sync();
 void sync_iop();
 
 bool load_elf(const std::string &path, std::uint32_t &entry);
+bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry);
 void boot(std::uint32_t entry, const std::vector<std::string> &args);
 int run();
 void halt(const std::string &reason);

@@ -8,7 +8,7 @@ VU0 `XTOP` returns zero and `XITOP` reads the current VIF0 ITOP, matching the re
 
 ## Record and build
 
-`port.sh <name> <disc> ...` creates `games/<name>/vu0` and `vu1`, records unknown entries during native exploration, and compiles both sets. When playing a native window build, the host discovers either recording directory beside the extracted executable or disc image. Explicit `PS2_VU0_RECORD=<directory>` and `PS2_VU_RECORD=<directory>` settings take precedence independently. Use separate directories for the two units.
+`port.sh <name> <disc> ...` creates `games/<name>/vu0` and `vu1`, records unknown entries during native exploration, and compiles both sets. When playing a native window build, the host records into the `vu1` and `vu0` folders of the game folder (`--game-dir`, which `port.sh` passes; otherwise the folder beside the executable or disc image). Explicit `PS2_VU0_RECORD=<directory>` and `PS2_VU_RECORD=<directory>` settings take precedence independently. Use separate directories for the two units.
 
 The recording format is `%016llX_%04X.bin` (key and byte entry address), with exactly 4096 bytes for VU0 or 16384 bytes for VU1. The CLI validates size/alignment and the generator verifies the reachable-code key:
 

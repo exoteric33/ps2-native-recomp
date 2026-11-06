@@ -9,6 +9,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <string_view>
 
 namespace ps2::disc {
 
@@ -219,6 +220,79 @@ std::optional<Entry> find(const std::string &raw) {
     auto it = g_index.find(upper(path));
     if (it == g_index.end()) return std::nullopt;
     return it->second;
+}
+
+namespace {
+
+bool read_boot_file(const std::string &path, std::size_t limit, std::vector<std::uint8_t> &out, std::string &why) {
+    const auto entry = find(path);
+    if (!entry || entry->directory) {
+        why = path + ": file not found in the disc image";
+        return false;
+    }
+    const std::uint64_t offset = std::uint64_t{entry->sector} * kSector;
+    if (!entry->size || entry->size > limit || offset > g_size || entry->size > g_size - offset) {
+        why = path + ": empty, too large or outside the disc image";
+        return false;
+    }
+    out.resize(entry->size);
+    // Boot is host I/O. Guest read() pads short sector reads with zeroes; here every file byte must be present.
+    if (g_reader(offset, out.data(), out.size()) != out.size()) {
+        out.clear();
+        why = path + ": short read from the disc image";
+        return false;
+    }
+    return true;
+}
+
+std::string_view trim_boot_value(std::string_view text) {
+    const auto begin = text.find_first_not_of(" \t\r\n");
+    return begin == std::string_view::npos ? std::string_view{} : text.substr(begin, text.find_last_not_of(" \t\r\n") - begin + 1);
+}
+
+}
+
+bool read_boot_elf(std::string &program, std::vector<std::uint8_t> &elf, std::string &why) {
+    program.clear();
+    elf.clear();
+    why.clear();
+    if (!is_open()) {
+        why = "no disc image is open";
+        return false;
+    }
+    // These are host allocation limits for untrusted file metadata, not PS2 hardware limits.
+    std::vector<std::uint8_t> cnf;
+    if (!read_boot_file("SYSTEM.CNF", 64u << 10, cnf, why)) return false;
+    std::string_view text(reinterpret_cast<const char *>(cnf.data()), cnf.size());
+    if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
+    text = text.substr(0, text.find('\0'));  // tolerate a padded configuration file
+    while (!text.empty()) {
+        const auto end = text.find('\n');
+        const auto line = text.substr(0, end);
+        text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+        const auto equal = line.find('=');
+        if (equal == std::string_view::npos || upper(std::string(trim_boot_value(line.substr(0, equal)))) != "BOOT2") continue;
+        const auto value = trim_boot_value(line.substr(equal + 1));
+        const auto colon = value.find(':');
+        if (value.empty() || (colon != std::string_view::npos && upper(std::string(value.substr(0, colon))) != "CDROM0")) {
+            why = "SYSTEM.CNF: BOOT2 must name a file on cdrom0";
+            return false;
+        }
+        const std::string path(value);
+        std::vector<std::uint8_t> bytes;
+        if (!read_boot_file(path, 128u << 20, bytes, why)) return false;
+        if (bytes.size() < 52 || std::memcmp(bytes.data(), "\x7F" "ELF\x01\x01", 6) != 0) {
+            why = path + ": not a little endian ELF32 file";
+            return false;
+        }
+        program = path;
+        if (colon == std::string_view::npos)
+            program = std::string("cdrom0:") + ((path.front() == '\\' || path.front() == '/') ? "" : "\\") + path;
+        elf = std::move(bytes);
+        return true;
+    }
+    why = "SYSTEM.CNF does not name a BOOT2 program";
+    return false;
 }
 
 std::uint32_t layer1_start() { return g_layer1; }

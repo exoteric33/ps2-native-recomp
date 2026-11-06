@@ -198,6 +198,80 @@ void irx_tests() {
     check(iop::load_module_buffer(irx({}), "valid-again.irx", "") >= 0, "valid module after the refused ones: loads");
 }
 
+// ---- booting directly from SYSTEM.CNF in an ISO ----
+
+struct BootDisc {
+    std::vector<std::uint8_t> bytes;
+    std::size_t cnf_record, elf_record;
+};
+
+BootDisc boot_disc(const std::string &cnf) {
+    BootDisc out{image(20, disc::kSector), 0, 0};
+    auto at = dots(out.bytes, 20 * disc::kSector, 20, 20);
+    out.cnf_record = at;
+    at = record(out.bytes, at, 30, static_cast<std::uint32_t>(cnf.size()), false, "SYSTEM.CNF;1");
+    out.elf_record = at;
+    record(out.bytes, at, 31, 53, false, "BOOT.ELF;1");
+    std::memcpy(out.bytes.data() + 30 * disc::kSector, cnf.data(), cnf.size());
+    std::memcpy(out.bytes.data() + 31 * disc::kSector, "\177ELF\1\1\1", 7);
+    return out;
+}
+
+void boot_disc_tests() {
+    const std::string cnf = "BOOT2 = cdrom0:\\BOOT.ELF;1\r\nVER = 1.00\r\n";
+    auto valid = boot_disc(cnf);
+    open_image(valid.bytes, "boot.iso");
+    std::string program, why;
+    std::vector<std::uint8_t> elf;
+    check(disc::read_boot_elf(program, elf, why) && program == "cdrom0:\\BOOT.ELF;1" && elf.size() == 53 && why.empty(),
+          "ISO boot: BOOT2 path and exact ELF bytes, excluding sector padding");
+    auto padded = boot_disc(std::string("\xEF\xBB\xBF\tboot2\t=\tcdrom0:\\BOOT.ELF;1 \n") + '\0' + "trailing padding");
+    open_image(padded.bytes, "padded-cnf.iso");
+    check(disc::read_boot_elf(program, elf, why) && elf.size() == 53, "ISO boot: BOM, mixed case, tabs, LF and NUL padding");
+    auto relative = boot_disc("BOOT2 = BOOT.ELF;1\n");
+    open_image(relative.bytes, "relative-boot.iso");
+    check(disc::read_boot_elf(program, elf, why) && program == "cdrom0:\\BOOT.ELF;1",
+          "ISO boot: relative BOOT2 becomes a guest disc path without duplicating ;1");
+    const auto refuse = [&](BootDisc &bad, const char *what) {
+        open_image(bad.bytes, "bad-boot.iso");
+        program = "stale";
+        elf.assign(4, 0xFF);
+        check(!disc::read_boot_elf(program, elf, why) && program.empty() && elf.empty() && !why.empty(), what);
+    };
+    { auto bad = valid; bad.bytes[bad.cnf_record + 33] = 'X'; refuse(bad, "ISO boot: missing SYSTEM.CNF"); }
+    { auto bad = valid; bad.bytes[bad.cnf_record + 25] = 2; refuse(bad, "ISO boot: SYSTEM.CNF is a directory"); }
+    { auto bad = boot_disc("BOOT = cdrom0:\\BOOT.ELF;1\n"); refuse(bad, "ISO boot: missing BOOT2"); }
+    { auto bad = boot_disc("BOOT2 = \t\r\n"); refuse(bad, "ISO boot: empty BOOT2"); }
+    { auto bad = boot_disc("BOOT2 = host:BOOT.ELF\n"); refuse(bad, "ISO boot: host path is not opened"); }
+    { auto bad = valid; bad.bytes[bad.elf_record + 33] = 'X'; refuse(bad, "ISO boot: missing boot program"); }
+    { auto bad = valid; bad.bytes[bad.elf_record + 25] = 2; refuse(bad, "ISO boot: boot program is a directory"); }
+    { auto bad = valid; bad.bytes[31 * disc::kSector] = 0; refuse(bad, "ISO boot: invalid ELF magic"); }
+    { auto bad = valid; put(bad.bytes, bad.elf_record + 10, 51u); refuse(bad, "ISO boot: truncated ELF header"); }
+    { auto bad = valid; put(bad.bytes, bad.cnf_record + 10, 65537u); refuse(bad, "ISO boot: configuration allocation is bounded"); }
+    { auto bad = valid; put(bad.bytes, bad.elf_record + 10, 0xFFFFFFFFu); refuse(bad, "ISO boot: ELF allocation is bounded"); }
+    { auto bad = valid; put(bad.bytes, bad.elf_record + 2, 0xFFFFFFFFu); refuse(bad, "ISO boot: ELF extent outside the image"); }
+    disc::open("short-boot.iso", valid.bytes.size(), [&valid](std::uint64_t offset, void *out, std::size_t bytes) -> std::size_t {
+        if (offset >= valid.bytes.size()) return 0;
+        auto count = std::min<std::size_t>(bytes, valid.bytes.size() - offset);
+        if (offset == 31 * disc::kSector && count) --count;
+        std::memcpy(out, valid.bytes.data() + offset, count);
+        return count;
+    });
+    check(!disc::read_boot_elf(program, elf, why) && why.find("short read") != std::string::npos,
+          "ISO boot: a positive but short reader result is refused");
+    auto nested = image(20, disc::kSector);
+    const std::string nested_cnf = "BOOT2=cdrom0:\\DIR\\BOOT.ELF;1\n";
+    auto at = dots(nested, 20 * disc::kSector, 20, 20);
+    at = record(nested, at, 30, static_cast<std::uint32_t>(nested_cnf.size()), false, "SYSTEM.CNF;1");
+    record(nested, at, 21, disc::kSector, true, "DIR");
+    at = dots(nested, 21 * disc::kSector, 21, 20);
+    record(nested, at, 31, 53, false, "BOOT.ELF;1");
+    std::memcpy(nested.data() + 30 * disc::kSector, nested_cnf.data(), nested_cnf.size());
+    std::memcpy(nested.data() + 31 * disc::kSector, "\177ELF\1\1\1", 7);
+    open_image(nested, "nested-boot.iso");
+    check(disc::read_boot_elf(program, elf, why) && program == "cdrom0:\\DIR\\BOOT.ELF;1", "ISO boot: program in a sub-directory");
+}
+
 // ---- the boot ELF: PT_LOAD segments copied into the 32 MiB of EE memory ----
 
 struct Segment { std::uint32_t offset = 0x100, vaddr = 0x00100000, filesz = 0x10, memsz = 0x40; };
@@ -234,6 +308,7 @@ int main() {
     disc_tests();
     irx_tests();
     elf_tests();
+    boot_disc_tests();
     std::printf("disc input: %d failed of %d checks\n", failed, checks);
     return failed ? 1 : 0;
 }

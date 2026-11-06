@@ -1390,9 +1390,61 @@ bool no_limit() {
     return on;
 }
 
+// PS2_PACE=audio: the sound device paces the game (the game waits while more than ~80 ms of sound is waiting), as before. A device
+// that takes its sound in large blocks (wireless headsets over WASAPI) then makes the frames uneven: seven of 20 ms, one of 30 ms, one
+// of 3 ms, about six times a second (measured with Urban Reign and a Corsair HS80), which shows as judder in every camera pan even
+// at a steady 50 fps. By default the clock paces the game instead, one frame every 1/50 or 1/60 s, and the sound only steers that
+// clock: frames up to 1% longer while more sound than kSteerMs is waiting, up to 1% shorter while less. The sound stretcher still
+// covers a game that runs slow.
+bool audio_paced() {
+    static const bool on = ps2::os::env("PS2_PACE") == "audio";
+    return on;
+}
+
+constexpr double kSteerMs = 90.0;  // the sound the clock-paced game keeps waiting for the device: enough that a device taking large blocks does not dip it under the stretcher's gap guard (~45 ms with a 20 ms frame), which would stretch the sound for no reason
+
+// Waits until the performance counter reaches `target`: sleeps while more than 2 ms are left, then spins, for a frame edge within
+// a few microseconds (SDL_Delay alone wakes up to a millisecond late, which is the unevenness this is meant to remove).
+void wait_until(std::uint64_t target) {
+    const std::uint64_t frequency = SDL_GetPerformanceFrequency();
+    for (;;) {
+        const std::uint64_t now = SDL_GetPerformanceCounter();
+        if (now >= target) return;
+        const double left_ms = static_cast<double>(target - now) * 1000.0 / static_cast<double>(frequency);
+        if (left_ms > 2.0) SDL_Delay(static_cast<Uint32>(left_ms - 1.5));
+        else std::this_thread::yield();
+    }
+}
+
 void pace() {
     if (no_limit()) return;
     static bool stuck = false;  // the device took no sound for a second; the clock paces the game until it takes some again
+    if (g_audio && !audio_paced() && !stuck) {
+        g_pipe->frame(audio_seconds());
+        const double started = audio_seconds();
+        const double frequency = static_cast<double>(SDL_GetPerformanceFrequency());
+        const double steer = std::clamp((g_pipe->queued_ms() - kSteerMs) / kSteerMs * 0.02, -0.01, 0.01);
+        const auto period = static_cast<std::uint64_t>(frequency / (ps2::g_options.pal ? 50.0 : 60.0) * (1.0 + steer));
+        const std::uint64_t now = SDL_GetPerformanceCounter();
+        // more than two frames behind (a load, a hold): start counting again from now rather than rushing to catch up
+        if (g_last && now < g_last + 2 * period) {
+            g_last += period;
+            wait_until(g_last);
+        } else {
+            g_last = now;
+        }
+        // a device that takes far less than the game makes (or none at all) must still hold the game: the old wait, as a ceiling
+        const double hold = audio_seconds();
+        while (g_pipe->queued_ms() > 3.0 * kSteerMs && audio_seconds() - hold < 1.0) SDL_Delay(1);
+        const double waited = audio_seconds() - started;
+        g_pipe->note_wait(waited);
+        note_audio();
+        if (audio_seconds() - hold >= 1.0) {
+            std::fprintf(stderr, "[audio] the sound device took no sound for a second (unplugged?); the clock paces the game until it does\n");
+            stuck = true;
+        }
+        return;
+    }
     if (g_audio && !(stuck && g_pipe->full())) {
         // The audio device clock paces emulation: wait while more than ~80 ms of sound is waiting. The pipe times the game between
         // the frames (how much it slows down decides how much the sound is stretched) and does not count this wait as slowness.

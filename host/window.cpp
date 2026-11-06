@@ -153,6 +153,9 @@ int g_stick_step[2] = {};  // the left stick moving the highlight: -1 up, 1 down
 // The inner resolution (PS2_SCALE): the one of this run, and the one keys.ini holds for the next start (the menu changes that one).
 int g_scale_now = 1, g_scale_next = 1;
 bool g_scale_locked = false;  // PS2_SCALE was set before the start: keys.ini does not count
+// The filter of upscaled 2D art (PS2_SHARP_2D: 0 soft, 1 sharp, 2 sharpest), the same way: this run's and keys.ini's for the next start.
+int g_sharp_now = 1, g_sharp_next = 1;
+bool g_sharp_locked = false;
 // A short note drawn over the picture for a moment after the menu is closed ("Saved", "Loaded"): the menu asked for a quick save or load
 bool g_note_wanted = false;  // a save or load was asked by the menu: the next message about it is shown over the picture
 std::string g_note_text;  // not empty while the note is up
@@ -897,6 +900,9 @@ void menu_paint(bool show_again = true) {
         v.scale_now = g_scale_now;
         v.scale_next = g_scale_next;
         v.scale_locked = g_scale_locked;
+        v.sharp_now = g_sharp_now;
+        v.sharp_next = g_sharp_next;
+        v.sharp_locked = g_sharp_locked;
         v.fullscreen = SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN;
         if (g_menu.on_keys_page()) {
             for (int a = 0; a < keymap::kChangeableCount; ++a) v.key_rows.push_back({keymap::action_label(a), keymap::keys_text(g_keys, a)});
@@ -1078,11 +1084,22 @@ void menu_command(quickmenu::Command c, int step) {
             set_notice("The resolution is set by PS2_SCALE; remove it to choose here");
             break;
         }
-        g_scale_next = (g_scale_next - 1 + step + 3) % 3 + 1;
+        g_scale_next = (g_scale_next - 1 + step + 4) % 4 + 1;
         g_keys.scale = g_scale_next;
         rewrite_keys_file([](const std::string &t) { return keymap::with_scale(t, g_scale_next); }, "resolution");
         set_notice("Resolution " + std::to_string(g_scale_next) + "x" + (g_scale_next == g_scale_now ? "" : ": used when the game starts the next time"));
         std::fprintf(stderr, "[menu] resolution %dx for the next start (this run: %dx)\n", g_scale_next, g_scale_now);
+        break;
+    case Command::sharp_2d:
+        if (g_sharp_locked) {
+            set_notice("Text and menus are set by PS2_SHARP_2D; remove it to choose here");
+            break;
+        }
+        g_sharp_next = (g_sharp_next + step + 3) % 3;
+        g_keys.sharp_2d = g_sharp_next;
+        rewrite_keys_file([](const std::string &t) { return keymap::with_sharp_2d(t, g_sharp_next); }, "2D art filter");
+        set_notice(std::string("Text and menus: ") + keymap::sharp_2d_word(g_sharp_next) + (g_sharp_next == g_sharp_now ? "" : ", used when the game starts the next time"));
+        std::fprintf(stderr, "[menu] 2D art %s for the next start (this run: %s)\n", keymap::sharp_2d_word(g_sharp_next), keymap::sharp_2d_word(g_sharp_now));
         break;
     case Command::fullscreen: toggle_fullscreen(); break;
     case Command::change_keys: g_key_note.clear(); break;  // (the menu has switched to its keys page)
@@ -1818,12 +1835,17 @@ bool open_window(bool fullscreen) {
     // The inner resolution: PS2_SCALE when it is set, else the 'scale' line of keys.ini (the quick menu writes it), else 1. It is read
     // when the graphics start (run_window, after this), so setting it here is in time.
     g_scale_locked = !ps2::os::env("PS2_SCALE").empty();
-    if (!g_scale_locked && g_keys.scale >= 1 && g_keys.scale <= 3) {
+    if (!g_scale_locked && g_keys.scale >= 1 && g_keys.scale <= 4) {
         ps2::os::set_env("PS2_SCALE", std::to_string(g_keys.scale));
         std::fprintf(stderr, "[video] resolution %dx from %s (scale = %d)\n", g_keys.scale, g_keys_path.c_str(), g_keys.scale);
     }
-    g_scale_now = std::clamp(std::atoi(ps2::os::env("PS2_SCALE").c_str()), 1, 3);
+    g_scale_now = std::clamp(std::atoi(ps2::os::env("PS2_SCALE").c_str()), 1, 4);
     g_scale_next = g_scale_locked ? g_scale_now : (g_keys.scale >= 1 ? g_keys.scale : g_scale_now);
+    // the 2D art filter the same way: PS2_SHARP_2D, else the 'sharp_2d' line of keys.ini, else sharp (gpu.cpp reads it at its start)
+    g_sharp_locked = !ps2::os::env("PS2_SHARP_2D").empty();
+    if (!g_sharp_locked && g_keys.sharp_2d >= 0) ps2::os::set_env("PS2_SHARP_2D", std::to_string(g_keys.sharp_2d));
+    g_sharp_now = ps2::os::env("PS2_SHARP_2D").empty() ? 1 : std::clamp(std::atoi(ps2::os::env("PS2_SHARP_2D").c_str()), 0, 2);
+    g_sharp_next = g_sharp_locked ? g_sharp_now : (g_keys.sharp_2d >= 0 ? g_keys.sharp_2d : g_sharp_now);
     Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
 #ifdef __APPLE__
     if (!std::getenv("PS2_SDL_RENDERER")) flags |= SDL_WINDOW_METAL;

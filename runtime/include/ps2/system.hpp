@@ -57,6 +57,10 @@ struct Options {
     std::vector<AxisPress> axis_presses;
     std::vector<Patch> patches;
     std::function<void()> on_vblank;
+    // Called about every 20 ms by the game's own thread while it waits for something long (a live translation, ee_live.cpp). Set by a window run
+    // that has the game on the window thread (--frames-dir, PS2_ONE_THREAD): that thread must go on taking window messages, or Windows marks the
+    // window "not responding" after 5 s and ends the program when the player closes it (no crash line: nothing crashed). Empty when the window has a thread of its own.
+    std::function<void()> keep_alive;
     std::function<void(const std::string &name, const std::uint8_t *code, std::size_t size)> on_vu_program;
     std::string memcard_path;
     std::function<void()> on_memcard_saved;

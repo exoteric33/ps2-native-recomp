@@ -1952,6 +1952,9 @@ int run_window(const std::function<int()> &emulate) {
     const bool threads = !std::getenv("PS2_ONE_THREAD") && !std::getenv("PS2_TIME") && ps2::g_options.frames_dir.empty();
     if (!threads) {
         ps2::g_options.on_vblank = on_vblank;
+        // The game runs on this thread, so while it waits for a live translation (15 to 35 s) it must still take the window's messages, or
+        // Windows marks the window "not responding" and ends the program when it is clicked (ee_live.cpp, while_pumping).
+        ps2::g_options.keep_alive = [] { poll(); };
         const int result = emulate();
         finish_audio();
 #ifdef __APPLE__

@@ -35,6 +35,7 @@ void frame_tick() {}
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -683,6 +684,29 @@ void take_finished() {
 // The emulation thread: the game needs code at pc, in the window at `base` that holds the image `name`. When a background build of
 // exactly this image is under way the game waits for it (it goes to normal priority meanwhile); one that has not started is not worth
 // waiting for. True when code for pc is there afterwards.
+// A window run with the game on the window thread (ps2::g_options.keep_alive is set) must go on taking window messages while the game waits
+// for a build of 15 to 35 s: otherwise Windows shows "not responding" after 5 s and ends the program when the player clicks the window
+// (the end of a Metal Gear Solid 3 run with --frames-dir at the stage change: no crash line, exit code 127 in Git Bash; nothing crashed).
+// The build then runs on a helper thread and this thread calls keep_alive about every 20 ms. Without keep_alive (the window has a thread of
+// its own, headless runs) the work simply runs here.
+template <class Work>
+auto while_pumping(Work &&work) -> decltype(work()) {
+    if (!ps2::g_options.keep_alive) return work();
+    using Result = decltype(work());
+    std::optional<Result> result;
+    std::atomic<bool> finished{false};
+    std::thread helper([&] {
+        result.emplace(work());
+        finished.store(true);
+    });
+    while (!finished.load()) {
+        ps2::g_options.keep_alive();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    helper.join();
+    return std::move(*result);
+}
+
 bool use_background(std::uint32_t pc, std::uint32_t base, const std::string &name) {
     std::shared_ptr<BgJob> job;
     for (const std::shared_ptr<BgJob> &candidate : g->active)
@@ -702,7 +726,10 @@ bool use_background(std::uint32_t pc, std::uint32_t base, const std::string &nam
     if (job->state == kRunning) {
         job->urgent = true;
         say("no translated code at 0x%08X: the background translation of window 0x%08X (image %s) is under way for %.1f s, the game waits for it", pc, base, name.c_str(), lb::seconds_since(job->queued));
-        while (job->state.load() == kRunning) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        while (job->state.load() == kRunning) {
+            if (ps2::g_options.keep_alive) ps2::g_options.keep_alive();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
     }
     take_finished();
     return ps2::has_code(pc);
@@ -1133,7 +1160,7 @@ void translate_program_calls(const std::vector<std::uint8_t> &image, std::uint32
         request.candidates = function_starts(pointers_into(request.base, static_cast<std::uint32_t>(request.image.size())));
         limit_to_new_code(request);
         const auto began = Clock::now();
-        const Built built = build_library(request, "functions of the program that " + std::to_string(mine.size()) + " calls reach", false, nullptr, nullptr);
+        const Built built = while_pumping([&] { return build_library(request, "functions of the program that " + std::to_string(mine.size()) + " calls reach", false, nullptr, nullptr); });
         std::size_t modules = 0;
         if (!built.ok || !load_library(built.library, modules, 1)) {
             if (!built.why.empty()) say("%s", built.why.c_str());
@@ -1257,7 +1284,7 @@ bool translate_missing(std::uint32_t pc) {
         return false;
     };
 
-    const Built built = build_library(request, "0x" + lb::hex(pc, 8), false, nullptr, nullptr, quick);
+    const Built built = while_pumping([&] { return build_library(request, "0x" + lb::hex(pc, 8), false, nullptr, nullptr, quick); });
     if (!built.ok) {
         if (!built.why.empty()) say("%s", built.why.c_str());
         return fail("the game stops");

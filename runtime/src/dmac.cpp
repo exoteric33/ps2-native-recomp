@@ -37,6 +37,13 @@ constexpr std::uint32_t kBase[10] = {0x10008000u, 0x10009000u, 0x1000A000u, 0x10
 std::uint64_t g_starts[10];
 bool g_mfifo_waiting = false;
 
+// D_ENABLEW bit 16 (CPND) holds every channel. A channel whose STR bit is set while the hold is on does not begin: it begins when
+// the hold ends, with the registers as they are then. Games hold the DMAC while they set up a transfer (Crash of the Titans
+// writes CHCR first and the new TADR after it, inside a hold; starting at the CHCR write ran the old chain a second time).
+// Not part of the save state: a state saved inside a hold is a few instructions long.
+constexpr std::uint32_t kHold = 0x10000u;
+std::uint32_t g_start_pending = 0;
+
 // MFIFO: with D_CTRL.MFD set to VIF1, fromSPR fills a ring buffer in main memory (D_RBOR,
 // D_RBSR) and VIF1 runs a chain out of it, stalling while its tag address has caught up
 // with fromSPR's write address.
@@ -351,8 +358,8 @@ void start(int ch) {
     c.tag_end = c.qwc && chain_ends_after_current(c);
     ++g_starts[ch];
     static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
-    if (trace) std::fprintf(stderr, "[dma] ch%d chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X thread %d%s\n", ch, c.chcr, c.madr, c.qwc, c.tadr,
-                            kernel::current_thread(), kernel::in_handler() ? " (handler)" : "");
+    if (trace) std::fprintf(stderr, "[dma] ch%d chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X thread %d%s ctrl 0x%X rbsr 0x%X rbor 0x%X pcr 0x%X enable 0x%X\n", ch, c.chcr, c.madr, c.qwc, c.tadr,
+                            kernel::current_thread(), kernel::in_handler() ? " (handler)" : "", g_ctrl, g_rbsr, g_rbor, g_pcr, g_enable);
     if (ch == 5 || ch == 6 || ch == 7) {
         finish(ch);
         return;
@@ -458,6 +465,7 @@ std::size_t ipu_push_many(const std::uint8_t *qwords, std::size_t count) {
 void reset() {
     for (Channel &c : g_ch) c = Channel{};
     g_ctrl = g_pcr = g_sqwc = g_rbsr = g_rbor = g_stadr = g_enable = 0;
+    g_start_pending = 0;
     g_mfifo_waiting = false;
 }
 
@@ -472,6 +480,18 @@ void stats() {
 bool cpcond0() {
     const std::uint32_t cpc = g_pcr & 0x3FFu;
     return (hw::read32(0x1000E010u) & cpc) == cpc;
+}
+
+// A write to D_ENABLEW (0x1000F590). Ending the hold (bit 16 back to 0) begins the channels that were started during it, lowest first.
+void enable_write(std::uint32_t v) {
+    const bool was_held = g_enable & kHold;
+    g_enable = v;
+    if (!was_held || (v & kHold)) return;
+    for (int ch = 0; ch < 10; ++ch) {
+        if (!(g_start_pending & (1u << ch))) continue;
+        g_start_pending &= ~(1u << ch);
+        if (g_ch[ch].chcr & 0x100u) start(ch);
+    }
 }
 
 bool owns(std::uint32_t a) { return (a >= 0x10008000u && a < 0x1000E000u) || (a >= 0x1000E000u && a < 0x1000E070u); }
@@ -525,9 +545,13 @@ void write(std::uint32_t a, std::uint32_t v) {
             c.chcr = v;
             if (!(v & 0x100u)) {
                 c.paused = false;
+                g_start_pending &= ~(1u << ch);
                 if (ch == 1) g_mfifo_waiting = false;
             }
-            if (!was && (v & 0x100u)) start(ch);
+            if (!was && (v & 0x100u)) {
+                if (g_enable & kHold) g_start_pending |= 1u << ch;
+                else start(ch);
+            }
             break;
         }
         // The scratchpad channels have no SPR bit in MADR: it does not read back and the transfer uses main memory.

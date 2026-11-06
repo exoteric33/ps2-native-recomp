@@ -323,6 +323,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
         return;
     }
     if (dmac::owns(a)) { dmac::write(a, v); return; }
+    if (a == 0x1000F590u) dmac::enable_write(v);  // D_ENABLEW: stored below, read back through 0x1000F520
     if (a >= 0x10003000u && a < 0x10003800u) { gif::write(a, v); return; }
     if (a >= 0x10003800u && a < 0x10003C00u) { vif::write(0, a & 0x3FFu, v); return; }
     if (a >= 0x10003C00u && a < 0x10004000u) { vif::write(1, a & 0x3FFu, v); return; }

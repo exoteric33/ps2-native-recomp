@@ -430,8 +430,9 @@ void reset() {
     // picks its text from it shows Japanese when it is 0 (Silent Hill 2 does, on its US disc). PS2_LANGUAGE=<n> picks another one (1 English,
     // 2 French, 3 Spanish, 4 German, 5 Italian, 6 Dutch, 7 Portuguese). It stays 0 by default: with English God of War II takes another way
     // at the start (an unhandled syscall 0x6F), so the default is not changed until that is understood.
-    unsigned language = 0;
-    if (const char *text = std::getenv("PS2_LANGUAGE")) language = static_cast<unsigned>(std::strtoul(text, nullptr, 10)) & 31u;
+    // --language (g_options.language) wins over the environment value.
+    unsigned language = g_options.language & 31u;
+    if (const char *text = std::getenv("PS2_LANGUAGE"); text && !language) language = static_cast<unsigned>(std::strtoul(text, nullptr, 10)) & 31u;
     g_osd_config = (g_options.widescreen ? 2u << 1 : 0u) | (language ? (1u << 4) | (2u << 13) | (language << 16) : 0u);
     std::memset(g_ram + kSyscallTable, 0, 0x400);
 }

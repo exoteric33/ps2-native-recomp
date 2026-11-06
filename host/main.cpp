@@ -77,6 +77,15 @@ std::filesystem::path find_game_dir(const std::string &program_location, const s
     return {};
 }
 
+// --language: a two-letter code or the console's own number (1 to 7); 0 for anything else
+unsigned language_number(const std::string &text) {
+    static const char *const kCodes[] = {"ja", "en", "fr", "es", "de", "it", "nl", "pt"};
+    for (unsigned n = 1; n < 8; ++n)
+        if (text == kCodes[n]) return n;
+    const unsigned n = static_cast<unsigned>(std::strtoul(text.c_str(), nullptr, 10));
+    return n >= 1 && n <= 7 ? n : 0;
+}
+
 int usage() {
     std::fprintf(stderr,
                  "usage: ps2run [elf] [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
@@ -823,6 +832,11 @@ int main(int argc, char **argv) {
         else if (a == "--misses" && i + 1 < argc) ps2::g_options.misses_path = argv[++i];
         else if (a == "--trace-syscalls") ps2::g_options.trace_syscalls = true;
         else if (a == "--widescreen") ps2::g_options.widescreen = true;
+        else if (a == "--language" && i + 1 < argc) {
+            // the language the console is set to, which multi-language discs (Urban Reign PAL: en fr de es it) show their text in
+            ps2::g_options.language = language_number(argv[++i]);
+            if (!ps2::g_options.language) return usage();
+        }
         else if (a == "--patches" && i + 1 < argc) {
             if (!ps2::load_patches(argv[++i])) return usage();
         }

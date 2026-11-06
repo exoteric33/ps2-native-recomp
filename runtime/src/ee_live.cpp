@@ -798,7 +798,11 @@ void drop_stale_jobs() {
     for (std::size_t i = 0; i < g->active.size();) {
         const std::shared_ptr<BgJob> job = g->active[i];
         const std::uint32_t size = static_cast<std::uint32_t>(job->image.size());
-        const bool state_ok = job->state == kQueued || job->state == kRunning;
+        // An upgrade (the quick library's code again with the normal flags) is never stale: it is made from its own copy of the image, its
+        // result is checked word by word against the window whenever it is entered, and it only replaces a library that already serves
+        // this code. A game that keeps data inside the code's 16 KiB units (Metal Gear Solid 3's stage images) changes the window all the time,
+        // and before this the build of 60 to 90 s was ended every time, so that code stayed on the slower -O0 build for good.
+        const bool state_ok = (job->state == kQueued || job->state == kRunning) && !job->upgrade;
         if (state_ok && !job->cancel.load() && (recomp::window_extent(g_ram, kRamSize, job->base) != size || std::memcmp(g_ram + job->base, job->image.data(), size) != 0)) {
             job->cancel = true;
             if (job->state == kQueued) {

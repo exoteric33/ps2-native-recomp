@@ -357,7 +357,10 @@ console's MPEG-2 decoder, which is rebuilt too: the game sends it the stream and
 ### Saves and checks
 
 A quick save is the whole machine in one file: memory, registers, all the chips. The game's own saves go to a memory card file,
-which is written through a temporary file, so it is always a whole card.
+which is written through a temporary file that is forced to the disk before it takes the old one's place, so it is always a whole
+card. Before the card file is replaced, a copy of it goes to `<card>.backups\` (once per run, then at most every 15 minutes; the
+newest 10 are kept). The card is checked when the game starts (the error-check bytes of every page): a damaged one is put aside as
+`<card>.damaged-<time>.ps2` and the newest good copy takes its place. Only one run at a time can use a card file.
 
 Every window run records the pad and, every 15 frames, a fingerprint of the machine. Playing that recording again without a
 window shows whether the game goes exactly the same way, and where it first differs. That, and comparing the whole machine and

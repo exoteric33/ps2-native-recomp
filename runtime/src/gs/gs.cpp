@@ -48,6 +48,7 @@ std::uint64_t g_pmode, g_smode1, g_smode2, g_srfsh, g_synch1, g_synch2, g_syncv;
 std::uint64_t g_dispfb[2], g_display[2], g_extbuf, g_extdata, g_extwrite, g_bgcolor;
 std::uint64_t g_csr = 0x551B4000ull, g_imr = 0x7F00ull, g_busdir, g_siglblid;
 std::uint32_t g_finish_pending = 0;  // FINISH events that arrived while CSR.FINISH was still set; raised as the game clears the bit
+std::uint32_t g_finish_queued = 0;   // FINISH writes that came while an earlier one was still on its way; each gets its own event (not in a state)
 std::uint64_t g_primitives = 0;
 constexpr std::uint64_t kFinishDelay = 1000; // EE cycles from the FINISH write to CSR.FINISH
 
@@ -552,6 +553,7 @@ void reset() {
     g_csr = 0x551B4000ull;
     g_imr = 0x7F00ull;
     g_finish_pending = 0;
+    g_finish_queued = 0;
     if (queue::active()) queue::post(queue::kReset, 0, 0, nullptr, 0);
     else render_reset();
 }
@@ -880,9 +882,20 @@ void write(std::uint32_t reg, std::uint64_t value) {
 // A game that counts FINISH events (Metal Gear Solid 3) would lose those that land while CSR.FINISH is still set from the one
 // before: they merge into one. So a FINISH that arrives with the bit set waits and is raised, one by one, as the game clears the
 // bit (follows upstream 75ccb0b, where the FINISH is raised at the write itself).
+static bool trace_finish() {
+    static const bool on = !ps2::os::env("PS2_TRACE_FINISH").empty();   // debugging: one line for every FINISH event and every write to CSR
+    return on;
+}
+
 void raise_finish() {
+    if (trace_finish()) std::fprintf(stderr, "[gs] FINISH event f%llu csr %llX imr %llX pending %u\n", static_cast<unsigned long long>(frame_count()),
+                                     static_cast<unsigned long long>(g_csr), static_cast<unsigned long long>(g_imr), g_finish_pending);
     if (g_csr & 2u) ++g_finish_pending;
     else raise(2);
+    if (g_finish_queued) {
+        --g_finish_queued;
+        schedule(hw::kEventGsFinish, now() + kFinishDelay, raise_finish);
+    }
 }
 
 void signal(std::uint32_t reg, std::uint64_t value) {
@@ -896,7 +909,11 @@ void signal(std::uint32_t reg, std::uint64_t value) {
         // The GS only gets to FINISH after it has drawn what came before, so it must not be visible the
         // moment the DMA starts: ps2sdk's graph_wait_vsync writes CSR back right after starting the DMA,
         // and a FINISH that is already set would be wiped before draw_wait_finish ever sees it.
-        schedule(hw::kEventGsFinish, now() + kFinishDelay, raise_finish);
+        // The scheduler keeps one event per id, so a second FINISH written before the first has fired would replace it and one event
+        // would be lost; a game that counts them (Metal Gear Solid 3 sends three in a row and waits for all three) then waits for ever.
+        // The later ones wait in g_finish_queued and follow one kFinishDelay apart.
+        if (scheduled_at(hw::kEventGsFinish) != UINT64_MAX) ++g_finish_queued;
+        else schedule(hw::kEventGsFinish, now() + kFinishDelay, raise_finish);
         break;
     case 0x62: {
         const std::uint64_t label = (g_siglblid >> 32 & ~static_cast<std::uint64_t>(mask)) | (id & mask);
@@ -1115,6 +1132,8 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
     case 0x00D0: g_extwrite = value; break;
     case 0x00E0: g_bgcolor = value; break;
     case 0x1000:
+        if (trace_finish()) std::fprintf(stderr, "[gs] CSR write %llX f%llu csr %llX pending %u\n", static_cast<unsigned long long>(value),
+                                         static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(g_csr), g_finish_pending);
         g_csr &= ~(value & 0x1Fu);
         if ((value & 2u) && g_finish_pending) {
             --g_finish_pending;
@@ -1122,6 +1141,7 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
         }
         if (value & 0x200u) {
             g_finish_pending = 0;
+            g_finish_queued = 0;
             g_csr = 0x551B4000ull;
             if (queue::active()) queue::post(queue::kSoftReset, 0, 0, nullptr, 0);
             else soft_reset();
@@ -1521,6 +1541,7 @@ void render_state(ps2::state::Stream &s) {
     s.pod(g_siglblid);
     if (s.version() >= 9) s.pod(g_finish_pending);
     else g_finish_pending = 0;
+    if (s.loading()) g_finish_queued = 0;   // a state keeps the event that is on its way, not the ones queued behind it
     s.pod(g_primitives);
     s.pod(g_odd_field);
     s.pod(g_transfer);

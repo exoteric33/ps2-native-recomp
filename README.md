@@ -1,7 +1,7 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 31 games work as far as they
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 32 games work as far as they
 have been tested, 19 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 30
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 31
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -125,6 +125,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Digimon World Data Squad | plays, not played through yet: the opening film, menus, gameplay and a battle look and sound right; about 80 % of full speed on a very weak PC (Windows, Intel N100, 4 GB, 1x resolution, an Xbox 360 controller) | a tester, by mail |
 | Football Kingdom | plays, not played through yet: no crashes; the crowd sometimes goes black for a moment and the free kick aiming arrow is half as wide as it should be | a tester, by mail |
 | College Basketball 2K5 | plays, not played through yet: no glitches except one small sound stutter | a tester, by mail |
+| Metal Gear Solid 3: Snake Eater (USA) | plays, not played through yet: from power-on through the title, New Game and the opening film, with sound, into the first scene you control in the jungle (played on my development build; the public code was run as far as the cargo hold). The first time you reach a new part the game freezes while its code is translated, from a few seconds to almost a minute; it does not freeze there again | me |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

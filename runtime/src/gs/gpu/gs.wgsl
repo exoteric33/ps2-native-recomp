@@ -646,14 +646,55 @@ fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
     return convert(s, raw & s.tf.mask);
 }
 
+// The 2D art of a game (text, icons, menus) is mostly sprites that map one texel to one pixel at the PS2's resolution. Upscaled,
+// bilinear filtering spreads every texel edge over SCALE pixels and the text looks soft. With SHARP set (PS2_SHARP_2D), such a
+// sprite narrows the blend between two texels to the middle of the step: 1 to two upscaled pixels, 2 to one. Inside a texel the
+// colour is the texel's own and the edges stay smooth. A sprite that copies an upscaled picture one to one gets closer to the
+// picture's own samples too (plain bilinear blends each with the same sample of the neighbouring pixel).
+override SHARP: u32 = 0u;
+var<private> sharp_sprite: bool = false;
+var<private> upscaled_source: bool = false;
+
+fn sharpen(f: f32) -> f32 {
+    return clamp((f - 0.5) * f32(SCALE) * 0.5 * f32(SHARP) + 0.5, 0.0, 1.0);
+}
+
+// One sample of an upscaled texture by its position in samples (SCALE per texel each way): the texel, then the sample in it.
+fn tap_upscaled(s: Setup, hx: i32, hy: i32) -> u32 {
+    let n = i32(SCALE);
+    let tx = select(hx / n, (hx - n + 1) / n, hx < 0);
+    let ty = select(hy / n, (hy - n + 1) / n, hy < 0);
+    return fetch(s, tx, ty, u32(hy - ty * n) * SCALE + u32(hx - tx * n));
+}
+
+// Bilinear filtering of a texture the GS drew at the upscaled size (upscaled_source): between its own samples. Filtering between whole
+// texels, each read at the sample the target pixel has, put the native pixel grid into copies that are not one to one (Urban
+// Reign's knockout trail, a slightly zoomed copy of the last picture laid over the next, showed a mesh of dots and lines).
+fn sample_upscaled(s: Setup, uin: f32, vin: f32) -> u32 {
+    let u = uin * f32(SCALE) - 0.5;
+    let v = vin * f32(SCALE) - 0.5;
+    let x0 = i32(floor(u));
+    let y0 = i32(floor(v));
+    return blend4(tap_upscaled(s, x0, y0), tap_upscaled(s, x0 + 1, y0), tap_upscaled(s, x0, y0 + 1), tap_upscaled(s, x0 + 1, y0 + 1), u - f32(x0), v - f32(y0));
+}
+
 fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
     if (!has(s, F_BILINEAR)) {
         return fetch(s, i32(floor(uin)), i32(floor(vin)), k);
+    }
+    if (SCALE > 1u && upscaled_source) {
+        return sample_upscaled(s, uin, vin);
     }
     let u = uin - 0.5;
     let v = vin - 0.5;
     let x0 = i32(floor(u));
     let y0 = i32(floor(v));
+    var fx = u - f32(x0);
+    var fy = v - f32(y0);
+    if (sharp_sprite) {
+        fx = sharpen(fx);
+        fy = sharpen(fy);
+    }
     let xa = texel_x(s, x0);
     let xb = texel_x(s, x0 + 1);
     let ya = texel_y(s, y0);
@@ -668,9 +709,9 @@ fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
         let nxb = spread_x(xb);
         let nya = spread_y(ya);
         let nyb = spread_y(yb);
-        return blend4(tap32(s, pxa + pya, nxa | nya, k), tap32(s, pxb + pya, nxb | nya, k), tap32(s, pxa + pyb, nxa | nyb, k), tap32(s, pxb + pyb, nxb | nyb, k), u - f32(x0), v - f32(y0));
+        return blend4(tap32(s, pxa + pya, nxa | nya, k), tap32(s, pxb + pya, nxb | nya, k), tap32(s, pxa + pyb, nxa | nyb, k), tap32(s, pxb + pyb, nxb | nyb, k), fx, fy);
     }
-    return blend4(fetch_at(s, xa, ya, k), fetch_at(s, xb, ya, k), fetch_at(s, xa, yb, k), fetch_at(s, xb, yb, k), u - f32(x0), v - f32(y0));
+    return blend4(fetch_at(s, xa, ya, k), fetch_at(s, xb, ya, k), fetch_at(s, xa, yb, k), fetch_at(s, xb, yb, k), fx, fy);
 }
 
 fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
@@ -1013,8 +1054,11 @@ fn edge_in(w: f32, inclusive: u32) -> bool {
 }
 
 fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
-    let kind = data[p + 1u];
+    // word 1: the kind of shape in the low byte, bit 8 when the texture is an upscaled picture the GS drew (gpu.cpp, kUpscaledSource)
+    let kind = data[p + 1u] & 0xFFu;
+    upscaled_source = (data[p + 1u] & 0x100u) != 0u;
     var at: Attr;
+    sharp_sprite = false;
     switch kind {
         case 0u {
             let x0 = fat(p + 4u);
@@ -1064,10 +1108,13 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
                 du = du / q * f32(1u << s.tw);
                 dv = dv / q * f32(1u << s.th);
             }
+            // one texel to one pixel at the PS2's resolution (within 2 %): 2D art drawn at its own size
+            sharp_sprite = SHARP != 0u && SCALE > 1u && has(s, F_FST) && abs(abs(du) - abs(dx)) <= abs(dx) * 0.02 && abs(abs(dv) - abs(dy)) <= abs(dy) * 0.02;
             var ux = px;
             var uy = py;
             let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
-            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct);
+            // (a bilinear read of an upscaled picture is exact one to one by itself: snapped, all its samples would read the same spot)
+            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || (direct && !upscaled_source));
             if (point && abs(du) >= abs(dx) * 0.999) {
                 ux = f32(x);
             }
@@ -1083,7 +1130,8 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             // sprite reads up to most of a texel beyond the ones it covers at native size: the neighbour in the texture shows as a
             // line along that edge (button icons cut from a sheet get a dark line under them). Keep the sample within the native
             // pixels the sprite covers: inside it still blends smoothly, at its edges it ends on its own texels as at native size.
-            if (SCALE > 1u) {
+            // (An upscaled picture read by its own samples needs no such clamp: they lie inside the native pixels the sprite covers.)
+            if (SCALE > 1u && !upscaled_source) {
                 let ax = ceil(min(x0, x0 + dx));
                 let ay = ceil(min(y0, y0 + dy));
                 ux = clamp(ux, ax, max(ax, ceil(max(x0, x0 + dx)) - 1.0));

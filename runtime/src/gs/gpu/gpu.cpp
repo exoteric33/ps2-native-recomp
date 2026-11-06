@@ -43,6 +43,9 @@ constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
+// word 1 of a shape: its kind (0 triangle, 1 sprite, 2 line, 3 point) in the low byte, and kUpscaledSource when its texture is an
+// upscaled picture the GS drew (gs.wgsl reads both)
+constexpr std::uint32_t kKindMask = 0xFFu, kUpscaledSource = 0x100u;
 constexpr std::uint32_t kSetupWords = 40;  // 25 fields, then the texture, frame and depth formats as the shader needs them (fmt_words)
 constexpr std::uint32_t kDecodedWords = 4u << 20;
 constexpr std::uint32_t kDecodePrims = 64;
@@ -75,6 +78,7 @@ struct Overlay {
 std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
 bool g_have_previous = false;
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
+std::uint32_t g_sharp_2d = 1;
 
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
@@ -327,7 +331,7 @@ constexpr std::uint32_t kExactPixels = 1024;  // the largest sprite whose pixels
 // the plain case (texture coordinates in 12.4 fixed point, a sprite whose width in pixels is a power of two) every step is exact and a coordinate that lies on a texel edge
 // (the usual half-texel offset of a bilinear sprite) is not widened, so the sprite does not touch the row above it.
 bool sprite_taps(const std::uint32_t *rec, const std::uint32_t *setup, int minx, int miny, int maxx, int maxy, int lo[2], int hi[2]) {
-    if (rec[1] != 1 || !(setup[0] & 2u)) return false;
+    if ((rec[1] & kKindMask) != 1 || !(setup[0] & 2u)) return false;
     const bool fst = setup[0] & 16u, bilinear = setup[0] & 16384u;
     float f[4], uv[6];
     std::memcpy(f, rec + 4, sizeof f);
@@ -416,7 +420,7 @@ bool sprite_read_range(const std::uint32_t *rec, const std::uint32_t *setup, int
 // colour format. The depth buffer is not listed: a read that comes near it cuts the batch by pages (draw).
 bool exact_add(const std::uint32_t *rec, const std::uint32_t *setup) {
     const std::uint32_t fpsm = setup[3];
-    if (rec[1] != 1 || (fpsm != PSMCT32 && fpsm != PSMCT24 && fpsm != PSMCT16 && fpsm != PSMCT16S)) return false;
+    if ((rec[1] & kKindMask) != 1 || (fpsm != PSMCT32 && fpsm != PSMCT24 && fpsm != PSMCT16 && fpsm != PSMCT16S)) return false;
     const std::uint32_t x0 = rec[2] & 0xFFFFu, y0 = rec[2] >> 16, x1 = rec[3] & 0xFFFFu, y1 = rec[3] >> 16;
     if (x1 < x0 || y1 < y0 || static_cast<std::uint64_t>(x1 - x0 + 1) * (y1 - y0 + 1) > kExactPixels) return false;
     Exact &e = g_exact;
@@ -701,7 +705,7 @@ void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi, std
     const auto whole = [&] {
         for (int ty = ty0; ty <= ty1; ++ty) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(tx0), static_cast<std::int16_t>(tx1), prim});
     };
-    if (rec[1] != 0 || tx1 - tx0 < 2) {
+    if ((rec[1] & kKindMask) != 0 || tx1 - tx0 < 2) {
         whole();
         return;
     }
@@ -754,7 +758,7 @@ void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi, std
 
 bool reads_own_word(const std::uint32_t *rec, const std::uint32_t *setup) {
     const std::uint32_t fpsm = setup[3], tpsm = setup[14];
-    if (rec[1] != 1 || (setup[0] & (16u | 16384u)) != 16u || setup[12] != setup[1] || setup[13] != setup[2]) return false;
+    if ((rec[1] & kKindMask) != 1 || (setup[0] & (16u | 16384u)) != 16u || setup[12] != setup[1] || setup[13] != setup[2]) return false;
     float f[6], uv[6];
     std::memcpy(f, rec + 4, sizeof f);
     std::memcpy(uv, rec + 15, sizeof uv);
@@ -775,7 +779,7 @@ bool reads_own_word(const std::uint32_t *rec, const std::uint32_t *setup) {
 }
 
 Range read_range(const std::uint32_t *rec, const std::uint32_t *setup, const Range &whole) {
-    if (rec[1] != 1 || !(setup[0] & 16u)) return whole;
+    if ((rec[1] & kKindMask) != 1 || !(setup[0] & 16u)) return whole;
     // Wrap mode 3 (region repeat) reads (u & MINU) | MAXU, which need not lie between the corners of the sprite: the range is that of the words it can touch, else the whole texture.
     if (region_repeat(setup)) {
         Range r;
@@ -867,7 +871,7 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
         const std::uint32_t *setup = b.setups.data() + rec[0] * kSetupWords;
         if (!(setup[0] & 2u) || reads_own_word(rec, setup)) continue;
         const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
-        const bool listed = rec[1] == 1 && region_repeat(setup) && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
+        const bool listed = (rec[1] & kKindMask) == 1 && region_repeat(setup) && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
         const Range t = listed ? g_exact.reads : read_range(rec, setup, region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1));
         for (const Range *w : {&fb, b.zwrite ? &z : nullptr})
             if (w && t.overlaps(w->lo, w->hi)) shared.add(std::max(t.lo, w->lo), std::min(t.hi, w->hi));
@@ -899,7 +903,7 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
             ++info.kinds[rec[1] & 3u];
             const double bw = static_cast<double>((rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1), bh = static_cast<double>((rec[3] >> 16) - (rec[2] >> 16) + 1);
             info.bbox += bw * bh;
-            info.area += rec[1] == 0 ? std::fabs(0.5 / static_cast<double>(u2f(rec[10]))) : bw * bh;
+            info.area += (rec[1] & kKindMask) == 0 ? std::fabs(0.5 / static_cast<double>(u2f(rec[10]))) : bw * bh;
             info.textured += (flags & 2u) ? 1u : 0u;
             info.blended += (flags & 8u) ? 1u : 0u;
             info.ztest += (flags & 512u) ? 1u : 0u;
@@ -2236,6 +2240,9 @@ bool init(Mode m) {
         }
     }
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 4u);
+    // PS2_SHARP_2D: how upscaled 2D art (text, icons, menus) is filtered, see SHARP in gs.wgsl: 0 plain bilinear, 1 sharp (the
+    // default), 2 sharpest
+    if (const char *sharp = std::getenv("PS2_SHARP_2D")) g_sharp_2d = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(sharp)), 0u, 2u);
     g_copy_words = (1u << 20) * g_scale * g_scale;
     if (const int tile = std::atoi(os::env("PS2_TILE").c_str()); tile == 4 || tile == 8 || tile == 16) g_tile = tile;
     g_tiles_per_row = (2048 * static_cast<int>(g_scale) + g_tile - 1) / g_tile;
@@ -2319,17 +2326,21 @@ bool init(Mode m) {
         cd.layout = g_pipeline_layout;
         cd.compute.module = module;
         cd.compute.entryPoint = view(kEntryPoints[i]);
-        WGPUConstantEntry constants[3] = {WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT};
-        constants[0].key = view("SCALE");
-        constants[0].value = static_cast<double>(g_scale);
-        constants[1].key = view("TILE");
-        constants[1].value = static_cast<double>(g_tile);
-        constants[2].key = view("EXPLICIT_FMA");
-        constants[2].value = explicit_fma ? 1.0 : 0.0;
-        // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE and EXPLICIT_FMA are listed only when it declares them
-        const bool has_tile = shader_text.empty() || shader_text.find("override TILE") != std::string::npos;
-        const bool has_fma = shader_text.empty() || shader_text.find("override EXPLICIT_FMA") != std::string::npos;
-        cd.compute.constantCount = has_tile ? (has_fma ? 3 : 2) : 1;
+        // a shader loaded with PS2_GS_SHADER may lack the later constants; each is listed only when the shader declares it
+        WGPUConstantEntry constants[4];
+        std::size_t count = 0;
+        const auto set = [&](const char *key, double value) {
+            if (count && !shader_text.empty() && shader_text.find(std::string("override ") + key) == std::string::npos) return;
+            constants[count] = WGPU_CONSTANT_ENTRY_INIT;
+            constants[count].key = view(key);
+            constants[count].value = value;
+            ++count;
+        };
+        set("SCALE", static_cast<double>(g_scale));
+        set("TILE", static_cast<double>(g_tile));
+        set("EXPLICIT_FMA", explicit_fma ? 1.0 : 0.0);
+        set("SHARP", static_cast<double>(g_sharp_2d));
+        cd.compute.constantCount = count;
         cd.compute.constants = constants;
         g_pipelines[i] = wgpuDeviceCreateComputePipeline(g_device, &cd);
         if (!g_pipelines[i]) return false;
@@ -2560,6 +2571,18 @@ void draw(const State &st, const Vertex *v, int count) {
             bool known = false;
             for (const Range &t : g_batch_reads) known = known || (t.lo <= tex.lo && tex.hi <= t.hi);
             if (!known) g_batch_reads.push_back(tex);
+        }
+    }
+    // Upscaled, a bilinear texture the GS drew itself (a copy of the picture for an effect) holds SCALE x SCALE samples per texel: the
+    // shader then filters between those samples instead of between whole texels (kUpscaledSource, sample_upscaled in gs.wgsl). Only
+    // the texels this shape reads count: a big texture may reach round to the frame buffer without reading it.
+    if (g_scale > 1 && (flags & 2u) && (flags & 16384u)) {
+        int rect[4];
+        if (texel_rect(setup, v, count, prim, fst, rect)) {
+            const Range used = region(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]);
+            if (rendered(pages(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3])) ||
+                (!b.prims.empty() && used.overlaps(b.fb_range.lo, b.fb_range.hi)))
+                rec[1] |= kUpscaledSource;
         }
     }
     rec[0] = setup_index;

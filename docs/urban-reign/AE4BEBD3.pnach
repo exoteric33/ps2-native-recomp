@@ -1,0 +1,144 @@
+gametitle=Urban Reign (Europe) (En,Fr,De,Es,It) SCES-53688
+
+// Lines outside any section always apply. These are bug fixes of the original game, safe on real hardware and in PCSX2 too.
+
+// --- Shadow scissor off-by-one ---------------------------------------------------------------------------------------------
+// Three copies of the function that projects a character's shadow clamp its screen rectangle to [0,640] x [0,448] and the
+// result goes to SCISSOR_2, whose bounds are inclusive. Column 640 and row 448 lie outside the 640x448 back buffer (fbp 0,
+// PSMCT32): row 448 is the first line of the 512x512 PSMCT16S display buffer at block 0x1180, so every shadow left short
+// coloured stripes at the top of the shown picture. A TV never showed them (the beam had passed those lines before the
+// shadows were drawn); an emulator that shows the whole buffer at vsync does. Clamp to 639/447 instead.
+patch=1,EE,00113D60,word,2402027F
+patch=1,EE,00113D88,word,240201BF
+patch=1,EE,00181CF4,word,2402027F
+patch=1,EE,00181D1C,word,240201BF
+patch=1,EE,001831EC,word,2402027F
+patch=1,EE,00183214,word,240201BF
+
+// --- Bloom sprite reads past its source ------------------------------------------------------------------------------------
+// The full-screen glow stretches an 80x56 reduced copy of the scene at block 0x3980 over the whole 640x448 picture with bilinear
+// filtering: a sprite from UV (160,56) to (240,112) (FST, x16: 0xA00, 0x380, 0xF00, 0x700). The blur passes before it are scissored
+// to 160..239 x 56..111, so texel row 112 is never written and holds stale VRAM; screen rows 446-447 blend in 37-44 % of it, which
+// showed as a band of coloured noise at the bottom of the fights (a TV's overscan hid it). Pull each edge in by half a texel:
+// (160.5,56.5)-(239.5,111.5), so the filter stays on the copy (the glow is 1% smaller and still centred, which does not show).
+// Two routines build that sprite into a GIF list once, when a stage loads (the list is then sent every frame): 0x175980 (global
+// glow task) and 0x1938D0 (stage glow presets). A save state made before this patch keeps the old list until a new stage loads.
+patch=1,EE,00177B7C,word,24130A08 // was 24130A00 addiu s3,0xA00  U0 160 -> 160.5 (builder 0x175980)
+patch=1,EE,00177B84,word,24140388 // was 24140380 addiu s4,0x380  V0 56 -> 56.5
+patch=1,EE,00177B88,word,240C0EF8 // was 240C0F00 addiu t4,0xF00  U1 240 -> 239.5
+patch=1,EE,00177B8C,word,240D06F8 // was 240D0700 addiu t5,0x700  V1 112 -> 111.5
+patch=1,EE,00194CE8,word,240C0A08 // was 240C0A00 t4 U0 (builder 0x1938D0)
+patch=1,EE,00194CF0,word,240D0388 // was 240D0380 t5 V0
+patch=1,EE,00194CF8,word,24090EF8 // was 24090F00 t1 U1
+patch=1,EE,00194CFC,word,240A06F8 // was 240A0700 t2 V1
+
+// ===========================================================================================================================
+// Optional sections (pick them with --pnach-section)
+// ===========================================================================================================================
+
+// How the PAL game sets its video mode (read from the executable, checked with PS2_TRACE_DISPLAY / --trace-syscalls):
+//   0x00144B58  static init of the settings block at 0x003D3E40: video setting (+0xA0 = 0x003D3EE0) = 1.
+//   0x0012897C  boot: jal 0x00137258 with a0 = video setting (lw a0, 0xA0(s3) in the delay slot).
+//   0x00137258  SetVideoMode(setting): stores the setting at [0x0034E118]+0xEA, then calls sceGsResetGraph (0x00315BE8):
+//                 1 (and >= 3) -> sceGsResetGraph(0, 1, 3, 1)     PAL 576i, 50 Hz   <- what the PAL game always uses
+//                 2            -> sceGsResetGraph(0, 0, 0x50, 1)  480p, 60 Hz       <- the NTSC game's progressive mode, still complete
+//                 0            -> sceGsResetGraph(0, 0, 3, 1)     PAL non-interlaced (unused)
+//               then 0x00137190 picks the drawing environment for the setting (0x003FCEA0 for 480p) and 0x00135AB8 builds
+//               DISPLAY1/2 from it (480p: DX 0x138, DY 0x60, 1280x448 at MAGH 2 -> 640x448).
+//   0x00315BE8  sceGsResetGraph -> j 0x00334720 SetGsCrt (syscall 2).
+//   0x00137478 / 0x00137560  switch to 480p / back to 576i at run time; only used by the game's "Change to Progressive
+//               Mode?" dialog (scene 2 states 1-3, 0x0021B380/0x0021B3B8/0x0021B4B0, state table 0x0059C360; the texts
+//               are on the disc in every language). No way to reach it from the PAL menus was found.
+// The game counts time in frames with PAL constants (50 frames = 1 s: round clock 0x0019DA04, 0x0023BAA0 "3000",
+// 0x0024CBF0, 4500 = 90 s ...). At 60 Hz everything, the round clock included, runs 1.2x as fast as the PAL game does
+// at 50 Hz; a 3:00 round lasts 2:30.
+
+[Progressive Scan]
+description=480p progressive: starts the game in its built-in 480p mode instead of PAL 576i (640x448 shown 1:1, no interlace, no flicker filter). Run it with --pal so the game keeps its 50 Hz pace.
+// SetVideoMode, 0x0013725C: daddu a1, a0, zero (a1 = requested setting) -> addiu a1, zero, 2 (always setting 2 = 480p).
+// The game's own 480p path then runs everywhere: sceGsResetGraph(0, 0, 0x50, 1), the 480p environment and display
+// (640x448 frame buffer shown 1:1), and the setting byte [0x0034E118]+0xEA = 2 that the rest of the game reads.
+patch=1,EE,0013725C,word,24050002
+
+// --- 480p: effects that read the shown picture back -----------------------------------------------------------------------
+// The PAL port moved the shown buffer to a 512x512 PSMCT16S picture at block 0x1180 (the 640x448 scene squeezed into it); the
+// effects that sample the shown picture (special-move heat haze, pause background grab ...) hard-code that layout in TEX0:
+// tbp 0x1180, tbw 8, PSMCT16S, 512x512 (built as (hi << 32) | 0x64A2 << 16 | 0x1180). In 480p the game shows the scene 1:1 from a
+// 640x448 PSMCT16S buffer at the same block, so read as 512 wide its blocks come out shuffled. Make it tbw 10 (bits 14-15 of the
+// low half: 0x1180 -> 0x9180) and 1024 wide (TW 9 -> 10: 0x64A2 -> 0x68A2).
+patch=1,EE,0016FDB4,word,344268A2
+patch=1,EE,0016FDBC,word,34429180
+patch=1,EE,001700F4,word,354A68A2
+patch=1,EE,001700FC,word,354A9180
+patch=1,EE,0017040C,word,350868A2
+patch=1,EE,00170414,word,35089180
+patch=1,EE,00170A2C,word,344268A2
+patch=1,EE,00170A34,word,34429180
+patch=1,EE,001717B0,word,365268A2
+patch=1,EE,001717B8,word,36529180
+patch=1,EE,0017A0AC,word,35CE68A2
+patch=1,EE,0017A0B4,word,35CE9180
+// The heat-haze fan (function around 0x1717B8) maps screen x,y to that buffer with x*0.8 (640 -> 512) and y*1.143 (448 -> 512);
+// in 480p the buffer is the screen, 1:1. lui at,0x3F4C / ori at,0xCCCC -> 1.0; lui at,0x3F92 / ori at,0x4DD2 -> 1.0.
+patch=1,EE,001718CC,word,3C013F80
+patch=1,EE,001718D0,word,34210000
+patch=1,EE,001718E4,word,3C013F80
+patch=1,EE,001718E8,word,34210000
+// --- 480p: no flicker filter -------------------------------------------------------------------------------------------------
+// The display setup (0x00135A1C..) reads the settings word 0x003D3EDC (block 0x003D3E40 + 0x9C): when it is set, PMODE is 0x7063,
+// both read circuits on, merged with fixed alpha 0x70, the second one a line lower (the GS anti-flicker filter, a vertical blur
+// meant for interlaced TVs), and DISPLAY1 is moved a line (0x00135BB0..). On a progressive picture it only blurs and washes it
+// out. Take the game's own "off" path both times: PMODE 0x62, one circuit.
+// 0x00135A24: beq v1, zero, 0x00135A40 -> beq zero, zero, 0x00135A40
+patch=1,EE,00135A24,word,10000006
+// 0x00135BB4: beq v0, zero, 0x00135C38 -> beq zero, zero, 0x00135C38
+patch=1,EE,00135BB4,word,10000020
+// --- 480p: show the 24-bit picture itself ----------------------------------------------------------------------------------
+// Each frame the game copies its 640x448 24-bit back buffer (fbp 0) into the 16-bit PSMCT16S buffer at block 0x1180 and shows
+// that one (DISPFB 0x5148C): dithered down to 15-bit colour, brightened by the sprite's Af (+6), resampled half a texel off with
+// bilinear filtering. The picture looks washed out and dotted. In 480p the copy is 1:1 and is made right after vblank, from the
+// finished frame, so show the back buffer directly: DISPFB fbp 0, fbw 10, PSMCT24 = 0x9400. The copy still runs (the effects
+// that read the shown picture back use it). Checked from boot through the intro movie and the in-engine cutscenes.
+// 0x00135AA4: or v0, a1, v0 (DISPFB from the buffer the caller passed) -> ori v0, zero, 0x9400
+patch=1,EE,00135AA4,word,34029400
+// --- 480p: menu backgrounds (pause, fight finished, fighter-select dialog) ----------------------------------------------------
+// 0x00179E48 (called for the pause, the fight-finished screen and the fighter-select dialog) builds the 320x224 background at
+// 0x3480 from the shown buffer at 0x1180 and reads it back to EE memory. Both passes take the source size from the rectangle at
+// 0x006AF090 = 512x512, the PAL shown buffer: in 480p the strips covered only 512 of 640 columns (misplaced dark rectangles) and
+// the blur read rows 448..511, which are the Z buffer (streaks along the bottom). The rectangle just before it, 0x006AF080 =
+// 640x448, is the one the game's own 480p grab uses. Nothing writes either table and only this instruction loads 0x6AF090.
+// 0x00179EA8: addiu v1, v1, -0x0F70 (0x006AF090) -> addiu v1, v1, -0x0F80 (0x006AF080)
+patch=1,EE,00179EA8,word,2463F080
+
+// Urban Reign already has a 16:9 mode: OPTIONS > screen 4:3 / 16:9 (kg_option.cpp, strings at 0x6B6D10). It sets the word
+// at 0x34DFF0 (= *(0x34E114) + 0x50, the screen object at 0x34DFA0). With it on the game renders anamorphic Hor+ 3D (vertical
+// FOV kept, x scaled by 0.8 in the camera at 0x1259B8), loads cri_wide/namco_wide/title_wide.vgs and squeezes by 0.75 the 2D
+// sprites whose layout data carries flag 0x40 (0x10D7xx, 0x10DFxx, 0x12AEB0). The BIOS 16:9 setting is NOT read
+// (sceScfGetAspect at 0x31B7C8 has no callers). This section forces that mode on and corrects the 3D squeeze to a true 16:9.
+
+[Widescreen 16:9]
+author=RatchetCinemaESP
+description=Forces the game's own 16:9 mode and corrects its 3D aspect from 0.8 to 0.75 (Hor+). Fight HUD and menus stay stretched.
+gsaspectratio=16:9
+
+// --- Force the 16:9 flag on ---------------------------------------------------------------------------------------------
+// Boot init (0x128960..): "addiu v0,s5,-23232 / sb v1,2763(v0) / lui s1,0x7000 / sw zero,80(a0)" clears the flag.
+// Fold the sb into one instruction (s5 = 0x360000, so 2763(v0) == -20469(s5)) and use the freed slot to make v0 = 1.
+patch=1,EE,00128968,word,A2A3B00B   // was 26A2A540 addiu v0,s5,-23232  -> sb v1,-20469(s5)   (same byte, same address 0x35B00B)
+patch=1,EE,0012896C,word,24020001   // was A0430ACB sb v1,2763(v0)       -> addiu v0,zero,1
+patch=1,EE,00128974,word,AC820050   // was AC800050 sw zero,80(a0)       -> sw v0,80(a0)          (flag = 1 at boot)
+// Options menu live value: flag = (menu choice == 1). Keep it 1 whatever the menu shows.
+patch=1,EE,00201614,word,24020001   // was 2C420001 sltiu v0,v0,1        -> addiu v0,zero,1
+// Apply options / load saved options (0x201D10, also from 0x2041A8): flag = (saved aspect != 0). Keep it 1.
+patch=1,EE,00201D44,word,24020001   // was 0002102B sltu v0,zero,v0      -> addiu v0,zero,1
+
+// --- True 16:9 for the 3D --------------------------------------------------------------------------------------------------
+// Camera setup 0x1259B8: if (wide) xscale *= 0.8 (0x3F4CCCCD). 4:3 -> 16:9 needs 0.75 (the game's own 2D code uses 0.75);
+// 0.8 left everything 6.7% too wide. Vertical scale is untouched, so this stays Hor+.
+patch=1,EE,001259C4,word,3C013F40   // was 3C013F4C lui at,0x3F4C        -> lui at,0x3F40
+patch=1,EE,001259C8,word,34210000   // was 3421CCCC ori at,at,0xCCCC     -> ori at,at,0            (0.75)
+// Menu code compensating for that squeeze with its inverse, 1.25 (0x3FA00000), in wide mode. Make it ~1/0.75
+// (0x3FAB0000 = 1.336, the closest a single lui gives). Not visually verified (menu 3D screens not reached headless).
+patch=1,EE,001EAC74,word,3C013FAB   // was 3C013FA0 lui at,0x3FA0 (f20 = 1.25)
+patch=1,EE,001EBFB0,word,3C013FAB   // was 3C013FA0 lui at,0x3FA0 (f21 = 1.25)
+patch=1,EE,001EDBAC,word,3C013FAB   // was 3C013FA0 lui at,0x3FA0 (f21 = 1.25)

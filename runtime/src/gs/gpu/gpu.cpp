@@ -267,6 +267,244 @@ bool uploads_overlap(const PreOp &a, const PreOp &b) {
 std::vector<PreOp> g_pre;
 std::vector<Range> g_batch_reads;
 
+// The words of graphics memory that the sprites of the open batch write, one bit per 32-bit word. The page and box tests that cut a batch
+// before a shape that reads what the batch draws are all that most shapes need, but a sprite that reads memory in another layout than the frame (Metal
+// Gear Solid 3 expands 8-bit indices in place into 32-bit pixels, 7,168 sprites of 16 pixels per frame) touches the same pages as the sprites before it
+// and almost never the same words. The set is built when the first such sprite asks (from every shape of the batch, which must all be small sprites)
+// and then grows with each sprite that joins; state 2 means a shape the set cannot hold is in the batch, and then the old tests decide alone.
+struct Exact {
+    std::vector<std::uint64_t> written;
+    std::vector<std::uint32_t> dirty;  // the parts of `written` that are not zero, so a reset does not clear 128 KB
+    int state = 0;                     // 0 not built, 1 holds every shape of the batch, 2 cannot
+    Range reads;                       // state 1: the range of bytes that the reads of the region-repeat sprites of the batch span (what their snapshot has to cover)
+    bool reads_ok = true;              // false when one of those sprites cannot be listed: the snapshot then takes the whole texture
+    Range pending;                     // the reads of the sprite exact_clear just allowed, until exact_follow has seen it appended
+    bool pending_valid = false;
+    std::uint32_t tests = 0, merged = 0, hazards = 0, refused = 0;  // PS2_BATCH_LOG: sprites asked, joined, kept out by a real overlap, kept out because no exact set could be made
+    std::uint64_t ns[2] = {};                                         // PS2_BATCH_LOG: processor time spent asking (exact_clear) and following (exact_follow)
+} g_exact;
+
+// Adds the time of its scope to g_exact.ns[which] when PS2_BATCH_LOG is on.
+struct ExactTimer {
+    bool on;
+    int which;
+    std::chrono::steady_clock::time_point start;
+    explicit ExactTimer(int w);
+    ~ExactTimer();
+};
+std::vector<std::uint32_t> g_swizzle;  // the processor's copy of the shader's address tables (swizzle_tables)
+
+ExactTimer::ExactTimer(int w) : on(g_batch_log), which(w), start(g_batch_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+ExactTimer::~ExactTimer() {
+    if (on) {
+        const auto d = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        g_exact.ns[which] += d;
+    }
+}
+
+void exact_reset() {
+    for (const std::uint32_t i : g_exact.dirty) g_exact.written[i] = 0;
+    g_exact.dirty.clear();
+    g_exact.state = 0;
+    g_exact.reads = Range{};
+    g_exact.reads_ok = true;
+    g_exact.pending_valid = false;
+}
+
+// The shader's addr() (gs.wgsl) for the format words `f` of a setup (fmt_words): the word of graphics memory that texel or pixel (x, y) lives in.
+std::uint32_t word_at(const std::uint32_t *f, std::uint32_t x, std::uint32_t y) {
+    const std::uint32_t pws = f[3] & 15u, phs = (f[3] >> 4) & 15u, nbit = (f[3] >> 10) & 1u;
+    const std::uint32_t n = g_swizzle[f[2] + ((y & ((1u << phs) - 1u)) << pws) + (x & ((1u << pws) - 1u))];
+    const std::uint32_t a = f[0] + ((x >> pws) + (y >> phs) * f[1]) * 8192u + (n >> nbit);
+    return (a & 0x3FFFFFu) >> 2;
+}
+
+constexpr std::uint32_t kExactPixels = 1024;  // the largest sprite whose pixels are listed word by word, and the most texels one sprite is asked about
+
+// The whole texel coordinates (before the wrap mode, `lo` to `hi` on each axis) that the pixels of a sprite can read, worked out the way the draw program does it
+// (shade_at, sample in gs.wgsl): a pixel's position is x + j / SCALE, the texture coordinate is linear in it, a nearest read takes floor(u) and a bilinear one the
+// four texels from floor(u - 0.5) on. A texel more on each side only where the 32-bit float arithmetic of the draw program may not give exactly the number worked out here: in
+// the plain case (texture coordinates in 12.4 fixed point, a sprite whose width in pixels is a power of two) every step is exact and a coordinate that lies on a texel edge
+// (the usual half-texel offset of a bilinear sprite) is not widened, so the sprite does not touch the row above it.
+bool sprite_taps(const std::uint32_t *rec, const std::uint32_t *setup, int minx, int miny, int maxx, int maxy, int lo[2], int hi[2]) {
+    if (rec[1] != 1 || !(setup[0] & 2u)) return false;
+    const bool fst = setup[0] & 16u, bilinear = setup[0] & 16384u;
+    float f[4], uv[6];
+    std::memcpy(f, rec + 4, sizeof f);
+    std::memcpy(uv, rec + 15, sizeof uv);
+    const double samples = static_cast<double>(g_scale);
+    for (int axis = 0; axis < 2; ++axis) {
+        const double origin = f[axis], d = f[2 + axis], a = uv[axis], b = uv[3 + axis];
+        const int from = axis ? miny : minx, to = axis ? maxy : maxx;
+        double k = 1.0 / 16.0;
+        bool exact = true;
+        if (!fst) {
+            double q = uv[5];
+            if (q == 0.0) q = 1.0;
+            k = static_cast<double>(1u << (axis ? (setup[15] >> 8) : (setup[15] & 0xFFu))) / q;
+            exact = false;
+        }
+        int exponent;
+        if (!(std::fabs(d) < 4096.0) || (d != 0.0 && std::frexp(std::fabs(d), &exponent) != 0.5) || to - from > 63 || !(std::fabs(a) < 32768.0) || !(std::fabs(b) < 32768.0) || (g_scale != 1 && g_scale != 2)) exact = false;
+        const auto at = [&](double p) { return (a + (b - a) * (d != 0.0 ? (p - origin) / d : 0.0)) * k; };
+        double u0 = at(static_cast<double>(from)), u1 = at(static_cast<double>(to) + (samples - 1.0) / samples);
+        if (u0 > u1) std::swap(u0, u1);
+        const double m = exact ? 0.0 : 1.0 / 64.0;
+        if (!(std::fabs(u0) < 1e6) || !(std::fabs(u1) < 1e6)) return false;
+        int l = static_cast<int>(std::floor(u0 - m)), h = static_cast<int>(std::floor(u1 + m));
+        if (bilinear) {
+            l = std::min(l, static_cast<int>(std::floor(u0 - 0.5 - m)));
+            h = std::max(h, static_cast<int>(std::floor(u1 - 0.5 + m)) + 1);
+        }
+        lo[axis] = l;
+        hi[axis] = h;
+    }
+    return true;
+}
+
+// The coordinates one axis reaches through the wrap mode (the shader's wrap_coord) when the whole coordinates `a` to `b` are asked for. False when there would be more than 32.
+bool tap_axis(std::uint32_t mode, int a, int b, int size, std::uint32_t minv, std::uint32_t maxv, int *out, int &n) {
+    n = 0;
+    if (b - a > 31 || (mode == 2 && maxv < minv)) return false;
+    for (int t = a; t <= b; ++t) {
+        int r;
+        switch (mode) {
+        case 0: r = t & (size - 1); break;
+        case 1: r = std::clamp(t, 0, size - 1); break;
+        case 2: r = std::clamp(t, static_cast<int>(minv), static_cast<int>(maxv)); break;
+        default: r = static_cast<int>((static_cast<std::uint32_t>(t) & minv) | maxv); break;
+        }
+        bool seen = false;
+        for (int i = 0; i < n && !seen; ++i) seen = out[i] == r;
+        if (!seen) out[n++] = r;
+    }
+    return true;
+}
+
+// Calls visit(word) for every word of graphics memory that the texture reads of a sprite can touch (the same word may come more than once). False, with nothing
+// visited, when they cannot be listed: not a sprite, not textured, or more than kExactPixels texels.
+template <typename Visit>
+bool sprite_reads(const std::uint32_t *rec, const std::uint32_t *setup, int minx, int miny, int maxx, int maxy, Visit visit) {
+    if (g_swizzle.empty()) return false;
+    int lo[2], hi[2], us[32], vs[32], nu, nv;
+    if (!sprite_taps(rec, setup, minx, miny, maxx, maxy, lo, hi) ||
+        !tap_axis((setup[7] >> 24) & 3u, lo[0], hi[0], 1 << (setup[15] & 0xFFu), setup[18] & 0xFFFFu, setup[18] >> 16, us, nu) ||
+        !tap_axis((setup[7] >> 26) & 3u, lo[1], hi[1], 1 << (setup[15] >> 8), setup[19] & 0xFFFFu, setup[19] >> 16, vs, nv) || nu * nv > static_cast<int>(kExactPixels))
+        return false;
+    for (int j = 0; j < nv; ++j)
+        for (int i = 0; i < nu; ++i) visit(word_at(setup + 25, static_cast<std::uint32_t>(us[i]), static_cast<std::uint32_t>(vs[j])));
+    return true;
+}
+
+// A textured sprite whose draw program reads (u & MINU) | MAXU on an axis: the range its reads span is not the range of its corners.
+bool region_repeat(const std::uint32_t *setup) { return (setup[0] & 2u) && ((((setup[7] >> 24) & 3u) == 3u) || (((setup[7] >> 26) & 3u) == 3u)); }
+
+// The words from the first to the last that the texture reads of a sprite can touch, as a range of bytes; false when they cannot be listed.
+bool sprite_read_range(const std::uint32_t *rec, const std::uint32_t *setup, int minx, int miny, int maxx, int maxy, Range &out) {
+    std::uint32_t first = ~0u, last = 0;
+    if (!sprite_reads(rec, setup, minx, miny, maxx, maxy, [&](std::uint32_t word) {
+            first = std::min(first, word);
+            last = std::max(last, word);
+        }))
+        return false;
+    out = Range{};
+    out.add(static_cast<std::uint64_t>(first) * 4, static_cast<std::uint64_t>(last) * 4 + 4);
+    return true;
+}
+
+// Adds the words a sprite of the batch writes in the frame (every pixel of its box). False when the shape is no sprite, is larger than kExactPixels, or the frame is not a
+// colour format. The depth buffer is not listed: a read that comes near it cuts the batch by pages (draw).
+bool exact_add(const std::uint32_t *rec, const std::uint32_t *setup) {
+    const std::uint32_t fpsm = setup[3];
+    if (rec[1] != 1 || (fpsm != PSMCT32 && fpsm != PSMCT24 && fpsm != PSMCT16 && fpsm != PSMCT16S)) return false;
+    const std::uint32_t x0 = rec[2] & 0xFFFFu, y0 = rec[2] >> 16, x1 = rec[3] & 0xFFFFu, y1 = rec[3] >> 16;
+    if (x1 < x0 || y1 < y0 || static_cast<std::uint64_t>(x1 - x0 + 1) * (y1 - y0 + 1) > kExactPixels) return false;
+    Exact &e = g_exact;
+    for (std::uint32_t y = y0; y <= y1; ++y)
+        for (std::uint32_t x = x0; x <= x1; ++x) {
+            const std::uint32_t word = word_at(setup + 30, x, y);
+            std::uint64_t &part = e.written[word >> 6];
+            if (!part) e.dirty.push_back(word >> 6);
+            part |= 1ull << (word & 63u);
+        }
+    return true;
+}
+
+void exact_fail() {
+    exact_reset();
+    g_exact.state = 2;
+}
+
+// Adds a region-repeat sprite's reads to the range the batch's snapshot has to cover; with `known` the range was just worked out by exact_clear.
+void exact_reads(const std::uint32_t *rec, const std::uint32_t *setup, bool known) {
+    Exact &e = g_exact;
+    if (!region_repeat(setup)) return;
+    Range r;
+    if (known) r = e.pending;
+    else if (!sprite_read_range(rec, setup, static_cast<int>(rec[2] & 0xFFFFu), static_cast<int>(rec[2] >> 16), static_cast<int>(rec[3] & 0xFFFFu), static_cast<int>(rec[3] >> 16), r)) {
+        e.reads_ok = false;
+        return;
+    }
+    e.reads.add(r.lo, r.hi);
+}
+
+// Called after a shape joined the batch: the set follows it, or is given up for this batch.
+void exact_follow(const std::uint32_t *rec, const std::uint32_t *setup) {
+    Exact &e = g_exact;
+    const bool known = e.pending_valid;
+    e.pending_valid = false;
+    if (e.state != 1) return;
+    const ExactTimer timer(1);
+    if (!exact_add(rec, setup)) exact_fail();
+    else exact_reads(rec, setup, known);
+}
+
+// True when the sprite about to join the batch (`rec` with its box, before it is appended) reads no word that a shape of the batch writes in the frame, so that every read of
+// the batch copy is also what the shapes in drawing order would have read; `reads` is the range of bytes its reads span. False means a word is shared, or "cannot say": the old
+// tests decide. (The depth buffer is judged by pages by the caller.)
+bool exact_clear(const std::uint32_t *rec, const std::uint32_t *setup, int minx, int miny, int maxx, int maxy, Range &reads) {
+    Exact &e = g_exact;
+    const ExactTimer timer(0);
+    ++e.tests;
+    e.pending_valid = false;
+    if (g_swizzle.empty()) {
+        ++e.refused;
+        return false;
+    }
+    if (e.state == 0) {
+        Batch &b = g_batch;
+        if (e.written.empty()) e.written.assign(kMemorySize / 4 / 64, 0);
+        e.state = 1;
+        const std::size_t prims = b.prims.size() / kPrimWords;
+        for (std::size_t i = 0; i < prims && e.state == 1; ++i) {
+            const std::uint32_t *r = b.prims.data() + i * kPrimWords;
+            const std::uint32_t *rs = b.setups.data() + r[0] * kSetupWords;
+            if (!exact_add(r, rs)) exact_fail();
+            else exact_reads(r, rs, false);
+        }
+    }
+    bool shared = false;
+    std::uint32_t first = ~0u, last = 0;
+    if (e.state != 1 || !sprite_reads(rec, setup, minx, miny, maxx, maxy, [&](std::uint32_t word) {
+            shared = shared || (e.written[word >> 6] >> (word & 63u)) & 1u;
+            first = std::min(first, word);
+            last = std::max(last, word);
+        })) {
+        ++e.refused;
+        return false;
+    }
+    if (shared) {
+        ++e.hazards;
+        return false;
+    }
+    reads = Range{};
+    reads.add(static_cast<std::uint64_t>(first) * 4, static_cast<std::uint64_t>(last) * 4 + 4);
+    e.pending = reads;
+    e.pending_valid = true;
+    ++e.merged;
+    return true;
+}
+
 int g_tile = 8;  // pixels along one side of a screen tile (one workgroup of the raster program): 8 was the cheaper of 16, 8 and 4 on the arena and hall test frames; PS2_TILE=4, 8 or 16 to try others
 int g_tiles_per_row = 128;
 std::vector<std::uint32_t> g_tile_count(128 * 128 + 8), g_tile_fill(128 * 128 + 8);
@@ -538,6 +776,11 @@ bool reads_own_word(const std::uint32_t *rec, const std::uint32_t *setup) {
 
 Range read_range(const std::uint32_t *rec, const std::uint32_t *setup, const Range &whole) {
     if (rec[1] != 1 || !(setup[0] & 16u)) return whole;
+    // Wrap mode 3 (region repeat) reads (u & MINU) | MAXU, which need not lie between the corners of the sprite: the range is that of the words it can touch, else the whole texture.
+    if (region_repeat(setup)) {
+        Range r;
+        return sprite_read_range(rec, setup, static_cast<int>(rec[2] & 0xFFFFu), static_cast<int>(rec[2] >> 16), static_cast<int>(rec[3] & 0xFFFFu), static_cast<int>(rec[3] >> 16), r) ? r : whole;
+    }
     float uv[6];
     std::memcpy(uv, rec + 15, sizeof uv);
     const int u0 = static_cast<int>(std::floor(std::min(uv[0], uv[3]) / 16.0f)) - 1, u1 = static_cast<int>(std::ceil(std::max(uv[0], uv[3]) / 16.0f)) + 1;
@@ -624,7 +867,8 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
         const std::uint32_t *setup = b.setups.data() + rec[0] * kSetupWords;
         if (!(setup[0] & 2u) || reads_own_word(rec, setup)) continue;
         const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
-        const Range t = read_range(rec, setup, region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1));
+        const bool listed = rec[1] == 1 && region_repeat(setup) && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
+        const Range t = listed ? g_exact.reads : read_range(rec, setup, region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1));
         for (const Range *w : {&fb, b.zwrite ? &z : nullptr})
             if (w && t.overlaps(w->lo, w->hi)) shared.add(std::max(t.lo, w->lo), std::min(t.hi, w->hi));
     }
@@ -677,6 +921,7 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
 
 void reset_batch() {
     Batch &b = g_batch;
+    exact_reset();
     b.prims.clear();
     b.setups.clear();
     b.setup_serial = 0;
@@ -1553,9 +1798,11 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     return flags;
 }
 
-bool texel_rect(const std::uint32_t *setup, const Vertex *v, int count, std::uint32_t prim, bool fst, int rect[4]) {
+// The smallest and largest texel position (u0, v0, u1, v1, in texels, before any wrap mode) that the corners of a shape name; false when they cannot be said.
+bool texel_extent(const std::uint32_t *setup, const Vertex *v, int count, std::uint32_t prim, bool fst, float &u0, float &v0, float &u1, float &v1) {
     const int tw = 1 << (setup[15] & 0xFFu), th = 1 << (setup[15] >> 8);
-    float u0 = 1e30f, v0 = 1e30f, u1 = -1e30f, v1 = -1e30f;
+    u0 = v0 = 1e30f;
+    u1 = v1 = -1e30f;
     for (int i = 0; i < count; ++i) {
         float u, t;
         if (fst) {
@@ -1573,6 +1820,13 @@ bool texel_rect(const std::uint32_t *setup, const Vertex *v, int count, std::uin
         v0 = std::min(v0, t);
         v1 = std::max(v1, t);
     }
+    return true;
+}
+
+bool texel_rect(const std::uint32_t *setup, const Vertex *v, int count, std::uint32_t prim, bool fst, int rect[4]) {
+    const int tw = 1 << (setup[15] & 0xFFu), th = 1 << (setup[15] >> 8);
+    float u0, v0, u1, v1;
+    if (!texel_extent(setup, v, count, prim, fst, u0, v0, u1, v1)) return false;
     const auto axis = [](std::uint32_t mode, float lo, float hi, int size, std::uint32_t clamp, int &a, int &b) {
         a = static_cast<int>(std::floor(lo)) - 1;
         b = static_cast<int>(std::ceil(hi)) + 1;
@@ -1619,6 +1873,146 @@ bool drawn_under(const Batch &b, const int rect[4]) {
         if (hits(static_cast<int>(lo & 0xFFFFu), static_cast<int>(lo >> 16), static_cast<int>(hi & 0xFFFFu), static_cast<int>(hi >> 16))) return true;
     }
     return false;
+}
+
+// PS2_EXACT_SELFTEST=1 (any program will do, no disc: docs/mgs3.md, "Checking the word sets"): runs sprite_taps and exact_clear on random sprites in 32-bit colour against a
+// look at every pixel, the way the draw program samples (the float arithmetic of shade_at with and without a fused multiply-add, every sub-sample of the pixel, every tap of
+// the bilinear filter, the wrap modes) and the addresses of ps2::gs::address32, which this code does not share. A sprite that the word sets let join although a pixel reads a word
+// an earlier sprite of the batch wrote, or a tap outside the range sprite_taps gives, is a failure; a sprite kept out without a shared word is only counted.
+void exact_selftest() {
+    std::uint64_t seed = 0x9E3779B97F4A7C15ull;
+    const auto rnd = [&seed](std::uint32_t n) {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        return static_cast<std::uint32_t>((seed >> 11) % n);
+    };
+    const std::uint32_t saved_scale = g_scale;
+    int failures = 0, sprites = 0, joined = 0, kept_out = 0, false_alarms = 0;
+    for (int round = 0; round < 6000; ++round) {
+        g_scale = 1 + rnd(3);
+        reset_batch();
+        std::uint32_t setup[kSetupWords] = {};
+        const std::uint32_t tw = 5 + rnd(4), th = 5 + rnd(4), wms = rnd(4), wmt = rnd(4);
+        const bool bilinear = rnd(2) != 0;
+        setup[0] = 2u | 16u | (bilinear ? 16384u : 0u);
+        setup[1] = 32u * rnd(3);
+        setup[2] = 1u << (1 + rnd(3));
+        setup[3] = PSMCT32;
+        setup[7] = (wms << 24) | (wmt << 26);
+        setup[12] = setup[1] + 32u * rnd(4);
+        setup[13] = 1u << rnd(4);
+        setup[14] = PSMCT32;
+        setup[15] = tw | (th << 8);
+        const auto bounds = [&](std::uint32_t mode, std::uint32_t bits, std::uint32_t &lo, std::uint32_t &hi) {
+            const std::uint32_t size = 1u << bits;
+            if (mode == 2) {
+                lo = rnd(size / 2);
+                hi = lo + rnd(size / 2);
+            } else {
+                lo = rnd(size);
+                hi = rnd(size);
+            }
+        };
+        std::uint32_t minu, maxu, minv, maxv;
+        bounds(wms, tw, minu, maxu);
+        bounds(wmt, th, minv, maxv);
+        setup[18] = minu | (maxu << 16);
+        setup[19] = minv | (maxv << 16);
+        fmt_words(setup[14], setup[12], setup[13], setup + 25);
+        fmt_words(setup[3], setup[1], setup[2], setup + 30);
+        Batch &b = g_batch;
+        b.setups.assign(setup, setup + kSetupWords);
+        std::vector<std::uint32_t> written;
+        const auto wrap = [&](std::uint32_t mode, int t, int size, std::uint32_t lo, std::uint32_t hi) {
+            switch (mode) {
+            case 0: return t & (size - 1);
+            case 1: return std::clamp(t, 0, size - 1);
+            case 2: return std::clamp(t, static_cast<int>(lo), static_cast<int>(hi));
+            default: return static_cast<int>((static_cast<std::uint32_t>(t) & lo) | hi);
+            }
+        };
+        const int count = 2 + static_cast<int>(rnd(6));
+        for (int n = 0; n < count; ++n) {
+            const int w = 1 + static_cast<int>(rnd(12)), h = 1 + static_cast<int>(rnd(6));
+            const float x0 = static_cast<float>(rnd(100)) + 0.25f * static_cast<float>(rnd(4)), y0 = static_cast<float>(rnd(50)) + 0.25f * static_cast<float>(rnd(4));
+            const float ratios[] = {1.0f, 1.0f, 2.0f, 0.5f, 1.5f, 0.75f, 3.0f};
+            const float rw = ratios[rnd(7)], rh = ratios[rnd(7)];
+            const float u0 = static_cast<float>(rnd((1u << tw) * 16u)) + (rnd(2) ? 8.0f : 0.0f), v0 = static_cast<float>(rnd((1u << th) * 16u)) + (rnd(2) ? 8.0f : 0.0f);
+            const float u1 = u0 + std::floor(static_cast<float>(w) * rw * 16.0f), v1 = v0 + std::floor(static_cast<float>(h) * rh * 16.0f);
+            const int minx = static_cast<int>(std::ceil(x0)), miny = static_cast<int>(std::ceil(y0)), maxx = static_cast<int>(std::ceil(x0 + static_cast<float>(w))) - 1, maxy = static_cast<int>(std::ceil(y0 + static_cast<float>(h))) - 1;
+            if (minx > maxx || miny > maxy) continue;
+            std::uint32_t rec[kPrimWords] = {};
+            const float geometry[4] = {x0, y0, static_cast<float>(w), static_cast<float>(h)}, uv[6] = {u0, v0, 1.0f, u1, v1, 1.0f};
+            rec[1] = 1;
+            std::memcpy(rec + 4, geometry, sizeof geometry);
+            std::memcpy(rec + 15, uv, sizeof uv);
+            // what the draw program reads: floats as in shade_at, every sub-sample position and the whole position of the pixel (the nearest read of a sprite that is not scaled)
+            std::vector<int> us[2];
+            int actual_lo[2] = {1 << 30, 1 << 30}, actual_hi[2] = {-(1 << 30), -(1 << 30)};
+            for (int axis = 0; axis < 2; ++axis) {
+                const float origin = geometry[axis], d = geometry[2 + axis], a = uv[axis], bb = uv[3 + axis];
+                for (int p = axis ? miny : minx; p <= (axis ? maxy : maxx); ++p)
+                    for (std::uint32_t j = 0; j <= g_scale; ++j) {
+                        const float position = j == g_scale ? static_cast<float>(p) : static_cast<float>(p) + static_cast<float>(j) / static_cast<float>(g_scale);
+                        const float t = d != 0.0f ? (position - origin) / d : 0.0f;
+                        for (const bool fused : {false, true}) {
+                            const float u = (fused ? std::fma(bb - a, t, a) : a + (bb - a) * t) / 16.0f;
+                            const int first = static_cast<int>(std::floor(bilinear ? u - 0.5f : u));
+                            for (const int tap : {first, first + (bilinear ? 1 : 0)}) {
+                                us[axis].push_back(tap);
+                                actual_lo[axis] = std::min(actual_lo[axis], tap);
+                                actual_hi[axis] = std::max(actual_hi[axis], tap);
+                            }
+                        }
+                    }
+            }
+            int lo[2], hi[2];
+            if (!sprite_taps(rec, setup, minx, miny, maxx, maxy, lo, hi)) {
+                ++failures;
+                std::fprintf(stderr, "[exact-selftest] FAIL: sprite_taps gives nothing for a textured sprite\n");
+                continue;
+            }
+            for (int axis = 0; axis < 2; ++axis)
+                if (actual_lo[axis] < lo[axis] || actual_hi[axis] > hi[axis]) {
+                    ++failures;
+                    std::fprintf(stderr, "[exact-selftest] FAIL: axis %d reads %d..%d, sprite_taps says %d..%d (scale %u, bilinear %d, d %g, u %g..%g)\n", axis, actual_lo[axis], actual_hi[axis], lo[axis], hi[axis], g_scale, bilinear, geometry[2 + axis], uv[axis], uv[3 + axis]);
+                }
+            std::vector<std::uint32_t> reads;
+            for (const int v : us[1])
+                for (const int u : us[0])
+                    reads.push_back(address32(setup[12], setup[13], static_cast<std::uint32_t>(wrap(wms, u, 1 << tw, minu, maxu)), static_cast<std::uint32_t>(wrap(wmt, v, 1 << th, minv, maxv))) / 4);
+            bool hazard = false;
+            for (const std::uint32_t word : reads) hazard = hazard || std::find(written.begin(), written.end(), word) != written.end();
+            ++sprites;
+            if (!b.prims.empty()) {
+                Range span;
+                if (exact_clear(rec, setup, minx, miny, maxx, maxy, span)) {
+                    ++joined;
+                    if (hazard) {
+                        ++failures;
+                        std::fprintf(stderr, "[exact-selftest] FAIL: a sprite joined the batch although it reads a word an earlier sprite writes (round %d)\n", round);
+                    }
+                } else {
+                    ++kept_out;
+                    if (!hazard) ++false_alarms;
+                    reset_batch();
+                    b.setups.assign(setup, setup + kSetupWords);
+                    written.clear();
+                }
+            }
+            rec[0] = 0;
+            rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
+            rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
+            b.prims.append(rec, kPrimWords);
+            exact_follow(rec, setup);
+            for (int y = miny; y <= maxy; ++y)
+                for (int x = minx; x <= maxx; ++x) written.push_back(address32(setup[1], setup[2], static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)) / 4);
+        }
+    }
+    reset_batch();
+    g_scale = saved_scale;
+    std::fprintf(stderr, "[exact-selftest] %s: %d sprites asked about, %d joined, %d kept out (%d of them with no shared word), %d failures\n", failures ? "FAIL" : "PASS", sprites, joined, kept_out, false_alarms, failures);
 }
 
 void attrs(std::uint32_t *rec, int n, const Vertex &v, bool fst, const Vertex *color) {
@@ -1852,6 +2246,8 @@ bool init(Mode m) {
     g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     std::vector<std::uint32_t> tables;
     swizzle_tables(tables);
+    g_swizzle = tables;
+    if (!os::env("PS2_EXACT_SELFTEST").empty()) exact_selftest();
     g_tables = make_buffer(tables.size() * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     wgpuQueueWriteBuffer(g_queue, g_tables, 0, tables.data(), tables.size() * 4);
     g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
@@ -2093,16 +2489,26 @@ void draw(const State &st, const Vertex *v, int count) {
             const auto written = [&](const Range &t) { return (!fb_untouched && t.overlaps(b.fb_range.lo, b.fb_range.hi)) || (b.zwrite && !z_untouched && t.overlaps(b.z_range.lo, b.z_range.hi)); };
             int rect[4];
             if (written(tex)) {
+                // The tests below are page and box tests. A sprite that reads the memory of the frame in another layout (indices of 8 bits read as the pixels of 32 bits, a
+                // texture window with wrap mode 3) is cut off by them although it often touches no word that an earlier shape wrote: exact_clear looks at the words.
+                const bool exact_ok = prim == 6 && !shares_frame(setup, b);
+                const auto exact_join = [&]() {
+                    Range reads;
+                    return exact_clear(rec, setup, minx, miny, maxx, maxy, reads) && !(b.zwrite && !z_untouched && reads.overlaps(b.z_range.lo, b.z_range.hi));
+                };
                 if (!texel_rect(setup, v, count, prim, fst, rect)) {
-                    g_why = kWhyTexel;
-                    emit_all();
+                    if (!exact_ok || !exact_join()) {
+                        g_why = kWhyTexel;
+                        emit_all();
+                    }
                 } else {
                     const Range used = region(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]);
                     const bool small = rect[2] - rect[0] < 64 && rect[3] - rect[1] < 64;
                     const bool cached = b.texflushes == g_texflushes && small && shares_frame(setup, b);
                     const bool same = shares_frame(setup, b);
                     const bool frame = !cached && (same ? drawn_under(b, rect) : used.overlaps(b.fb_range.lo, b.fb_range.hi));
-                    if (frame || (b.zwrite && !z_untouched && used.overlaps(b.z_range.lo, b.z_range.hi))) {
+                    const bool zhit = b.zwrite && !z_untouched && used.overlaps(b.z_range.lo, b.z_range.hi);
+                    if ((frame || zhit) && !(frame && !zhit && exact_ok && exact_join())) {
                         if (g_batch_log_frame > 1 && frame_count() == g_batch_log_frame) {
                             int hit = -1;
                             const std::size_t n = b.prims.size() / kPrimWords;
@@ -2160,6 +2566,7 @@ void draw(const State &st, const Vertex *v, int count) {
     rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
     rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
     b.prims.append(rec, kPrimWords);
+    exact_follow(rec, setup);
     b.minx = std::min(b.minx, minx);
     b.miny = std::min(b.miny, miny);
     b.maxx = std::max(b.maxx, maxx);
@@ -2256,9 +2663,12 @@ void flush() {
             std::fprintf(stderr, "[batch] frame %llu: %u runs, %u shapes, ended by:", static_cast<unsigned long long>(frame_count()), runs, prims);
             for (int w = 0; w < kWhys; ++w)
                 if (g_why_runs[w]) std::fprintf(stderr, " %s %u (%u shapes)", kWhyName[w], g_why_runs[w], g_why_prims[w]);
+            std::fprintf(stderr, "; word test: %u asked, %u joined, %u real overlaps, %u not possible, processor time %.3f ms (asking %.3f, following %.3f)", g_exact.tests, g_exact.merged, g_exact.hazards, g_exact.refused, static_cast<double>(g_exact.ns[0] + g_exact.ns[1]) / 1e6, static_cast<double>(g_exact.ns[0]) / 1e6, static_cast<double>(g_exact.ns[1]) / 1e6);
             std::fprintf(stderr, "\n");
         }
         for (int w = 0; w < kWhys; ++w) g_why_runs[w] = g_why_prims[w] = 0;
+        g_exact.tests = g_exact.merged = g_exact.hazards = g_exact.refused = 0;
+        g_exact.ns[0] = g_exact.ns[1] = 0;
     }
     if (!g_bench.configured || g_bench.done) return;
     ++g_vblanks;

@@ -60,6 +60,23 @@ void register_generated_vu();
 
 namespace {
 
+// The game folder port.sh made (games/<name>): --game-dir when given, else the first of the program's folder, its parent and the
+// disc image's folder that holds vu1/ or entries.txt. Empty when none does. The log starts before the arguments are read in full
+// and needs the answer too, so this is one function used in both places.
+std::filesystem::path find_game_dir(const std::string &program_location, const std::string &disc_path, const std::string &explicit_dir) {
+    std::error_code error;
+    if (!explicit_dir.empty()) return std::filesystem::absolute(ps2::os::path(explicit_dir), error);
+    const std::filesystem::path program_file = std::filesystem::absolute(ps2::os::path(program_location), error);
+    std::vector<std::filesystem::path> places{program_file.parent_path(), program_file.parent_path().parent_path()};
+    if (!disc_path.empty()) {
+        const std::filesystem::path disc = std::filesystem::absolute(ps2::os::path(disc_path), error);
+        if (!error) places.push_back(disc.parent_path());
+    }
+    for (const auto &place : places)
+        if (std::filesystem::is_directory(place / "vu1", error) || std::filesystem::is_regular_file(place / "entries.txt", error)) return place;
+    return {};
+}
+
 int usage() {
     std::fprintf(stderr,
                  "usage: ps2run [elf] [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
@@ -753,13 +770,19 @@ int main(int argc, char **argv) {
     {
         // PS2_LOG_COPY=1 (a test aid): a headless run keeps the log copy too, so the log file can be tested without a window
         bool window_run = ps2::os::env("PS2_LOG_COPY") == "1";
+        std::string early_disc, early_game_dir;
         for (int i = from_disc ? 1 : 2; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--window" || a == "--fullscreen") window_run = true;
             else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
             else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
+            else if (a == "--disc" && i + 1 < argc) early_disc = argv[++i];
+            else if (a == "--game-dir" && i + 1 < argc) early_game_dir = argv[++i];
         }
         if (!from_disc) ps2::g_options.program_path = argv[1];
+        // The log goes where the quick saves go (the memory card's folder, else the game folder), so the game folder must be known
+        // by now, as it is later. An image-only start has no program path yet: its folder stands in for it, as below.
+        ps2::g_options.game_dir = ps2::os::utf8(find_game_dir(from_disc ? early_disc : argv[1], early_disc, early_game_dir).lexically_normal());
         // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
         if (window_run && ps2::os::env("PS2_NO_LOG_COPY").empty() && g_log.start(ps2::os::path(ps2::quick_folder("logs")))) {
             ps2::g_options.recent_log = [](std::size_t lines) { return g_log.tail(lines); };
@@ -782,7 +805,7 @@ int main(int argc, char **argv) {
 #endif
     std::vector<std::string> args{argv[1]};
     [[maybe_unused]] bool window = false, fullscreen = false;
-    std::string load_path;
+    std::string load_path, given_game_dir;
     bool no_record = false;
     ps2::g_options.disc_program = from_disc;
     for (int i = 0; i < argc; ++i) {
@@ -806,7 +829,7 @@ int main(int argc, char **argv) {
         else if (a == "--trace-io") ps2::g_options.trace_io = true;
         else if (a == "--trace-threads") ps2::g_options.trace_threads = true;
         else if (a == "--disc" && i + 1 < argc) ps2::g_options.disc_path = argv[++i];
-        else if (a == "--game-dir" && i + 1 < argc) ps2::g_options.game_dir = argv[++i];
+        else if (a == "--game-dir" && i + 1 < argc) given_game_dir = argv[++i];
         else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
@@ -876,23 +899,14 @@ int main(int argc, char **argv) {
     std::error_code error;
     const std::filesystem::path program_file = std::filesystem::absolute(ps2::os::path(program_location), error);
     std::filesystem::path game_dir;
-    if (!ps2::g_options.game_dir.empty()) {
-        game_dir = std::filesystem::absolute(ps2::os::path(ps2::g_options.game_dir), error);
+    if (!given_game_dir.empty()) {
+        game_dir = std::filesystem::absolute(ps2::os::path(given_game_dir), error);
         if (error || !std::filesystem::is_directory(game_dir, error)) {
-            std::fprintf(stderr, "[game] not a directory: %s\n", ps2::g_options.game_dir.c_str());
+            std::fprintf(stderr, "[game] not a directory: %s\n", given_game_dir.c_str());
             return 1;
         }
     } else {
-        std::vector<std::filesystem::path> places{program_file.parent_path(), program_file.parent_path().parent_path()};
-        if (!ps2::g_options.disc_path.empty()) {
-            const std::filesystem::path disc = std::filesystem::absolute(ps2::os::path(ps2::g_options.disc_path), error);
-            if (!error) places.push_back(disc.parent_path());
-        }
-        for (const auto &place : places)
-            if (std::filesystem::is_directory(place / "vu1", error) || std::filesystem::is_regular_file(place / "entries.txt", error)) {
-                game_dir = place;
-                break;
-            }
+        game_dir = find_game_dir(program_location, ps2::g_options.disc_path, {});
     }
     game_dir = game_dir.lexically_normal();
     ps2::g_options.game_dir = ps2::os::utf8(game_dir);

@@ -90,7 +90,7 @@ jobs:
           build/ci/ps2iopboundstest
           "$CXX_BIN" -std=c++20 -O2 tests/stretch_test.cpp host/stretch.cpp -o build/ci/stretchtest
           build/ci/stretchtest
-          for t in analysis_tailcall elf_bss codegen_fallthrough; do
+          for t in analysis_tailcall elf_bss codegen_fallthrough codegen_labels; do
             python3 tests/$t.py --recompiler build/tools/eerecomp
           done
           python3 tests/disc_boot.py --recompiler build/tools/eerecomp --runtime build/ci/libps2runtime.a --cxx "$CXX_BIN"

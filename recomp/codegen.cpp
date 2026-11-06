@@ -90,6 +90,9 @@ public:
                 write_unit(u);
                 rows.push_back({layout_.base_of(u), layout_.size(), unit_name(u), table_name(u)});
             }
+        if (unserved_ && !options_.quiet)
+            std::fprintf(stderr, "eerecomp: note: %zu branch targets of %s had no label in their unit and leave through the dispatcher\n", unserved_,
+                         prefix_.empty() ? "the program" : prefix_.c_str());
         return rows;
     }
 
@@ -208,6 +211,7 @@ private:
             }
             if (has_delay_slot(i.op) && labels_.count(a + 4) && in_unit(a + 8)) labels_.insert(a + 8);
         }
+        label_after_slots();
 
         out_.str({});
         out_ << "#include \"units.hpp\"\n\nnamespace gen {\n\nusing namespace ps2;\n\n";
@@ -262,7 +266,8 @@ private:
                 falls = !complex_slot(ds) && fl != Flow::Jump && fl != Flow::JumpRegister;
                 skip = true;
                 if (falls && (labels_.count(a + 4) || !in_unit(a + 4))) {
-                    if (in_unit(a + 8) && p_.is_code(a + 8)) line("goto " + label(a + 8) + ";");
+                    if (in_unit(a + 8) && p_.is_code(a + 8) && have_label(a + 8)) line("goto " + label(a + 8) + ";");
+                    else if (in_unit(a + 8) && p_.is_code(a + 8)) leave_by_dispatch(a + 8);
                     else exit_to(a + 8);
                     falls = false;
                 }
@@ -271,6 +276,25 @@ private:
         if (falls) exit_to(end);
         out_ << "}\n\n}\n";
         write_if_changed(ps2::os::path(options_.output) / std::format("{}.cpp", unit_name(u)), out_.str());
+    }
+
+    // A labelled delay slot is something the code can be entered at, so the branch in front of it skips it with a goto to the
+    // instruction after it (see write_unit). That instruction needs its label even when the slot only got its label later in the
+    // scan, from a branch further down that goes back to the slot: the first pass over the unit has passed the branch by then.
+    // A label that is new here can be the label of another delay slot, so the pass runs until nothing is added.
+    void label_after_slots() {
+        const std::uint32_t end = base_ + layout_.size();
+        for (bool added = true; added;) {
+            added = false;
+            for (std::uint32_t a = base_; a < end; a += 4) {
+                if (!p_.is_code(a) || !p_.is_code(a + 4) || !labels_.count(a + 4) || labels_.count(a + 8) || !in_unit(a + 8) || !p_.is_code(a + 8)) continue;
+                const Insn i = at(a);
+                const Flow fl = flow(i.op);
+                if (!has_delay_slot(i.op) || fl == Flow::Jump || fl == Flow::JumpRegister || complex_slot(at(a + 4))) continue;
+                labels_.insert(a + 8);
+                added = true;
+            }
+        }
     }
 
     // Both versions of a switched instruction, chosen by the game variable when it runs. Only plain instructions can be
@@ -305,9 +329,27 @@ private:
         }
     }
 
+    // The last line of defence against a goto to a label that the unit does not have, which the C++ compiler rejects and so
+    // stops the build of the whole game (issue #55): code of this unit that no scan of write_unit labelled leaves through the
+    // dispatcher, like any address the translation does not serve. Which one does shows in the note generate() prints.
+    bool have_label(std::uint32_t a) const { return labels_.count(a) != 0; }
+
+    std::string unserved(std::uint32_t t) {
+        ++unserved_;
+        return std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u, depth);", pc(t));
+    }
+
+    void leave_by_dispatch(std::uint32_t t) {
+        flush();
+        line(unserved(t));
+    }
+
     std::string jump(std::uint32_t t, std::uint32_t from) {
         std::string check = t <= from ? std::format("if (c.budget < 0 && preempt(c)) {{ c.pc = {} | kUnwind; return; }} ", pc(t)) : "";
-        if (in_unit(t) && p_.is_code(t)) return check + "goto " + label(t) + ";";
+        if (in_unit(t) && p_.is_code(t)) {
+            if (have_label(t)) return check + "goto " + label(t) + ";";
+            return check + unserved(t);
+        }
         if (p_.is_code(t))
             return check + std::format("{}[[clang::musttail]] return {}(c, {}u, depth);", rebase(), unit_name(layout_.unit_of(t)), id_of(t));
         return std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u, depth);", pc(t));
@@ -965,6 +1007,7 @@ private:
     std::vector<bool> has_code_;
     std::uint32_t base_{};
     std::set<std::uint32_t> labels_;
+    std::size_t unserved_{};  // branch targets without a label that left through the dispatcher (see unserved())
     std::string *capture_{};
     bool collecting_{};
     std::set<std::uint32_t> reached_, called_, resumes_;

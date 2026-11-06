@@ -2235,7 +2235,7 @@ bool init(Mode m) {
             g_bench.reps = std::clamp<unsigned long long>(reps, 1, 500);
         }
     }
-    if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
+    if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 4u);
     g_copy_words = (1u << 20) * g_scale * g_scale;
     if (const int tile = std::atoi(os::env("PS2_TILE").c_str()); tile == 4 || tile == 8 || tile == 16) g_tile = tile;
     g_tiles_per_row = (2048 * static_cast<int>(g_scale) + g_tile - 1) / g_tile;

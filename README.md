@@ -1,7 +1,7 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 38 games work as far as they
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 39 games work as far as they
 have been tested, 25 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 37
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 38
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -120,8 +120,9 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Zone of the Enders (USA) | plays well, not played through yet: from power-on through the film and the menus into the first battle ([#24](https://github.com/exoteric33/ps2-native-recomp/issues/24)) | Pacioso, me |
 | Robotech: Battlecry | plays, not played through yet: from power-on through the memory card save into the first mission; a tester saw sound stutter and frame drops when characters speak, which I could not reproduce ([#1](https://github.com/exoteric33/ps2-native-recomp/issues/1), [#7](https://github.com/exoteric33/ps2-native-recomp/issues/7)) | omegakatana92, me |
 | Gundam vs. Zeta Gundam | plays, not played through yet: menus at full speed, a fight at 45 to 55 fps, a short pause the first time a new part loads ([#2](https://github.com/exoteric33/ps2-native-recomp/issues/2)) | omegakatana92, me |
+| Kidou Senshi Gundam: Ichinen Sensou (Japan) | plays, not played through yet: from power-on through the logos, the opening film and the title into the first mission; it needs a memory card in slot 1 ([#61](https://github.com/exoteric33/ps2-native-recomp/issues/61)) | omegakatana92, me |
 | Tales of the Abyss (USA) | plays, not played through yet: the opening films, the title and exploration at about 30 fps like the PS2, menus at 60 fps; battles not tried; at 2x resolution a dashed line shows along the bottom of the picture (SteamOS on a ROG Ally X, a DualShock 3; [#59](https://github.com/exoteric33/ps2-native-recomp/issues/59)) | Kush Peshin |
-| Final Fantasy X International (Japan) | plays in a tester's own copy, not played through yet: to Besaid Village, with fights, a boss and saving, generally at full speed, some graphics errors; that copy has three fixes that are not in this project yet, so here it may stop sooner (Windows 11, an RTX 4070 Ti Super, an Xbox controller) | a tester, by mail |
+| Final Fantasy X International (Japan) | runs, not played through yet: on this project's code from power-on through the opening film into Zanarkand (the first fight not reached yet); a tester reached Besaid Village in their own copy with three fixes of their own, and the one for long folder paths on Windows is now in the project (Windows 11, an RTX 4070 Ti Super, an Xbox controller) | a tester, by mail; me |
 | Digimon World Data Squad | plays, not played through yet: the opening film, menus, gameplay and a battle look and sound right; about 80 % of full speed on a very weak PC (Windows, Intel N100, 4 GB, 1x resolution, an Xbox 360 controller; Vulkan is as fast as Direct3D 12 there) | mizushucku |
 | Football Kingdom | plays, not played through yet: no crashes; the crowd sometimes goes black for a moment and the free kick aiming arrow is half as wide as it should be | a tester, by mail |
 | College Basketball 2K5 | plays, not played through yet: no glitches except one small sound stutter | a tester, by mail |

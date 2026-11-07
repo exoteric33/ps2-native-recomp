@@ -32,21 +32,22 @@ Running with the extracted directory:
 
 ---
 
-## 2. Unpacking 2nd-Level Game Archives & Converting PS2 3D/Texture/Audio Assets
+## 2. Unpacking 2nd-Level Game Archives & Converting PS2 3D/Texture/Audio/Video Assets
 
-Many PS2 games pack their 3D models, textures, audio streams, and relocatable overlays inside container files (`.AFS`, `.PAC`, `.MOMO`, `.LMP`, `.GOB`, `.TEX`, `DATA.BIN`, etc.). `extract_disc.py` includes a built-in 2nd-level unpacker and asset converter (`tools/ps2_disc_toolkit/archives.py`, `ps2_textures.py`, `ps2_audio.py`, `ps2_meshes.py`):
+Many PS2 games pack their 3D models, textures, audio streams, FMV videos, and relocatable overlays inside container files (`.AFS`, `.PAC`, `.MOMO`, `.LMP`, `.GOB`, `.TEX`, `DATA.BIN`, etc.). `extract_disc.py` includes a built-in 2nd-level unpacker and bidirectional asset converter (`tools/ps2_disc_toolkit/archives.py`, `ps2_textures.py`, `ps2_audio.py`, `ps2_video.py`, `ps2_meshes.py`, `repacker.py`):
 
 - **Archive containers**: CRI `.AFS` (`AFS\x00`), `.MOMO`, headerless offset-table `.PAC` archives (`count + [offset, size]`), sector-aligned (`0x800`) `.PAC` containers, Snowblind `.LMP`/`.GOB`/`.TEX`, Capcom 16-bit LZ16 streams, and a fallback universal signature carver (`--carve`).
-- **Textures**: Sony SDK `.TIM2` (`.tm2`), `.tex`, and `.16` $\rightarrow$ **32-bit RGBA `.png`** (with hardware GS VRAM unswizzling, CSM1 CLUT palette unswizzling, and PS2 $0..128 \rightarrow 0..255$ alpha scaling).
-- **Audio**: Sony SDK SPU2 ADPCM `.vag` (`VAGp`) $\rightarrow$ **16-bit PCM `.wav`**.
-- **3D Meshes**: Recursive chunk-based `.FMOD` 3D models and VIF1/VU1 geometry packets (`.vif`, honoring the GS `ADC 0x8000` strip-restart flag) $\rightarrow$ **Wavefront `.obj`** (with UVs, normals, per-vertex RGB shading, automatic sub-mesh splitting `_partXX.obj`, and bounding-box role classification in `assets_catalog.json`).
+- **Textures**: Sony SDK `.TIM2` (`.tm2`), `.tex`, and `.16` $\leftrightarrow$ **32-bit RGBA `.png`** (with hardware GS VRAM unswizzling/swizzling, CSM1 CLUT palette unswizzling, PS2 $0..128 \leftrightarrow 0..255$ alpha scaling, and `textures_index.tsv` GPU hash indexing).
+- **Audio & Sound Banks**: CRI Middleware `.ADX` (`\x80\x00...(c)CRI`), Sony SDK SPU2 ADPCM `.vag` (`VAGp`), `.ads` (`SShd`/`SSbd`), and raw SPU2 `.bd` sound banks $\leftrightarrow$ **16-bit PCM `.wav`**.
+- **Videos**: CRI Sofdec `.SFD` (MPEG-2 + CRI ADX audio) and Sony `.PSS` (MPEG-2 + SPU2/PCM audio) (`0x000001BA`) $\leftrightarrow$ **`.mp4` (H.264 + synchronized stereo AAC audio)**.
+- **3D Meshes**: Recursive chunk-based `.FMOD` 3D models (including `0x000C0000` skeletal skinning weights) and VIF1/VU1 geometry packets (`.vif`, honoring the GS `ADC 0x8000` strip-restart flag) $\leftrightarrow$ **Wavefront `.obj`** (with UVs, normals, per-vertex RGB shading, automatic sub-mesh splitting `_partXX.obj`, nearest-vertex bone weight transfer on re-encode, and bounding-box role classification in `assets_catalog.json`).
 
 ```bash
 # List subfiles inside an archive (.AFS, .PAC, .MOMO, .LMP, .GOB, .TEX, DATA.BIN)
 python3 scripts/extract_disc.py unpack-list games/<name>/disc_files/layer0/DATA.BIN --max-entries 20
 
-# Extract and convert PS2 textures (.tm2, .tex, .16 -> .png), audio (.vag -> .wav),
-# 3D models (.fmod, .vif -> .obj + submesh parts + assets_catalog.json),
+# Extract and convert PS2 textures (.tm2, .tex, .16 -> .png), audio (.vag, .adx, .ads, .bd -> .wav),
+# videos (.sfd, .pss -> .mp4), 3D models (.fmod, .vif -> .obj + submesh parts + assets_catalog.json),
 # Metrowerks MWo3 overlays, and Capcom LZ16 containers
 python3 scripts/extract_disc.py unpack-extract \
   games/<name>/disc_files/layer0/DATA.BIN \
@@ -59,6 +60,17 @@ python3 scripts/extract_disc.py unpack-extract \
   games/<name>/assets_unpacked/data_carved \
   --carve --convert
 ```
+
+### 2.1 Bidirectional Modding: Live 1x/HD `.PNG` Texture Overrides & Multi-Core Incremental `sync`
+
+- **Live `.PNG` Texture Overrides (1x, 2x, 4x, 8x HD — 0 s repack)**:
+  When `games/<name>/assets_unpacked/textures_index.tsv` is present, the WebGPU GS runtime (`runtime/src/gs/gpu/gpu.cpp` & `gs.wgsl`) automatically detects any modified `.png` file on disk by its 64-bit upload hash (`content_key`) and loads it directly into the GPU decoded texture buffer—supporting both **1x** replacements and **2x, 4x, and 8x HD** textures without being constrained by the 4 MB PS2 GS VRAM limit.
+- **Multi-Core Incremental Asset Repacker (`sync`)**:
+  Modified 3D meshes (`.obj` $\rightarrow$ `.fmod`), audio tracks/SFX (`.wav` $\rightarrow$ `.adx`/`.vag`/`.bd`), FMV videos (`.mp4` $\rightarrow$ `.sfd`/`.pss`), and 1x textures (`.png` $\rightarrow$ `.tm2`) are incrementally repacked in parallel (`ProcessPoolExecutor`) into their parent `.PAC` / `.MOMO` / `LZ16` / `.AFS` / `DATA.BIN` containers in `games/<name>/disc_files/layer0/`:
+  ```bash
+  python3 scripts/extract_disc.py sync --game <name>
+  ```
+  *(Also invoked automatically before `extract_disc.py bundle --game <name>`).*
 
 ---
 

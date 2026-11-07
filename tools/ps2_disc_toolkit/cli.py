@@ -33,6 +33,7 @@ if __package__ in (None, ''):
         collect_non_file_gaps,
         scan_non_zero_runs,
     )
+    from ps2_disc_toolkit.repacker import sync_game_assets, sync_unpacked_directory
 else:
     from .bundler import build_single_file_bundle, bundle_game_targets
     from .containers import open_container, SECTOR_SIZE
@@ -43,6 +44,8 @@ else:
         collect_non_file_gaps,
         scan_non_zero_runs,
     )
+    from .repacker import sync_game_assets, sync_unpacked_directory
+
 
 
 def resolve_profile(profile_arg, syscnf, files):
@@ -774,6 +777,13 @@ def main(argv=None):
     p_uex.add_argument('--carve', action='store_true', help='Force universal signature carver (TIM2/VAGp) for unknown containers')
     p_uex.add_argument('--max-entries', type=int, default=None, help='Maximum number of top-level entries to extract')
 
+    p_sync = sub.add_parser('sync', help='Incrementally repack modified PC assets (.obj, .wav, .mp4, 1x .png) from assets_unpacked/ back into disc_files/')
+    p_sync.add_argument('--game', default=None, help='Short game name (e.g. mhdos, norrath) to sync all unpacked directories under games/<game>/assets_unpacked/')
+    p_sync.add_argument('--dir', default=None, help='Explicit unpacked directory path to sync')
+    p_sync.add_argument('--archive', default=None, help='Explicit target PS2 archive path in disc_files/layer0/ when using --dir')
+    p_sync.add_argument('--workers', type=int, default=None, help='Maximum parallel worker processes (default: CPU count)')
+    p_sync.add_argument('--force', action='store_true', help='Force re-conversion of all tracked assets regardless of mtime')
+
     p_bnd = sub.add_parser('bundle', help='Build a self-contained Single-File Executable (PS2PACK1) for Linux, Windows, or both')
     p_bnd.add_argument('--game', default=None, help='Short game name (e.g. mhdos, norrath) to auto-resolve disc_files, translations, and per-OS binaries/caches')
     p_bnd.add_argument('--os', default='auto', choices=['auto', 'linux', 'windows', 'all'], help='Target OS when using --game (linux, windows, or all)')
@@ -785,6 +795,7 @@ def main(argv=None):
     p_bnd.add_argument('--ee-live', default=None, help='Optional ee-live folder containing pre-compiled overlay libraries')
     p_bnd.add_argument('--vu1-live', default=None, help='Optional vu1-live folder containing pre-compiled VU1 libraries')
     p_bnd.add_argument('--game-id', default=None, help='Optional short game identifier (default: --game or disc_id from disc_info.json)')
+    p_bnd.add_argument('--no-sync', action='store_true', help='Skip automatic incremental repack of modified assets_unpacked/ files before bundling')
 
     args = parser.parse_args(argv)
     if args.cmd == 'inspect':
@@ -838,8 +849,31 @@ def main(argv=None):
             force_carve=args.carve,
             max_entries=args.max_entries,
         )
+    elif args.cmd == 'sync':
+        from pathlib import Path
+        repo_root = Path(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        if args.dir:
+            src_arc = Path(args.archive) if args.archive else None
+            rep = sync_unpacked_directory(Path(args.dir), source_archive=src_arc, workers=args.workers, force=args.force)
+            print(f"[ps2-sync] {rep['dir']}: {rep['modified']} modified file(s) synced in {rep['elapsed_ms']:.1f} ms")
+        elif args.game:
+            rep = sync_game_assets(repo_root, args.game, workers=args.workers, force=args.force)
+            print(
+                f"[ps2-sync] game={args.game}: {rep['total_modified']} modified asset(s) synced across "
+                f"{len(rep['synced_dirs'])} unpacked folder(s) in {rep['elapsed_ms']:.1f} ms"
+            )
+        else:
+            sys.exit("Error: specify either --game <name> or --dir <unpacked_dir>")
     elif args.cmd == 'bundle':
+        from pathlib import Path
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if args.game and not args.no_sync:
+            rep = sync_game_assets(Path(repo_root), args.game)
+            if rep['total_modified'] > 0:
+                print(
+                    f"[ps2-bundle] auto-synced {rep['total_modified']} modified asset(s) from assets_unpacked/ "
+                    f"into disc_files/ in {rep['elapsed_ms']:.1f} ms"
+                )
         bundle_game_targets(
             repo_root=repo_root,
             game_name=args.game,
@@ -857,4 +891,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
     main()
+
 

@@ -61,6 +61,7 @@ else()
         runtime/src/hw.cpp
         runtime/src/cop.cpp
         runtime/src/disc.cpp
+        runtime/src/disc_folder.cpp
         runtime/src/dmac.cpp
         runtime/src/vif.cpp
         runtime/src/vu_micro.cpp

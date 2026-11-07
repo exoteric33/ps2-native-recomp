@@ -1,6 +1,7 @@
 #include "ps2/disc.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
+#include "disc_folder.hpp"
 #include "load_stats.hpp"
 
 #include <algorithm>
@@ -97,6 +98,13 @@ void self_check();
 }
 
 bool open(const std::string &path) {
+    if (open_folder(path)) {
+        if (g_file) {
+            std::fclose(g_file);
+            g_file = nullptr;
+        }
+        return true;
+    }
     std::FILE *file = os::open(path, "rb");
     if (!file) return false;
 #if defined(_WIN32)

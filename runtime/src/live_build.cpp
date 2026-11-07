@@ -490,7 +490,30 @@ bool compile_and_link(const Job &job, Timing &timing) {
         args.push_back("-static-libgcc");
         args.push_back("-static-libstdc++");
 #endif
-        for (const fs::path &o : objects) args.push_back(ps2::os::utf8(o));
+        // Windows refuses a command line over 32767 characters (CreateProcess fails with "filename or extension too long", the log of
+        // the game then says "cannot start <compiler>"). A big library has 200 objects or more, each named by its full path, so a game
+        // folder in a long path is enough to cross the limit (Final Fantasy X, 213 objects: 26 600 characters in a path of 71, over the
+        // limit at about 100). Past 12 000 characters the objects go into a response file, `@file`, which the compiler reads for itself.
+        // Quotes and forward slashes: both ways a compiler can split such a file (Windows or GNU rules) read that the same.
+        std::size_t object_chars = 0;
+        for (const fs::path &o : objects) object_chars += ps2::os::utf8(o).size() + 3;
+        if (object_chars > 12000) {
+            const fs::path list = job.work / "link.rsp";
+            std::ofstream out(list, std::ios::binary | std::ios::trunc);
+            for (const fs::path &o : objects) {
+                std::string name = ps2::os::utf8(o);
+                std::replace(name.begin(), name.end(), '\\', '/');
+                out << '"' << name << "\"\n";
+            }
+            out.close();
+            if (!out) {
+                say("cannot write " + ps2::os::utf8(list));
+                return false;
+            }
+            args.push_back("@" + ps2::os::utf8(list));
+        } else {
+            for (const fs::path &o : objects) args.push_back(ps2::os::utf8(o));
+        }
         args.push_back("-o");
         args.push_back(ps2::os::utf8(job.library));
         Process process;

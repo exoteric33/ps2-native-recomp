@@ -1,8 +1,8 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 32 games work as far as they
-have been tested, 19 of them out of the box, with zero game-specific code. God of War II has been played from start to
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 36 games work as far as they
+have been tested, 23 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
 **How it works, from the disc to the picture: [read the explanation](#how-it-works).**
@@ -11,9 +11,9 @@ Built on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nu
 
 https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
 
-**19 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
+**23 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
 Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
-Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom and College Basketball 2K5. *Out of the box* means nobody changed anything for these games: the
+Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe and Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima. *Out of the box* means nobody changed anything for these games: the
 tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)). Gran Turismo 4 needs one small build step that
 unpacks its program; the runtime has no code for it.
 
@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 31
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 35
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -122,10 +122,14 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Gundam vs. Zeta Gundam | plays, not played through yet: menus at full speed, a fight at 45 to 55 fps, a short pause the first time a new part loads ([#2](https://github.com/exoteric33/ps2-native-recomp/issues/2)) | omegakatana92, me |
 | Tales of the Abyss (USA) | plays, not played through yet: the opening films, the title and exploration at about 30 fps like the PS2, menus at 60 fps; battles not tried; at 2x resolution a dashed line shows along the bottom of the picture (SteamOS on a ROG Ally X, a DualShock 3; [#59](https://github.com/exoteric33/ps2-native-recomp/issues/59)) | Kush Peshin |
 | Final Fantasy X International (Japan) | plays in a tester's own copy, not played through yet: to Besaid Village, with fights, a boss and saving, generally at full speed, some graphics errors; that copy has three fixes that are not in this project yet, so here it may stop sooner (Windows 11, an RTX 4070 Ti Super, an Xbox controller) | a tester, by mail |
-| Digimon World Data Squad | plays, not played through yet: the opening film, menus, gameplay and a battle look and sound right; about 80 % of full speed on a very weak PC (Windows, Intel N100, 4 GB, 1x resolution, an Xbox 360 controller) | a tester, by mail |
+| Digimon World Data Squad | plays, not played through yet: the opening film, menus, gameplay and a battle look and sound right; about 80 % of full speed on a very weak PC (Windows, Intel N100, 4 GB, 1x resolution, an Xbox 360 controller; Vulkan is as fast as Direct3D 12 there) | mizushucku |
 | Football Kingdom | plays, not played through yet: no crashes; the crowd sometimes goes black for a moment and the free kick aiming arrow is half as wide as it should be | a tester, by mail |
 | College Basketball 2K5 | plays, not played through yet: no glitches except one small sound stutter | a tester, by mail |
 | Metal Gear Solid 3: Snake Eater (USA) | plays, not played through yet: from power-on through the title, New Game and the opening film, with sound, into the first scene you control in the jungle (played on my development build; the public code was run as far as the cargo hold). The first time you reach a new part the game freezes while its code is translated, from a few seconds to almost a minute; it does not freeze there again | me |
+| Castlevania: Lament of Innocence (USA) | plays well, not played through yet: exploring the castle and fights at about 60 fps, and saves from a PCSX2 memory card load; some banding in the textures, less with soft texture filtering (SteamOS on a ROG Ally X; [#60](https://github.com/exoteric33/ps2-native-recomp/issues/60)) | Kush Peshin |
+| Auto Modellista (USA) | plays well, not played through yet: the start, the film, the menus and an arcade race, smooth even with many cars | a tester, by mail |
+| Viewtiful Joe (Europe) | runs, not played through yet: the start, the film and the menus | a tester, by mail |
+| Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima (Japan) | plays well, not played through yet: no bugs found | a tester, by mail |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

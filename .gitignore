@@ -7,7 +7,8 @@
 *.rar
 
 /generated/
-/tools/
+/tools/*
+!/tools/ps2_disc_toolkit/
 /build/
 
 *.ppm
@@ -15,6 +16,8 @@
 __pycache__/
 
 /third_party/wgpu-native/
+/third_party/wgpu-native-win/
+/third_party/llvm-mingw/
 /third_party/sdl2/
 /third_party/dxc/
 
@@ -66,3 +69,4 @@ __pycache__/
 # Per-PC Claude Code settings and private notes.
 /.claude/settings.local.json
 /CLAUDE.local.md
+/dist/

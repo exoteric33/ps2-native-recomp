@@ -215,6 +215,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2iopresettest PRIVATE synchronization)
     endif()
+    # SMFLAG's SIFINIT, CMDINIT and BOOTEND while the IOP boots after a reset (public issue 61, no game needed): ninja ps2iopbootflagstest
+    add_executable(ps2iopbootflagstest EXCLUDE_FROM_ALL tests/iop_boot_flags.cpp)
+    target_include_directories(ps2iopbootflagstest PRIVATE runtime/src)
+    target_link_libraries(ps2iopbootflagstest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2iopbootflagstest PRIVATE synchronization)
+    endif()
     # an UNPACK with CL 0 (or before any STCYCL) takes its data and the stream stays in step, no game needed: ninja ps2viftest
     add_executable(ps2viftest EXCLUDE_FROM_ALL tests/vif_cycle.cpp)
     target_include_directories(ps2viftest PRIVATE runtime/src)

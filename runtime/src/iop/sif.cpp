@@ -113,7 +113,13 @@ struct CmdHandler {
     std::uint32_t handler, data;
 };
 
-std::uint32_t g_mainaddr = 0, g_msflag = 0, g_smflag = 0x60000u;
+// SMFLAG bits the IOP raises when it is up: SIFINIT (sifman), CMDINIT (sifcmd) and BOOTEND (the end of the boot, what SifIopSync
+// looks at); a booted console has all three. A reset takes them down for the time the IOP needs to boot (kIopBootUsec, IOP clock),
+// then they come back. g_boot_end is the IOP clock when that is over, 0 when no boot is running.
+constexpr std::uint32_t kSmflagUp = 0x70000u;
+constexpr std::uint64_t kIopBootUsec = 2000;
+std::uint32_t g_mainaddr = 0, g_msflag = 0, g_smflag = kSmflagUp;
+std::uint64_t g_boot_end = 0;
 std::uint32_t g_ee_recv = 0;
 std::uint32_t g_data_addr = 0;
 bool g_processed = true;
@@ -501,6 +507,22 @@ void read_reboot_image(const std::string &image_path) {
     std::fprintf(stderr, "[sif] LOADFILE from %s reports %.4s\n", image_path.c_str(), g_loadfile_version);
 }
 
+// The IOP starts booting: SMFLAG shows no SIFINIT, CMDINIT or BOOTEND until the boot time is over (get_reg). On the console the EE
+// clears these bits itself just before and after the reset command (ps2sdk's SifIopReset: SifSetReg(SMFLAG, ...)) and the IOP sets
+// them again as its modules start. A library may wait for the bit to be down first (a vendor SifIopSync that returns 1 while
+// BOOTEND is up, polled in a loop that ends when it returns 0); with the bits always up that loop never ended (docs/ichinen-boot.md).
+void begin_boot() { g_boot_end = iop::kernel::now() + iop::kernel::usec_to_cycles(kIopBootUsec); }
+
+// SMFLAG as the EE and the IOP's modules see it. g_smflag keeps what the IOP has raised, so a state saved while the IOP boots
+// (not stored) still has the bits when it is loaded.
+std::uint32_t smflag() {
+    if (!g_boot_end) return g_smflag;
+    if (iop::kernel::now() < g_boot_end) return g_smflag & ~kSmflagUp;
+    g_boot_end = 0;
+    g_smflag |= kSmflagUp;
+    return g_smflag;
+}
+
 // What the EE sends with ps2sdk's SifIopReset(arg, mode) and the vendor library's sceSifRebootIop(image): SIF command 0x80000003,
 // the text length at +16, the mode at +20 and the text at +24 (iopcontrol.c, AFL-2.0). The text is "rom0:UDNL <image>" to start the
 // IOP again from an image that replaces the ROM's modules (IOPRP*.IMG), or empty (SifIopReset("", 0)) to start it from the ROM's
@@ -525,18 +547,21 @@ void reboot(std::uint32_t src) {
         std::fprintf(stderr, "[sif] that transfer to IOP address 0 carries command 0x%08X, not a reset\n", cid);
         return;
     }
-    if (!image.empty()) return;
+    if (!image.empty()) {
+        begin_boot();
+        return;
+    }
     // The new IOP has none of the game's modules, threads, servers or queued answers: a packet or thread of the old one that survived
     // would write into EE memory the game has reused, and an answer still queued for the EE would meet the new handshake. The EE's
-    // view (its receive address, the two flag registers) stays; the boot-end, command and SIF bits of SMFLAG are set at once, as the
-    // IOP's boot is not timed here (the EE clears them just before and after the command, ps2sdk's SifIopReset; set_reg ignores that).
+    // view (its receive address, the two flag registers) stays; the boot-end, command and SIF bits of SMFLAG go down and come back
+    // when the IOP's boot time is over (begin_boot).
     const std::size_t modules = iop::kernel::modules().size(), threads = iop::kernel::thread_ids().size();
     const std::uint32_t mainaddr = g_mainaddr, msflag = g_msflag, ee_recv = g_ee_recv;
     iop::soft_reset();
     g_mainaddr = mainaddr;
     g_msflag = msflag;
     g_ee_recv = ee_recv;
-    g_smflag = 0x70000u;
+    begin_boot();
     std::fprintf(stderr, "[sif] the IOP starts from its own modules (mode %u): %zu modules and %zu threads of the game are gone\n", mode, modules, threads);
 }
 
@@ -674,7 +699,7 @@ void install_iop_side() {
     def("sifman", 8, "sceSifDmaStat", [](iop::Cpu &c) { c.r[2] = static_cast<std::uint32_t>(-1); });
     def("sifman", 29, "sceSifCheckInit", [](iop::Cpu &c) { c.r[2] = 1; });
     def("sifman", 32, "sceSifSetDmaIntr", [set_dma](iop::Cpu &c) { set_dma(c, arg(c, 2), arg(c, 3)); });
-    def("sifman", 23, "sceSifGetSMFlag", [](iop::Cpu &c) { c.r[2] = g_smflag; });
+    def("sifman", 23, "sceSifGetSMFlag", [](iop::Cpu &c) { c.r[2] = smflag(); });
     def("sifman", 24, "sceSifSetSMFlag", [](iop::Cpu &c) { g_smflag |= arg(c, 0); c.r[2] = 0; });
 
     iop::kernel::register_hle_library("sifcmd", 0x0101);
@@ -1162,7 +1187,8 @@ void install_servers() {
 
 void reset() {
     g_mainaddr = g_msflag = 0;
-    g_smflag = 0x60000u;
+    g_smflag = kSmflagUp;
+    g_boot_end = 0;
     g_ee_recv = g_data_addr = 0;
     g_processed = true;
     g_outgoing.clear();
@@ -1195,7 +1221,7 @@ std::uint32_t get_reg(std::uint32_t reg) {
     case 1: return g_mainaddr;
     case 2: return kCmdBuffer;
     case 3: return g_msflag;
-    case 4: return g_smflag;
+    case 4: return smflag();
     case 0x80000000u: return 0;
     case 0x80000002u: return 1;
     default: return 0;
@@ -1330,6 +1356,7 @@ void state(ps2::state::Stream &s) {
     s.pod(g_mainaddr);
     s.pod(g_msflag);
     s.pod(g_smflag);
+    if (s.loading()) g_boot_end = 0;
     s.pod(g_ee_recv);
     s.pod(g_data_addr);
     s.pod(g_processed);

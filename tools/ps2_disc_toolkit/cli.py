@@ -24,6 +24,7 @@ import time
 
 if __package__ in (None, ''):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from ps2_disc_toolkit.bundler import build_single_file_bundle, bundle_game_targets
     from ps2_disc_toolkit.containers import open_container, SECTOR_SIZE
     from ps2_disc_toolkit.iso9660 import IsoFileSystem, FileEntry, is_inside_directory, parse_system_cnf
     from ps2_disc_toolkit.profiles import (
@@ -33,6 +34,7 @@ if __package__ in (None, ''):
         scan_non_zero_runs,
     )
 else:
+    from .bundler import build_single_file_bundle, bundle_game_targets
     from .containers import open_container, SECTOR_SIZE
     from .iso9660 import IsoFileSystem, FileEntry, is_inside_directory, parse_system_cnf
     from .profiles import (
@@ -772,6 +774,18 @@ def main(argv=None):
     p_uex.add_argument('--carve', action='store_true', help='Force universal signature carver (TIM2/VAGp) for unknown containers')
     p_uex.add_argument('--max-entries', type=int, default=None, help='Maximum number of top-level entries to extract')
 
+    p_bnd = sub.add_parser('bundle', help='Build a self-contained Single-File Executable (PS2PACK1) for Linux, Windows, or both')
+    p_bnd.add_argument('--game', default=None, help='Short game name (e.g. mhdos, norrath) to auto-resolve disc_files, translations, and per-OS binaries/caches')
+    p_bnd.add_argument('--os', default='auto', choices=['auto', 'linux', 'windows', 'all'], help='Target OS when using --game (linux, windows, or all)')
+    p_bnd.add_argument('--binary', default=None, help='Explicit path to compiled ps2run or ps2run.exe binary')
+    p_bnd.add_argument('--disc', default=None, help='Path to extracted virtual disc folder (default: games/<game>/disc_files)')
+    p_bnd.add_argument('--out', default=None, help='Output single-file executable path or prefix (e.g. dist/MonsterHunter2)')
+    p_bnd.add_argument('--elf', default=None, help='Optional guest boot ELF path (auto-detected from disc_info.json if omitted)')
+    p_bnd.add_argument('--translations', default=None, help='Optional translations folder containing *.json dictionaries')
+    p_bnd.add_argument('--ee-live', default=None, help='Optional ee-live folder containing pre-compiled overlay libraries')
+    p_bnd.add_argument('--vu1-live', default=None, help='Optional vu1-live folder containing pre-compiled VU1 libraries')
+    p_bnd.add_argument('--game-id', default=None, help='Optional short game identifier (default: --game or disc_id from disc_info.json)')
+
     args = parser.parse_args(argv)
     if args.cmd == 'inspect':
         inspect_disc(args.image, profile_arg=args.profile, scan_gaps=args.scan_gaps)
@@ -823,6 +837,21 @@ def main(argv=None):
             recursive=args.recursive,
             force_carve=args.carve,
             max_entries=args.max_entries,
+        )
+    elif args.cmd == 'bundle':
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        bundle_game_targets(
+            repo_root=repo_root,
+            game_name=args.game,
+            target_os=args.os,
+            binary_path=args.binary,
+            disc_dir=args.disc,
+            output_path=args.out,
+            elf_path=args.elf,
+            translations_dir=args.translations,
+            ee_live_dir=args.ee_live,
+            vu1_live_dir=args.vu1_live,
+            game_id=args.game_id,
         )
 
 

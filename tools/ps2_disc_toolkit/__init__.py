@@ -43,3 +43,5 @@ from .ps2_meshes import (  # noqa: F401
     export_mesh_to_obj,
     export_meshes_to_obj,
 )
+from .bundler import build_single_file_bundle  # noqa: F401
+

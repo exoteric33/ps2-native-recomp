@@ -59,3 +59,32 @@ python3 scripts/extract_disc.py unpack-extract \
   games/<name>/assets_unpacked/data_carved \
   --carve --convert
 ```
+
+---
+
+## 3. Single-File Executable Bundler (`PS2PACK1`, Linux & Windows)
+
+Once a game has been extracted into `games/<name>/disc_files` and compiled, you can package the entire recompiled game—including the host `ps2run` binary, the guest ELF, precompiled `ee-live` caches (`.so` on Linux, `.dll` on Windows), optional JSON assets, and the complete virtual disc (`disc_files/`)—into a **single self-contained executable** per target OS (`<Game>-Linux-x86_64` and `<Game>-Windows-x86_64.exe`).
+
+At launch (0 command-line arguments / double-click), the executable inspects the last 64 bytes of its own binary (`/proc/self/exe` on Linux, `GetModuleFileNameW(NULL)` on Windows) for the `PS2PACK1` trailer. If present:
+- It serves all disc sector reads (`sceCdRead`) directly from its own file descriptor via `pread64` / `ReadFile(OVERLAPPED)` (`0 bytes` of temporary disc extraction to `/tmp`).
+- It loads the embedded guest ELF directly into RAM.
+- It automatically creates a `saves/` folder (`saves/memcard.ps2`, `saves/states/`, `saves/cache/ee-live/`) next to the executable on first launch and seeds any embedded `ee-live` caches.
+- If a file inside `games/<name>/disc_files/layer0/` was modified (e.g. modded textures or patched scripts) before bundling, the bundler automatically patches its ISO-9660 directory entry LBA/size inside `disc_meta.bin`.
+
+```bash
+# 1. (Optional, fetched automatically when building for Windows)
+#    Fetch llvm-mingw UCRT toolchain, SDL2 mingw, and wgpu-native-win into third_party/
+sh scripts/fetch_win_cross.sh
+
+# 2. Build a single-file executable for Linux, Windows, or both (--os linux | windows | all)
+python3 scripts/extract_disc.py bundle \
+  --game <name> \
+  --os all \
+  --out dist/<GameTitle>
+```
+
+Output:
+- `dist/<GameTitle>-Linux-x86_64`
+- `dist/<GameTitle>-Windows-x86_64.exe` (statically linked against `libc++`, `libunwind`, `winpthread`, `SDL2`, and `wgpu_native`; zero external runtime DLL dependencies)
+

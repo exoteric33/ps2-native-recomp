@@ -117,6 +117,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Persona 4 (USA) | plays well, not played through yet: booted right in and played until you get home and take control, with a small hitch now and then (Windows 11, an RTX 3080, a game controller; [#52](https://github.com/exoteric33/ps2-native-recomp/issues/52)) | dguillot-gh |
 | Crash of the Titans (USA) | plays well, not played through yet: about 6 minutes from power-on; gameplay, a cutscene and saving work, the cutscene at 60 fps with good sound | me |
 | Devil May Cry | plays well, not played through yet: from power-on through New Game and the opening scenes into Mission 1, about 50 fps; fights, saving and later missions not tried ([#16](https://github.com/exoteric33/ps2-native-recomp/issues/16)) | me |
+| Urban Reign (Europe) | plays well, not played through yet: menus, versus and team fights with knockouts, pause and saves, all five languages, at 4x and full speed in 480p (Windows 11, an RTX 4080 SUPER, a game controller); two bugs of the game itself fixed by a patch file, notes in [docs/urban-reign](docs/urban-reign/README.md) | RatchetCinemaESP |
 | Zone of the Enders (USA) | plays well, not played through yet: from power-on through the film and the menus into the first battle ([#24](https://github.com/exoteric33/ps2-native-recomp/issues/24)) | Pacioso, me |
 | Robotech: Battlecry | plays, not played through yet: from power-on through the memory card save into the first mission; a tester saw sound stutter and frame drops when characters speak, which I could not reproduce ([#1](https://github.com/exoteric33/ps2-native-recomp/issues/1), [#7](https://github.com/exoteric33/ps2-native-recomp/issues/7)) | omegakatana92, me |
 | Gundam vs. Zeta Gundam | plays, not played through yet: menus at full speed, a fight at 45 to 55 fps, a short pause the first time a new part loads ([#2](https://github.com/exoteric33/ps2-native-recomp/issues/2)) | omegakatana92, me |
@@ -362,7 +363,10 @@ console's MPEG-2 decoder, which is rebuilt too: the game sends it the stream and
 ### Saves and checks
 
 A quick save is the whole machine in one file: memory, registers, all the chips. The game's own saves go to a memory card file,
-which is written through a temporary file, so it is always a whole card.
+which is written through a temporary file that is forced to the disk before it takes the old one's place, so it is always a whole
+card. Before the card file is replaced, a copy of it goes to `<card>.backups\` (once per run, then at most every 15 minutes; the
+newest 10 are kept). The card is checked when the game starts (the error-check bytes of every page): a damaged one is put aside as
+`<card>.damaged-<time>.ps2` and the newest good copy takes its place. Only one run at a time can use a card file.
 
 Every window run records the pad and, every 15 frames, a fingerprint of the machine. Playing that recording again without a
 window shows whether the game goes exactly the same way, and where it first differs. That, and comparing the whole machine and

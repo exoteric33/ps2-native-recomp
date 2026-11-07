@@ -107,11 +107,11 @@ constexpr const char *kFont[95] = {
     "..... ..... .#... #.#.# ...#. ..... ..... .....",  // ~
 };
 
-constexpr int kEntries = 9;
-constexpr Command kCommands[kEntries] = {Command::resume, Command::save,       Command::load, Command::look,       Command::scale,
-                                         Command::fullscreen, Command::keys, Command::change_keys, Command::quit};
+constexpr int kEntries = 10;
+constexpr Command kCommands[kEntries] = {Command::resume,   Command::save,       Command::load, Command::look,        Command::scale,
+                                         Command::sharp_2d, Command::fullscreen, Command::keys, Command::change_keys, Command::quit};
 // the program's key for the same thing, shown dim at the right end of the entry
-constexpr const char *kKeys[kEntries] = {"F1", "F5", "F8", "F2", "", "F11", "", "", ""};
+constexpr const char *kKeys[kEntries] = {"F1", "F5", "F8", "F2", "", "", "F11", "", "", ""};
 constexpr int kVisibleRows = 11;  // lines of the keys page shown at once; the page scrolls
 constexpr int kKeysPageChars = 58;
 
@@ -150,6 +150,12 @@ std::string entry_text(int i, const Values &v, bool quit_armed) {
         const std::string now = std::to_string(v.scale_now) + "x";
         if (v.scale_locked) return "Resolution: " + now + " (set by PS2_SCALE)";
         return "Resolution:  < " + std::to_string(v.scale_next) + "x >" + (v.scale_next != v.scale_now ? "  at the next start" : "");
+    }
+    case Command::sharp_2d: {
+        static const char *const kNames[] = {"soft", "sharp", "sharpest"};
+        const auto name = [](int n) { return kNames[n >= 0 && n <= 2 ? n : 1]; };
+        if (v.sharp_locked) return std::string("Text and menus: ") + name(v.sharp_now) + " (set by PS2_SHARP_2D)";
+        return std::string("Text and menus:  < ") + name(v.sharp_next) + " >" + (v.sharp_next != v.sharp_now ? "  at the next start" : "");
     }
     case Command::fullscreen: return std::string("Full screen: ") + (v.fullscreen ? "on" : "off");
     case Command::keys: return "Show keys";
@@ -235,7 +241,7 @@ Command Menu::choose() {
 Command Menu::side() const {
     if (page_ == Page::keys) return Command::none;
     const Command c = kCommands[selected_];
-    return c == Command::look || c == Command::scale || c == Command::fullscreen ? c : Command::none;
+    return c == Command::look || c == Command::scale || c == Command::sharp_2d || c == Command::fullscreen ? c : Command::none;
 }
 
 bool Menu::select_at(int x, int y) {

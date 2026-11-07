@@ -228,7 +228,13 @@ struct CachedDownload {
     DownloadKey key;
     std::vector<std::uint8_t> data;
     std::uint64_t used;
+    std::uint64_t frame = 0;  // the frame the game last asked for this rectangle (frames_run)
 };
+
+// A cached download stands in for a fresh one only while the game reads the same rectangle every frame or so (the case the cache is
+// for: the answer is then one frame old). A read of a rectangle last asked for longer ago than this waits for the real contents:
+// Urban Reign reads its pause background once per pause, and the cache gave it the picture of the pause before.
+constexpr std::uint64_t kCacheFrames = 2;
 
 std::mutex g_cache_mutex;
 std::vector<CachedDownload> g_download_cache;
@@ -246,6 +252,7 @@ void remember(const DownloadKey &key, const std::uint8_t *data, std::size_t byte
     }
     it->data.assign(data, data + bytes);
     it->used = ++g_cache_clock;
+    it->frame = frames_run();
 }
 
 void forget(const DownloadKey &key) {
@@ -1028,9 +1035,10 @@ void read_image(std::uint8_t *data, std::uint32_t qwords) {
     {
         std::lock_guard lock(g_cache_mutex);
         const auto it = std::find_if(g_download_cache.begin(), g_download_cache.end(), [&](const CachedDownload &c) { return c.key == key; });
-        if (it != g_download_cache.end() && it->data.size() == bytes) {
+        if (it != g_download_cache.end() && it->data.size() == bytes && frames_run() - it->frame <= kCacheFrames) {
             std::memcpy(data, it->data.data(), bytes);
             it->used = ++g_cache_clock;
+            it->frame = frames_run();
             queue::post(queue::kDownloadAsync, qwords, 0, &key, sizeof key);
             return;
         }

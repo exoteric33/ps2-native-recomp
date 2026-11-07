@@ -34,7 +34,8 @@ struct Config {
     int mouse_invert = 0;      // 0 none, 1 left-right, 2 up-down, 3 both
     double mouse_deadzone = 0; // 0 to 0.9: how far the stick jumps out as soon as the mouse moves
     int look = -1;             // the picture look (F2) written in keys.ini, -1 when the file has no 'look' line
-    int scale = 0;             // the inner resolution (1 to 3 times the console's) used at the next start, 0 when the file has no 'scale' line
+    int scale = 0;             // the inner resolution (1 to 4 times the console's) used at the next start, 0 when the file has no 'scale' line
+    int sharp_2d = -1;         // how upscaled 2D art is filtered (0 soft, 1 sharp, 2 sharpest) at the next start, -1 when the file has no line
 };
 
 // The picture looks the F2 key goes through. The number is also the video option bits (ps2/video.hpp): bit 0 smooth edges, bit 1 soft, bit 2 sharp (look 4: cubic enlargement + light sharpening; look 5 = sharp + smooth edges).
@@ -46,6 +47,9 @@ const char *look_word(int look);           // the word written in keys.ini
 std::string with_look(const std::string &file_text, int look);
 // the same for the 'scale' line (the quick menu's resolution, used when the game starts the next time)
 std::string with_scale(const std::string &file_text, int scale);
+// the same for the 'sharp_2d' line (the quick menu's 2D art filter, used when the game starts the next time)
+std::string with_sharp_2d(const std::string &file_text, int sharp);
+const char *sharp_2d_word(int sharp);  // "soft", "sharp", "sharpest"
 
 const char *action_name(int action);  // the word used in keys.ini
 

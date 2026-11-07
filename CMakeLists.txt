@@ -112,6 +112,14 @@ if(NOT WIN32 AND NOT EMSCRIPTEN)
 endif()
 target_include_directories(ps2runtime ${PS2_API} "${CMAKE_CURRENT_SOURCE_DIR}/runtime/include")
 
+if(NOT EMSCRIPTEN)
+    # Rewritten EE instructions after FlushCache/iFlushCache, no game needed.
+    add_executable(ps2icachetest EXCLUDE_FROM_ALL tests/ee_icache.cpp)
+    target_link_libraries(ps2icachetest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2icachetest PRIVATE synchronization)
+    endif()
+endif()
 # the IOP thread manager tested through a synthetic module, no game needed: ninja ps2thbasetest
 if(NOT EMSCRIPTEN)
     add_executable(ps2thbasetest EXCLUDE_FROM_ALL tests/iop_thbase.cpp)

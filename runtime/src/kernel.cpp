@@ -1,4 +1,5 @@
 #include "kernel.hpp"
+#include "dispatch_cache.hpp"
 
 #include "hw.hpp"
 #include "iop/sif.hpp"
@@ -782,7 +783,12 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     }
     case 0x4A: g_osd_config = ld32(arg(c, 0)); ret(c, 0); break;
     case 0x4B: st32(arg(c, 0), g_osd_config); ret(c, 0); break;
-    case 0x64: case 0x68: ret(c, 0); break;
+    case 0x64: case 0x68:
+        // FlushCache(2) invalidates instructions; (3) invalidates both caches.
+        // A rewritten window must be matched again before its native code runs.
+        if (arg(c, 0) == 2 || arg(c, 0) == 3) invalidate_window_instances();
+        ret(c, 0);
+        break;
     // KSeg0 (0x60), EnableCache (0x61), DisableCache (0x62): cache and segment controls. The numbers are those of
     // ps2sdk's syscallnr.h (AFL-2.0); EnableCache/DisableCache take CPU_DATA_CACHE (1) and CPU_INSTRUCTION_CACHE (2) in
     // their argument (ps2sdk kernel.h). The recompiled code has no caches to switch, so they do nothing and return 0.

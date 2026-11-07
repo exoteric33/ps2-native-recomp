@@ -651,6 +651,30 @@ class TestPs2DiscToolkit(unittest.TestCase):
         self.assertEqual(rgba2, rgba)
         self.assertGreater(compute_tim2_gpu_key(tim2_rt), 0)
 
+        # Verify light smoke/dust/shadow .TM2 (all CLUT alphas < 128, e.g. [0, 16, 47, 96])
+        # preserves exact native 0..255 alpha values without doubling them
+        light_clut = bytearray(256 * 4)
+        for idx, alpha_val in enumerate((0, 16, 47, 96)):
+            light_clut[idx * 4 : idx * 4 + 4] = bytes((100 + idx, 110 + idx, 120 + idx, alpha_val))
+        light_img = bytes([0, 1, 2, 3] * 16)  # 8x8 pixels
+        light_pic = struct.pack(
+            '<IIIHHBBBBHH',
+            48 + len(light_img) + len(light_clut),
+            len(light_clut),
+            len(light_img),
+            48,
+            256,
+            0,
+            1,
+            3,  # CSM1 32-bit CLUT
+            5,  # 8-bit indexed
+            8,
+            8,
+        ) + b'\x00' * 24
+        light_tim2 = b'TIM2' + struct.pack('<BBH', 4, 0, 1) + b'\x00' * 8 + light_pic + light_img + bytes(light_clut)
+        _, _, light_rgba = decode_tim2_to_rgba(light_tim2)
+        self.assertEqual([light_rgba[i * 4 + 3] for i in range(4)], [0, 16, 47, 96])
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

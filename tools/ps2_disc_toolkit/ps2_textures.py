@@ -6,12 +6,6 @@ PSMCT16, PSMT8, PSMT4), CSM1 CLUT palette unswizzling, GIF IMAGE/PACKED transfer
 execution, Sony SDK .TIM2 (.TM2) decoding, Snowblind Engine .tex/.TEX decoding, and raw
 16-bit (.16) framebuffer decoding, exporting directly to 32-bit RGBA .PNG using only the
 Python standard library.
-
-Format provenance:
-- PS2 GS VRAM page/block/column swizzling & CSM1 CLUT layout: Sony GS Users Manual (Ch. 8, Local Memory) & PS2Dev Wiki.
-- Sony .TIM2 ('TIM2' magic, 16/64-byte alignment, picture/CLUT headers): public Sony PS2 SDK TIM2 specification & PS2Dev Wiki.
-- Snowblind .tex/.TEX (GIF transfer packets + header): clean-room inspection of Champions of Norrath / Dark Alliance files.
-- PNG (.png): public W3C / ISO/IEC 15948 specification via Python standard library `zlib`.
 """
 
 import struct
@@ -129,27 +123,30 @@ def bgr555_to_rgba(pixel16, force_opaque=False):
     return r | (r >> 5), g | (g >> 5), b | (b >> 5), a
 
 
-def unswizzle_clut_csm1(palette_bytes, bpp=32):
+def unswizzle_clut_csm1(palette_bytes, bpp=32, scale_alpha=True):
     """
     Unswizzle a 256-entry PS2 GS CSM1 palette into linear RGBA32 (256 * 4 = 1024 bytes).
     In CSM1 mode, every 32 entries swap indices [8..15] with [16..23].
+    When `scale_alpha=False` (standard 32-bit .TM2 CLUTs), 8-bit alpha values (0..255)
+    are preserved as-is even when all entries are <= 128 (e.g. light smoke/dust/shadow layers).
     """
     entry_size = 4 if bpp == 32 else 2
     num_entries = len(palette_bytes) // entry_size
 
-    # Detect TCC=0 / opaque diffuse CLUTs where most non-black colors have alpha == 0
-    force_opaque_nonblack = False
-    if bpp == 32 and num_entries > 0:
-        nonblack = 0
-        zero_alpha_nonblack = 0
-        for i in range(num_entries):
-            r, g, b, a = palette_bytes[i * 4:i * 4 + 4]
-            if (r | g | b) > 0:
-                nonblack += 1
-                if a == 0:
-                    zero_alpha_nonblack += 1
-        if nonblack > 0 and zero_alpha_nonblack == nonblack:
-            force_opaque_nonblack = True
+    # Only fallback to opaque if 100% of the CLUT entries have alpha == 0 (uninitialized alpha).
+    # As soon as at least one entry has alpha > 0, the palette explicitly manages its transparency.
+    force_opaque_nonblack = (
+        bpp == 32
+        and num_entries > 0
+        and all(palette_bytes[i * 4 + 3] == 0 for i in range(num_entries))
+    )
+    use_raw_8bit_alpha = (
+        bpp == 32
+        and (
+            not scale_alpha
+            or any(palette_bytes[i * 4 + 3] > 0x80 for i in range(num_entries))
+        )
+    )
 
     rgba_entries = []
     for i in range(num_entries):
@@ -157,6 +154,8 @@ def unswizzle_clut_csm1(palette_bytes, bpp=32):
             r, g, b, a = palette_bytes[i * 4:i * 4 + 4]
             if force_opaque_nonblack:
                 alpha = 0 if (i == 0 and (r | g | b) == 0) else 255
+            elif use_raw_8bit_alpha:
+                alpha = a
             else:
                 alpha = scale_ps2_alpha(a)
             rgba_entries.append(bytes((r, g, b, alpha)))
@@ -490,20 +489,32 @@ def decode_tim2_to_rgba(data):
     clut_bytes = data[clut_start:clut_start + clut_size]
 
     # Decode CLUT if indexed (image_type 4 = 4-bit, 5 = 8-bit)
+    # By default, .TM2 32-bit CLUTs (bpp == 32) store standard 8-bit 0..255 alpha
+    # (including light smoke/dust/shadow textures whose max alpha is < 128).
     clut_rgba = b''
     if image_type in (4, 5) and clut_size > 0:
         csm2 = (clut_type & 0x80) != 0
         clut_low = clut_type & 0x3F
         bpp = 16 if clut_low == 1 else (24 if clut_low == 2 else 32)
         if image_type == 5 and not csm2 and clut_colors >= 256:
-            clut_rgba = unswizzle_clut_csm1(clut_bytes, bpp=bpp)
+            clut_rgba = unswizzle_clut_csm1(clut_bytes, bpp=bpp, scale_alpha=False)
         else:
             entries = []
             step = bpp // 8
-            for i in range(min(clut_colors, len(clut_bytes) // step)):
+            count = min(clut_colors, len(clut_bytes) // step)
+            force_opaque = (
+                bpp == 32
+                and count > 0
+                and all(clut_bytes[i * 4 + 3] == 0 for i in range(count))
+            )
+            for i in range(count):
                 if bpp == 32:
                     r, g, b, a = clut_bytes[i * 4:i * 4 + 4]
-                    entries.append(bytes((r, g, b, scale_ps2_alpha(a))))
+                    if force_opaque:
+                        alpha = 0 if (i == 0 and (r | g | b) == 0) else 255
+                    else:
+                        alpha = a
+                    entries.append(bytes((r, g, b, alpha)))
                 elif bpp == 24:
                     r, g, b = clut_bytes[i * 3:i * 3 + 3]
                     entries.append(bytes((r, g, b, 255)))
@@ -513,10 +524,12 @@ def decode_tim2_to_rgba(data):
             clut_rgba = b''.join(entries)
 
     out = bytearray(width * height * 4)
-    if image_type == 3:  # 32-bit RGBA
-        for i in range(min(width * height, len(img_bytes) // 4)):
+    if image_type == 3:  # 32-bit RGBA (native 0..255 alpha in .TM2)
+        npix = min(width * height, len(img_bytes) // 4)
+        force_opaque = npix > 0 and all(img_bytes[i * 4 + 3] == 0 for i in range(npix))
+        for i in range(npix):
             r, g, b, a = img_bytes[i * 4:i * 4 + 4]
-            out[i * 4:i * 4 + 4] = bytes((r, g, b, scale_ps2_alpha(a)))
+            out[i * 4:i * 4 + 4] = bytes((r, g, b, 255 if force_opaque else a))
     elif image_type == 2:  # 24-bit RGB
         for i in range(min(width * height, len(img_bytes) // 3)):
             r, g, b = img_bytes[i * 3:i * 3 + 3]
@@ -783,10 +796,10 @@ def encode_png_to_tim2_bytes(png_bytes: bytes, reference_tim2: bytes) -> bytes:
     new_img = bytearray(image_size)
     new_clut = bytearray(reference_tim2[clut_start : clut_start + clut_size])
 
-    if image_type == 3:  # 32-bit RGBA
+    if image_type == 3:  # 32-bit RGBA (native 0..255 alpha in .TM2)
         for i in range(min(npix, image_size // 4)):
             r, g, b, a = rgba[i * 4 : i * 4 + 4]
-            new_img[i * 4 : i * 4 + 4] = bytes((r, g, b, _unscale_ps2_alpha(a)))
+            new_img[i * 4 : i * 4 + 4] = bytes((r, g, b, a))
     elif image_type == 2:  # 24-bit RGB
         for i in range(min(npix, image_size // 3)):
             new_img[i * 3 : i * 3 + 3] = rgba[i * 4 : i * 4 + 3]
@@ -832,7 +845,7 @@ def encode_png_to_tim2_bytes(png_bytes: bytes, reference_tim2: bytes) -> bytes:
         linear_clut = bytearray(max_colors * step)
         for i, (r, g, b, a) in enumerate(palette_list):
             if bpp == 32:
-                linear_clut[i * 4 : i * 4 + 4] = bytes((r, g, b, _unscale_ps2_alpha(a)))
+                linear_clut[i * 4 : i * 4 + 4] = bytes((r, g, b, a))
             elif bpp == 24:
                 linear_clut[i * 3 : i * 3 + 3] = bytes((r, g, b))
             else:

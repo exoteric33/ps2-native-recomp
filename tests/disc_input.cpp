@@ -6,6 +6,7 @@
 #include "iop/iop.hpp"
 #include "iop/kernel.hpp"
 #include "ps2/disc.hpp"
+#include "ps2/disc_bundle.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
@@ -371,11 +372,80 @@ void disc_folder_tests() {
     std::filesystem::remove_all(dir, ec);
 }
 
+void disc_bundle_tests() {
+    const std::size_t S = disc::kSector;
+    auto img = image(20, S);
+    std::size_t at = dots(img, 20 * S, 20, 20);
+    record(img, at, 30, 19, false, "SYSTEM.CNF;1");
+    const char *cnf_text = "BOOT2 = cdrom0:\\X;1";
+    const char *boot_arg = "cdrom0:\\X;1";
+
+    const auto bundle_path = std::filesystem::temp_directory_path() / "ps2-disc-bundle-test.bin";
+    std::error_code ec;
+    std::filesystem::remove(bundle_path, ec);
+
+    {
+        std::vector<std::uint8_t> blob(128, 0x90);  // synthetic runner prefix
+        const auto append_bytes = [&](const void *src, std::size_t len) -> std::uint64_t {
+            const std::uint64_t off = blob.size();
+            const auto *p = static_cast<const std::uint8_t *>(src);
+            blob.insert(blob.end(), p, p + len);
+            return off;
+        };
+
+        const std::uint64_t bundle_start = blob.size();
+        const std::uint64_t boot_off = append_bytes(boot_arg, 11);
+        const std::uint64_t meta_off = append_bytes(img.data() + 16 * S, 5 * S);
+        const std::uint64_t cnf_off = append_bytes(cnf_text, 19);
+
+        const std::uint64_t toc_offset = blob.size();
+        const auto add_toc = [&](std::uint8_t kind, std::uint64_t disk_off, std::uint64_t b_off, std::uint64_t len, const std::string &vpath) {
+            disc::Ps2BundleTocEntryHeader hdr{};
+            hdr.kind = kind;
+            hdr.path_len = static_cast<std::uint32_t>(vpath.size());
+            hdr.disk_offset = disk_off;
+            hdr.bundle_offset = b_off;
+            hdr.byte_length = len;
+            append_bytes(&hdr, sizeof(hdr));
+            append_bytes(vpath.data(), vpath.size());
+        };
+        add_toc(0, 0, boot_off, 11, "boot_name.txt");
+        add_toc(1, 16 * S, meta_off, 5 * S, "__META__");
+        add_toc(1, 30 * S, cnf_off, 19, "SYSTEM.CNF");
+        const std::uint64_t toc_size = blob.size() - toc_offset;
+
+        disc::Ps2BundleFooter footer{};
+        std::memcpy(footer.magic, "PS2PACK1", 8);
+        footer.bundle_start = bundle_start;
+        footer.toc_offset = toc_offset;
+        footer.toc_size = toc_size;
+        footer.total_sectors = kSectors;
+        footer.layer1_start = 0;
+        footer.entry_count = 3;
+        std::strcpy(footer.game_id, "testgame");
+        append_bytes(&footer, sizeof(footer));
+
+        std::ofstream out(bundle_path, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(blob.data()), static_cast<std::streamsize>(blob.size()));
+    }
+
+    disc::SelfBundleInfo info{};
+    check(disc::detect_self_bundle(&info, bundle_path.string()), "disc_bundle: PS2PACK1 trailer detected");
+    check(info.game_id == "testgame" && info.boot_elf_arg == boot_arg, "disc_bundle: game_id and boot_name.txt parsed");
+    std::vector<std::uint8_t> asset;
+    check(disc::read_bundle_asset("boot_name.txt", asset) && asset.size() == 11, "disc_bundle: asset reads back");
+    check(disc::open(disc::kBundleSentinel), "disc_bundle: @bundle mounts as virtual disc");
+    const auto data = iop::kernel::read_disc_file("cdrom0:\\SYSTEM.CNF;1");
+    check(data.size() == 19 && std::memcmp(data.data(), cnf_text, 19) == 0, "disc_bundle: virtual disc file reads back from bundle");
+    std::filesystem::remove(bundle_path, ec);
+}
+
 }
 
 int main() {
     disc_tests();
     disc_folder_tests();
+    disc_bundle_tests();
     irx_tests();
     elf_tests();
     boot_disc_tests();

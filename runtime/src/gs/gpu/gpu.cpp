@@ -19,8 +19,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
 
@@ -44,7 +47,9 @@ constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
 constexpr std::uint32_t kSetupWords = 40;  // 25 fields, then the texture, frame and depth formats as the shader needs them (fmt_words)
-constexpr std::uint32_t kDecodedWords = 4u << 20;
+constexpr std::uint32_t kDecodedShaderWords = 4u << 20;
+constexpr std::uint32_t kDecodedOverrideWords = 12u << 20;
+constexpr std::uint32_t kDecodedWords = kDecodedShaderWords + kDecodedOverrideWords;
 constexpr std::uint32_t kDecodePrims = 64;
 
 
@@ -812,6 +817,368 @@ bool rendered(const Range &r) {
     return false;
 }
 
+// Live .png texture override system (1x & HD 2x/4x/8x): maps gpu_content_key -> modified .png on disk
+struct TexIndexEntry {
+    std::uint32_t orig_w = 0, orig_h = 0;
+    std::uint64_t orig_mtime_ns = 0, orig_size = 0;
+    std::string png_path;
+    std::uint32_t cached_dec = 0xFFFFFFFFu;
+    std::uint64_t loaded_mtime_sec = 0, loaded_size = 0;
+    bool checked_unmodified = false;
+};
+
+std::unordered_map<std::uint64_t, TexIndexEntry> g_tex_index;
+std::uint64_t g_dbp_tex_key[16384] = {};
+std::uint32_t g_override_used = 0;
+bool g_tex_overrides_enabled = false;
+bool g_tex_override_all = false;
+
+bool inflate_rfc1951(const std::uint8_t *src, std::size_t src_len, std::vector<std::uint8_t> &out) {
+    std::size_t bit_pos = 0;
+    const std::size_t total_bits = src_len * 8;
+    const auto read_bits = [&](int n) -> std::uint32_t {
+        std::uint32_t v = 0;
+        for (int i = 0; i < n; ++i) {
+            if (bit_pos >= total_bits) return 0;
+            v |= static_cast<std::uint32_t>((src[bit_pos >> 3] >> (bit_pos & 7)) & 1u) << i;
+            ++bit_pos;
+        }
+        return v;
+    };
+    struct Huff {
+        std::uint16_t counts[16] = {};
+        std::uint16_t symbols[320] = {};
+        void build(const std::uint8_t *lengths, int n) {
+            std::memset(counts, 0, sizeof counts);
+            for (int i = 0; i < n; ++i)
+                if (lengths[i] < 16) ++counts[lengths[i]];
+            counts[0] = 0;
+            std::uint16_t offs[16] = {};
+            for (int i = 1; i < 15; ++i) offs[i + 1] = offs[i] + counts[i];
+            for (int i = 0; i < n; ++i)
+                if (lengths[i]) symbols[offs[lengths[i]]++] = static_cast<std::uint16_t>(i);
+        }
+    };
+    const auto decode_huff = [&](const Huff &h) -> int {
+        int code = 0, first = 0, index = 0;
+        for (int len = 1; len <= 15; ++len) {
+            code |= static_cast<int>(read_bits(1));
+            int count = h.counts[len];
+            if (code - count < first) return h.symbols[index + (code - first)];
+            index += count;
+            first += count;
+            first <<= 1;
+            code <<= 1;
+        }
+        return -1;
+    };
+    static const int kLenBase[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static const int kLenExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static const int kDistBase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+    static const int kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+    static const int kClOrder[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+
+    while (bit_pos < total_bits) {
+        const std::uint32_t bfinal = read_bits(1);
+        const std::uint32_t btype = read_bits(2);
+        if (btype == 0) {
+            bit_pos = (bit_pos + 7) & ~static_cast<std::size_t>(7);
+            if (bit_pos + 32 > total_bits) return false;
+            const std::size_t byte_pos = bit_pos >> 3;
+            const std::uint16_t len = static_cast<std::uint16_t>(src[byte_pos] | (src[byte_pos + 1] << 8));
+            bit_pos += 32;
+            if ((bit_pos >> 3) + len > src_len) return false;
+            out.insert(out.end(), src + (bit_pos >> 3), src + (bit_pos >> 3) + len);
+            bit_pos += static_cast<std::size_t>(len) * 8;
+        } else if (btype == 1 || btype == 2) {
+            Huff lit_huff, dist_huff;
+            if (btype == 1) {
+                std::uint8_t lit_lens[288], dist_lens[32];
+                for (int i = 0; i < 144; ++i) lit_lens[i] = 8;
+                for (int i = 144; i < 256; ++i) lit_lens[i] = 9;
+                for (int i = 256; i < 280; ++i) lit_lens[i] = 7;
+                for (int i = 280; i < 288; ++i) lit_lens[i] = 8;
+                for (int i = 0; i < 32; ++i) dist_lens[i] = 5;
+                lit_huff.build(lit_lens, 288);
+                dist_huff.build(dist_lens, 32);
+            } else {
+                const int hlit = static_cast<int>(read_bits(5)) + 257;
+                const int hdist = static_cast<int>(read_bits(5)) + 1;
+                const int hclen = static_cast<int>(read_bits(4)) + 4;
+                std::uint8_t cl_lens[19] = {};
+                for (int i = 0; i < hclen; ++i) cl_lens[kClOrder[i]] = static_cast<std::uint8_t>(read_bits(3));
+                Huff cl_huff;
+                cl_huff.build(cl_lens, 19);
+                std::uint8_t lens[320] = {};
+                int idx = 0;
+                while (idx < hlit + hdist) {
+                    const int sym = decode_huff(cl_huff);
+                    if (sym < 0) return false;
+                    if (sym < 16) {
+                        lens[idx++] = static_cast<std::uint8_t>(sym);
+                    } else if (sym == 16) {
+                        if (idx == 0) return false;
+                        const int rep = static_cast<int>(read_bits(2)) + 3;
+                        const std::uint8_t prev = lens[idx - 1];
+                        for (int r = 0; r < rep && idx < hlit + hdist; ++r) lens[idx++] = prev;
+                    } else if (sym == 17) {
+                        const int rep = static_cast<int>(read_bits(3)) + 3;
+                        for (int r = 0; r < rep && idx < hlit + hdist; ++r) lens[idx++] = 0;
+                    } else {
+                        const int rep = static_cast<int>(read_bits(7)) + 11;
+                        for (int r = 0; r < rep && idx < hlit + hdist; ++r) lens[idx++] = 0;
+                    }
+                }
+                lit_huff.build(lens, hlit);
+                dist_huff.build(lens + hlit, hdist);
+            }
+            for (;;) {
+                const int sym = decode_huff(lit_huff);
+                if (sym < 0) return false;
+                if (sym < 256) {
+                    out.push_back(static_cast<std::uint8_t>(sym));
+                } else if (sym == 256) {
+                    break;
+                } else {
+                    const int li = sym - 257;
+                    if (li >= 29) return false;
+                    const int length = kLenBase[li] + static_cast<int>(read_bits(kLenExtra[li]));
+                    const int di = decode_huff(dist_huff);
+                    if (di < 0 || di >= 30) return false;
+                    const std::size_t dist = static_cast<std::size_t>(kDistBase[di] + read_bits(kDistExtra[di]));
+                    if (dist == 0 || dist > out.size()) return false;
+                    for (int k = 0; k < length; ++k) out.push_back(out[out.size() - dist]);
+                }
+            }
+        } else {
+            return false;
+        }
+        if (bfinal) break;
+    }
+    return true;
+}
+
+bool decode_png_rgba_ps2(const std::string &path, std::uint32_t &out_w, std::uint32_t &out_h, std::vector<std::uint32_t> &out_words) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    const auto sz = f.tellg();
+    if (sz < 33 || sz > 64 * 1024 * 1024) return false;
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(sz));
+    f.seekg(0);
+    if (!f.read(reinterpret_cast<char *>(data.data()), sz)) return false;
+    static const std::uint8_t kSig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    if (std::memcmp(data.data(), kSig, 8) != 0) return false;
+
+    const auto be32 = [](const std::uint8_t *p) -> std::uint32_t {
+        return (static_cast<std::uint32_t>(p[0]) << 24) | (static_cast<std::uint32_t>(p[1]) << 16) |
+               (static_cast<std::uint32_t>(p[2]) << 8) | static_cast<std::uint32_t>(p[3]);
+    };
+    std::uint32_t w = 0, h = 0;
+    std::uint8_t bit_depth = 0, color_type = 0, interlace = 0;
+    std::vector<std::uint8_t> idat, plte, trns;
+    std::size_t pos = 8;
+    while (pos + 12 <= data.size()) {
+        const std::uint32_t clen = be32(data.data() + pos);
+        const char *ctype = reinterpret_cast<const char *>(data.data() + pos + 4);
+        const std::uint8_t *cdata = data.data() + pos + 8;
+        if (pos + 12 + clen > data.size()) break;
+        if (std::memcmp(ctype, "IHDR", 4) == 0 && clen >= 13) {
+            w = be32(cdata);
+            h = be32(cdata + 4);
+            bit_depth = cdata[8];
+            color_type = cdata[9];
+            interlace = cdata[12];
+        } else if (std::memcmp(ctype, "PLTE", 4) == 0) {
+            plte.assign(cdata, cdata + clen);
+        } else if (std::memcmp(ctype, "tRNS", 4) == 0) {
+            trns.assign(cdata, cdata + clen);
+        } else if (std::memcmp(ctype, "IDAT", 4) == 0) {
+            idat.insert(idat.end(), cdata, cdata + clen);
+        } else if (std::memcmp(ctype, "IEND", 4) == 0) {
+            break;
+        }
+        pos += 12 + clen;
+    }
+    if (!w || !h || bit_depth != 8 || interlace != 0 || idat.size() < 6) return false;
+    const std::size_t bpp = (color_type == 6) ? 4 : (color_type == 2) ? 3 : (color_type == 4) ? 2 : (color_type == 0 || color_type == 3) ? 1 : 0;
+    if (!bpp) return false;
+    const std::size_t z_start = (idat[0] & 0x0Fu) == 8 && (idat[1] & 0x20u) ? 6 : 2;
+    if (idat.size() <= z_start + 4) return false;
+    std::vector<std::uint8_t> raw;
+    const std::size_t stride = static_cast<std::size_t>(w) * bpp;
+    raw.reserve(static_cast<std::size_t>(h) * (1 + stride));
+    if (!inflate_rfc1951(idat.data() + z_start, idat.size() - z_start - 4, raw)) return false;
+    if (raw.size() < static_cast<std::size_t>(h) * (1 + stride)) return false;
+
+    std::vector<std::uint8_t> recon(static_cast<std::size_t>(h) * stride, 0);
+    for (std::uint32_t y = 0; y < h; ++y) {
+        const std::uint8_t ftype = raw[static_cast<std::size_t>(y) * (1 + stride)];
+        const std::uint8_t *src_row = raw.data() + static_cast<std::size_t>(y) * (1 + stride) + 1;
+        std::uint8_t *dst_row = recon.data() + static_cast<std::size_t>(y) * stride;
+        const std::uint8_t *up_row = y > 0 ? (dst_row - stride) : nullptr;
+        for (std::size_t i = 0; i < stride; ++i) {
+            const int a = i >= bpp ? dst_row[i - bpp] : 0;
+            const int b = up_row ? up_row[i] : 0;
+            const int c = (up_row && i >= bpp) ? up_row[i - bpp] : 0;
+            int pred = 0;
+            if (ftype == 1) pred = a;
+            else if (ftype == 2) pred = b;
+            else if (ftype == 3) pred = (a + b) >> 1;
+            else if (ftype == 4) {
+                const int p = a + b - c;
+                const int pa = std::abs(p - a), pb = std::abs(p - b), pc = std::abs(p - c);
+                pred = (pa <= pb && pa <= pc) ? a : (pb <= pc) ? b : c;
+            }
+            dst_row[i] = static_cast<std::uint8_t>((src_row[i] + pred) & 0xFF);
+        }
+    }
+    out_w = w;
+    out_h = h;
+    out_words.resize(static_cast<std::size_t>(w) * h);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i) {
+        std::uint8_t r = 0, g = 0, b = 0, a = 255;
+        if (color_type == 6) {
+            r = recon[i * 4]; g = recon[i * 4 + 1]; b = recon[i * 4 + 2]; a = recon[i * 4 + 3];
+        } else if (color_type == 2) {
+            r = recon[i * 3]; g = recon[i * 3 + 1]; b = recon[i * 3 + 2];
+        } else if (color_type == 3) {
+            const std::size_t idx = recon[i];
+            if (idx * 3 + 2 < plte.size()) {
+                r = plte[idx * 3]; g = plte[idx * 3 + 1]; b = plte[idx * 3 + 2];
+            }
+            if (idx < trns.size()) a = trns[idx];
+        } else if (color_type == 4) {
+            r = g = b = recon[i * 2]; a = recon[i * 2 + 1];
+        } else {
+            r = g = b = recon[i];
+        }
+        const std::uint32_t ps2_a = (static_cast<std::uint32_t>(a) * 128u + 127u) / 255u;
+        out_words[i] = static_cast<std::uint32_t>(r) | (static_cast<std::uint32_t>(g) << 8) |
+                       (static_cast<std::uint32_t>(b) << 16) | (ps2_a << 24);
+    }
+    return true;
+}
+
+void load_tex_index_file(const std::filesystem::path &tsv_path) {
+    std::ifstream f(tsv_path);
+    if (!f) return;
+    const std::filesystem::path base_dir = tsv_path.parent_path();
+    std::string line;
+    std::size_t count = 0;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        unsigned long long key = 0, mtime_ns = 0, fsize = 0;
+        unsigned int w = 0, h = 0;
+        char rel_buf[1024] = {};
+        if (std::sscanf(line.c_str(), "%llx\t%u\t%u\t%llu\t%llu\t%1023[^\r\n]", &key, &w, &h, &mtime_ns, &fsize, rel_buf) == 6) {
+            TexIndexEntry e;
+            e.orig_w = w;
+            e.orig_h = h;
+            e.orig_mtime_ns = mtime_ns;
+            e.orig_size = fsize;
+            e.png_path = (base_dir / rel_buf).string();
+            g_tex_index[static_cast<std::uint64_t>(key)] = std::move(e);
+            ++count;
+        }
+    }
+    if (count > 0) {
+        g_tex_overrides_enabled = true;
+        std::fprintf(stderr, "[gpu] indexed %zu moddable textures from %s (live 1x/HD .png overrides ready)\n", count, tsv_path.string().c_str());
+    }
+}
+
+void init_tex_overrides() {
+    g_tex_index.clear();
+    g_override_used = 0;
+    g_tex_overrides_enabled = false;
+    g_tex_override_all = os::env("PS2_TEX_OVERRIDE_ALL") == "1";
+    if (os::env("PS2_TEX_OVERRIDES") == "0") return;
+
+    if (const std::string custom = os::env("PS2_TEX_OVERRIDES"); !custom.empty() && custom != "1") {
+        std::filesystem::path p(custom);
+        if (std::filesystem::is_directory(p)) p /= "textures_index.tsv";
+        if (std::filesystem::is_regular_file(p)) {
+            load_tex_index_file(p);
+            return;
+        }
+    }
+    for (const char *cand : {"assets_unpacked/textures_index.tsv", "mods/textures_index.tsv", "../assets_unpacked/textures_index.tsv"}) {
+        if (std::filesystem::is_regular_file(cand)) {
+            load_tex_index_file(cand);
+            return;
+        }
+    }
+    for (const char *games_root : {"games", "../games"}) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(games_root, ec)) continue;
+        for (const auto &entry : std::filesystem::directory_iterator(games_root, ec)) {
+            if (!entry.is_directory(ec)) continue;
+            const auto tsv = entry.path() / "assets_unpacked" / "textures_index.tsv";
+            if (std::filesystem::is_regular_file(tsv, ec)) {
+                load_tex_index_file(tsv);
+            } else {
+                const auto unpacked = entry.path() / "assets_unpacked";
+                if (std::filesystem::is_directory(unpacked, ec)) {
+                    for (const auto &sub : std::filesystem::directory_iterator(unpacked, ec)) {
+                        const auto sub_tsv = sub.path() / "textures_index.tsv";
+                        if (std::filesystem::is_regular_file(sub_tsv, ec)) load_tex_index_file(sub_tsv);
+                    }
+                }
+            }
+        }
+        if (g_tex_overrides_enabled) return;
+    }
+}
+
+std::uint32_t resolve_tex_override(std::uint32_t dbp, std::uint32_t base_w, std::uint32_t base_h) {
+    if (!g_tex_overrides_enabled) return 0xFFFFFFFFu;
+    const std::uint64_t key = g_dbp_tex_key[dbp & 0x3FFFu];
+    if (!key) return 0xFFFFFFFFu;
+    auto it = g_tex_index.find(key);
+    if (it == g_tex_index.end()) return 0xFFFFFFFFu;
+    TexIndexEntry &e = it->second;
+
+    struct stat st = {};
+    if (::stat(e.png_path.c_str(), &st) != 0) return 0xFFFFFFFFu;
+    const auto cur_size = static_cast<std::uint64_t>(st.st_size);
+    const auto cur_mtime_sec = static_cast<std::uint64_t>(st.st_mtime);
+#if defined(__linux__)
+    const std::uint64_t cur_mtime_ns = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
+    const bool modified = g_tex_override_all || cur_size != e.orig_size || cur_mtime_ns != e.orig_mtime_ns;
+#else
+    const bool modified = g_tex_override_all || cur_size != e.orig_size || cur_mtime_sec != (e.orig_mtime_ns / 1000000000ULL);
+#endif
+    if (!modified) return 0xFFFFFFFFu;
+    if (e.cached_dec != 0xFFFFFFFFu && e.loaded_size == cur_size && e.loaded_mtime_sec == cur_mtime_sec) {
+        return e.cached_dec;
+    }
+
+    std::uint32_t png_w = 0, png_h = 0;
+    std::vector<std::uint32_t> words;
+    if (!decode_png_rgba_ps2(e.png_path, png_w, png_h, words)) return 0xFFFFFFFFu;
+
+    std::uint32_t hd_shift = 0;
+    if (png_w == base_w * 2 && png_h == base_h * 2) hd_shift = 1;
+    else if (png_w == base_w * 4 && png_h == base_h * 4) hd_shift = 2;
+    else if (png_w == base_w * 8 && png_h == base_h * 8) hd_shift = 3;
+    else if (png_w != base_w || png_h != base_h) return 0xFFFFFFFFu;
+
+    const auto word_count = static_cast<std::uint32_t>(words.size());
+    if (g_override_used + word_count > kDecodedOverrideWords) {
+        g_override_used = 0;
+        for (auto &kv : g_tex_index) kv.second.cached_dec = 0xFFFFFFFFu;
+        if (word_count > kDecodedOverrideWords) return 0xFFFFFFFFu;
+    }
+    const std::uint32_t dec_offset = kDecodedShaderWords + g_override_used;
+    g_override_used += word_count;
+    wgpuQueueWriteBuffer(g_queue, g_decoded, static_cast<std::uint64_t>(dec_offset) * 4, words.data(), static_cast<std::uint64_t>(word_count) * 4);
+    e.cached_dec = dec_offset | (hd_shift << 28);
+    e.loaded_size = cur_size;
+    e.loaded_mtime_sec = cur_mtime_sec;
+    std::fprintf(stderr, "[gpu] loaded live %ux .png texture override: %s (%ux%u)\n", 1u << hd_shift, e.png_path.c_str(), png_w, png_h);
+    return e.cached_dec;
+}
+
 struct Decode {
     std::uint32_t setup, offset, words;
 };
@@ -820,12 +1187,21 @@ std::vector<Decode> g_decodes;
 void plan_decodes(std::uint32_t prims) {
     Batch &b = g_batch;
     g_decodes.clear();
-    if (!g_decode || prims <= kDecodePrims) return;
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
+    if (g_tex_overrides_enabled) {
+        for (std::uint32_t i = 0; i < setups; ++i) {
+            std::uint32_t *w = b.setups.data() + i * kSetupWords;
+            if (!(w[0] & 2u)) continue;
+            const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+            const std::uint32_t ov = resolve_tex_override(w[12], 1u << tw, 1u << th);
+            if (ov != 0xFFFFFFFFu) w[24] = ov;
+        }
+    }
+    if (!g_decode || prims <= kDecodePrims) return;
     static const int kKey[] = {12, 13, 14, 15, 16, 17, 20, 22};
     for (std::uint32_t i = 0; i < setups; ++i) {
         std::uint32_t *w = b.setups.data() + i * kSetupWords;
-        if (!(w[0] & 2u)) continue;
+        if (!(w[0] & 2u) || w[24] != 0xFFFFFFFFu) continue;
         bool shared = false;
         for (const Decode &d : g_decodes) {
             const std::uint32_t *o = b.setups.data() + d.setup * kSetupWords;
@@ -843,7 +1219,7 @@ void plan_decodes(std::uint32_t prims) {
         const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
         if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
         const std::uint32_t words = 1u << (tw + th);
-        if (g_decoded_used + words > kDecodedWords) continue;
+        if (g_decoded_used + words > kDecodedShaderWords) continue;
         if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) continue;
         w[24] = g_decoded_used;
         g_decodes.push_back({i, g_decoded_used, words});
@@ -1111,6 +1487,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     std::uint32_t offset = 0, source = 0;
     if (n >= kCacheMinBytes) {
         const std::uint64_t key = content_key(bytes, n);
+        if (im.done == 0) g_dbp_tex_key[im.dbp & 0x3FFFu] = key;
         bool cached = cache_find(key, bytes, n, offset);
         if (!cached && ++g_cache_seen[key] >= 2) {
             cached = cache_insert(key, bytes, n, offset);
@@ -1125,6 +1502,8 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
         }
         if (cached) source = 0x80000000u;
         if (g_cache_seen.size() > 65536) g_cache_seen.clear();
+    } else if (g_tex_overrides_enabled && im.done == 0 && n >= 64) {
+        g_dbp_tex_key[im.dbp & 0x3FFFu] = content_key(bytes, n);
     }
     if (!source) offset = arena_append(bytes, n);
     const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, lead_bits, im.bpp | source};
@@ -2253,8 +2632,9 @@ bool init(Mode m) {
     g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
-    g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
+    g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
+    init_tex_overrides();
     g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     if (g_timestamps) {

@@ -581,13 +581,23 @@ fn load_texel(l: Loc, k: u32) -> u32 {
     return load_at(l, k);
 }
 
+fn texel_x_hd(s: Setup, xi: i32, hd_shift: u32) -> u32 {
+    return u32(wrap_coord(xi, 1 << (s.tw + hd_shift), mode(s, 24u, 2u), s.minu << hd_shift, ((s.maxu + 1u) << hd_shift) - 1u));
+}
+
+fn texel_y_hd(s: Setup, yi: i32, hd_shift: u32) -> u32 {
+    return u32(wrap_coord(yi, 1 << (s.th + hd_shift), mode(s, 26u, 2u), s.minv << hd_shift, ((s.maxv + 1u) << hd_shift) - 1u));
+}
+
 fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
     return fetch_at(s, texel_x(s, xi), texel_y(s, yi), k);
 }
 
 fn fetch_at(s: Setup, x: u32, y: u32, k: u32) -> u32 {
     if (s.dec != 0xFFFFFFFFu) {
-        return decoded[s.dec + (y << s.tw) + x];
+        let hd_shift = (s.dec >> 28u) & 7u;
+        let dec_base = s.dec & 0x0FFFFFFFu;
+        return decoded[dec_base + (y << (s.tw + hd_shift)) + x];
     }
     return convert(s, load_texel(addr(s.tf, x, y), k));
 }
@@ -647,6 +657,26 @@ fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
 }
 
 fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
+    if (s.dec != 0xFFFFFFFFu) {
+        let hd_shift = (s.dec >> 28u) & 7u;
+        if (hd_shift > 0u) {
+            let scale_f = f32(1u << hd_shift);
+            let uhd = uin * scale_f;
+            let vhd = vin * scale_f;
+            if (!has(s, F_BILINEAR)) {
+                return fetch_at(s, texel_x_hd(s, i32(floor(uhd)), hd_shift), texel_y_hd(s, i32(floor(vhd)), hd_shift), k);
+            }
+            let u = uhd - 0.5;
+            let v = vhd - 0.5;
+            let x0 = i32(floor(u));
+            let y0 = i32(floor(v));
+            let xa = texel_x_hd(s, x0, hd_shift);
+            let xb = texel_x_hd(s, x0 + 1, hd_shift);
+            let ya = texel_y_hd(s, y0, hd_shift);
+            let yb = texel_y_hd(s, y0 + 1, hd_shift);
+            return blend4(fetch_at(s, xa, ya, k), fetch_at(s, xb, ya, k), fetch_at(s, xa, yb, k), fetch_at(s, xb, yb, k), u - f32(x0), v - f32(y0));
+        }
+    }
     if (!has(s, F_BILINEAR)) {
         return fetch(s, i32(floor(uin)), i32(floor(vin)), k);
     }
@@ -1066,8 +1096,9 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             }
             var ux = px;
             var uy = py;
+            let is_hd_override = s.dec != 0xFFFFFFFFu && ((s.dec >> 28u) & 7u) > 0u;
             let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
-            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct);
+            let point = has(s, F_TME) && !is_hd_override && (!has(s, F_BILINEAR) || direct);
             if (point && abs(du) >= abs(dx) * 0.999) {
                 ux = f32(x);
             }

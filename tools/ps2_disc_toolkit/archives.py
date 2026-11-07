@@ -18,13 +18,25 @@ import os
 import struct
 from dataclasses import dataclass
 
+from pathlib import Path
+
 from .ps2_textures import (
+    compute_tim2_gpu_key,
     decode_raw16_to_rgba,
     decode_snowblind_tex_to_rgba,
     decode_tim2_to_rgba,
     encode_rgba_png,
 )
-from .ps2_audio import decode_vag_to_wav_bytes
+from .ps2_audio import (
+    decode_adx_to_wav_bytes,
+    decode_sshd_to_wav_bytes,
+    decode_vag_to_wav_bytes,
+    is_adx_bytes,
+    is_spu2_bd_bank,
+    is_sshd_bytes,
+    split_spu2_bd_bank_to_vag,
+)
+from .ps2_video import convert_sfd_pss_to_mp4, detect_ps2_video_subtype
 from .ps2_meshes import (
     decode_fmod_to_meshes,
     decode_vif_to_meshes,
@@ -92,17 +104,28 @@ def _sniff_payload_ext_and_kind(payload: bytes, fallback_name: str = '') -> tupl
         return '.tm2', 'texture:tim2'
     if hdr[:4] == b'VAGp' or low.endswith('.vag'):
         return '.vag', 'audio:vag'
+    if is_adx_bytes(payload) or low.endswith('.adx'):
+        return '.adx', 'audio:cri_adx'
+    if is_sshd_bytes(payload) or low.endswith('.ads'):
+        return '.ads', 'audio:sony_ads'
+    vid_ext = detect_ps2_video_subtype(payload)
+    if vid_ext is not None or low.endswith(('.sfd', '.pss')):
+        return (vid_ext or ('.sfd' if low.endswith('.sfd') else '.pss')), 'video:ps2_mpeg'
     if hdr[:4] == b'\x7fELF' or low.endswith(('.elf', '.irx')):
         return '.elf', 'exec:elf'
     if hdr[:4] == b'MWo3' or low.endswith('.mwo3'):
         return '.mwo3', 'exec:mwo3_overlay'
-    if hdr[:4] in (b'AFS\x00', b'MOMO') or low.endswith('.afs'):
+    if hdr[:4] == b'AFS\x00' or low.endswith('.afs'):
         return '.afs', 'archive:cri_afs'
+    if hdr[:4] == b'MOMO' or low.endswith('.momo'):
+        return '.momo', 'archive:ps2_momo'
     if is_fmod_bytes(payload) or low.endswith('.fmod'):
         return '.fmod', 'mesh:ps2_fmod'
     # Check if payload is itself a valid .PAC container with recognizable children
     if PacArchiveDriver.probe(payload):
         return '.pac', 'archive:ps2_pac'
+    if is_spu2_bd_bank(payload) or low.endswith('.bd'):
+        return '.bd', 'audio:spu2_bd_bank'
     if low.endswith('.tex'):
         return '.tex', 'texture:snowblind_tex'
     if low.endswith('.16'):
@@ -116,6 +139,7 @@ def _sniff_payload_ext_and_kind(payload: bytes, fallback_name: str = '') -> tupl
     if low.endswith('.anm'):
         return '.anm', 'anim:snowblind_anm'
     return '.bin', 'data:raw'
+
 
 
 def _classify_asset_name(name, header_bytes=b'', full_bytes=b''):
@@ -563,8 +587,8 @@ def open_archive(path, force_carve=False):
 
 def convert_asset_bytes(name, data):
     """
-    Attempt to convert a single PS2 asset buffer (.tex, .tm2, .16, .vag, .fmod, .vif) into a
-    standard PC format (.png, .wav, .obj). Returns (new_filename, converted_bytes) or (None, None).
+    Attempt to convert a single PS2 asset buffer (.tex, .tm2, .16, .vag, .adx, .ads, .fmod, .vif)
+    into a standard PC format (.png, .wav, .obj). Returns (new_filename, converted_bytes) or (None, None).
     """
     stem, ext = os.path.splitext(name)
     low_ext = ext.lower()
@@ -575,6 +599,14 @@ def convert_asset_bytes(name, data):
 
     if data[:4] == b'VAGp' or low_ext == '.vag':
         _sr, _ns, wav_bytes = decode_vag_to_wav_bytes(data)
+        return f'{stem}.wav', wav_bytes
+
+    if is_adx_bytes(data) or low_ext == '.adx':
+        _sr, _ns, wav_bytes = decode_adx_to_wav_bytes(data)
+        return f'{stem}.wav', wav_bytes
+
+    if is_sshd_bytes(data) or low_ext == '.ads':
+        _sr, _ns, wav_bytes = decode_sshd_to_wav_bytes(data)
         return f'{stem}.wav', wav_bytes
 
     if is_fmod_bytes(data) or low_ext == '.fmod':
@@ -609,8 +641,9 @@ def convert_asset_bytes(name, data):
 def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=False, max_entries=None):
     """
     Extract a 2nd-level PS2 archive (or convert a standalone PS2 asset file) into out_dir.
-    When `convert=True`, converts textures (.tm2, .tex, .16 -> .png), audio (.vag -> .wav),
-    and 3D models (.fmod, .vif -> .obj + submesh parts), and writes `assets_catalog.json`.
+    When `convert=True`, converts textures (.tm2, .tex, .16 -> .png), audio (.vag, .adx, .ads, .bd -> .wav),
+    videos (.sfd, .pss -> .mp4 with synchronized audio), and 3D models (.fmod, .vif -> .obj + submesh parts),
+    and writes `assets_catalog.json`, `textures_index.tsv`, and `.unpack_manifest.json`.
     Returns a summary dict with counts of extracted and converted files.
     """
     os.makedirs(out_dir, exist_ok=True)
@@ -625,6 +658,12 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
 
     if arc is None:
         if convert:
+            vid_ext = detect_ps2_video_subtype(data)
+            if vid_ext is not None:
+                stem = os.path.splitext(base_name)[0]
+                mp4_path = Path(out_dir) / f'{stem}.mp4'
+                if convert_sfd_pss_to_mp4(data, mp4_path):
+                    return {'format': 'Standalone-Video', 'extracted': 0, 'converted': 1, 'files': [str(mp4_path)]}
             conv_name, conv_bytes = convert_asset_bytes(base_name, data)
             if conv_name and conv_bytes:
                 dst = os.path.join(out_dir, conv_name)
@@ -632,22 +671,45 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
                     out_f.write(conv_bytes)
                 return {'format': 'Standalone-Asset', 'extracted': 0, 'converted': 1, 'files': [dst]}
         raise ValueError(f'{path}: unrecognized archive format (and no standard TIM2/VAG signatures found)')
+
     summary = {'format': arc.format_name, 'extracted': 0, 'converted': 0, 'files': []}
     catalog = {
         'source': os.path.basename(path),
+        'sourcePath': os.path.abspath(path),
         'format': arc.format_name,
         'textures': [],
         'audio': [],
+        'videos': [],
         'meshes': [],
     }
+    textures_tsv_rows: list[str] = []
+    manifest_assets: dict[str, dict] = {}
 
-    def _convert_and_record(rel_prefix: str, payload: bytes, target_dir: str) -> None:
+    def _record_manifest_file(conv_abs_path: str, orig_abs_path: str, kind: str, extra: dict | None = None) -> None:
+        try:
+            st = os.stat(conv_abs_path)
+            rel_conv = os.path.relpath(conv_abs_path, out_dir)
+            rel_orig = os.path.relpath(orig_abs_path, out_dir)
+            rec = {
+                'original': rel_orig,
+                'kind': kind,
+                'mtime_ns': st.st_mtime_ns,
+                'size': st.st_size,
+            }
+            if extra:
+                rec.update(extra)
+            manifest_assets[rel_conv] = rec
+        except OSError:
+            pass
+
+    def _convert_and_record(rel_prefix: str, payload: bytes, target_dir: str, orig_file_path: str) -> None:
         stem, ext = os.path.splitext(rel_prefix)
         low_ext = ext.lower()
 
-        # 1. TIM2 Texture -> .png
+        # 1. TIM2 Texture -> .png + GPU FNV-1a key
         if payload[:4] == b'TIM2' or low_ext in ('.tm2', '.tim2'):
             w, h, rgba = decode_tim2_to_rgba(payload)
+            gpu_key = compute_tim2_gpu_key(payload)
             png_bytes = encode_rgba_png(w, h, rgba)
             png_path = os.path.join(target_dir, f'{stem}.png')
             os.makedirs(os.path.dirname(png_path), exist_ok=True)
@@ -655,15 +717,22 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
                 cf.write(png_bytes)
             summary['converted'] += 1
             summary['files'].append(png_path)
+            rel_png = os.path.relpath(png_path, out_dir)
+            st = os.stat(png_path)
             catalog['textures'].append({
                 'id': stem,
-                'file': os.path.relpath(png_path, out_dir),
+                'file': rel_png,
                 'width': w,
                 'height': h,
+                'gpuKey': f'{gpu_key:016x}',
             })
+            textures_tsv_rows.append(
+                f'{gpu_key:016x}\t{w}\t{h}\t{st.st_mtime_ns}\t{st.st_size}\t{rel_png}'
+            )
+            _record_manifest_file(png_path, orig_file_path, 'tim2', {'width': w, 'height': h, 'gpuKey': f'{gpu_key:016x}'})
             return
 
-        # 2. VAG Audio -> .wav
+        # 2. VAG / ADX / ADS Audio -> .wav
         if payload[:4] == b'VAGp' or low_ext == '.vag':
             sr, ns, wav_bytes = decode_vag_to_wav_bytes(payload)
             wav_path = os.path.join(target_dir, f'{stem}.wav')
@@ -675,12 +744,97 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
             catalog['audio'].append({
                 'id': stem,
                 'file': os.path.relpath(wav_path, out_dir),
+                'codec': 'vag',
                 'sampleRate': sr,
                 'samples': ns,
             })
+            _record_manifest_file(wav_path, orig_file_path, 'vag')
             return
 
-        # 3. FMOD 3D Model -> combined .obj + split _partXX.obj submeshes
+        if is_adx_bytes(payload) or low_ext == '.adx':
+            sr, ns, wav_bytes = decode_adx_to_wav_bytes(payload)
+            wav_path = os.path.join(target_dir, f'{stem}.wav')
+            os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+            with open(wav_path, 'wb') as cf:
+                cf.write(wav_bytes)
+            summary['converted'] += 1
+            summary['files'].append(wav_path)
+            catalog['audio'].append({
+                'id': stem,
+                'file': os.path.relpath(wav_path, out_dir),
+                'codec': 'adx',
+                'sampleRate': sr,
+                'samples': ns,
+            })
+            _record_manifest_file(wav_path, orig_file_path, 'adx')
+            return
+
+        if is_sshd_bytes(payload) or low_ext == '.ads':
+            sr, ns, wav_bytes = decode_sshd_to_wav_bytes(payload)
+            wav_path = os.path.join(target_dir, f'{stem}.wav')
+            os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+            with open(wav_path, 'wb') as cf:
+                cf.write(wav_bytes)
+            summary['converted'] += 1
+            summary['files'].append(wav_path)
+            catalog['audio'].append({
+                'id': stem,
+                'file': os.path.relpath(wav_path, out_dir),
+                'codec': 'ads',
+                'sampleRate': sr,
+                'samples': ns,
+            })
+            _record_manifest_file(wav_path, orig_file_path, 'ads')
+            return
+
+        # 2B. Raw SPU2 .BD Sound Bank -> split into individual .vag + .wav sound effects
+        if is_spu2_bd_bank(payload) or low_ext == '.bd':
+            sfx_list = split_spu2_bd_bank_to_vag(payload)
+            if sfx_list:
+                sfx_dir = os.path.join(target_dir, f'{stem}_sfx')
+                os.makedirs(sfx_dir, exist_ok=True)
+                for sfx_idx, (b_off, b_len, vag_b) in enumerate(sfx_list):
+                    vag_path = os.path.join(sfx_dir, f'sfx_{sfx_idx:04d}.vag')
+                    wav_path = os.path.join(sfx_dir, f'sfx_{sfx_idx:04d}.wav')
+                    with open(vag_path, 'wb') as vf:
+                        vf.write(vag_b)
+                    sr, ns, wav_b = decode_vag_to_wav_bytes(vag_b)
+                    with open(wav_path, 'wb') as wf:
+                        wf.write(wav_b)
+                    summary['extracted'] += 1
+                    summary['converted'] += 1
+                    summary['files'].extend([vag_path, wav_path])
+                    catalog['audio'].append({
+                        'id': f'{stem}_sfx_{sfx_idx:04d}',
+                        'file': os.path.relpath(wav_path, out_dir),
+                        'codec': 'bd_vag',
+                        'sampleRate': sr,
+                        'samples': ns,
+                    })
+                    _record_manifest_file(
+                        wav_path,
+                        orig_file_path,
+                        'bd_vag',
+                        {'bdOffset': b_off, 'bdLength': b_len, 'vagFile': os.path.relpath(vag_path, out_dir)},
+                    )
+                return
+
+        # 3. PS2 Video (.SFD / .PSS) -> .mp4 with synchronized audio
+        vid_ext = detect_ps2_video_subtype(payload)
+        if vid_ext is not None or low_ext in ('.sfd', '.pss'):
+            mp4_path = Path(target_dir) / f'{stem}.mp4'
+            if convert_sfd_pss_to_mp4(payload, mp4_path):
+                summary['converted'] += 1
+                summary['files'].append(str(mp4_path))
+                catalog['videos'].append({
+                    'id': stem,
+                    'file': os.path.relpath(str(mp4_path), out_dir),
+                    'container': vid_ext or low_ext,
+                })
+                _record_manifest_file(str(mp4_path), orig_file_path, 'video_sfd' if (vid_ext or low_ext) == '.sfd' else 'video_pss')
+            return
+
+        # 4. FMOD 3D Model -> combined .obj + split _partXX.obj submeshes
         if is_fmod_bytes(payload) or low_ext == '.fmod':
             meshes = decode_fmod_to_meshes(payload)
             if meshes:
@@ -690,6 +844,7 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
                     cf.write(export_meshes_to_obj(meshes, header_comment=f'PS2 FMOD 3D Mesh ({stem})'))
                 summary['converted'] += 1
                 summary['files'].append(full_obj_path)
+                _record_manifest_file(full_obj_path, orig_file_path, 'fmod')
 
                 if len(meshes) > 1:
                     for sub in meshes:
@@ -717,9 +872,9 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
                     })
             return
 
-        # 4. Other convertible assets (.tex, .16, .vif)
+        # 5. Other convertible assets (.tex, .16, .vif)
         conv_name, conv_bytes = convert_asset_bytes(rel_prefix, payload)
-        if conv_name and conv_bytes and not conv_name.endswith(('.dec.bin', '.dec.pac', '.dec.afs', '.dec.fmod', '.dec.tm2')):
+        if conv_name and conv_bytes and not conv_name.endswith(('.dec.bin', '.dec.pac', '.dec.afs', '.dec.momo', '.dec.fmod', '.dec.tm2')):
             conv_path = os.path.join(target_dir, conv_name)
             os.makedirs(os.path.dirname(conv_path), exist_ok=True)
             with open(conv_path, 'wb') as cf:
@@ -744,7 +899,8 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
             active_bytes = raw_bytes
             active_rel = safe_rel
             active_kind = entry.kind
-            if (convert or recursive) and raw_bytes[:4] not in (b'TIM2', b'VAGp', b'AFS\x00', b'MOMO', b'\x7fELF', b'MWo3') and 32 <= len(raw_bytes) <= 4 * 1024 * 1024:
+            active_file_path = dst_path
+            if (convert or recursive) and raw_bytes[:4] not in (b'TIM2', b'VAGp', b'AFS\x00', b'MOMO', b'\x7fELF', b'MWo3', b'\x00\x00\x01\xba') and not is_adx_bytes(raw_bytes) and 32 <= len(raw_bytes) <= 4 * 1024 * 1024:
                 dec = decompress_capcom_lz16(raw_bytes)
                 if dec is not None and len(dec) > len(raw_bytes):
                     dec_ext, dec_kind = _sniff_payload_ext_and_kind(dec)
@@ -755,6 +911,7 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
                     dec_path = os.path.join(target_dir, active_rel)
                     with open(dec_path, 'wb') as df:
                         df.write(dec)
+                    active_file_path = dec_path
                     summary['converted'] += 1
                     summary['files'].append(dec_path)
 
@@ -768,17 +925,38 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
 
             if convert:
                 try:
-                    _convert_and_record(active_rel, active_bytes, target_dir)
+                    _convert_and_record(active_rel, active_bytes, target_dir, active_file_path)
                 except Exception:
                     pass
 
     _process_archive(arc, out_dir, limit=max_entries)
 
-    if convert and (catalog['textures'] or catalog['audio'] or catalog['meshes']):
+    if convert and (catalog['textures'] or catalog['audio'] or catalog['videos'] or catalog['meshes']):
         catalog_path = os.path.join(out_dir, 'assets_catalog.json')
         with open(catalog_path, 'w', encoding='utf-8') as jf:
             json.dump(catalog, jf, indent=2)
             jf.write('\n')
         summary['catalog'] = catalog_path
 
+    if convert and textures_tsv_rows:
+        tsv_path = os.path.join(out_dir, 'textures_index.tsv')
+        with open(tsv_path, 'w', encoding='utf-8') as tf:
+            tf.write('\n'.join(textures_tsv_rows) + '\n')
+        summary['textures_index'] = tsv_path
+
+    if convert and manifest_assets:
+        manifest_path = os.path.join(out_dir, '.unpack_manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as mf:
+            json.dump(
+                {
+                    'sourceArchive': os.path.abspath(path),
+                    'format': arc.format_name,
+                    'assets': manifest_assets,
+                },
+                mf,
+                indent=2,
+            )
+            mf.write('\n')
+
     return summary
+

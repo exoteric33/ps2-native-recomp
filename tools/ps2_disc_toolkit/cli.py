@@ -683,15 +683,16 @@ def port_standalone(
     )
 
 
-def unpack_list_cmd(archive_path, force_carve=False):
+def unpack_list_cmd(archive_path, force_carve=False, max_entries=None):
     from ps2_disc_toolkit.archives import open_archive
     arc = open_archive(archive_path, force_carve=force_carve)
-    print(f"[unpack-list] {archive_path} [{arc.format_name}]: {len(arc.entries)} entry(ies)")
-    for idx, entry in enumerate(arc.entries):
+    entries = arc.entries[:max_entries] if max_entries is not None else arc.entries
+    print(f"[unpack-list] {archive_path} [{arc.format_name}]: showing {len(entries)}/{len(arc.entries)} entry(ies)")
+    for idx, entry in enumerate(entries):
         print(f"  [{idx:4d}] {entry.name:36s}  offset=0x{entry.offset:08x}  size={entry.size:9d} B  ({entry.kind})")
 
 
-def unpack_extract_cmd(archive_path, out_dir, convert=False, recursive=False, force_carve=False):
+def unpack_extract_cmd(archive_path, out_dir, convert=False, recursive=False, force_carve=False, max_entries=None):
     from ps2_disc_toolkit.archives import extract_archive
     summary = extract_archive(
         archive_path,
@@ -699,10 +700,12 @@ def unpack_extract_cmd(archive_path, out_dir, convert=False, recursive=False, fo
         convert=convert,
         recursive=recursive,
         force_carve=force_carve,
+        max_entries=max_entries,
     )
+    cat_note = f", catalog -> {summary['catalog']}" if summary.get('catalog') else ""
     print(
         f"[unpack-extract] {archive_path} [{summary['format']}]: "
-        f"{summary['extracted']} extracted, {summary['converted']} converted -> {out_dir}"
+        f"{summary['extracted']} extracted, {summary['converted']} converted -> {out_dir}{cat_note}"
     )
     return summary
 
@@ -756,16 +759,18 @@ def main(argv=None):
     p_prt.add_argument('--keys', default=None, help='Optional keys.ini file to bundle')
     p_prt.add_argument('--memcard', default=None, help='Optional existing .ps2 memory card file to bundle')
 
-    p_uls = sub.add_parser('unpack-list', help='List subfiles inside a 2nd-level PS2 archive (.AFS, .LMP, .GOB, .TEX, or --carve)')
+    p_uls = sub.add_parser('unpack-list', help='List subfiles inside a 2nd-level PS2 archive (.AFS, .PAC, .MOMO, .LMP, .GOB, .TEX, or --carve)')
     p_uls.add_argument('archive', help='Path to 2nd-level archive file')
     p_uls.add_argument('--carve', action='store_true', help='Force universal signature carver (TIM2/VAGp)')
+    p_uls.add_argument('--max-entries', type=int, default=None, help='Maximum number of entries to display')
 
-    p_uex = sub.add_parser('unpack-extract', help='Extract and optionally convert assets from a 2nd-level PS2 archive')
-    p_uex.add_argument('archive', help='Path to 2nd-level archive file or standalone PS2 asset (.tex, .tm2, .vag, .16)')
+    p_uex = sub.add_parser('unpack-extract', help='Extract and optionally convert assets (.png, .wav, .obj + assets_catalog.json) from a PS2 archive')
+    p_uex.add_argument('archive', help='Path to 2nd-level archive file (.AFS, .PAC, .LMP, .GOB, .TEX, DATA.BIN) or standalone asset (.fmod, .vif, .tex, .tm2, .vag, .16)')
     p_uex.add_argument('out_dir', help='Output directory for extracted/converted files')
-    p_uex.add_argument('--convert', action='store_true', help='Convert PS2 textures (.tex, .tm2, .16) to .png and audio (.vag) to .wav')
-    p_uex.add_argument('--recursive', action='store_true', help='Recursively unpack nested archives (e.g. .LMP inside .GOB)')
+    p_uex.add_argument('--convert', action='store_true', help='Convert PS2 textures (.tex, .tm2, .16) to .png, audio (.vag) to .wav, and 3D models (.fmod, .vif) to .obj + assets_catalog.json')
+    p_uex.add_argument('--recursive', action='store_true', help='Recursively unpack nested archives (e.g. .PAC / .AFS / .LMP inside containers)')
     p_uex.add_argument('--carve', action='store_true', help='Force universal signature carver (TIM2/VAGp) for unknown containers')
+    p_uex.add_argument('--max-entries', type=int, default=None, help='Maximum number of top-level entries to extract')
 
     args = parser.parse_args(argv)
     if args.cmd == 'inspect':
@@ -809,7 +814,7 @@ def main(argv=None):
             memcard_path=args.memcard,
         )
     elif args.cmd == 'unpack-list':
-        unpack_list_cmd(args.archive, force_carve=args.carve)
+        unpack_list_cmd(args.archive, force_carve=args.carve, max_entries=args.max_entries)
     elif args.cmd == 'unpack-extract':
         unpack_extract_cmd(
             args.archive,
@@ -817,6 +822,7 @@ def main(argv=None):
             convert=args.convert,
             recursive=args.recursive,
             force_carve=args.carve,
+            max_entries=args.max_entries,
         )
 
 

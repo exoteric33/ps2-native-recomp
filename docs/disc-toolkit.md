@@ -32,22 +32,28 @@ Running with the extracted directory:
 
 ---
 
-## 2. Unpacking 2nd-Level Game Archives & Converting PS2 Assets
+## 2. Unpacking 2nd-Level Game Archives & Converting PS2 3D/Texture/Audio Assets
 
-Many PS2 games pack their 3D models, textures, audio streams, and relocatable overlays inside container files (`.AFS`, `.LMP`, `.GOB`, `.TEX`, `DATA.BIN`, etc.). `extract_disc.py` includes a built-in 2nd-level unpacker and Sony SDK asset converter:
+Many PS2 games pack their 3D models, textures, audio streams, and relocatable overlays inside container files (`.AFS`, `.PAC`, `.MOMO`, `.LMP`, `.GOB`, `.TEX`, `DATA.BIN`, etc.). `extract_disc.py` includes a built-in 2nd-level unpacker and asset converter (`tools/ps2_disc_toolkit/archives.py`, `ps2_textures.py`, `ps2_audio.py`, `ps2_meshes.py`):
+
+- **Archive containers**: CRI `.AFS` (`AFS\x00`), `.MOMO`, headerless offset-table `.PAC` archives (`count + [offset, size]`), sector-aligned (`0x800`) `.PAC` containers, Snowblind `.LMP`/`.GOB`/`.TEX`, Capcom 16-bit LZ16 streams, and a fallback universal signature carver (`--carve`).
+- **Textures**: Sony SDK `.TIM2` (`.tm2`), `.tex`, and `.16` $\rightarrow$ **32-bit RGBA `.png`** (with hardware GS VRAM unswizzling, CSM1 CLUT palette unswizzling, and PS2 $0..128 \rightarrow 0..255$ alpha scaling).
+- **Audio**: Sony SDK SPU2 ADPCM `.vag` (`VAGp`) $\rightarrow$ **16-bit PCM `.wav`**.
+- **3D Meshes**: Recursive chunk-based `.FMOD` 3D models and VIF1/VU1 geometry packets (`.vif`, honoring the GS `ADC 0x8000` strip-restart flag) $\rightarrow$ **Wavefront `.obj`** (with UVs, normals, per-vertex RGB shading, automatic sub-mesh splitting `_partXX.obj`, and bounding-box role classification in `assets_catalog.json`).
 
 ```bash
-# List subfiles inside an archive (.AFS, .LMP, .GOB, .TEX)
-python3 scripts/extract_disc.py unpack-list games/<name>/disc_files/layer0/DAT.AFS
+# List subfiles inside an archive (.AFS, .PAC, .MOMO, .LMP, .GOB, .TEX, DATA.BIN)
+python3 scripts/extract_disc.py unpack-list games/<name>/disc_files/layer0/DATA.BIN --max-entries 20
 
 # Extract and convert PS2 textures (.tm2, .tex, .16 -> .png), audio (.vag -> .wav),
-# Metrowerks MWo3 overlays, and Capcom LZ16 containers (.dec.bin)
+# 3D models (.fmod, .vif -> .obj + submesh parts + assets_catalog.json),
+# Metrowerks MWo3 overlays, and Capcom LZ16 containers
 python3 scripts/extract_disc.py unpack-extract \
-  games/<name>/disc_files/layer0/DAT.AFS \
-  games/<name>/assets_unpacked/dat_afs \
-  --convert --recursive
+  games/<name>/disc_files/layer0/DATA.BIN \
+  games/<name>/assets_unpacked/data_bin \
+  --convert --recursive --max-entries 50
 
-# Carve TIM2 textures and VAGp audio from proprietary binary containers
+# Carve TIM2 textures and VAGp audio from arbitrary binary containers
 python3 scripts/extract_disc.py unpack-extract \
   games/<name>/disc_files/layer0/DATA.BIN \
   games/<name>/assets_unpacked/data_carved \

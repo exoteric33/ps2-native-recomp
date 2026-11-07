@@ -35,3 +35,11 @@ from .ps2_audio import (  # noqa: F401
     decode_vag_to_wav_bytes,
     decode_spu2_adpcm_blocks,
 )
+from .ps2_meshes import (  # noqa: F401
+    Ps2SubMesh,
+    is_fmod_bytes,
+    decode_fmod_to_meshes,
+    decode_vif_to_meshes,
+    export_mesh_to_obj,
+    export_meshes_to_obj,
+)

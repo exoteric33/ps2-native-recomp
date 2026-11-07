@@ -460,3 +460,325 @@ def export_meshes_to_obj(
 def export_mesh_to_obj(sub: Ps2SubMesh, header_comment: str = "PS2 Disc Toolkit - Extracted SubMesh") -> str:
     """Export a single Ps2SubMesh to Wavefront .OBJ format."""
     return export_meshes_to_obj([sub], header_comment=header_comment)
+
+
+def parse_obj_to_submeshes(obj_text: str) -> list[Ps2SubMesh]:
+    """
+    Parse a Wavefront .OBJ string back into a list of Ps2SubMesh objects.
+    Handles multiple `o`/`g` submeshes, arbitrary polygon fan-triangulation,
+    negative or positive 1-based indices, UVs, normals, and optional per-vertex RGB colors.
+    """
+    global_v: list[tuple[float, float, float]] = []
+    global_vc: list[tuple[float, float, float, float] | None] = []
+    global_vt: list[tuple[float, float]] = []
+    global_vn: list[tuple[float, float, float]] = []
+
+    raw_groups: list[tuple[str, list[list[tuple[int, int, int]]]]] = []
+    current_name = "part00"
+    current_faces: list[list[tuple[int, int, int]]] = []
+
+    for raw_line in obj_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        cmd = parts[0]
+        if cmd in ("o", "g") and len(parts) >= 2:
+            if current_faces:
+                raw_groups.append((current_name, current_faces))
+                current_faces = []
+            current_name = parts[1]
+        elif cmd == "v" and len(parts) >= 4:
+            vx, vy, vz = float(parts[1]), float(parts[2]), float(parts[3])
+            global_v.append((vx, vy, vz))
+            if len(parts) >= 7:
+                r, g, b = float(parts[4]), float(parts[5]), float(parts[6])
+                a = float(parts[7]) if len(parts) >= 8 else 1.0
+                global_vc.append((r, g, b, a))
+            else:
+                global_vc.append(None)
+        elif cmd == "vt" and len(parts) >= 3:
+            global_vt.append((float(parts[1]), float(parts[2])))
+        elif cmd == "vn" and len(parts) >= 4:
+            global_vn.append((float(parts[1]), float(parts[2]), float(parts[3])))
+        elif cmd == "f" and len(parts) >= 4:
+            poly: list[tuple[int, int, int]] = []
+            for corner in parts[1:]:
+                 segs = corner.split("/")
+                 vi = int(segs[0])
+                 vti = int(segs[1]) if len(segs) > 1 and segs[1] else 0
+                 vni = int(segs[2]) if len(segs) > 2 and segs[2] else 0
+                 if vi < 0:
+                     vi = len(global_v) + 1 + vi
+                 if vti < 0:
+                     vti = len(global_vt) + 1 + vti
+                 if vni < 0:
+                     vni = len(global_vn) + 1 + vni
+                 poly.append((vi - 1, vti - 1, vni - 1))
+            for k in range(2, len(poly)):
+                current_faces.append([poly[0], poly[k - 1], poly[k]])
+
+    if current_faces:
+        raw_groups.append((current_name, current_faces))
+
+    submeshes: list[Ps2SubMesh] = []
+    for idx, (g_name, tris) in enumerate(raw_groups):
+        sub = Ps2SubMesh(index=idx, name=g_name)
+        vert_map: dict[tuple[int, int, int], int] = {}
+        has_any_color = False
+
+        for tri in tris:
+            tri_indices: list[int] = []
+            for vi, vti, vni in tri:
+                key = (vi, vti, vni)
+                new_idx = vert_map.get(key)
+                if new_idx is None:
+                    new_idx = len(sub.vertices)
+                    vert_map[key] = new_idx
+                    vx, vy, vz = global_v[vi] if 0 <= vi < len(global_v) else (0.0, 0.0, 0.0)
+                    sub.vertices.append((vx, vy, vz))
+                    if 0 <= vti < len(global_vt):
+                        sub.uvs.append(global_vt[vti])
+                    else:
+                        sub.uvs.append((0.0, 0.0))
+                    if 0 <= vni < len(global_vn):
+                        sub.normals.append(global_vn[vni])
+                    else:
+                        sub.normals.append((0.0, 1.0, 0.0))
+                    vc = global_vc[vi] if 0 <= vi < len(global_vc) else None
+                    if vc is not None:
+                        has_any_color = True
+                        sub.colors.append(vc)
+                    else:
+                        sub.colors.append((1.0, 1.0, 1.0, 1.0))
+                tri_indices.append(new_idx)
+            if (
+                tri_indices[0] != tri_indices[1]
+                and tri_indices[1] != tri_indices[2]
+                and tri_indices[0] != tri_indices[2]
+            ):
+                sub.faces.append((tri_indices[0], tri_indices[1], tri_indices[2]))
+
+        if not has_any_color:
+            sub.colors.clear()
+        if sub.vertices and sub.faces:
+            submeshes.append(sub)
+
+    return submeshes
+
+
+def _extract_fmod_skinning_records(
+    vert_payload: bytes,
+    vert_count: int,
+    skin_payload: bytes,
+    skin_count: int,
+) -> list[tuple[tuple[float, float, float], bytes]]:
+    """
+    Extract (position_xyz, raw_skin_record_bytes) pairs from an original FMOD submesh's
+    0x00070000 vertex chunk and 0x000C0000 variable-length bone weight chunk.
+    """
+    if vert_count <= 0 or vert_count != skin_count or len(vert_payload) < vert_count * 12:
+        return []
+    records: list[tuple[tuple[float, float, float], bytes]] = []
+    s_pos = 0
+    for i in range(vert_count):
+        if s_pos + 4 > len(skin_payload):
+            return []
+        num_bones = struct.unpack_from("<I", skin_payload, s_pos)[0]
+        rec_len = 4 + num_bones * 8
+        if num_bones > 16 or s_pos + rec_len > len(skin_payload):
+            return []
+        vx, vy, vz = struct.unpack_from("<fff", vert_payload, i * 12)
+        records.append(((vx, vy, vz), skin_payload[s_pos : s_pos + rec_len]))
+        s_pos += rec_len
+    return records
+
+
+def _rebuild_fmod_submesh_block(orig_sub_block: bytes, new_sub: Ps2SubMesh) -> bytes:
+    """
+    Rebuild a single 0x00000004 SubMesh block using the geometry from `new_sub`,
+    while preserving materials (0x00050000), metadata (0x000F0000 / 0x00110000)
+    and transferring nearest-vertex skeletal skinning weights (0x000C0000).
+    """
+    btype, orig_child_count, bsize = struct.unpack_from("<IiI", orig_sub_block, 0)
+    if btype != 0x00000004 or bsize < 12:
+        return orig_sub_block
+
+    # First pass: inspect original children to extract reference vertices, skinning, and strip type
+    pos = 12
+    orig_vert_payload = b""
+    orig_vert_count = 0
+    orig_skin_payload = b""
+    orig_skin_count = 0
+    orig_default_mat_idx = 0
+    orig_strip_btype = 0x00040000
+    children_meta: list[tuple[int, int, bytes]] = []
+
+    while pos + 12 <= bsize:
+        ct, cc, cs = struct.unpack_from("<IiI", orig_sub_block, pos)
+        if cs < 12 or pos + cs > bsize:
+            break
+        cpayload = orig_sub_block[pos + 12 : pos + cs]
+        children_meta.append((ct, cc, cpayload))
+        if ct == 0x00000005 and len(cpayload) >= 12:
+            st = struct.unpack_from("<I", cpayload, 0)[0]
+            if st in (0x00030000, 0x00040000):
+                orig_strip_btype = st
+        elif ct == 0x00060000 and len(cpayload) >= 4:
+            orig_default_mat_idx = struct.unpack_from("<I", cpayload, 0)[0]
+        elif ct == 0x00070000 and len(cpayload) == cc * 12:
+            orig_vert_payload = cpayload
+            orig_vert_count = cc
+        elif ct == 0x000C0000:
+            orig_skin_payload = cpayload
+            orig_skin_count = cc
+        pos += cs
+
+    skin_refs = _extract_fmod_skinning_records(
+        orig_vert_payload, orig_vert_count, orig_skin_payload, orig_skin_count
+    )
+
+    n_verts = len(new_sub.vertices)
+    n_faces = len(new_sub.faces)
+
+    # Second pass: rebuild each child chunk in its original order
+    new_children = bytearray()
+    for ct, cc, cpayload in children_meta:
+        if ct == 0x00000005:
+            # Pack each triangle as a 3-index strip inside a single strip chunk
+            strip_words: list[int] = []
+            for i0, i1, i2 in new_sub.faces:
+                strip_words.extend((3, i0, i1, i2))
+            strip_body = struct.pack(f"<{len(strip_words)}I", *strip_words)
+            strip_chunk = struct.pack("<IiI", orig_strip_btype, n_faces, 12 + len(strip_body)) + strip_body
+            new_children.extend(struct.pack("<IiI", 0x00000005, 1, 12 + len(strip_chunk)))
+            new_children.extend(strip_chunk)
+
+        elif ct == 0x00060000:
+            # Per-strip material table (1 uint32 per triangle strip)
+            mat_body = struct.pack(f"<{n_faces}I", *([orig_default_mat_idx] * n_faces))
+            new_children.extend(struct.pack("<IiI", 0x00060000, n_faces, 12 + len(mat_body)))
+            new_children.extend(mat_body)
+
+        elif ct == 0x00070000 and len(cpayload) == cc * 12:
+            # Float32x3 vertices
+            v_floats: list[float] = []
+            for vx, vy, vz in new_sub.vertices:
+                v_floats.extend((vx, vy, vz))
+            v_body = struct.pack(f"<{len(v_floats)}f", *v_floats)
+            new_children.extend(struct.pack("<IiI", 0x00070000, n_verts, 12 + len(v_body)))
+            new_children.extend(v_body)
+
+        elif ct == 0x00080000 and len(cpayload) == cc * 12:
+            # Float32x3 normals
+            n_floats: list[float] = []
+            for idx in range(n_verts):
+                nx, ny, nz = new_sub.normals[idx] if idx < len(new_sub.normals) else (0.0, 1.0, 0.0)
+                n_floats.extend((nx, ny, nz))
+            n_body = struct.pack(f"<{len(n_floats)}f", *n_floats)
+            new_children.extend(struct.pack("<IiI", 0x00080000, n_verts, 12 + len(n_body)))
+            new_children.extend(n_body)
+
+        elif ct == 0x000A0000 and len(cpayload) == cc * 8:
+            # Float32x2 UVs (flip V back to PS2 1.0 - v convention)
+            uv_floats: list[float] = []
+            for idx in range(n_verts):
+                u, v = new_sub.uvs[idx] if idx < len(new_sub.uvs) else (0.0, 0.0)
+                uv_floats.extend((u, 1.0 - v))
+            uv_body = struct.pack(f"<{len(uv_floats)}f", *uv_floats)
+            new_children.extend(struct.pack("<IiI", 0x000A0000, n_verts, 12 + len(uv_body)))
+            new_children.extend(uv_body)
+
+        elif ct == 0x000B0000 and len(cpayload) == cc * 16:
+            # Float32x4 RGBA vertex colors (0..255.0f range)
+            c_floats: list[float] = []
+            for idx in range(n_verts):
+                if idx < len(new_sub.colors):
+                    r, g, b, a = new_sub.colors[idx]
+                    c_floats.extend((r * 255.0, g * 255.0, b * 255.0, a * 255.0))
+                else:
+                    c_floats.extend((255.0, 255.0, 255.0, 255.0))
+            c_body = struct.pack(f"<{len(c_floats)}f", *c_floats)
+            new_children.extend(struct.pack("<IiI", 0x000B0000, n_verts, 12 + len(c_body)))
+            new_children.extend(c_body)
+
+        elif ct == 0x000C0000 and skin_refs:
+            # Transfer nearest-vertex skeletal skinning weights for each new vertex
+            skin_body = bytearray()
+            for vx, vy, vz in new_sub.vertices:
+                best_rec = skin_refs[0][1]
+                best_dist = float("inf")
+                for (rx, ry, rz), rec_bytes in skin_refs:
+                    d = (vx - rx) * (vx - rx) + (vy - ry) * (vy - ry) + (vz - rz) * (vz - rz)
+                    if d < best_dist:
+                        best_dist = d
+                        best_rec = rec_bytes
+                skin_body.extend(best_rec)
+            new_children.extend(struct.pack("<IiI", 0x000C0000, n_verts, 12 + len(skin_body)))
+            new_children.extend(skin_body)
+
+        else:
+            # Preserve material IDs (0x00050000), bounding boxes (0x000F0000, 0x00110000), etc.
+            new_children.extend(struct.pack("<IiI", ct, cc, 12 + len(cpayload)))
+            new_children.extend(cpayload)
+
+    return struct.pack("<IiI", 0x00000004, orig_child_count, 12 + len(new_children)) + bytes(new_children)
+
+
+def encode_obj_to_fmod(obj_text: str, reference_fmod: bytes) -> bytes:
+    """
+    Encode a modified Wavefront .OBJ mesh back into a PS2 .FMOD binary buffer,
+    using `reference_fmod` as template for materials, texture indices, and
+    nearest-vertex skeletal skinning weights (0x000C0000).
+    """
+    new_submeshes = parse_obj_to_submeshes(obj_text)
+    if not new_submeshes or len(reference_fmod) < 24:
+        return reference_fmod
+
+    sub_cursor = 0
+
+    def rebuild_container(buf: bytes) -> bytes:
+        nonlocal sub_cursor
+        pos = 0
+        n = len(buf)
+        out = bytearray()
+        while pos + 12 <= n:
+            btype, count, bsize = struct.unpack_from("<IiI", buf, pos)
+            if bsize < 12 or pos + bsize > n:
+                out.extend(buf[pos:])
+                break
+            raw_block = buf[pos : pos + bsize]
+            if btype == 0x00000004:
+                if sub_cursor < len(new_submeshes):
+                    out.extend(_rebuild_fmod_submesh_block(raw_block, new_submeshes[sub_cursor]))
+                elif new_submeshes:
+                    # If the modder merged submeshes into fewer objects in Blender, collapse remaining into degenerate 1-tri stub
+                    stub = Ps2SubMesh(
+                        index=sub_cursor,
+                        vertices=[(0.0, 0.0, 0.0)] * 3,
+                        normals=[(0.0, 1.0, 0.0)] * 3,
+                        uvs=[(0.0, 0.0)] * 3,
+                        faces=[(0, 1, 2)],
+                    )
+                    out.extend(_rebuild_fmod_submesh_block(raw_block, stub))
+                else:
+                    out.extend(raw_block)
+                sub_cursor += 1
+            elif btype in (0x00000001, 0x00000002, 0x00000003):
+                rebuilt_payload = rebuild_container(buf[pos + 12 : pos + bsize])
+                out.extend(struct.pack("<IiI", btype, count, 12 + len(rebuilt_payload)))
+                out.extend(rebuilt_payload)
+            else:
+                out.extend(raw_block)
+            pos += bsize
+        return bytes(out)
+
+    if reference_fmod[:4] == b"FMOD":
+        for cand in (4, 8, 12, 16):
+            if cand + 12 <= len(reference_fmod):
+                bt, _cnt, bsz = struct.unpack_from("<IiI", reference_fmod, cand)
+                if bt in (1, 2, 4) and 12 <= bsz <= len(reference_fmod) - cand:
+                    return reference_fmod[:cand] + rebuild_container(reference_fmod[cand:])
+
+    return rebuild_container(reference_fmod)
+

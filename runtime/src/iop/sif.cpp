@@ -501,14 +501,43 @@ void read_reboot_image(const std::string &image_path) {
     std::fprintf(stderr, "[sif] LOADFILE from %s reports %.4s\n", image_path.c_str(), g_loadfile_version);
 }
 
+// What the EE sends with ps2sdk's SifIopReset(arg, mode) and the vendor library's sceSifRebootIop(image): SIF command 0x80000003,
+// the text length at +16, the mode at +20 and the text at +24 (iopcontrol.c, AFL-2.0). The text is "rom0:UDNL <image>" to start the
+// IOP again from an image that replaces the ROM's modules (IOPRP*.IMG), or empty (SifIopReset("", 0)) to start it from the ROM's
+// own modules. The console forgets everything the game loaded in both cases; `reboot` wipes the IOP only for the empty text, because
+// an image's modules are not read here (only their FILEIO and LOADFILE versions) and the games that reboot with one are the ones
+// that work today (docs/iop-reboot-empty.md).
 void reboot(std::uint32_t src) {
+    constexpr std::uint32_t kCmdReset = 0x80000003u;
     const std::uint8_t *packet = g_ram + (src & (kRamSize - 1));
-    std::uint32_t args_size;
+    std::uint32_t cid, args_size, mode;
+    std::memcpy(&cid, packet + 8, 4);
     std::memcpy(&args_size, packet + 16, 4);
+    std::memcpy(&mode, packet + 20, 4);
     const std::string path(reinterpret_cast<const char *>(packet + 24), strnlen(reinterpret_cast<const char *>(packet + 24), std::min<std::uint32_t>(args_size, 80)));
     std::fprintf(stderr, "[sif] IOP reboot requested with \"%s\"\n", path.c_str());
     if (path.find("IOPRP") != std::string::npos) g_fileio_async = true;
     if (const auto space = path.find(' '); space != std::string::npos) read_reboot_image(path.substr(space + 1));
+    std::string image = path;
+    if (image.rfind("rom0:UDNL", 0) == 0) image.erase(0, 9);
+    image.erase(0, image.find_first_not_of(' '));
+    if (cid != kCmdReset) {
+        std::fprintf(stderr, "[sif] that transfer to IOP address 0 carries command 0x%08X, not a reset\n", cid);
+        return;
+    }
+    if (!image.empty()) return;
+    // The new IOP has none of the game's modules, threads, servers or queued answers: a packet or thread of the old one that survived
+    // would write into EE memory the game has reused, and an answer still queued for the EE would meet the new handshake. The EE's
+    // view (its receive address, the two flag registers) stays; the boot-end, command and SIF bits of SMFLAG are set at once, as the
+    // IOP's boot is not timed here (the EE clears them just before and after the command, ps2sdk's SifIopReset; set_reg ignores that).
+    const std::size_t modules = iop::kernel::modules().size(), threads = iop::kernel::thread_ids().size();
+    const std::uint32_t mainaddr = g_mainaddr, msflag = g_msflag, ee_recv = g_ee_recv;
+    iop::soft_reset();
+    g_mainaddr = mainaddr;
+    g_msflag = msflag;
+    g_ee_recv = ee_recv;
+    g_smflag = 0x70000u;
+    std::fprintf(stderr, "[sif] the IOP starts from its own modules (mode %u): %zu modules and %zu threads of the game are gone\n", mode, modules, threads);
 }
 
 std::uint32_t arg(const iop::Cpu &c, int i) { return i < 4 ? c.r[4 + i] : iop::read32(c.r[29] + 16u + static_cast<std::uint32_t>(i - 4) * 4u); }

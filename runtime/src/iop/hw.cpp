@@ -160,6 +160,14 @@ void reset() {
     std::memset(g_ohci, 0, sizeof g_ohci);
 }
 
+void soft_reset() {
+    g_istat = g_imask = g_dicr = g_dicr2 = 0;
+    g_ictrl = 1;
+    std::memset(g_dma, 0, sizeof g_dma);
+    std::memset(g_ohci, 0, sizeof g_ohci);
+    spu2::restart_ticks();
+}
+
 void raise_interrupt(unsigned line) {
     if (line < 32) g_istat |= 1u << line;
 }

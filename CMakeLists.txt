@@ -208,6 +208,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2talestest PRIVATE synchronization)
     endif()
+    # an IOP reset with no image (SifIopReset("", 0), Need for Speed) and the waits after it, no game needed: ninja ps2iopresettest
+    add_executable(ps2iopresettest EXCLUDE_FROM_ALL tests/iop_reboot_empty.cpp)
+    target_include_directories(ps2iopresettest PRIVATE runtime/src)
+    target_link_libraries(ps2iopresettest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2iopresettest PRIVATE synchronization)
+    endif()
     # an UNPACK with CL 0 (or before any STCYCL) takes its data and the stream stays in step, no game needed: ninja ps2viftest
     add_executable(ps2viftest EXCLUDE_FROM_ALL tests/vif_cycle.cpp)
     target_include_directories(ps2viftest PRIVATE runtime/src)

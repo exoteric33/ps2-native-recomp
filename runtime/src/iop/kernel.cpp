@@ -613,6 +613,14 @@ void reset() {
     kernel::boot();
 }
 
+void soft_reset() {
+    const std::uint64_t now = kernel::g_now, target = kernel::g_target;
+    hw::soft_reset();
+    kernel::boot();
+    kernel::g_now = now;
+    kernel::g_target = target;
+}
+
 std::uint64_t cycles() { return kernel::g_now; }
 
 void run(std::uint64_t ee_cycles) {

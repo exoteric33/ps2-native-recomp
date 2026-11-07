@@ -65,6 +65,9 @@ std::uint32_t register_hle(const std::string &library, std::uint32_t index, HleF
 void call_hle(Cpu &c, std::uint32_t id);
 
 void reset();
+// The IOP starts again with only its own (native) modules, as after SIF command 0x80000003 with no image: every module, thread,
+// semaphore, timer, interrupt handler, file and RPC server of the game is gone and the SIF state is new. The clock goes on.
+void soft_reset();
 void run(std::uint64_t ee_cycles);
 std::uint64_t cycles();
 void raise_interrupt(unsigned line);

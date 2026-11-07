@@ -726,6 +726,8 @@ void reset() {
     if (!out.empty() && out != chip && !g_sink && g_out_wav.open(out)) std::fprintf(stderr, "[spu2] writing the sound to %s (no sound device)\n", out.c_str());
 }
 
+void restart_ticks() { g_tick_pending = false; }
+
 std::uint16_t *ram() { return g_ram.data(); }
 
 std::uint32_t read(std::uint32_t a, unsigned size) {

@@ -12,6 +12,8 @@ namespace ps2::iop::spu2 {
 void state(ps2::state::Stream &s);
 
 void reset();
+// The IOP queue that held the next sound tick was emptied (an IOP reset): the next register access schedules a new one.
+void restart_ticks();
 std::uint16_t *ram();
 std::uint32_t read(std::uint32_t a, unsigned size);
 void write(std::uint32_t a, std::uint32_t v, unsigned size);

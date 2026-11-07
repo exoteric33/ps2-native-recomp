@@ -7,7 +7,8 @@
 *.rar
 
 /generated/
-/tools/
+/tools/*
+!/tools/ps2_disc_toolkit/
 /build/
 
 *.ppm
@@ -69,3 +70,4 @@ __pycache__/
 
 # Files saved by hand when a download fails (docs/fetch-retry.md); the app's Update keeps them.
 /downloads/
+/dist/

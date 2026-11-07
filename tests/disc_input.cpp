@@ -335,10 +335,47 @@ void elf_tests() {
     { Segment e; e.vaddr = ps2::kRamSize; e.filesz = 0; e.memsz = 0x800; check(boot({}, 52, entry, &e), "boot ELF empty segment right at the end of memory: ignored"); }
 }
 
+void disc_folder_tests() {
+    const std::size_t S = disc::kSector;
+    auto img = image(20, S);
+    std::size_t at = dots(img, 20 * S, 20, 20);
+    record(img, at, 30, 19, false, "SYSTEM.CNF;1");
+    const char *cnf_text = "BOOT2 = cdrom0:\\X;1";
+
+    const auto dir = std::filesystem::temp_directory_path() / "ps2-disc-folder-test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir / "layer0", ec);
+
+    {
+        std::ofstream meta(dir / "disc_meta.bin", std::ios::binary);
+        meta.write(reinterpret_cast<const char *>(img.data() + 16 * S), static_cast<std::streamsize>(5 * S));
+    }
+    {
+        std::ofstream f(dir / "layer0" / "SYSTEM.CNF", std::ios::binary);
+        f.write(cnf_text, 19);
+    }
+    {
+        std::ofstream mf(dir / "disc_manifest.tsv");
+        mf << "# ps2-disc-manifest v1\n"
+           << "TOTAL_SECTORS\t64\tLAYER1_START\t0\n"
+           << "META\t16\t5\t0\n"
+           << "FILE\t0\t30\t19\tSYSTEM.CNF\tlayer0/SYSTEM.CNF\n";
+    }
+
+    check(disc::open(dir.string()), "disc_folder: valid extracted directory mounts");
+    const auto cnf = disc::find("cdrom0:\\SYSTEM.CNF;1");
+    check(cnf && cnf->sector == 30 && cnf->size == 19, "disc_folder: SYSTEM.CNF is indexed from disc_meta.bin");
+    const auto data = iop::kernel::read_disc_file("cdrom0:\\SYSTEM.CNF;1");
+    check(data.size() == 19 && std::memcmp(data.data(), cnf_text, 19) == 0, "disc_folder: extracted file reads back at its LBA");
+    std::filesystem::remove_all(dir, ec);
+}
+
 }
 
 int main() {
     disc_tests();
+    disc_folder_tests();
     irx_tests();
     elf_tests();
     boot_disc_tests();

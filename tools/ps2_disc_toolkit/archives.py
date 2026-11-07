@@ -1,15 +1,19 @@
 """
-Generic & Pluggable 2nd-Level PS2 Archive Unpacker and Signature Carver.
+Generic & Pluggable 2nd-Level PS2 Archive Unpacker, 3D/Texture/Audio Converter, and Signature Carver.
 
 Supported archive families:
-  1. CRI Middleware .AFS ('AFS\\x00') — standard container across hundreds of PS2 games
-  2. Snowblind Engine .LMP (v1 64-byte inline records & v2 12-byte string-table records)
-  3. Snowblind Engine .GOB (level container holding nested .LMP archives)
-  4. Snowblind Engine .TEX (level texture chunk container)
-  5. Universal PS2 Signature Carver (--carve) — scans any unknown proprietary container
-     for standard Sony SDK assets ('TIM2' textures, 'VAGp' SPU2 audio, '\\x7fELF' modules)
+  1. CRI Middleware .AFS ('AFS\\x00') & 'MOMO' offset-table containers
+  2. PS2 Headerless Offset-Table Archives (.PAC: count + count * (offset, size))
+  3. Snowblind Engine .LMP (v1 64-byte inline records & v2 12-byte string-table records)
+  4. Snowblind Engine .GOB (level container holding nested .LMP archives)
+  5. Snowblind Engine .TEX (level texture chunk container)
+  6. Sector-Aligned Container Scanner (0x800 DVD sector boundaries for monolithic containers)
+  7. Universal PS2 Signature Carver (--carve) — scans any unknown proprietary container
+     for standard Sony SDK & PS2 assets ('TIM2' textures, 'VAGp' SPU2 audio, 'FMOD' 3D meshes,
+     '\\x7fELF' modules, 'MWo3' overlays)
 """
 
+import json
 import os
 import struct
 from dataclasses import dataclass
@@ -21,7 +25,16 @@ from .ps2_textures import (
     encode_rgba_png,
 )
 from .ps2_audio import decode_vag_to_wav_bytes
+from .ps2_meshes import (
+    decode_fmod_to_meshes,
+    decode_vif_to_meshes,
+    export_mesh_to_obj,
+    export_meshes_to_obj,
+    is_fmod_bytes,
+)
 from .codecs import decompress_capcom_lz16, parse_mwo3_header
+
+SECTOR_SIZE = 0x800
 
 
 @dataclass
@@ -32,31 +45,83 @@ class ArchiveEntry:
     kind: str
 
 
-def _classify_asset_name(name, header_bytes=b''):
-    low = name.lower()
-    if header_bytes[:4] == b'TIM2' or low.endswith(('.tm2', '.tim2')):
-        return 'texture:tim2'
-    if header_bytes[:4] == b'VAGp' or low.endswith('.vag'):
-        return 'audio:vag'
-    if header_bytes[:4] == b'\x7fELF' or low.endswith(('.elf', '.irx')):
-        return 'exec:elf'
-    if header_bytes[:4] == b'MWo3' or low.endswith('.mwo3'):
-        return 'exec:mwo3_overlay'
+def validate_pac_header(buf: bytes, max_entries: int = 512) -> tuple[bool, int, int]:
+    """
+    Validate whether `buf` begins with a coherent PS2 .PAC offset/size allocation table:
+      - uint32 count (1 .. max_entries)
+      - count * (uint32 offset, uint32 size)
+    Returns (is_valid, count, max_end_offset).
+    """
+    if len(buf) < 12:
+        return (False, 0, 0)
+    count = struct.unpack_from('<I', buf, 0)[0]
+    if count == 0 or count > max_entries:
+        return (False, 0, 0)
+
+    header_end = 4 + count * 8
+    if header_end > len(buf):
+        return (False, 0, 0)
+
+    max_end = 0
+    prev_offset = header_end
+    non_empty = 0
+    for i in range(count):
+        offset, size = struct.unpack_from('<II', buf, 4 + i * 8)
+        if offset == 0 and size == 0:
+            continue
+        if size == 0:
+            continue
+        if offset < header_end or offset < prev_offset or size > 64 * 1024 * 1024:
+            return (False, 0, 0)
+        max_end = max(max_end, offset + size)
+        prev_offset = offset
+        non_empty += 1
+
+    if non_empty == 0 or max_end <= header_end:
+        return (False, 0, 0)
+    return (True, count, max_end)
+
+
+def _sniff_payload_ext_and_kind(payload: bytes, fallback_name: str = '') -> tuple[str, str]:
+    """
+    Inspect a binary payload buffer and return (recommended_extension, asset_kind).
+    """
+    low = fallback_name.lower()
+    hdr = payload[:16]
+    if hdr[:4] == b'TIM2' or low.endswith(('.tm2', '.tim2')):
+        return '.tm2', 'texture:tim2'
+    if hdr[:4] == b'VAGp' or low.endswith('.vag'):
+        return '.vag', 'audio:vag'
+    if hdr[:4] == b'\x7fELF' or low.endswith(('.elf', '.irx')):
+        return '.elf', 'exec:elf'
+    if hdr[:4] == b'MWo3' or low.endswith('.mwo3'):
+        return '.mwo3', 'exec:mwo3_overlay'
+    if hdr[:4] in (b'AFS\x00', b'MOMO') or low.endswith('.afs'):
+        return '.afs', 'archive:cri_afs'
+    if is_fmod_bytes(payload) or low.endswith('.fmod'):
+        return '.fmod', 'mesh:ps2_fmod'
+    # Check if payload is itself a valid .PAC container with recognizable children
+    if PacArchiveDriver.probe(payload):
+        return '.pac', 'archive:ps2_pac'
     if low.endswith('.tex'):
-        return 'texture:snowblind_tex'
+        return '.tex', 'texture:snowblind_tex'
     if low.endswith('.16'):
-        return 'texture:raw16'
+        return '.16', 'texture:raw16'
     if low.endswith('.lmp'):
-        return 'archive:snowblind_lmp'
+        return '.lmp', 'archive:snowblind_lmp'
     if low.endswith('.gob'):
-        return 'archive:snowblind_gob'
-    if low.endswith('.afs') or header_bytes[:4] == b'AFS\x00':
-        return 'archive:cri_afs'
+        return '.gob', 'archive:snowblind_gob'
     if low.endswith('.vif'):
-        return 'mesh:ps2_vif'
+        return '.vif', 'mesh:ps2_vif'
     if low.endswith('.anm'):
-        return 'anim:snowblind_anm'
-    return 'data:raw'
+        return '.anm', 'anim:snowblind_anm'
+    return '.bin', 'data:raw'
+
+
+def _classify_asset_name(name, header_bytes=b'', full_bytes=b''):
+    probe_buf = full_bytes if full_bytes else header_bytes
+    _ext, kind = _sniff_payload_ext_and_kind(probe_buf, fallback_name=name)
+    return kind
 
 
 class BaseArchiveDriver:
@@ -72,26 +137,31 @@ class BaseArchiveDriver:
 
 
 class AfsArchiveDriver(BaseArchiveDriver):
-    """CRI Middleware .AFS archive reader ('AFS\\x00')."""
+    """CRI Middleware .AFS ('AFS\\x00') and 'MOMO' offset-table archive reader."""
 
     format_name = 'CRI-AFS'
 
     @classmethod
     def probe(cls, data, path=''):
-        if len(data) < 16 or data[:4] != b'AFS\x00':
+        if len(data) < 16 or data[:4] not in (b'AFS\x00', b'MOMO'):
             return False
         count = struct.unpack_from('<I', data, 4)[0]
-        return 0 < count <= 65535 and 8 + count * 8 <= len(data)
+        if not (0 < count <= 65535 and 8 + count * 8 <= len(data)):
+            return False
+        off0, sz0 = struct.unpack_from('<II', data, 8)
+        return off0 >= 8 + count * 8 and off0 + sz0 <= len(data)
 
     def __init__(self, path, data):
         super().__init__(path, data)
+        if data[:4] == b'MOMO':
+            self.format_name = 'PS2-MOMO'
         count = struct.unpack_from('<I', data, 4)[0]
         raw_pairs = [struct.unpack_from('<II', data, 8 + i * 8) for i in range(count)]
 
-        # Optional 48-byte filename directory pointer stored right after the entry table
+        # Optional 48-byte filename directory pointer stored right after the entry table in CRI AFS
         meta_off = 0
         meta_size = 0
-        if 8 + (count + 1) * 8 <= len(data):
+        if data[:4] == b'AFS\x00' and 8 + (count + 1) * 8 <= len(data):
             meta_off, meta_size = struct.unpack_from('<II', data, 8 + count * 8)
 
         has_meta = (
@@ -103,23 +173,75 @@ class AfsArchiveDriver(BaseArchiveDriver):
         for i, (off, size) in enumerate(raw_pairs):
             if off == 0 and size == 0:
                 continue
+            if off + size > len(data):
+                continue
             name = ''
             if has_meta:
                 rec = data[meta_off + i * 48:meta_off + i * 48 + 32]
                 raw_name = rec.split(b'\x00', 1)[0].decode('ascii', 'replace').strip()
                 if raw_name and all(32 <= ord(c) < 127 for c in raw_name):
                     name = raw_name
-            hdr = data[off:off + 16]
+            chunk = data[off:off + min(size, 65536)]
+            ext, kind = _sniff_payload_ext_and_kind(chunk, fallback_name=name)
             if not name:
-                ext = '.bin'
-                if hdr[:4] == b'TIM2':
-                    ext = '.tm2'
-                elif hdr[:4] == b'VAGp':
-                    ext = '.vag'
-                elif hdr[:4] == b'AFS\x00':
-                    ext = '.afs'
                 name = f'file_{i:04d}{ext}'
-            self.entries.append(ArchiveEntry(name=name, offset=off, size=size, kind=_classify_asset_name(name, hdr)))
+            self.entries.append(ArchiveEntry(name=name, offset=off, size=size, kind=kind))
+
+
+class PacArchiveDriver(BaseArchiveDriver):
+    """
+    Generic PS2 .PAC headerless offset-table archive reader.
+    Layout:
+      - 0x00: uint32 entry_count (1..512)
+      - 0x04: entry_count * (uint32 offset, uint32 size)
+    """
+
+    format_name = 'PS2-PAC'
+
+    @classmethod
+    def _has_recognized_child(cls, data: bytes, count: int, depth: int = 0) -> bool:
+        for i in range(min(count, 32)):
+            off, size = struct.unpack_from('<II', data, 4 + i * 8)
+            if size < 12 or off + size > len(data):
+                continue
+            chunk = data[off:off + size]
+            magic = chunk[:4]
+            if magic in (b'TIM2', b'VAGp', b'FMOD', b'AFS\x00', b'MOMO', b'\x7fELF', b'MWo3'):
+                return True
+            if is_fmod_bytes(chunk):
+                return True
+            if depth < 2:
+                sub_ok, sub_cnt, sub_end = validate_pac_header(chunk[:4096])
+                if sub_ok and sub_end <= len(chunk) and (len(chunk) - sub_end) <= 2048:
+                    if cls._has_recognized_child(chunk, sub_cnt, depth + 1):
+                        return True
+        return False
+
+    @classmethod
+    def probe(cls, data: bytes, path: str = '') -> bool:
+        if len(data) < 20 or data[:4] in (b'TIM2', b'VAGp', b'FMOD', b'AFS\x00', b'MOMO', b'\x7fELF', b'MWo3'):
+            return False
+        if is_fmod_bytes(data):
+            return False
+        ok, count, max_end = validate_pac_header(data[:4096])
+        if not ok or max_end > len(data) or (len(data) - max_end) > 4096:
+            return False
+        return cls._has_recognized_child(data, count)
+
+    def __init__(self, path, data):
+        super().__init__(path, data)
+        ok, count, _max_end = validate_pac_header(data[:4096])
+        if not ok:
+            raise ValueError(f'{path}: not a valid PS2 .PAC archive')
+
+        for i in range(count):
+            off, size = struct.unpack_from('<II', data, 4 + i * 8)
+            if size == 0 or off + size > len(data):
+                continue
+            chunk = data[off:off + size]
+            ext, kind = _sniff_payload_ext_and_kind(chunk)
+            name = f'entry_{i:04d}{ext}'
+            self.entries.append(ArchiveEntry(name=name, offset=off, size=size, kind=kind))
 
 
 class SnowblindLmpDriver(BaseArchiveDriver):
@@ -277,6 +399,72 @@ class SnowblindLevelTexDriver(BaseArchiveDriver):
             pos += 12
 
 
+def _count_pac_signatures(pac_bytes: bytes, count: int, depth: int = 0) -> dict[str, int]:
+    """Recursively count FMOD (3D), TIM2 (texture), and VAGp (audio) chunks inside a .PAC buffer."""
+    counts = {'fmod': 0, 'tm2': 0, 'vag': 0}
+    for i in range(count):
+        offset, size = struct.unpack_from('<II', pac_bytes, 4 + i * 8)
+        if size < 12 or offset + size > len(pac_bytes):
+            continue
+        chunk = pac_bytes[offset:offset + size]
+        magic = chunk[:4]
+        if magic == b'TIM2':
+            counts['tm2'] += 1
+        elif magic == b'VAGp':
+            counts['vag'] += 1
+        elif magic == b'FMOD' or is_fmod_bytes(chunk):
+            counts['fmod'] += 1
+        elif depth < 2:
+            is_sub, sub_count, sub_end = validate_pac_header(chunk[:4096])
+            if is_sub and sub_end <= len(chunk):
+                sub = _count_pac_signatures(chunk, sub_count, depth + 1)
+                counts['fmod'] += sub['fmod']
+                counts['tm2'] += sub['tm2']
+                counts['vag'] += sub['vag']
+    return counts
+
+
+class SectorAlignedPacScannerDriver(BaseArchiveDriver):
+    """
+    Scans 2048-byte (0x800) DVD sector boundaries of a monolithic container for embedded
+    .PAC archives containing 3D models (.FMOD) and/or textures (.TIM2).
+    """
+
+    format_name = 'PS2-Sector-PAC-Scanner'
+
+    @classmethod
+    def probe(cls, data: bytes, path: str = '') -> bool:
+        if len(data) < SECTOR_SIZE * 4:
+            return False
+        total_sectors = len(data) // SECTOR_SIZE
+        sector = 0
+        while sector < min(total_sectors, 65536):
+            off = sector * SECTOR_SIZE
+            ok, count, byte_len = validate_pac_header(data[off:off + 4096])
+            if ok and byte_len <= 32 * 1024 * 1024 and off + byte_len <= len(data):
+                sigs = _count_pac_signatures(data[off:off + byte_len], count)
+                if sigs['fmod'] >= 1 or sigs['tm2'] >= 1 or sigs['vag'] >= 1:
+                    return True
+            sector += 1
+        return False
+
+    def __init__(self, path, data):
+        super().__init__(path, data)
+        total_sectors = len(data) // SECTOR_SIZE
+        sector = 0
+        while sector < total_sectors:
+            off = sector * SECTOR_SIZE
+            ok, count, byte_len = validate_pac_header(data[off:off + 4096])
+            if ok and byte_len <= 32 * 1024 * 1024 and off + byte_len <= len(data):
+                sigs = _count_pac_signatures(data[off:off + byte_len], count)
+                if sigs['fmod'] >= 1 or sigs['tm2'] >= 1 or sigs['vag'] >= 1:
+                    fname = f"pac_sec{sector:06d}_fmod{sigs['fmod']}_tm2{sigs['tm2']}.pac"
+                    self.entries.append(ArchiveEntry(name=fname, offset=off, size=byte_len, kind='archive:ps2_pac'))
+                    sector += max(1, (byte_len + SECTOR_SIZE - 1) // SECTOR_SIZE)
+                    continue
+            sector += 1
+
+
 class SignatureCarverDriver(BaseArchiveDriver):
     """
     Universal PS2 File Carver (--carve).
@@ -341,15 +529,25 @@ _DRIVERS = (
     SnowblindLmpDriver,
     SnowblindGobDriver,
     SnowblindLevelTexDriver,
+    PacArchiveDriver,
+    SectorAlignedPacScannerDriver,
 )
 
 
 def open_archive_bytes(data, path='', force_carve=False):
-    """Detect and open a 2nd-level PS2 archive from an in-memory buffer."""
+    """Detect and open a 2nd-level PS2 archive from an in-memory buffer (transparently unwrapping LZ16 if compressed)."""
     if not force_carve:
         for drv_cls in _DRIVERS:
             if drv_cls.probe(data, path):
                 return drv_cls(path, data)
+        if data[:4] not in (b'TIM2', b'VAGp', b'AFS\x00', b'MOMO', b'\x7fELF', b'MWo3') and 32 <= len(data) <= 16 * 1024 * 1024:
+            dec = decompress_capcom_lz16(data)
+            if dec is not None and len(dec) > len(data):
+                for drv_cls in _DRIVERS:
+                    if drv_cls.probe(dec, path):
+                        drv = drv_cls(path, dec)
+                        drv.format_name = f'{drv.format_name}+LZ16'
+                        return drv
     carver = SignatureCarverDriver(path, data)
     if carver.entries or force_carve:
         return carver
@@ -365,8 +563,8 @@ def open_archive(path, force_carve=False):
 
 def convert_asset_bytes(name, data):
     """
-    Attempt to convert a single PS2 asset buffer (.tex, .tm2, .16, .vag) into a standard PC
-    format (.png or .wav). Returns (new_filename, converted_bytes) or (None, None).
+    Attempt to convert a single PS2 asset buffer (.tex, .tm2, .16, .vag, .fmod, .vif) into a
+    standard PC format (.png, .wav, .obj). Returns (new_filename, converted_bytes) or (None, None).
     """
     stem, ext = os.path.splitext(name)
     low_ext = ext.lower()
@@ -379,6 +577,18 @@ def convert_asset_bytes(name, data):
         _sr, _ns, wav_bytes = decode_vag_to_wav_bytes(data)
         return f'{stem}.wav', wav_bytes
 
+    if is_fmod_bytes(data) or low_ext == '.fmod':
+        meshes = decode_fmod_to_meshes(data)
+        if meshes:
+            obj_txt = export_meshes_to_obj(meshes, header_comment=f'PS2 FMOD 3D Mesh ({name})')
+            return f'{stem}.obj', obj_txt.encode('utf-8')
+
+    if low_ext == '.vif':
+        meshes = decode_vif_to_meshes(data)
+        if meshes:
+            obj_txt = export_meshes_to_obj(meshes, header_comment=f'PS2 VIF/VU1 3D Mesh ({name})')
+            return f'{stem}.obj', obj_txt.encode('utf-8')
+
     if low_ext == '.tex':
         w, h, rgba = decode_snowblind_tex_to_rgba(data)
         return f'{stem}.png', encode_rgba_png(w, h, rgba)
@@ -387,26 +597,33 @@ def convert_asset_bytes(name, data):
         w, h, rgba = decode_raw16_to_rgba(data, 640, 448)
         return f'{stem}.png', encode_rgba_png(w, h, rgba)
 
-    if data[:4] not in (b'TIM2', b'VAGp', b'AFS\x00', b'\x7fELF', b'MWo3') and 32 <= len(data) <= 2 * 1024 * 1024:
+    if data[:4] not in (b'TIM2', b'VAGp', b'AFS\x00', b'MOMO', b'\x7fELF', b'MWo3') and 32 <= len(data) <= 4 * 1024 * 1024:
         dec = decompress_capcom_lz16(data)
         if dec is not None and len(dec) > len(data):
-            return f'{stem}.dec.bin', dec
+            dec_ext, _dec_kind = _sniff_payload_ext_and_kind(dec)
+            return f'{stem}.dec{dec_ext}', dec
 
     return None, None
 
 
-def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=False):
+def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=False, max_entries=None):
     """
     Extract a 2nd-level PS2 archive (or convert a standalone PS2 asset file) into out_dir.
+    When `convert=True`, converts textures (.tm2, .tex, .16 -> .png), audio (.vag -> .wav),
+    and 3D models (.fmod, .vif -> .obj + submesh parts), and writes `assets_catalog.json`.
     Returns a summary dict with counts of extracted and converted files.
     """
     os.makedirs(out_dir, exist_ok=True)
     with open(path, 'rb') as f:
         data = f.read()
 
-    # Check if the input file itself is a standalone convertible asset (.16, .tm2, .vag, or single .tex)
     base_name = os.path.basename(path)
-    if not force_carve and not any(d.probe(data, path) for d in _DRIVERS):
+    try:
+        arc = open_archive_bytes(data, path=path, force_carve=force_carve)
+    except ValueError:
+        arc = None
+
+    if arc is None:
         if convert:
             conv_name, conv_bytes = convert_asset_bytes(base_name, data)
             if conv_name and conv_bytes:
@@ -414,13 +631,106 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
                 with open(dst, 'wb') as out_f:
                     out_f.write(conv_bytes)
                 return {'format': 'Standalone-Asset', 'extracted': 0, 'converted': 1, 'files': [dst]}
-
-    arc = open_archive_bytes(data, path=path, force_carve=force_carve)
+        raise ValueError(f'{path}: unrecognized archive format (and no standard TIM2/VAG signatures found)')
     summary = {'format': arc.format_name, 'extracted': 0, 'converted': 0, 'files': []}
+    catalog = {
+        'source': os.path.basename(path),
+        'format': arc.format_name,
+        'textures': [],
+        'audio': [],
+        'meshes': [],
+    }
 
-    def _process_archive(driver, target_dir):
+    def _convert_and_record(rel_prefix: str, payload: bytes, target_dir: str) -> None:
+        stem, ext = os.path.splitext(rel_prefix)
+        low_ext = ext.lower()
+
+        # 1. TIM2 Texture -> .png
+        if payload[:4] == b'TIM2' or low_ext in ('.tm2', '.tim2'):
+            w, h, rgba = decode_tim2_to_rgba(payload)
+            png_bytes = encode_rgba_png(w, h, rgba)
+            png_path = os.path.join(target_dir, f'{stem}.png')
+            os.makedirs(os.path.dirname(png_path), exist_ok=True)
+            with open(png_path, 'wb') as cf:
+                cf.write(png_bytes)
+            summary['converted'] += 1
+            summary['files'].append(png_path)
+            catalog['textures'].append({
+                'id': stem,
+                'file': os.path.relpath(png_path, out_dir),
+                'width': w,
+                'height': h,
+            })
+            return
+
+        # 2. VAG Audio -> .wav
+        if payload[:4] == b'VAGp' or low_ext == '.vag':
+            sr, ns, wav_bytes = decode_vag_to_wav_bytes(payload)
+            wav_path = os.path.join(target_dir, f'{stem}.wav')
+            os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+            with open(wav_path, 'wb') as cf:
+                cf.write(wav_bytes)
+            summary['converted'] += 1
+            summary['files'].append(wav_path)
+            catalog['audio'].append({
+                'id': stem,
+                'file': os.path.relpath(wav_path, out_dir),
+                'sampleRate': sr,
+                'samples': ns,
+            })
+            return
+
+        # 3. FMOD 3D Model -> combined .obj + split _partXX.obj submeshes
+        if is_fmod_bytes(payload) or low_ext == '.fmod':
+            meshes = decode_fmod_to_meshes(payload)
+            if meshes:
+                full_obj_path = os.path.join(target_dir, f'{stem}.obj')
+                os.makedirs(os.path.dirname(full_obj_path), exist_ok=True)
+                with open(full_obj_path, 'w', encoding='utf-8') as cf:
+                    cf.write(export_meshes_to_obj(meshes, header_comment=f'PS2 FMOD 3D Mesh ({stem})'))
+                summary['converted'] += 1
+                summary['files'].append(full_obj_path)
+
+                if len(meshes) > 1:
+                    for sub in meshes:
+                        part_id = f'{stem}_part{sub.index:02d}'
+                        part_path = os.path.join(target_dir, f'{part_id}.obj')
+                        with open(part_path, 'w', encoding='utf-8') as pf:
+                            pf.write(export_mesh_to_obj(sub, header_comment=f'PS2 FMOD SubMesh {sub.index} ({stem})'))
+                        summary['converted'] += 1
+                        summary['files'].append(part_path)
+                        catalog['meshes'].append({
+                            'id': part_id,
+                            'file': os.path.relpath(part_path, out_dir),
+                            'vertexCount': len(sub.vertices),
+                            'triangleCount': len(sub.faces),
+                            'bounds': sub.compute_bounds(),
+                        })
+                else:
+                    sub = meshes[0]
+                    catalog['meshes'].append({
+                        'id': stem,
+                        'file': os.path.relpath(full_obj_path, out_dir),
+                        'vertexCount': len(sub.vertices),
+                        'triangleCount': len(sub.faces),
+                        'bounds': sub.compute_bounds(),
+                    })
+            return
+
+        # 4. Other convertible assets (.tex, .16, .vif)
+        conv_name, conv_bytes = convert_asset_bytes(rel_prefix, payload)
+        if conv_name and conv_bytes and not conv_name.endswith(('.dec.bin', '.dec.pac', '.dec.afs', '.dec.fmod', '.dec.tm2')):
+            conv_path = os.path.join(target_dir, conv_name)
+            os.makedirs(os.path.dirname(conv_path), exist_ok=True)
+            with open(conv_path, 'wb') as cf:
+                cf.write(conv_bytes)
+            summary['converted'] += 1
+            summary['files'].append(conv_path)
+
+    def _process_archive(driver, target_dir, limit=None):
         os.makedirs(target_dir, exist_ok=True)
-        for entry in driver.entries:
+        entries = driver.entries[:limit] if limit is not None else driver.entries
+        for entry in entries:
             safe_rel = entry.name.replace('\\', '/').lstrip('/')
             raw_bytes = driver.read_entry(entry)
             dst_path = os.path.join(target_dir, safe_rel)
@@ -430,26 +740,45 @@ def extract_archive(path, out_dir, convert=False, recursive=False, force_carve=F
             summary['extracted'] += 1
             summary['files'].append(dst_path)
 
-            if recursive and entry.kind.startswith('archive:'):
-                sub_dir = os.path.join(target_dir, os.path.splitext(safe_rel)[0] + '_unpacked')
+            # Check if the entry is Capcom LZ16-compressed
+            active_bytes = raw_bytes
+            active_rel = safe_rel
+            active_kind = entry.kind
+            if (convert or recursive) and raw_bytes[:4] not in (b'TIM2', b'VAGp', b'AFS\x00', b'MOMO', b'\x7fELF', b'MWo3') and 32 <= len(raw_bytes) <= 4 * 1024 * 1024:
+                dec = decompress_capcom_lz16(raw_bytes)
+                if dec is not None and len(dec) > len(raw_bytes):
+                    dec_ext, dec_kind = _sniff_payload_ext_and_kind(dec)
+                    stem = os.path.splitext(safe_rel)[0]
+                    active_rel = f'{stem}.dec{dec_ext}'
+                    active_bytes = dec
+                    active_kind = dec_kind
+                    dec_path = os.path.join(target_dir, active_rel)
+                    with open(dec_path, 'wb') as df:
+                        df.write(dec)
+                    summary['converted'] += 1
+                    summary['files'].append(dec_path)
+
+            if recursive and active_kind.startswith('archive:'):
+                sub_dir = os.path.join(target_dir, os.path.splitext(active_rel)[0] + '_unpacked')
                 try:
-                    sub_drv = open_archive_bytes(raw_bytes, path=entry.name)
-                    _process_archive(sub_drv, sub_dir)
+                    sub_drv = open_archive_bytes(active_bytes, path=active_rel)
+                    _process_archive(sub_drv, sub_dir, limit=None)
                 except ValueError:
                     pass
 
             if convert:
                 try:
-                    conv_name, conv_bytes = convert_asset_bytes(safe_rel, raw_bytes)
-                    if conv_name and conv_bytes:
-                        conv_path = os.path.join(target_dir, conv_name)
-                        os.makedirs(os.path.dirname(conv_path), exist_ok=True)
-                        with open(conv_path, 'wb') as cf:
-                            cf.write(conv_bytes)
-                        summary['converted'] += 1
-                        summary['files'].append(conv_path)
+                    _convert_and_record(active_rel, active_bytes, target_dir)
                 except Exception:
                     pass
 
-    _process_archive(arc, out_dir)
+    _process_archive(arc, out_dir, limit=max_entries)
+
+    if convert and (catalog['textures'] or catalog['audio'] or catalog['meshes']):
+        catalog_path = os.path.join(out_dir, 'assets_catalog.json')
+        with open(catalog_path, 'w', encoding='utf-8') as jf:
+            json.dump(catalog, jf, indent=2)
+            jf.write('\n')
+        summary['catalog'] = catalog_path
+
     return summary

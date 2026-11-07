@@ -377,7 +377,7 @@ def package_game(binary_path, iso_or_disc_dir, output_dir, elf_path=None, keys_p
         f.write('cd "$DIR"\n')
         f.write('mkdir -p "$DIR/saves"\n')
         f.write('export PS2_KEYS="${PS2_KEYS:-$DIR/keys.ini}"\n')
-        f.write('EXTRA_ARGS=(--widescreen)\n')
+        f.write('EXTRA_ARGS=()\n')
         f.write('if [[ " $* " != *" --frames "* && " $* " != *" --window "* && " $* " != *" --fullscreen "* ]]; then\n')
         f.write('  EXTRA_ARGS+=(--window)\n')
         f.write('fi\n')
@@ -461,7 +461,7 @@ def port_standalone(
     presses=None,
     pnach_files=None,
     pnach_sections=None,
-    widescreen=True,
+    widescreen=False,
     link_assets=True,
     keys_path=None,
     memcard_path=None,
@@ -754,7 +754,7 @@ def main(argv=None):
     p_prt.add_argument('--press', action='append', default=None, help='Input press F:BUTTON for exploring runs (repeatable)')
     p_prt.add_argument('--pnach', action='append', default=None, help='Apply PCSX2 .pnach patch file (repeatable)')
     p_prt.add_argument('--pnach-section', action='append', default=None, help='Enable section [S] in .pnach files')
-    p_prt.add_argument('--no-widescreen', action='store_true', help='Disable default 16:9 widescreen flag')
+    p_prt.add_argument('--widescreen', action='store_true', help='Enable 16:9 widescreen flag during exploration runs')
     p_prt.add_argument('--copy-assets', action='store_true', help='Copy extracted disc files into dist/<name>/data instead of symlinking')
     p_prt.add_argument('--keys', default=None, help='Optional keys.ini file to bundle')
     p_prt.add_argument('--memcard', default=None, help='Optional existing .ps2 memory card file to bundle')
@@ -764,13 +764,18 @@ def main(argv=None):
     p_uls.add_argument('--carve', action='store_true', help='Force universal signature carver (TIM2/VAGp)')
     p_uls.add_argument('--max-entries', type=int, default=None, help='Maximum number of entries to display')
 
-    p_uex = sub.add_parser('unpack-extract', help='Extract and optionally convert assets (.png, .wav, .obj + assets_catalog.json) from a PS2 archive')
-    p_uex.add_argument('archive', help='Path to 2nd-level archive file (.AFS, .PAC, .LMP, .GOB, .TEX, DATA.BIN) or standalone asset (.fmod, .vif, .tex, .tm2, .vag, .16)')
+    p_uex = sub.add_parser('unpack-extract', help='Extract and optionally convert assets (.png, .wav, .mp4, .obj + assets_catalog.json) from a PS2 archive')
+    p_uex.add_argument('archive', help='Path to 2nd-level archive file (.AFS, .PAC, .MOMO, .LMP, .GOB, .TEX, DATA.BIN) or standalone asset (.fmod, .vif, .tex, .tm2, .vag, .adx, .sfd, .pss, .16)')
     p_uex.add_argument('out_dir', help='Output directory for extracted/converted files')
-    p_uex.add_argument('--convert', action='store_true', help='Convert PS2 textures (.tex, .tm2, .16) to .png, audio (.vag) to .wav, and 3D models (.fmod, .vif) to .obj + assets_catalog.json')
-    p_uex.add_argument('--recursive', action='store_true', help='Recursively unpack nested archives (e.g. .PAC / .AFS / .LMP inside containers)')
+    p_uex.add_argument('--convert', action='store_true', help='Convert PS2 textures (.tex, .tm2, .16) to .png, audio (.vag, .adx, .ads, .bd) to .wav, videos (.sfd, .pss) to .mp4, and 3D models (.fmod, .vif) to .obj + assets_catalog.json')
+    p_uex.add_argument('--recursive', action='store_true', help='Recursively unpack nested archives (e.g. .PAC / .AFS / .MOMO / .LMP inside containers)')
     p_uex.add_argument('--carve', action='store_true', help='Force universal signature carver (TIM2/VAGp) for unknown containers')
     p_uex.add_argument('--max-entries', type=int, default=None, help='Maximum number of top-level entries to extract')
+
+    p_syn = sub.add_parser('sync', help='Incrementally repack modified PC assets (.obj, .wav, .mp4, 1x .png) in games/<game>/assets_unpacked/ back into games/<game>/disc_files/layer0/')
+    p_syn.add_argument('--game', required=True, help='Game identifier under games/<game>')
+    p_syn.add_argument('--workers', type=int, default=None, help='Number of parallel worker processes (default: CPU core count)')
+    p_syn.add_argument('--force', action='store_true', help='Force re-conversion of all tracked assets even if timestamps are unchanged')
 
     args = parser.parse_args(argv)
     if args.cmd == 'inspect':
@@ -808,7 +813,7 @@ def main(argv=None):
             presses=args.press,
             pnach_files=args.pnach,
             pnach_sections=args.pnach_section,
-            widescreen=not args.no_widescreen,
+            widescreen=args.widescreen,
             link_assets=not args.copy_assets,
             keys_path=args.keys,
             memcard_path=args.memcard,
@@ -824,8 +829,17 @@ def main(argv=None):
             force_carve=args.carve,
             max_entries=args.max_entries,
         )
+    elif args.cmd == 'sync':
+        from .repacker import sync_game_assets
+        repo_root = Path(__file__).resolve().parents[2]
+        rep = sync_game_assets(repo_root, args.game, workers=args.workers, force=args.force)
+        print(
+            f"[ps2-sync] game={rep['game']}: {rep['total_modified']} modified asset(s) "
+            f"synced across {len(rep['synced_dirs'])} unpacked folder(s) in {rep['elapsed_ms']:.1f} ms"
+        )
 
 
 if __name__ == '__main__':
     main()
+
 

@@ -1,6 +1,10 @@
 """
 Standalone ISO 9660 (ECMA-119) single/dual-layer filesystem parser and PS2 SYSTEM.CNF analyzer.
 Zero dependency on scripts/disc.py.
+
+Format provenance:
+- ISO 9660 Primary Volume Descriptor (sector 16) and 33-byte directory records: public ECMA-119 standard.
+- PlayStation 2 SYSTEM.CNF boot configuration: plain-text key=value format ('BOOT2 = cdrom0:\\...').
 """
 
 from dataclasses import dataclass

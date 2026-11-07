@@ -16,6 +16,8 @@
 __pycache__/
 
 /third_party/wgpu-native/
+/third_party/wgpu-native-win/
+/third_party/llvm-mingw/
 /third_party/sdl2/
 /third_party/dxc/
 

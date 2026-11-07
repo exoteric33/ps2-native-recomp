@@ -24,6 +24,7 @@ import time
 
 if __package__ in (None, ''):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from ps2_disc_toolkit.bundler import build_single_file_bundle, bundle_game_targets
     from ps2_disc_toolkit.containers import open_container, SECTOR_SIZE
     from ps2_disc_toolkit.iso9660 import IsoFileSystem, FileEntry, is_inside_directory, parse_system_cnf
     from ps2_disc_toolkit.profiles import (
@@ -32,7 +33,9 @@ if __package__ in (None, ''):
         collect_non_file_gaps,
         scan_non_zero_runs,
     )
+    from ps2_disc_toolkit.repacker import sync_game_assets, sync_unpacked_directory
 else:
+    from .bundler import build_single_file_bundle, bundle_game_targets
     from .containers import open_container, SECTOR_SIZE
     from .iso9660 import IsoFileSystem, FileEntry, is_inside_directory, parse_system_cnf
     from .profiles import (
@@ -41,6 +44,8 @@ else:
         collect_non_file_gaps,
         scan_non_zero_runs,
     )
+    from .repacker import sync_game_assets, sync_unpacked_directory
+
 
 
 def resolve_profile(profile_arg, syscnf, files):
@@ -764,18 +769,33 @@ def main(argv=None):
     p_uls.add_argument('--carve', action='store_true', help='Force universal signature carver (TIM2/VAGp)')
     p_uls.add_argument('--max-entries', type=int, default=None, help='Maximum number of entries to display')
 
-    p_uex = sub.add_parser('unpack-extract', help='Extract and optionally convert assets (.png, .wav, .mp4, .obj + assets_catalog.json) from a PS2 archive')
-    p_uex.add_argument('archive', help='Path to 2nd-level archive file (.AFS, .PAC, .MOMO, .LMP, .GOB, .TEX, DATA.BIN) or standalone asset (.fmod, .vif, .tex, .tm2, .vag, .adx, .sfd, .pss, .16)')
+    p_uex = sub.add_parser('unpack-extract', help='Extract and optionally convert assets (.png, .wav, .obj + assets_catalog.json) from a PS2 archive')
+    p_uex.add_argument('archive', help='Path to 2nd-level archive file (.AFS, .PAC, .LMP, .GOB, .TEX, DATA.BIN) or standalone asset (.fmod, .vif, .tex, .tm2, .vag, .16)')
     p_uex.add_argument('out_dir', help='Output directory for extracted/converted files')
-    p_uex.add_argument('--convert', action='store_true', help='Convert PS2 textures (.tex, .tm2, .16) to .png, audio (.vag, .adx, .ads, .bd) to .wav, videos (.sfd, .pss) to .mp4, and 3D models (.fmod, .vif) to .obj + assets_catalog.json')
-    p_uex.add_argument('--recursive', action='store_true', help='Recursively unpack nested archives (e.g. .PAC / .AFS / .MOMO / .LMP inside containers)')
+    p_uex.add_argument('--convert', action='store_true', help='Convert PS2 textures (.tex, .tm2, .16) to .png, audio (.vag) to .wav, and 3D models (.fmod, .vif) to .obj + assets_catalog.json')
+    p_uex.add_argument('--recursive', action='store_true', help='Recursively unpack nested archives (e.g. .PAC / .AFS / .LMP inside containers)')
     p_uex.add_argument('--carve', action='store_true', help='Force universal signature carver (TIM2/VAGp) for unknown containers')
     p_uex.add_argument('--max-entries', type=int, default=None, help='Maximum number of top-level entries to extract')
 
-    p_syn = sub.add_parser('sync', help='Incrementally repack modified PC assets (.obj, .wav, .mp4, 1x .png) in games/<game>/assets_unpacked/ back into games/<game>/disc_files/layer0/')
-    p_syn.add_argument('--game', required=True, help='Game identifier under games/<game>')
-    p_syn.add_argument('--workers', type=int, default=None, help='Number of parallel worker processes (default: CPU core count)')
-    p_syn.add_argument('--force', action='store_true', help='Force re-conversion of all tracked assets even if timestamps are unchanged')
+    p_sync = sub.add_parser('sync', help='Incrementally repack modified PC assets (.obj, .wav, .mp4, 1x .png) from assets_unpacked/ back into disc_files/')
+    p_sync.add_argument('--game', default=None, help='Short game name (e.g. mhdos, norrath) to sync all unpacked directories under games/<game>/assets_unpacked/')
+    p_sync.add_argument('--dir', default=None, help='Explicit unpacked directory path to sync')
+    p_sync.add_argument('--archive', default=None, help='Explicit target PS2 archive path in disc_files/layer0/ when using --dir')
+    p_sync.add_argument('--workers', type=int, default=None, help='Maximum parallel worker processes (default: CPU count)')
+    p_sync.add_argument('--force', action='store_true', help='Force re-conversion of all tracked assets regardless of mtime')
+
+    p_bnd = sub.add_parser('bundle', help='Build a self-contained Single-File Executable (PS2PACK1) for Linux, Windows, or both')
+    p_bnd.add_argument('--game', default=None, help='Short game name (e.g. mhdos, norrath) to auto-resolve disc_files, translations, and per-OS binaries/caches')
+    p_bnd.add_argument('--os', default='auto', choices=['auto', 'linux', 'windows', 'all'], help='Target OS when using --game (linux, windows, or all)')
+    p_bnd.add_argument('--binary', default=None, help='Explicit path to compiled ps2run or ps2run.exe binary')
+    p_bnd.add_argument('--disc', default=None, help='Path to extracted virtual disc folder (default: games/<game>/disc_files)')
+    p_bnd.add_argument('--out', default=None, help='Output single-file executable path or prefix (e.g. dist/MonsterHunter2)')
+    p_bnd.add_argument('--elf', default=None, help='Optional guest boot ELF path (auto-detected from disc_info.json if omitted)')
+    p_bnd.add_argument('--translations', default=None, help='Optional translations folder containing *.json dictionaries')
+    p_bnd.add_argument('--ee-live', default=None, help='Optional ee-live folder containing pre-compiled overlay libraries')
+    p_bnd.add_argument('--vu1-live', default=None, help='Optional vu1-live folder containing pre-compiled VU1 libraries')
+    p_bnd.add_argument('--game-id', default=None, help='Optional short game identifier (default: --game or disc_id from disc_info.json)')
+    p_bnd.add_argument('--no-sync', action='store_true', help='Skip automatic incremental repack of modified assets_unpacked/ files before bundling')
 
     args = parser.parse_args(argv)
     if args.cmd == 'inspect':
@@ -830,12 +850,42 @@ def main(argv=None):
             max_entries=args.max_entries,
         )
     elif args.cmd == 'sync':
-        from .repacker import sync_game_assets
-        repo_root = Path(__file__).resolve().parents[2]
-        rep = sync_game_assets(repo_root, args.game, workers=args.workers, force=args.force)
-        print(
-            f"[ps2-sync] game={rep['game']}: {rep['total_modified']} modified asset(s) "
-            f"synced across {len(rep['synced_dirs'])} unpacked folder(s) in {rep['elapsed_ms']:.1f} ms"
+        from pathlib import Path
+        repo_root = Path(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        if args.dir:
+            src_arc = Path(args.archive) if args.archive else None
+            rep = sync_unpacked_directory(Path(args.dir), source_archive=src_arc, workers=args.workers, force=args.force)
+            print(f"[ps2-sync] {rep['dir']}: {rep['modified']} modified file(s) synced in {rep['elapsed_ms']:.1f} ms")
+        elif args.game:
+            rep = sync_game_assets(repo_root, args.game, workers=args.workers, force=args.force)
+            print(
+                f"[ps2-sync] game={args.game}: {rep['total_modified']} modified asset(s) synced across "
+                f"{len(rep['synced_dirs'])} unpacked folder(s) in {rep['elapsed_ms']:.1f} ms"
+            )
+        else:
+            sys.exit("Error: specify either --game <name> or --dir <unpacked_dir>")
+    elif args.cmd == 'bundle':
+        from pathlib import Path
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if args.game and not args.no_sync:
+            rep = sync_game_assets(Path(repo_root), args.game)
+            if rep['total_modified'] > 0:
+                print(
+                    f"[ps2-bundle] auto-synced {rep['total_modified']} modified asset(s) from assets_unpacked/ "
+                    f"into disc_files/ in {rep['elapsed_ms']:.1f} ms"
+                )
+        bundle_game_targets(
+            repo_root=repo_root,
+            game_name=args.game,
+            target_os=args.os,
+            binary_path=args.binary,
+            disc_dir=args.disc,
+            output_path=args.out,
+            elf_path=args.elf,
+            translations_dir=args.translations,
+            ee_live_dir=args.ee_live,
+            vu1_live_dir=args.vu1_live,
+            game_id=args.game_id,
         )
 
 

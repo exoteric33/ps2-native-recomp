@@ -16,6 +16,7 @@ void frame_tick() {}
 #include "live_build.hpp"
 
 #include "eerecomp_gen.hpp"
+#include "ps2/disc_bundle.hpp"
 #include "ps2/ee_live_abi.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
@@ -219,6 +220,11 @@ bool is_cache_library(const fs::path &p, std::string &prefix) {
 }
 
 std::vector<std::uint8_t> read_file(const fs::path &p) {
+    if (ps2::os::utf8(p) == ps2::disc::kBundleSentinel) {
+        std::vector<std::uint8_t> out;
+        ps2::disc::read_bundle_asset("boot.elf", out);
+        return out;
+    }
     std::ifstream in(p, std::ios::binary);
     return std::vector<std::uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
@@ -968,7 +974,7 @@ void start(std::span<const std::uint8_t> program, const std::string &cache, cons
             } else if (e.is_regular_file() && is_cache_library(e.path(), prefix)) {
                 if (prefix == mine) libraries.push_back(e.path());
                 else fs::remove(e.path(), error);
-            } else if (e.is_directory() && ps2::os::utf8(e.path().filename()).rfind("work-", 0) == 0) {
+            } else if (!g->keep_work && e.is_directory() && ps2::os::utf8(e.path().filename()).rfind("work-", 0) == 0) {
                 fs::remove_all(e.path(), error);  // a build the last run did not finish
             }
         }

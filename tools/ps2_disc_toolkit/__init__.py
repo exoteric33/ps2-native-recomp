@@ -1,9 +1,10 @@
 """
-Independent, multi-format PS2 Disc Extraction & Virtual Disc Packaging Toolkit.
+Independent, multi-format PS2 Disc Extraction, Bidirectional Modding & Packaging Toolkit.
 Supports ISO-2048 (DVD-5 / DVD-9), BIN/CUE-2352 (CD-ROM Mode 1 / Mode 2 XA),
 CSO (CISO zlib compressed images), and CHD v5 (MAME Compressed Hunks of Data:
-zlib, lzma, zstd, cdzl, cdlz, cdzs), plus configurable engine profiles and
-hidden-LBA unindexed region extraction.
+zlib, lzma, zstd, cdzl, cdlz, cdzs), plus configurable engine profiles,
+hidden-LBA unindexed region extraction, 3D/Texture/Audio/Video conversion,
+and multi-core incremental asset repacking.
 """
 
 from .containers import (  # noqa: F401
@@ -45,6 +46,7 @@ from .ps2_audio import (  # noqa: F401
     is_adx_bytes,
     is_spu2_bd_bank,
     is_sshd_bytes,
+    is_vag_bytes,
     split_spu2_bd_bank_to_vag,
 )
 from .ps2_video import (  # noqa: F401
@@ -69,4 +71,4 @@ from .repacker import (  # noqa: F401
     sync_game_assets,
     sync_unpacked_directory,
 )
-
+from .bundler import build_single_file_bundle  # noqa: F401

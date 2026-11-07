@@ -1,4 +1,5 @@
 #include "ps2/disc.hpp"
+#include "ps2/disc_bundle.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
 #include "disc_folder.hpp"
@@ -98,7 +99,7 @@ void self_check();
 }
 
 bool open(const std::string &path) {
-    if (open_folder(path)) {
+    if ((path == kBundleSentinel && open_bundle(path)) || open_folder(path) || open_bundle(path)) {
         if (g_file) {
             std::fclose(g_file);
             g_file = nullptr;

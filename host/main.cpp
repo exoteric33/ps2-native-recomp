@@ -1,4 +1,5 @@
 #include "ps2/disc.hpp"
+#include "ps2/disc_bundle.hpp"
 #include "ps2/os.hpp"
 #include "ps2/system.hpp"
 #include "ps2/ee_live.hpp"
@@ -780,10 +781,25 @@ int main(int argc, char **argv) {
         argv = utf8_argv.data();
     }
 #endif
-    if (argc < 2) return usage();
-    const bool from_disc = argv[1][0] == '-';
-    std::string program = from_disc ? std::string() : argv[1];
+    ps2::disc::SelfBundleInfo bundle_info;
+    const bool use_self_bundle = (argc < 2 || std::string_view(argv[1]).rfind("--", 0) == 0) &&
+                                 ps2::disc::detect_self_bundle(&bundle_info);
+    if (!use_self_bundle && argc < 2) return usage();
+    const bool from_disc = !use_self_bundle && argv[1][0] == '-';
+    std::string program = use_self_bundle ? std::string(ps2::disc::kBundleSentinel)
+                        : from_disc       ? std::string()
+                                          : std::string(argv[1]);
     std::vector<std::uint8_t> disc_elf;
+    if (use_self_bundle) {
+        ps2::g_options.program_path = bundle_info.exe_path;
+        ps2::g_options.disc_path = ps2::disc::kBundleSentinel;
+        ps2::g_options.widescreen = true;
+        const std::string saves_dir = ps2::disc::bundle_writable_data_dir();
+        if (!saves_dir.empty()) {
+            ps2::g_options.memcard_path = saves_dir + "/memcard.ps2";
+            ps2::g_options.quick_dir = saves_dir;
+        }
+    }
 #ifdef PS2_WINDOW
     // The log copy starts before anything else that can fail (the arguments, the window, the translation set-up, the disc), so
     // whatever ends the run later leaves a log file behind: the app points a player at it ("Logs are not being created", public
@@ -791,19 +807,24 @@ int main(int argc, char **argv) {
     {
         // PS2_LOG_COPY=1 (a test aid): a headless run keeps the log copy too, so the log file can be tested without a window
         bool window_run = ps2::os::env("PS2_LOG_COPY") == "1";
+        bool has_max_frames = false;
         std::string early_disc, early_game_dir;
-        for (int i = from_disc ? 1 : 2; i < argc; ++i) {
+        for (int i = (use_self_bundle || from_disc) ? 1 : 2; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--window" || a == "--fullscreen") window_run = true;
+            else if (a == "--frames" && i + 1 < argc) { has_max_frames = true; ++i; }
             else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
             else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
             else if (a == "--disc" && i + 1 < argc) early_disc = argv[++i];
             else if (a == "--game-dir" && i + 1 < argc) early_game_dir = argv[++i];
         }
-        if (!from_disc) ps2::g_options.program_path = argv[1];
-        // The log goes where the quick saves go (the memory card's folder, else the game folder), so the game folder must be known
-        // by now, as it is later. An image-only start has no program path yet: its folder stands in for it, as below.
-        ps2::g_options.game_dir = ps2::os::utf8(find_game_dir(from_disc ? early_disc : argv[1], early_disc, early_game_dir).lexically_normal());
+        if (use_self_bundle && !has_max_frames) window_run = true;
+        if (!use_self_bundle) {
+            if (!from_disc) ps2::g_options.program_path = argv[1];
+            // The log goes where the quick saves go (the memory card's folder, else the game folder), so the game folder must be known
+            // by now, as it is later. An image-only start has no program path yet: its folder stands in for it, as below.
+            ps2::g_options.game_dir = ps2::os::utf8(find_game_dir(from_disc ? early_disc : argv[1], early_disc, early_game_dir).lexically_normal());
+        }
         // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
         if (window_run && ps2::os::env("PS2_NO_LOG_COPY").empty() && g_log.start(ps2::os::path(ps2::quick_folder("logs")))) {
             ps2::g_options.recent_log = [](std::size_t lines) { return g_log.tail(lines); };
@@ -824,7 +845,7 @@ int main(int argc, char **argv) {
 #else
     std::atexit([] { ps2::flush_memory_card(); });
 #endif
-    std::vector<std::string> args{argv[1]};
+    std::vector<std::string> args{use_self_bundle ? bundle_info.boot_elf_arg : (from_disc ? std::string() : std::string(argv[1]))};
     [[maybe_unused]] bool window = false, fullscreen = false;
     std::string load_path, given_game_dir;
     bool no_record = false;
@@ -833,7 +854,7 @@ int main(int argc, char **argv) {
         const std::string a = argv[i];
         ps2::g_options.command_line += (i ? " " : "") + (a.find_first_of(" \t") == std::string::npos ? a : "\"" + a + "\"");
     }
-    for (int i = from_disc ? 1 : 2; i < argc; ++i) {
+    for (int i = (use_self_bundle || from_disc) ? 1 : 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) ps2::g_options.max_frames = std::strtoull(argv[++i], nullptr, 10);
@@ -892,12 +913,15 @@ int main(int argc, char **argv) {
         else if (a == "--quick-dir" && i + 1 < argc) ps2::g_options.quick_dir = argv[++i];
         else return usage();
     }
+#ifdef PS2_WINDOW
+    if (use_self_bundle && !window && ps2::g_options.max_frames == 0) window = true;
+#endif
     std::sort(ps2::g_options.frame_capture_frames.begin(), ps2::g_options.frame_capture_frames.end());
     ps2::g_options.frame_capture_frames.erase(
         std::unique(ps2::g_options.frame_capture_frames.begin(), ps2::g_options.frame_capture_frames.end()),
         ps2::g_options.frame_capture_frames.end());
 
-    std::string program_location = program;
+    std::string program_location = use_self_bundle ? bundle_info.exe_path : program;
     if (from_disc) {
         if (ps2::g_options.disc_path.empty()) return usage();
         if (!ps2::disc::open(ps2::g_options.disc_path)) {
@@ -931,7 +955,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "[game] not a directory: %s\n", given_game_dir.c_str());
             return 1;
         }
-    } else {
+    } else if (!use_self_bundle) {
         game_dir = find_game_dir(program_location, ps2::g_options.disc_path, {});
     }
     game_dir = game_dir.lexically_normal();
@@ -944,7 +968,7 @@ int main(int argc, char **argv) {
     // docs/vu0-native.md). Without that, a game is slow wherever the exploring runs did not go: unknown programs run in the
     // interpreter. A PS2_VU_RECORD or PS2_VU0_RECORD the user set wins, each on its own. This runs before anything reads the
     // variables (the vector unit code reads them on its first program, long after main).
-    if (window) {
+    if (window && !use_self_bundle) {
         for (int unit : {1, 0}) {
             const char *setting = unit ? "PS2_VU_RECORD" : "PS2_VU0_RECORD";
             if (!ps2::os::env(setting).empty()) continue;
@@ -964,10 +988,11 @@ int main(int argc, char **argv) {
     // The libraries go next to the game: the game folder that port.sh made (the one with the vu1 folder), else the program's own folder.
     {
         const std::string setting = ps2::os::env("PS2_VU_LIVE");
-        if (setting != "0" && setting != "off" && (window || !setting.empty())) {
+        if (setting != "0" && setting != "off" && (window || !setting.empty() || use_self_bundle)) {
             std::string cache = setting == "1" || setting == "on" ? std::string() : setting;
-            if (cache.empty()) cache = ps2::os::utf8(data_dir / "vu1-live");
-            ps2::vu::live::start(cache);
+            if (cache.empty() && use_self_bundle) cache = ps2::disc::ensure_bundle_live_cache("vu1-live");
+            if (cache.empty() && !use_self_bundle) cache = ps2::os::utf8(data_dir / "vu1-live");
+            if (!cache.empty()) ps2::vu::live::start(cache);
         }
     }
     register_generated_code();
@@ -978,10 +1003,20 @@ int main(int argc, char **argv) {
     // The libraries go next to the game like the vector programs'; entries.txt and overlays\ of the game folder get what was found.
     {
         const std::string setting = ps2::os::env("PS2_EE_LIVE");
-        if (setting != "0" && setting != "off" && (window || !setting.empty())) {
-            const std::string cache = setting.empty() || setting == "1" || setting == "on" ? ps2::os::utf8(data_dir / "ee-live") : setting;
-            if (from_disc) ps2::ee::live::start(disc_elf, cache, ps2::os::utf8(game_dir));
-            else ps2::ee::live::start(program_location, cache, ps2::os::utf8(game_dir));
+        if (setting != "0" && setting != "off" && (window || !setting.empty() || use_self_bundle)) {
+            std::string cache = setting == "1" || setting == "on" ? std::string() : setting;
+            if (cache.empty() && use_self_bundle) {
+                cache = ps2::disc::ensure_bundle_live_cache("ee-live");
+                if (cache.empty() && window) {
+                    const std::string saves_dir = ps2::disc::bundle_writable_data_dir();
+                    if (!saves_dir.empty()) cache = saves_dir + "/ee-live";
+                }
+            }
+            if (cache.empty() && !use_self_bundle) cache = ps2::os::utf8(data_dir / "ee-live");
+            if (!cache.empty()) {
+                if (from_disc) ps2::ee::live::start(disc_elf, cache, ps2::os::utf8(game_dir));
+                else ps2::ee::live::start(program, cache, ps2::os::utf8(game_dir));
+            }
         }
     }
     const auto emulate = [&]() -> int {

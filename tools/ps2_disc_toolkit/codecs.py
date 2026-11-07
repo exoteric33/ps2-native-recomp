@@ -1,10 +1,11 @@
 """
 Generic PS2 Binary Codecs & Executable Overlay Parsers.
 
-Supported formats:
-  1. Capcom 16-bit word-aligned LZ16 compression (decompress_capcom_lz16 / compress_capcom_lz16)
-     Used in Monster Hunter, Monster Hunter G, Monster Hunter 2 (dos), Resident Evil Outbreak, etc.
-  2. Metrowerks CodeWarrior PS2 'MWo3' Overlay Header parser (parse_mwo3_header)
+Supported formats & provenance:
+  1. Capcom 16-bit word-aligned LZ16 compression (decompress_capcom_lz16 / compress_capcom_lz16):
+     Clean-room reverse-engineering of the MIPS R5900 decompression routine in Monster Hunter 2 (dos) (SLPM_662.80).
+  2. Metrowerks CodeWarrior PS2 'MWo3' Overlay Header parser (parse_mwo3_header):
+     Clean-room reverse-engineering of the 32-byte 'MWo3' (0x4D576F33) header and overlay table in SLPM_662.80.
 """
 
 from __future__ import annotations

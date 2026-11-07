@@ -1,8 +1,8 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 37 games work as far as they
-have been tested, 24 of them out of the box, with zero game-specific code. God of War II has been played from start to
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 38 games work as far as they
+have been tested, 25 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
 **How it works, from the disc to the picture: [read the explanation](#how-it-works).**
@@ -11,9 +11,9 @@ Built on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nu
 
 https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
 
-**24 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
+**25 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
 Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
-Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe, Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima and Robot Alchemic Drive. *Out of the box* means nobody changed anything for these games: the
+Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe, Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima, Robot Alchemic Drive and Altered Beast. *Out of the box* means nobody changed anything for these games: the
 tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)). Gran Turismo 4 needs one small build step that
 unpacks its program; the runtime has no code for it.
 
@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 36
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 37
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -127,10 +127,11 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | College Basketball 2K5 | plays, not played through yet: no glitches except one small sound stutter | a tester, by mail |
 | Metal Gear Solid 3: Snake Eater (USA) | plays, not played through yet: from power-on through the title, New Game and the opening film, with sound, into the first scene you control in the jungle (played on my development build; the public code was run as far as the cargo hold). The first time you reach a new part the game freezes while its code is translated, from a few seconds to almost a minute; it does not freeze there again | me |
 | Castlevania: Lament of Innocence (USA) | plays well, not played through yet: exploring the castle and fights at about 60 fps, and saves from a PCSX2 memory card load; some banding in the textures, less with soft texture filtering (SteamOS on a ROG Ally X; [#60](https://github.com/exoteric33/ps2-native-recomp/issues/60)) | Kush Peshin |
-| Auto Modellista (USA) | plays well, not played through yet: the start, the film, the menus and an arcade race, smooth even with many cars | a tester, by mail |
-| Viewtiful Joe (Europe) | runs, not played through yet: the start, the film and the menus | a tester, by mail |
-| Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima (Japan) | plays well, not played through yet: no bugs found | a tester, by mail |
+| Auto Modellista (USA) | plays well, not played through yet: the start, the film, the menus and an arcade race, smooth even with many cars | Bugra06 |
+| Viewtiful Joe (Europe) | runs, not played through yet: the start, the film and the menus | Bugra06 |
+| Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima (Japan) | plays well, not played through yet: no bugs found | Bugra06 |
 | Robot Alchemic Drive | runs, not played through yet: "works fine" | a tester on Reddit |
+| Altered Beast (Europe) | runs, not played through yet: past the first enemy wave, smooth, slower around fire and smoke ([#68](https://github.com/exoteric33/ps2-native-recomp/issues/68)) | XOCX404 |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

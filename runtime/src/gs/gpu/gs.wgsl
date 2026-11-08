@@ -1037,11 +1037,12 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             // Only for half of an upright rectangle (one horizontal and one vertical edge) at one depth, i.e. a 2D piece: its
             // other half shares the slanted edge and tests it the same way. A triangle with a single straight edge next to other
             // triangles' slanted edges would decide that line differently from its neighbours (specks along the dial's inner
-            // fan), and small 3D triangles often have straight edges by chance on the 1/16-pixel grid (specks in hair).
+            // fan, drawn untextured), and small 3D triangles often have straight edges by chance on the 1/16-pixel grid (specks
+            // in hair). So: textured, one depth, one horizontal and one vertical edge.
             let flat = y0 == y1 || y1 == y2 || y2 == y0;
             let upright = x0 == x1 || x1 == x2 || x2 == x0;
             let level = fat(p + 25u) == 0.0 && fat(p + 26u) == 0.0;
-            let rect = SCALE > 1u && flat && upright && level;
+            let rect = SCALE > 1u && flat && upright && level && has(s, F_TME);
             let a0 = rect && (x1 == x2 || y1 == y2);
             let a1 = rect && (x2 == x0 || y2 == y0);
             let a2 = rect && (x0 == x1 || y0 == y1);

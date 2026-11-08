@@ -110,6 +110,22 @@ struct PendingBind {
     std::uint64_t deadline;
 };
 
+// An IOP module's bind to an EE server the EE has not registered yet. The EE's libsifrpc answers such a bind with server 0 at
+// once, and the usual IOP client loops until it gets a server; a client that binds once would keep server 0 for good. Atlus's
+// SDFSDMAN (Digital Devil Saga) sends the EE its ready flag (sreg 31) and binds to the EE's sound RPC server in the next
+// instruction, and the EE registers that server only after it has seen the flag: on the hardware the EE wins that race, here the
+// bind reached the EE first and every later call (voices, movie audio) went to server 0. So a bind the EE answers with server
+// 0 is sent again a little later, until the EE answers with a server or the deadline passes, as an EE bind to an IOP server
+// that is not registered yet (g_binds) is held until the server appears. Not part of the save state: a bind is microseconds long.
+struct IopBind {
+    std::uint32_t server;  // the SID bound to
+    std::uint64_t deadline;
+    bool reported;
+};
+std::map<std::uint32_t, IopBind> g_iop_binds;  // by client
+constexpr std::uint64_t kIopBindRetryUsec = 1000;
+constexpr std::uint64_t kIopBindTimeoutUsec = 4000000;
+
 struct CmdHandler {
     std::uint32_t handler, data;
 };
@@ -223,6 +239,35 @@ std::uint32_t begin_iop_rpc_packet(std::uint32_t client, std::uint32_t reply, st
     iop::write32(client + 4u, rpc_id);
     return address;
 }
+void send(const void *packet, std::uint32_t size);
+
+// The end of an IOP client's bind without a reply from the EE (a bind sent again found no request packet): the client's fields
+// as an EE reply would set them, and its thread woken, as the RPC end command does.
+void finish_iop_bind(std::uint32_t client, std::uint32_t server_data, std::uint32_t buff, std::uint32_t cbuff) {
+    iop::write32(client + 36, server_data);
+    iop::write32(client + 20, buff);
+    iop::write32(client + 24, cbuff);
+    iop::write32(client + 0, 0);
+    auto it = g_iop_clients.find(client);
+    if (it != g_iop_clients.end()) {
+        if (iop::kernel::Thread *t = iop::kernel::thread(it->second)) iop::kernel::wake(*t, 0);
+        iop::kernel::reschedule();
+        g_iop_clients.erase(it);
+    }
+}
+
+// The bind request of an IOP client, as sceSifBindRpc sends it (and sends again, see IopBind).
+bool send_iop_bind(std::uint32_t client, std::uint32_t server) {
+    std::uint32_t record_id = 0;
+    const std::uint32_t packet_addr = begin_iop_rpc_packet(client, 0, record_id);
+    if (!packet_addr) return false;
+    iop::write32(client + 36, 0);
+    iop::write32(client + 8, 0xFFFFFFFFu);
+    const std::uint32_t packet[9] = {0x24u, 0, 0x80000009u, 0, record_id, packet_addr, iop::read32(client + 4), client, server};
+    send(packet, sizeof packet);
+    return true;
+}
+
 std::uint32_t g_loop_stub = 0, g_finish_stub = 0, g_exec_stub = 0;
 // A server thread that runs its own loop (sceSifGetNextRequest, then sceSifExecRequest, then SleepThread) instead of sceSifRpcLoop: the
 // requests it has taken but not run yet (by handle), and where each thread goes on after the request it runs.
@@ -463,6 +508,31 @@ void command(std::uint32_t src, std::uint32_t size) {
         release_client_iop_rpc_packet(client);
         release_iop_rpc_packet(words[5]);
         if (cmd == 0x80000009u) {
+            auto pending = g_iop_binds.find(client);
+            if (pending != g_iop_binds.end()) {
+                const std::uint32_t server = pending->second.server;
+                if (!words[9] && iop::kernel::now() < pending->second.deadline) {
+                    if (!pending->second.reported) {
+                        pending->second.reported = true;
+                        std::fprintf(stderr, "[sif] IOP bind to EE server 0x%08X (client 0x%08X) waits for the server\n", server, client);
+                    }
+                    // The client keeps its packet pointer (the released packet still reports the call as running to
+                    // sceSifCheckStatRpc) and its thread stays blocked; the next request takes a packet again.
+                    iop::kernel::schedule(iop::kernel::now() + iop::kernel::usec_to_cycles(kIopBindRetryUsec), [client, server] {
+                        if (!g_iop_binds.count(client)) return;
+                        if (!send_iop_bind(client, server)) {
+                            std::fprintf(stderr, "[sif] IOP bind to EE server 0x%08X (client 0x%08X) has no request packet\n", server, client);
+                            g_iop_binds.erase(client);
+                            finish_iop_bind(client, 0, 0, 0);
+                        }
+                    });
+                    break;
+                }
+                if (!words[9]) std::fprintf(stderr, "[sif] IOP bind to EE server 0x%08X (client 0x%08X) timed out\n", server, client);
+                else if (pending->second.reported)
+                    std::fprintf(stderr, "[sif] IOP bind to EE server 0x%08X (client 0x%08X) bound to 0x%08X\n", server, client, words[9]);
+                g_iop_binds.erase(pending);
+            }
             iop::write32(client + 36, words[9]);
             iop::write32(client + 20, words[10]);
             iop::write32(client + 24, words[11]);
@@ -779,14 +849,8 @@ void install_iop_side() {
     def("sifcmd", 14, "sceSifInitRpc", [](iop::Cpu &c) { c.r[2] = 0; });
     def("sifcmd", 15, "sceSifBindRpc", [](iop::Cpu &c) {
         const std::uint32_t client = arg(c, 0), server = arg(c, 1), mode = arg(c, 2);
-        std::uint32_t record_id = 0;
-        const std::uint32_t packet_addr = begin_iop_rpc_packet(client, 0, record_id);
-        if (!packet_addr) { c.r[2] = static_cast<std::uint32_t>(-1); return; }
-        iop::write32(client + 36, 0);
-        iop::write32(client + 8, 0xFFFFFFFFu);
-        const std::uint32_t packet[9] = {0x24u, 0, 0x80000009u, 0, record_id, packet_addr,
-                                         iop::read32(client + 4), client, server};
-        send(packet, sizeof packet);
+        if (!send_iop_bind(client, server)) { c.r[2] = static_cast<std::uint32_t>(-1); return; }
+        g_iop_binds[client] = IopBind{server, iop::kernel::now() + iop::kernel::usec_to_cycles(kIopBindTimeoutUsec), false};
         c.r[2] = 0;
         if (!(mode & 1u) && iop::kernel::current()) {
             g_iop_clients[client] = iop::kernel::current()->id;
@@ -1239,6 +1303,7 @@ void reset() {
     g_guest_servers.clear();
     g_server_order.clear();
     g_binds.clear();
+    g_iop_binds.clear();
     g_held_calls.clear();
     g_hle_replies.clear();
     g_requests.clear();

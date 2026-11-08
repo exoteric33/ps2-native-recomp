@@ -455,7 +455,7 @@ void xgkick(Unit &u, std::uint32_t address) {
     if (g_reference_dry) return;
     const std::uint32_t qwords = u.data_qwords, first = address & (qwords - 1);
     std::uint32_t q = first, count = 0;
-    bool done = false;
+    bool done = false, cut = false;
     while (!done && count < qwords) {
         std::uint64_t tag;
         std::memcpy(&tag, qword(u, q), 8);
@@ -468,12 +468,16 @@ void xgkick(Unit &u, std::uint32_t address) {
         if (!nreg) nreg = 16;
         const std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
         const std::uint32_t take = std::min(body, qwords - count);
+        cut = take < body;
         q += take;
         count += take;
         done = eop;
     }
     if (first + count <= qwords) gif::transfer(1, u.data + first * 16, count);
     else xgkick_wrapped(u, first, count);
+    // More than the whole memory is never a real packet: the GIF met a "tag" that is not one. It ends with this kick, as the console's
+    // next XGKICK starts a packet of its own (gif::end_runaway_kick).
+    if (cut || !done) [[unlikely]] gif::end_runaway_kick(first);
 }
 
 // A VU branch that reads an integer register the instruction right before it

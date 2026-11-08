@@ -13,6 +13,8 @@ void state(ps2::state::Stream &s);
 void reset();
 void stats();
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc);
+// An XGKICK packet that did not end within VU1's data memory (kicked at `address`): end it, so the next kick starts a new packet
+void end_runaway_kick(std::uint32_t address);
 void render(int path, const std::uint8_t *data, std::uint32_t qwc);
 void render_reset();
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc);

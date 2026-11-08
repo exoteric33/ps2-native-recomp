@@ -90,15 +90,63 @@ void walk(Path &p, const std::uint8_t *data, std::uint32_t qwc, Sink &sink) {
     }
 }
 
+// In the path argument of a GIF message: end that path's packet there (end_runaway_kick).
+constexpr int kEndPacket = 0x100;
+
+// Signs that the GIF is reading something that is not a packet (vertex data taken for a tag, which then sprays the rest over random
+// registers): writes to GS registers that do not exist, and XGKICK packets without an end. A game does neither on purpose. Counted
+// per path on the drawing thread (render()), with the first of each kept, and printed by stats(), so a player's log shows which
+// path and from which frame on (public issue #69, Nickelodeon Barnyard: about 15000 writes to every missing register).
+struct Odd {
+    std::uint64_t count = 0;
+    std::uint32_t frame = 0, reg = 0, address = 0;
+    char how = 0;  // 'a' an A+D address, 'p' a PACKED register descriptor, 'r' a REGLIST one
+    std::uint64_t tag[2] = {0, 0};
+};
+Odd g_missing[4], g_runaway[4];
+std::uint64_t g_last_tag[4][2];
+
+// The GS registers by address (GS manual, register list; 0x7F is the address ps2sdk writes as a NOP).
+constexpr std::uint64_t kRegsLow = 0xA8F000041FF037FFull, kRegsHigh = 0x80000007001FFFFFull;
+bool exists(std::uint32_t reg) { return reg < 64 ? ((kRegsLow >> reg) & 1u) : reg < 128 && ((kRegsHigh >> (reg - 64)) & 1u); }
+
+// The first of each is also printed at once: a run that freezes later never reaches stats().
+void note(Odd &o, int path, std::uint32_t reg, char how, std::uint32_t address) {
+    if (o.count++) return;
+    o.frame = gs::present_frame();
+    o.reg = reg;
+    o.how = how;
+    o.address = address;
+    o.tag[0] = g_last_tag[path][0];
+    o.tag[1] = g_last_tag[path][1];
+    if (how)
+        std::fprintf(stderr, "[gif] path %d writes a GS register that does not exist about frame %u (%s 0x%02X, packet tag %016llX %016llX)\n", path, o.frame,
+                     how == 'a' ? "A+D address" : how == 'p' ? "PACKED descriptor" : "REGLIST descriptor", reg,
+                     static_cast<unsigned long long>(o.tag[1]), static_cast<unsigned long long>(o.tag[0]));
+    else
+        std::fprintf(stderr, "[gif] path %d: an XGKICK packet did not end within VU1's data memory about frame %u (kicked at 0x%03X, last tag %016llX %016llX)\n",
+                     path, o.frame, address, static_cast<unsigned long long>(o.tag[1]), static_cast<unsigned long long>(o.tag[0]));
+}
+
 struct GsSink {
     int path;
     void tag(const Path &p, const Reg128 &q) {
         ++g_tags[path][p.flg];
+        g_last_tag[path][0] = q.d[0];
+        g_last_tag[path][1] = q.d[1];
         gs::g_state.q = 1.0f;
         if (((q.d[0] >> 46) & 1u) && p.flg == 0) gs::write(0x00, (q.d[0] >> 47) & 0x7FFu);
     }
-    void packed(std::uint32_t reg, const Reg128 &q) { gs::write_packed(reg, q); }
-    void reglist(std::uint32_t reg, std::uint64_t value) { gs::write(reg, value); }
+    void packed(std::uint32_t reg, const Reg128 &q) {
+        // 0xB is the one PACKED descriptor the GS manual leaves reserved; 0xE is A+D, whose address byte must name a register.
+        if ((reg == 0xEu && !exists(static_cast<std::uint32_t>(q.d[1]) & 0xFFu)) || reg == 0xBu) [[unlikely]]
+            note(g_missing[path], path, reg == 0xEu ? static_cast<std::uint32_t>(q.d[1]) & 0xFFu : reg, reg == 0xEu ? 'a' : 'p', 0);
+        gs::write_packed(reg, q);
+    }
+    void reglist(std::uint32_t reg, std::uint64_t value) {
+        if (reg == 0xBu || reg == 0xEu) [[unlikely]] note(g_missing[path], path, reg, 'r', 0);
+        gs::write(reg, value);
+    }
     void image(const std::uint8_t *data, std::uint32_t qwords) { gs::write_image(data, qwords); }
 };
 
@@ -257,11 +305,35 @@ void render_reset() {
 }
 
 void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (path & kEndPacket) [[unlikely]] {
+        path &= 3;
+        note(g_runaway[path], path, 0, 0, qwc);  // qwc carries the kick address here
+        g_paths[path].active = false;
+        return;
+    }
     GsSink sink{path};
     walk(g_paths[path], data, qwc, sink);
 }
 
+// VU1's GIF reads a kicked packet round the data memory until a tag with EOP has had all its data, and the next XGKICK waits for
+// that and then starts with a tag of its own (EE manual, PATH1). vu::xgkick sends at most one pass over the memory; when the
+// packet has not ended by then (only a tag that is not one, such as vertex data, does that) this ends it, in order with the data,
+// so the next kick is read as a new packet instead of as more of this one. Without it one bad tag with a large NLOOP swallowed the
+// packets of many kicks after it and sprayed them over random GS registers.
+void end_runaway_kick(std::uint32_t address) {
+    if (!gs::queue::active()) {
+        render(1 | kEndPacket, nullptr, address);
+        return;
+    }
+    if (gs::queue::role() != gs::queue::Role::Vu) g_scan[1].active = false;
+    gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(1 | kEndPacket), address, nullptr, 0);
+}
+
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (path & kEndPacket) [[unlikely]] {  // the message above, should it come through the vector thread's queue
+        end_runaway_kick(qwc);
+        return;
+    }
     Held &h = g_held;
     if (!hold_here()) {
         out(path, data, qwc);
@@ -295,6 +367,14 @@ void stats() {
         std::fprintf(stderr, "[gif] path %d tags: packed %llu reglist %llu image %llu\n", p,
                      static_cast<unsigned long long>(g_tags[p][0]), static_cast<unsigned long long>(g_tags[p][1]),
                      static_cast<unsigned long long>(g_tags[p][2] + g_tags[p][3]));
+    for (int p = 1; p < 4; ++p) {
+        if (const Odd &o = g_missing[p]; o.count)
+            std::fprintf(stderr, "[gif] path %d: %llu writes to GS registers that do not exist (the first about frame %u): the GIF read something that is not a packet\n",
+                         p, static_cast<unsigned long long>(o.count), o.frame);
+        if (const Odd &o = g_runaway[p]; o.count)
+            std::fprintf(stderr, "[gif] path %d: %llu XGKICK packets did not end within VU1's data memory (the first about frame %u); each was cut there\n",
+                         p, static_cast<unsigned long long>(o.count), o.frame);
+    }
 }
 
 std::uint32_t read(std::uint32_t a) {

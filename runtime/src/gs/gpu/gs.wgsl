@@ -1028,7 +1028,27 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let w1 = cross2(x2 - px, y0 - py, x0 - px, y2 - py) * inv;
             let c2 = cross2(x0 - px, y1 - py, x1 - px, y0 - py) * inv;
             let inclusive = data[p + 27u];
-            if (!edge_in(w0, inclusive & 1u) || !edge_in(w1, inclusive & 2u) || !edge_in(c2, inclusive & 4u)) {
+            // An edge that is exactly horizontal or vertical decides coverage at the console pixel's centre, as a sprite does
+            // below: 2D pieces laid side by side for the console's grid (Digital Devil Saga's solar-noise dial is two
+            // rectangles, x 27-56.5 and 57-86.5) leave a gap narrower than a pixel that covers no console pixel centre but
+            // does cover the finer samples of a scaled picture (a seam). Slanted edges keep the finer samples.
+            var e0 = w0;
+            var e1 = w1;
+            var e2 = c2;
+            if (SCALE > 1u) {
+                let cx = f32(x);
+                let cy = f32(y);
+                if (x1 == x2 || y1 == y2) {
+                    e0 = cross2(x1 - cx, y2 - cy, x2 - cx, y1 - cy) * inv;
+                }
+                if (x2 == x0 || y2 == y0) {
+                    e1 = cross2(x2 - cx, y0 - cy, x0 - cx, y2 - cy) * inv;
+                }
+                if (x0 == x1 || y0 == y1) {
+                    e2 = cross2(x0 - cx, y1 - cy, x1 - cx, y0 - cy) * inv;
+                }
+            }
+            if (!edge_in(e0, inclusive & 1u) || !edge_in(e1, inclusive & 2u) || !edge_in(e2, inclusive & 4u)) {
                 return;
             }
             let w2 = 1.0 - w0 - w1;

@@ -1034,9 +1034,15 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             // does cover the finer samples of a scaled picture (a seam). Slanted edges keep the finer samples.
             let cx = f32(x);
             let cy = f32(y);
-            let a0 = SCALE > 1u && (x1 == x2 || y1 == y2);
-            let a1 = SCALE > 1u && (x2 == x0 || y2 == y0);
-            let a2 = SCALE > 1u && (x0 == x1 || y0 == y1);
+            // Only for half of an upright rectangle (one horizontal and one vertical edge): its other half shares the slanted
+            // edge and tests it the same way. A triangle with a single straight edge next to other triangles' slanted edges
+            // would decide that line differently from its neighbours (specks along the dial's inner fan).
+            let flat = y0 == y1 || y1 == y2 || y2 == y0;
+            let upright = x0 == x1 || x1 == x2 || x2 == x0;
+            let rect = SCALE > 1u && flat && upright;
+            let a0 = rect && (x1 == x2 || y1 == y2);
+            let a1 = rect && (x2 == x0 || y2 == y0);
+            let a2 = rect && (x0 == x1 || y0 == y1);
             let ce0 = cross2(x1 - cx, y2 - cy, x2 - cx, y1 - cy) * inv;
             let ce1 = cross2(x2 - cx, y0 - cy, x0 - cx, y2 - cy) * inv;
             let ce2 = cross2(x0 - cx, y1 - cy, x1 - cx, y0 - cy) * inv;

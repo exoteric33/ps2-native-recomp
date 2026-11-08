@@ -17,6 +17,7 @@
 #include <deque>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <map>
 #include <vector>
 
@@ -136,6 +137,11 @@ std::deque<Call> g_hle_replies;
 std::map<std::uint32_t, std::deque<Request>> g_requests;
 std::map<std::uint32_t, int> g_queue_threads;
 std::map<std::uint32_t, CmdHandler> g_cmd_handlers;
+// What the EE sent the IOP during the run, for the summary in dump(): SIF commands by id, those no IOP handler took, and binds by
+// server id. Only for the log: not in save states, and an IOP reset does not clear them (the summary covers the whole run).
+std::map<std::uint32_t, std::uint64_t> g_ee_commands;
+std::map<std::uint32_t, std::uint64_t> g_unhandled_commands;
+std::map<std::uint32_t, std::uint64_t> g_ee_binds;
 std::uint32_t g_sreg[32] = {};
 std::map<std::uint32_t, int> g_iop_clients;
 std::uint32_t g_iop_rpc_id = 1;
@@ -314,6 +320,7 @@ void bind(const std::uint8_t *packet) {
     std::memcpy(&rpc, packet + 24, 4);
     std::memcpy(&client, packet + 28, 4);
     std::memcpy(&server, packet + 32, 4);
+    ++g_ee_binds[server];
     Rend r = make_rend(*h, record, paddr, rpc, client, 0x80000009u);
     if (fill_bind_endpoint(r, server)) {
         send(&r, sizeof r);
@@ -422,6 +429,7 @@ void command(std::uint32_t src, std::uint32_t size) {
             std::fprintf(stderr, "\n");
         }
     }
+    ++g_ee_commands[h->cid];
     switch (h->cid) {
     case 0x80000001u: {
         std::uint32_t index, value;
@@ -470,7 +478,20 @@ void command(std::uint32_t src, std::uint32_t size) {
     default: {
         auto it = g_cmd_handlers.find(h->cid);
         if (it == g_cmd_handlers.end()) {
-            std::fprintf(stderr, "[sif] command 0x%08X has no handler (from ee buffer 0x%08X)\n", h->cid, src);
+            // The console's IOP drops a packet whose slot holds no handler (ps2sdk iop/system/sifcmd, _sceSifCmdIntrHdlr; the only
+            // system slots Sony's SIFCMD and SIFRPC fill are 0, 1, 2, 8, 9, 10 and 12). Data sent with it (sceSifSendCmd's extra
+            // transfer, size and IOP address in the header) came in the same DMA list before the packet and is already in IOP memory,
+            // so a command that only carries data needs nothing more. DreamWorks Madagascar: Escape 2 Africa (public issue 70) sends
+            // 0x80000004 before every module it loads and then 30 times a second: said once per command id here, counted in dump().
+            if (g_unhandled_commands[h->cid]++ == 0) {
+                std::uint32_t words[8] = {};
+                std::memcpy(words, packet, sizeof words);
+                std::fprintf(stderr,
+                             "[sif] command 0x%08X from the EE has no handler on the IOP: dropped as on the console (packet %u bytes, "
+                             "%u bytes of data with it to IOP 0x%08X, opt 0x%X, words %08X %08X %08X %08X, ee buffer 0x%08X); "
+                             "later ones are only counted\n",
+                             h->cid, h->packet_size(), h->size_word >> 8, h->dest, h->opt, words[4], words[5], words[6], words[7], src);
+            }
             break;
         }
         std::memcpy(iop::ram_ptr(kCmdBuffer), packet, std::min<std::uint32_t>(size, 0x400u));
@@ -1326,6 +1347,40 @@ void dump() {
         if (!list.empty()) std::fprintf(stderr, "[sif] queue 0x%08X has %zu requests\n", queue, list.size());
     for (const auto &[id, b] : g_binds) std::fprintf(stderr, "[sif] bind to 0x%08X is waiting\n", id);
     std::fprintf(stderr, "[sif] %zu packets wait for the EE (processed %d)\n", g_outgoing.size(), g_processed ? 1 : 0);
+    // Who talked to whom during the run, a few lines: which commands and binds the EE sent, which ones no IOP handler took, and what
+    // the IOP's modules registered (command handlers, RPC servers). Enough to tell from a player's log how a game's EE side reaches
+    // its sound or other IOP module.
+    const auto counts = [](const char *title, const std::map<std::uint32_t, std::uint64_t> &m) {
+        if (m.empty()) return;
+        std::string line;
+        char item[40];
+        for (const auto &[id, n] : m) {
+            std::snprintf(item, sizeof item, " 0x%08X x%llu", id, static_cast<unsigned long long>(n));
+            line += item;
+        }
+        std::fprintf(stderr, "[sif] %s:%s\n", title, line.c_str());
+    };
+    counts("commands from the EE", g_ee_commands);
+    counts("of them with no IOP handler (dropped)", g_unhandled_commands);
+    counts("EE binds by server id", g_ee_binds);
+    std::string line;
+    char item[64];
+    for (const auto &[cid, h] : g_cmd_handlers) {
+        std::snprintf(item, sizeof item, " 0x%08X at 0x%08X", cid, h.handler);
+        line += item;
+    }
+    if (!line.empty()) std::fprintf(stderr, "[sif] command handlers of IOP modules:%s\n", line.c_str());
+    line.clear();
+    for (const auto &[sd, s] : g_guest_servers) {
+        std::snprintf(item, sizeof item, " 0x%08X (function 0x%08X)", s.sid, s.func);
+        line += item;
+    }
+    if (!line.empty()) std::fprintf(stderr, "[sif] RPC servers of IOP modules:%s\n", line.c_str());
+}
+
+std::uint64_t unhandled_commands(std::uint32_t cid) {
+    const auto it = g_unhandled_commands.find(cid);
+    return it == g_unhandled_commands.end() ? 0 : it->second;
 }
 
 void complete_call(std::uint32_t id) {

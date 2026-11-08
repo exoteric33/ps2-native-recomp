@@ -21,6 +21,8 @@ int dma_stat(std::uint32_t id);
 void packet_processed();
 void pump();
 void dump();
+// How many SIF commands with this id came from the EE with no IOP handler for them this run (dropped, as the console does).
+std::uint64_t unhandled_commands(std::uint32_t cid);
 
 void register_hle_server(std::uint32_t id, HleServer server);
 void complete_call(std::uint32_t id);

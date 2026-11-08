@@ -573,12 +573,64 @@ fn texel_y(s: Setup, yi: i32) -> u32 {
 
 var<private> snapshot_lo: u32 = 0u;
 var<private> snapshot_hi: u32 = 0u;
+// A sprite that copies a rendered picture (a colour or depth format) at almost 1:1 but not exactly, with a slight zoom or a
+// fractional offset, reads it on the inner-resolution grid (rt_copy, set per pixel in shade_at): texel X / SCALE and sub-sample
+// X % SCALE on each axis. Read on the console's grid with the output pixel's own sub-sample, such a copy lands up to one console
+// pixel off at SCALE > 1, and the picture blended over the frame draws a blocky fringe around everything with contrast. Digital
+// Devil Saga blends the last frame, 0.2 % larger and half a pixel off, over each new one (an afterimage glow); exact 1:1 copies
+// are unchanged.
+var<private> rt_copy: bool = false;
 
 fn load_texel(l: Loc, k: u32) -> u32 {
     if (l.word >= snapshot_lo && l.word < snapshot_hi) {
         return (scratch[(l.word - snapshot_lo) * SCALE * SCALE + k] >> l.shift) & l.mask;
     }
     return load_at(l, k);
+}
+
+fn fetch_sub(s: Setup, xs: i32, ys: i32) -> u32 {
+    let n = i32(SCALE);
+    let tx = select(xs / n, (xs - n + 1) / n, xs < 0);
+    let ty = select(ys / n, (ys - n + 1) / n, ys < 0);
+    return fetch(s, tx, ty, u32(ys - ty * n) * SCALE + u32(xs - tx * n));
+}
+
+fn unpack4(c: u32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(c & 0xFFu, (c >> 8u) & 0xFFu, (c >> 16u) & 0xFFu, c >> 24u));
+}
+
+// A bilinear read on the inner-resolution grid (u, v in inner texels, the half-texel shift already taken off).
+fn bilinear_sub(s: Setup, u: f32, v: f32) -> vec4<f32> {
+    let x0 = i32(floor(u));
+    let y0 = i32(floor(v));
+    let fx = u - f32(x0);
+    let fy = v - f32(y0);
+    let top = lerp4(unpack4(fetch_sub(s, x0, y0)), unpack4(fetch_sub(s, x0 + 1, y0)), fx);
+    let bottom = lerp4(unpack4(fetch_sub(s, x0, y0 + 1)), unpack4(fetch_sub(s, x0 + 1, y0 + 1)), fx);
+    return lerp4(top, bottom, fy);
+}
+
+// The console's bilinear filter spreads over one console texel each way (a tent of half-width 1); on the inner grid that tent is
+// exactly the sum of inner-grid bilinear reads at offsets m = -(SCALE-1)..SCALE-1 inner texels, weighted (SCALE - |m|) per axis
+// (the tent is linear between multiples of 1/SCALE). So the copy keeps the inner resolution and the blur the game asked for: a
+// narrower blur showed the previous frame's fine stripes crisp next to the current ones (flickering lines on striped lights).
+fn sample_scaled(s: Setup, uin: f32, vin: f32) -> u32 {
+    let nf = f32(SCALE);
+    if (!has(s, F_BILINEAR)) {
+        return fetch_sub(s, i32(floor(uin * nf)), i32(floor(vin * nf)));
+    }
+    let u = uin * nf - 0.5;
+    let v = vin * nf - 0.5;
+    let n = i32(SCALE);
+    var acc = vec4<f32>(0.0);
+    for (var my = 1 - n; my < n; my = my + 1) {
+        for (var mx = 1 - n; mx < n; mx = mx + 1) {
+            let w = f32((n - abs(mx)) * (n - abs(my)));
+            acc = acc + w * bilinear_sub(s, u + f32(mx), v + f32(my));
+        }
+    }
+    let o = vec4<u32>(clamp(acc / f32(n * n * n * n) + vec4<f32>(0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
+    return o.x | (o.y << 8u) | (o.z << 16u) | (o.w << 24u);
 }
 
 fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
@@ -647,6 +699,9 @@ fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
 }
 
 fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
+    if (rt_copy) {
+        return sample_scaled(s, uin, vin);
+    }
     if (!has(s, F_BILINEAR)) {
         return fetch(s, i32(floor(uin)), i32(floor(vin)), k);
     }
@@ -1013,6 +1068,7 @@ fn edge_in(w: f32, inclusive: u32) -> bool {
 }
 
 fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
+    rt_copy = false;
     let kind = data[p + 1u];
     var at: Attr;
     switch kind {
@@ -1068,6 +1124,10 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             var uy = py;
             let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
             let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct);
+            let near_x = abs(abs(du) - abs(dx)) <= abs(dx) * 0.05;
+            let near_y = abs(abs(dv) - abs(dy)) <= abs(dy) * 0.05;
+            let exact = abs(du) >= abs(dx) * 0.999 && abs(dv) >= abs(dy) * 0.999;
+            rt_copy = SCALE > 1u && has(s, F_TME) && direct && s.dec == 0xFFFFFFFFu && near_x && near_y && !exact;
             if (point && abs(du) >= abs(dx) * 0.999) {
                 ux = f32(x);
             }

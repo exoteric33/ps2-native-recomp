@@ -170,6 +170,12 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
             target_link_libraries(ps2runtime ${PS2_API} "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework CoreFoundation" "-framework IOKit" "-framework IOSurface" objc)
         endif()
     endif()
+    # the GS's mipmapping in the software reference and the draw program, no game data (docs/mipmap.md): ninja ps2mipmaptest
+    if(NOT EMSCRIPTEN)
+        add_executable(ps2mipmaptest EXCLUDE_FROM_ALL tests/mipmap.cpp)
+        target_include_directories(ps2mipmaptest PRIVATE runtime/src)
+        target_link_libraries(ps2mipmaptest PRIVATE ps2runtime)
+    endif()
 endif()
 
 

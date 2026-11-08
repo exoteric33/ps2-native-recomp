@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -44,12 +46,14 @@ constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
 constexpr std::uint32_t kSetupWords = 40;  // 25 fields, then the texture, frame and depth formats as the shader needs them (fmt_words)
+constexpr std::uint32_t kMipWords = 8;     // the mipmap words of a setup, in a table beside the setups (Batch::mips, make_mip)
 constexpr std::uint32_t kDecodedWords = 4u << 20;
 constexpr std::uint32_t kDecodePrims = 64;
 
 
 Mode g_mode = Mode::off;
 std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
+std::uint64_t g_mip_setups = 0, g_mip_shapes = 0, g_filter_setups = 0, g_filter_shapes = 0;  // the mipmaps line of stats(): setups and shapes that read levels above 0 / only pick the filter per pixel
 
 WGPUInstance g_instance = nullptr;
 WGPUAdapter g_adapter = nullptr;
@@ -94,12 +98,34 @@ WGPUBindGroupLayout g_layout = nullptr;
 WGPUPipelineLayout g_pipeline_layout = nullptr;
 WGPUBindGroup g_group = nullptr;
 WGPUComputePipeline g_pipelines[kPipelines] = {};
+// The draw program with mipmap levels (HAS_MIP = true in gs.wgsl) takes as long to translate as all the others together on FXC, so it is built
+// in the background after the plain programs; a batch that needs it waits for it (pipeline_of), every other batch never does.
+WGPUComputePipeline g_raster_mip = nullptr;
+std::thread *g_raster_mip_thread = nullptr;  // never destroyed: a running thread's destructor at exit would end the program
+std::atomic<bool> g_raster_mip_ready{false};
+std::mutex g_raster_mip_lock;
 
 struct Command {
     Pipeline pipeline;
     std::uint32_t x, y;
     std::uint32_t param;
+    bool mip = false;  // kRaster only: the batch carries a mipmap table, so it needs the draw program built with HAS_MIP (g_raster_mip)
 };
+
+// The program a draw command runs. A batch with a mipmap table runs the HAS_MIP program, and waits here, once, until it is built.
+WGPUComputePipeline pipeline_of(const Command &c) {
+    if (!c.mip || c.pipeline != kRaster) return g_pipelines[c.pipeline];
+    if (!g_raster_mip_ready.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_raster_mip_lock);
+        if (!g_raster_mip_ready.load(std::memory_order_acquire)) {
+            const auto start = std::chrono::steady_clock::now();
+            if (g_raster_mip_thread && g_raster_mip_thread->joinable()) g_raster_mip_thread->join();
+            g_raster_mip_ready.store(true, std::memory_order_release);
+            std::fprintf(stderr, "[gpu] waited %.0f ms for the mipmap draw program\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        }
+    }
+    return g_raster_mip ? g_raster_mip : g_pipelines[kRaster];
+}
 
 struct CommandInfo {
     std::size_t index;
@@ -230,6 +256,8 @@ struct Words {
 struct Batch {
     Words prims;
     std::vector<std::uint32_t> setups;
+    std::vector<std::uint32_t> mips;  // kMipWords per setup, the same index as `setups` (make_mip)
+    bool any_mip = false;             // a setup of the batch has mipmap words that are not zero: the table goes to the chip
     std::uint32_t setup_serial = 0;  // the cache serial of the setup that is the last one of `setups`; 0: none (see draw)
     std::uint64_t key = ~0ull;
     int minx = 1 << 30, miny = 1 << 30, maxx = -1, maxy = -1;
@@ -244,6 +272,8 @@ struct SetupCache {
     std::uint32_t generation = ~0u, clut = ~0u, serial = 0;
     std::uint64_t attr = ~0ull;
     std::uint32_t setup[kSetupWords] = {};
+    std::uint32_t mip[kMipWords] = {};
+    std::uint32_t mip_top = 0;  // the highest mip level a pixel of this setup can read (make_mip); 0: only the base texture
     std::uint32_t flags = 0;
     std::uint64_t key = 0;
     Range tex;
@@ -851,6 +881,9 @@ void plan_decodes(std::uint32_t prims) {
     }
 }
 
+std::uint32_t mip_top_of(const std::uint32_t *mip);
+Range mip_range(const std::uint32_t *setup, const std::uint32_t *mip, std::uint32_t top);
+
 std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi) {
     Batch &b = g_batch;
     lo = hi = 0;
@@ -865,10 +898,17 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
     for (std::uint32_t i = 0; i < prims; ++i) {
         const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
         const std::uint32_t *setup = b.setups.data() + rec[0] * kSetupWords;
-        if (!(setup[0] & 2u) || reads_own_word(rec, setup)) continue;
+        const std::uint32_t *mip = b.any_mip && (rec[0] + 1) * kMipWords <= b.mips.size() ? b.mips.data() + rec[0] * kMipWords : nullptr;
+        const std::uint32_t top = mip ? mip_top_of(mip) : 0u;
+        if (!(setup[0] & 2u) || (!top && reads_own_word(rec, setup))) continue;
         const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
-        const bool listed = rec[1] == 1 && region_repeat(setup) && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
-        const Range t = listed ? g_exact.reads : read_range(rec, setup, region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1));
+        const Range whole = region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1);
+        const bool listed = !top && rec[1] == 1 && region_repeat(setup) && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
+        Range t = top ? whole : listed ? g_exact.reads : read_range(rec, setup, whole);
+        if (top) {  // a shape that reads mip levels: the whole of every level it can reach (mip_range)
+            const Range levels = mip_range(setup, mip, top);
+            t.add(levels.lo, levels.hi);
+        }
         for (const Range *w : {&fb, b.zwrite ? &z : nullptr})
             if (w && t.overlaps(w->lo, w->hi)) shared.add(std::max(t.lo, w->lo), std::min(t.hi, w->hi));
     }
@@ -924,6 +964,8 @@ void reset_batch() {
     exact_reset();
     b.prims.clear();
     b.setups.clear();
+    b.mips.clear();
+    b.any_mip = false;
     b.setup_serial = 0;
     g_batch_reads.clear();
     b.key = ~0ull;
@@ -972,6 +1014,8 @@ void flush_batch() {
     plan_decodes(prims);
     const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
+    // The mipmap table only when a setup of the batch has one (the draw program then reads it for every setup; prm 9 is ~0 otherwise)
+    const std::uint32_t mip_offset = b.any_mip && b.mips.size() / kMipWords == b.setups.size() / kSetupWords ? arena_append(b.mips.data(), b.mips.size() * 4) : 0xFFFFFFFFu;
     for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
     std::uint32_t total = 0;
     for (std::uint32_t n = 0; n < touched_n; ++n) total += count[touched[n]];
@@ -1018,7 +1062,7 @@ void flush_batch() {
     for (std::uint32_t n = 0; n < touched_n; ++n) count[touched[n]] = 0;
     std::uint32_t snapshot_lo, snapshot_hi;
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
-    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
+    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi, 1u, 0u, mip_offset});
     note_raster(prims, tiles, total, snapshot);
     if (g_batch_log) {
         if (g_batch_log_frame > 1 && frame_count() == g_batch_log_frame) std::fprintf(stderr, "[break] %s %u\n", kWhyName[g_why], prims);
@@ -1026,7 +1070,7 @@ void flush_batch() {
         g_why_prims[g_why] += prims;
         g_why = kWhyFlush;
     }
-    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
+    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param, mip_offset != 0xFFFFFFFFu});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     reset_batch();
@@ -1261,7 +1305,7 @@ void profile_submit() {
         WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
         if (i < n) cd.timestampWrites = &writes;
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
-        wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
+        wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
         const std::uint32_t offset = c.param * kParamStride;
         wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
@@ -1359,6 +1403,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     if (measure) cd.timestampWrites = &writes;
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
     Pipeline current = kPipelines;
+    bool current_mip = false;
     ++g_submits;
     ++g_total_passes;
     static const unsigned skip = [] {  // PS2_GPU_SKIP=raster,snapshot: leave these kinds of work out (the picture is wrong; only to see what they cost)
@@ -1371,9 +1416,10 @@ void submit(WGPUTextureView present_view = nullptr) {
     for (const Command &c : g_commands) {
         ++g_dispatches[c.pipeline];
         if (skip & (1u << c.pipeline)) continue;
-        if (c.pipeline != current) {
-            wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
+        if (c.pipeline != current || c.mip != current_mip) {
+            wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
             current = c.pipeline;
+            current_mip = c.mip;
         }
         const std::uint32_t offset = c.param * kParamStride;
         wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
@@ -1530,14 +1576,16 @@ double bench_time(const std::vector<BenchBuffers> &bufs, unsigned skip, unsigned
         for (std::size_t i = 0; i < g_bench.subs.size(); ++i) {
             WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
             Pipeline current = kPipelines;
+            bool current_mip = false;
             for (std::size_t n = 0; n < g_bench.subs[i].commands.size(); ++n) {
                 const Command &c = g_bench.subs[i].commands[n];
                 if (skip & (1u << c.pipeline)) continue;
                 if (size_filter && size_filter <= 2 && c.pipeline == kRaster && ((c.x * c.y <= 8u) == (size_filter == 1))) continue;  // 1: leave out the small runs (8 tiles or fewer), 2: leave out the big ones
                 if (size_filter >= 3 && c.pipeline == kRaster && (g_bench_glow[i][n] != 0) == (size_filter == 3)) continue;  // 3: leave out the full-screen sprite passes (lane glow), 4: leave out all the others
-                if (c.pipeline != current) {
-                    wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
+                if (c.pipeline != current || c.mip != current_mip) {
+                    wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
                     current = c.pipeline;
+                    current_mip = c.mip;
                 }
                 const std::uint32_t offset = c.param * kParamStride;
                 wgpuComputePassEncoderSetBindGroup(pass, 0, bufs[i].group, 1, &offset);
@@ -1562,7 +1610,7 @@ double bench_time(const std::vector<BenchBuffers> &bufs, unsigned skip, unsigned
 double bench_one(const BenchBuffers &buf, const Command &c, unsigned count) {
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
-    wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
+    wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
     const std::uint32_t offset = c.param * kParamStride;
     for (unsigned i = 0; i < count; ++i) {
         wgpuComputePassEncoderSetBindGroup(pass, 0, buf.group, 1, &offset);
@@ -1718,6 +1766,20 @@ void bench_run() {
     }
 }
 
+// The highest mip level the mipmap words `mip` (make_mip) let a pixel read: 0 when only the base texture is read. With LCM = 1 the level of
+// detail is K alone, so at most the level after floor(K) is reached (the *_MIPMAP_LINEAR blend); K <= 0 magnifies (level 0).
+std::uint32_t mip_top_of(const std::uint32_t *mip) {
+    if (!mip[0]) return 0;
+    const std::uint32_t mxl = (mip[0] >> 1) & 7u, mmin = (mip[0] >> 5) & 7u;
+    if (mxl == 0 || mmin < 2) return 0;
+    if (mip[0] & 1u) {
+        const float lod = static_cast<float>(static_cast<std::int32_t>(((mip[0] >> 16) & 0xFFFu) << 20) >> 20) / 16.0f;
+        if (lod <= 0.0f) return 0;
+        return std::min(static_cast<std::uint32_t>(std::floor(lod)) + 1u, mxl);
+    }
+    return mxl;
+}
+
 // The shader's picture of a memory format: base address, pages per row, swizzle table, packed layout bits, pixel mask (what fmt_of in gs.wgsl used to compute per tile pass).
 void fmt_words(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t *out) {
     constexpr std::uint32_t kOff32 = 0, kOffZ32 = 2048, kOff16 = 4096, kOff16S = 8192, kOffZ16 = 12288, kOffZ16S = 16384, kOff8 = 20480, kOff4 = 28672;
@@ -1796,6 +1858,39 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     fmt_words(w[3], w[1], w[2], w + 30);
     fmt_words(w[6], w[5], w[2], w + 35);
     return flags;
+}
+
+// The mipmap words of a setup (docs/mipmap.md), kept out of the 40 setup words: [0] is 0 when the texture
+// is sampled as before (one level and the same filter for magnification and reduction), else bit 31 plus TEX1's LCM (bit 0), MXL (bits 1-3,
+// at most 6), MMAG (4), MMIN (5-7), L (8-9) and K (16-27, signed 7.4); [1..6] base pointer | buffer width << 14 of levels 1 to 6 (mip_levels).
+// Returns the highest level a pixel can read: 0 when only the base texture is read.
+std::uint32_t make_mip(const State &st, std::uint64_t attr, std::uint32_t *m) {
+    std::fill(m, m + kMipWords, 0u);
+    static const bool off = std::getenv("PS2_MIPMAP") && std::getenv("PS2_MIPMAP")[0] == '0';  // PS2_MIPMAP=0: level 0 and MMAG's filter, as before (an A/B aid)
+    if (!(attr & 0x10u) || off) return 0;
+    const Context &c = st.ctx[(attr >> 9) & 1u];
+    const std::uint32_t lcm = c.tex1 & 1u, mxl = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex1 >> 2) & 7u, 6u), mmag = static_cast<std::uint32_t>(c.tex1 >> 5) & 1u;
+    const std::uint32_t mmin = static_cast<std::uint32_t>(c.tex1 >> 6) & 7u, l = static_cast<std::uint32_t>(c.tex1 >> 19) & 3u, kraw = static_cast<std::uint32_t>(c.tex1 >> 32) & 0xFFFu;
+    const bool min_linear = mmin == 1 || mmin >= 4, levels = mxl > 0 && mmin >= 2;
+    if (mmag == (min_linear ? 1u : 0u) && !levels) return 0;
+    m[0] = 0x80000000u | lcm | (mxl << 1) | (mmag << 4) | (mmin << 5) | (l << 8) | (kraw << 16);
+    std::uint32_t bp[7], bw[7];
+    mip_levels(c, bp, bw);
+    for (int n = 1; n <= 6; ++n) m[n] = bp[n] | (bw[n] << 14);
+    return mip_top_of(m);
+}
+
+// The bytes the mip levels 1 to `top` of a setup span (the base texture is cache.tex, the region of setup words 12 to 14).
+Range mip_range(const std::uint32_t *setup, const std::uint32_t *mip, std::uint32_t top) {
+    Range r;
+    const std::uint32_t tw = setup[15] & 0xFFu, th = setup[15] >> 8;
+    for (std::uint32_t n = 1; n <= top; ++n) {
+        const std::uint32_t lw = tw > n ? tw - n : 0u, lh = th > n ? th - n : 0u;
+        const int w = std::max(1 << lw, static_cast<int>((setup[18] >> 16) >> n) + 1), h = std::max(1 << lh, static_cast<int>((setup[19] >> 16) >> n) + 1);
+        const Range level = region(mip[n] & 0x3FFFu, (mip[n] >> 14) & 0x3Fu, setup[14], 0, 0, w - 1, h - 1);
+        r.add(level.lo, level.hi);
+    }
+    return r;
 }
 
 // The smallest and largest texel position (u0, v0, u1, v1, in texels, before any wrap mode) that the corners of a shape name; false when they cannot be said.
@@ -2314,28 +2409,66 @@ bool init(Mode m) {
     if (explicit_fma) std::fprintf(stderr, "[gpu] shader sums written as fma() (DXC)\n");
     const auto compile_start = std::chrono::steady_clock::now();
     WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
-    for (int i = 0; i < kPipelines; ++i) {
+    // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE, EXPLICIT_FMA and HAS_MIP are listed only when it declares them
+    const bool has_tile = shader_text.empty() || shader_text.find("override TILE") != std::string::npos;
+    const bool has_fma = shader_text.empty() || shader_text.find("override EXPLICIT_FMA") != std::string::npos;
+    const bool has_mip = shader_text.empty() || shader_text.find("override HAS_MIP") != std::string::npos;
+    const int scale = static_cast<int>(g_scale), tile = g_tile;
+    // `mip`: the draw program that reads mipmap levels (HAS_MIP in gs.wgsl); without it the program is the plain one
+    auto make_pipeline = [=](int entry, bool mip) {
         WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
         cd.layout = g_pipeline_layout;
         cd.compute.module = module;
-        cd.compute.entryPoint = view(kEntryPoints[i]);
-        WGPUConstantEntry constants[3] = {WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT};
+        cd.compute.entryPoint = view(kEntryPoints[entry]);
+        WGPUConstantEntry constants[4] = {WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT};
         constants[0].key = view("SCALE");
-        constants[0].value = static_cast<double>(g_scale);
+        constants[0].value = static_cast<double>(scale);
         constants[1].key = view("TILE");
-        constants[1].value = static_cast<double>(g_tile);
+        constants[1].value = static_cast<double>(tile);
         constants[2].key = view("EXPLICIT_FMA");
         constants[2].value = explicit_fma ? 1.0 : 0.0;
-        // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE and EXPLICIT_FMA are listed only when it declares them
-        const bool has_tile = shader_text.empty() || shader_text.find("override TILE") != std::string::npos;
-        const bool has_fma = shader_text.empty() || shader_text.find("override EXPLICIT_FMA") != std::string::npos;
-        cd.compute.constantCount = has_tile ? (has_fma ? 3 : 2) : 1;
+        constants[3].key = view("HAS_MIP");
+        constants[3].value = mip ? 1.0 : 0.0;
+        cd.compute.constantCount = has_tile ? (has_fma ? (has_mip ? 4 : 3) : 2) : 1;
         cd.compute.constants = constants;
-        g_pipelines[i] = wgpuDeviceCreateComputePipeline(g_device, &cd);
+        return wgpuDeviceCreateComputePipeline(g_device, &cd);
+    };
+    // The mipmap variant of the draw program: most games never use it, and on FXC it would double the start. Built in a thread beside the
+    // plain programs and the game's own start (the browser build has none and does it after them); a batch with a mipmap table waits for
+    // it (pipeline_of).
+    if (g_raster_mip_thread) {
+        if (g_raster_mip_thread->joinable()) g_raster_mip_thread->join();
+        delete g_raster_mip_thread;
+        g_raster_mip_thread = nullptr;
+    }
+    g_raster_mip = nullptr;
+    g_raster_mip_ready.store(true, std::memory_order_release);  // nothing to wait for unless the thread below starts
+    // the module is released by whoever finishes last: this function after the plain programs, the thread after its one
+    auto users = std::make_shared<std::atomic<int>>(has_mip ? 2 : 1);
+    const auto release_module = [users, module]() {
+        if (users->fetch_sub(1) == 1) wgpuShaderModuleRelease(module);
+    };
+    const auto build_mip = [make_pipeline, release_module]() {
+        const auto start = std::chrono::steady_clock::now();
+        g_raster_mip = make_pipeline(kRaster, true);
+        std::fprintf(stderr, "[gpu] mipmap draw program %s in %.0f ms\n", g_raster_mip ? "compiled" : "FAILED (levels are ignored)", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        release_module();
+    };
+#ifndef __EMSCRIPTEN__
+    if (has_mip) {
+        g_raster_mip_ready.store(false, std::memory_order_release);
+        g_raster_mip_thread = new std::thread(build_mip);
+    }
+#endif
+    for (int i = 0; i < kPipelines; ++i) {
+        g_pipelines[i] = make_pipeline(i, false);
         if (!g_pipelines[i]) return false;
     }
     std::fprintf(stderr, "[gpu] %d shaders compiled in %.0f ms\n", kPipelines, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count());
-    wgpuShaderModuleRelease(module);
+#ifdef __EMSCRIPTEN__
+    if (has_mip) build_mip();  // the browser build has no threads
+#endif
+    release_module();
     ensure_capacity();
     g_mode = m;
     g_current_mode = m;
@@ -2359,10 +2492,15 @@ void draw(const State &st, const Vertex *v, int count) {
         cache.flags = make_setup(st, attr, cache.setup);
         cache.key = static_cast<std::uint64_t>(w[1]) | (static_cast<std::uint64_t>(w[2]) << 14) | (static_cast<std::uint64_t>(w[3]) << 20) |
                     (static_cast<std::uint64_t>(w[5]) << 26) | (static_cast<std::uint64_t>(w[6]) << 40);
+        cache.mip_top = make_mip(st, attr, cache.mip);
         if (cache.flags & 2u) {
             const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
             const int tex_w = std::max(1 << tw, static_cast<int>(w[18] >> 16) + 1), tex_h = std::max(1 << th, static_cast<int>(w[19] >> 16) + 1);
             cache.tex = region(w[12], w[13], w[14], 0, 0, tex_w - 1, tex_h - 1);
+            if (cache.mip_top) {  // the other levels are read too: uploads, palette loads and the cuts below must see their memory as well
+                const Range levels = mip_range(w, cache.mip, cache.mip_top);
+                cache.tex.add(levels.lo, levels.hi);
+            }
         }
     }
     const std::uint32_t *setup = cache.setup;
@@ -2488,7 +2626,11 @@ void draw(const State &st, const Vertex *v, int count) {
             const bool fb_untouched = upper_byte && b.fpsm == PSMCT24;
             const auto written = [&](const Range &t) { return (!fb_untouched && t.overlaps(b.fb_range.lo, b.fb_range.hi)) || (b.zwrite && !z_untouched && t.overlaps(b.z_range.lo, b.z_range.hi)); };
             int rect[4];
-            if (written(tex)) {
+            if (written(tex) && cache.mip_top) {
+                // The rectangle and word-set tests below know only the base level: a shape that reads other levels too is cut off whenever any level was drawn on.
+                g_why = kWhyTexel;
+                emit_all();
+            } else if (written(tex)) {
                 // The tests below are page and box tests. A sprite that reads the memory of the frame in another layout (indices of 8 bits read as the pixels of 32 bits, a
                 // texture window with wrap mode 3) is cut off by them although it often touches no word that an earlier shape wrote: exact_clear looks at the words.
                 const bool exact_ok = prim == 6 && !shares_frame(setup, b);
@@ -2547,14 +2689,21 @@ void draw(const State &st, const Vertex *v, int count) {
         // the setup words did not change since the shape that wrote the last entry (the cache is only rebuilt in the block at the top)
         setup_index = static_cast<std::uint32_t>(setups - 1);
     } else {
-        if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, kSetupWords * 4) == 0) {
+        if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, kSetupWords * 4) == 0 &&
+            std::memcmp(b.mips.data() + (setups - 1) * kMipWords, cache.mip, kMipWords * 4) == 0) {
             setup_index = static_cast<std::uint32_t>(setups - 1);
         } else {
             setup_index = static_cast<std::uint32_t>(setups);
             b.setups.insert(b.setups.end(), setup, setup + kSetupWords);
+            b.mips.insert(b.mips.end(), cache.mip, cache.mip + kMipWords);
+            if (cache.mip[0]) {
+                b.any_mip = true;
+                ++(cache.mip_top ? g_mip_setups : g_filter_setups);
+            }
         }
         b.setup_serial = cache.serial;
     }
+    if (cache.mip[0]) ++(cache.mip_top ? g_mip_shapes : g_filter_shapes);
     if (flags & 2u) {
         if (g_batch_reads.empty() || g_batch_reads.back().lo != tex.lo || g_batch_reads.back().hi != tex.hi) {
             bool known = false;
@@ -2793,6 +2942,9 @@ void stats() {
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "[gpu] mipmaps: %llu setups (%llu shapes) read levels above 0, %llu setups (%llu shapes) only pick the filter per pixel\n",
+                 static_cast<unsigned long long>(g_mip_setups), static_cast<unsigned long long>(g_mip_shapes), static_cast<unsigned long long>(g_filter_setups),
+                 static_cast<unsigned long long>(g_filter_shapes));
 }
 
 void configure_surface() {

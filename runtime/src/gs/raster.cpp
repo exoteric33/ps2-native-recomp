@@ -26,6 +26,12 @@ struct Setup {
     std::uint32_t tbp, tbw, tpsm, tw, th, cpsm, csa;
     bool tcc, bilinear;
     int tfx, wms, wmt;
+    // Mipmapping (TEX1, MIPTBP1/2; docs/mipmap.md). `mip` is false when the level and the filter cannot depend on the pixel (one level
+    // and the same filter for magnification and reduction): then the texture is sampled as before, level 0 with `bilinear`.
+    bool mip;
+    int lcm, mxl, mmag, mmin, lodl;
+    float lodk;
+    std::uint32_t lbp[7], lbw[7];
     std::uint32_t minu, maxu, minv, maxv;
     std::uint32_t ta0, ta1;
     bool aem;
@@ -77,8 +83,72 @@ std::uint32_t fetch(const Setup &s, int x, int y) {
     }
 }
 
+std::uint32_t sample_with(const Setup &s, float u, float v, bool bilinear);
+
 std::uint32_t sample(const Setup &s, float u, float v) {
-    if (!s.bilinear) return fetch(s, static_cast<int>(std::floor(u)), static_cast<int>(std::floor(v)));
+    return sample_with(s, u, v, s.bilinear);
+}
+
+// The texture as mip level `n` sees it: its base pointer and buffer width (from MIPTBP1/2 or worked out, make_setup), its size (TW and TH
+// shifted by the level, at least one texel) and the region of the clamp modes 2 and 3 shifted the same way.
+Setup level_setup(const Setup &s, int n) {
+    Setup l = s;
+    l.tbp = s.lbp[n];
+    l.tbw = s.lbw[n];
+    l.tw = s.tw > static_cast<std::uint32_t>(n) ? s.tw - static_cast<std::uint32_t>(n) : 0u;
+    l.th = s.th > static_cast<std::uint32_t>(n) ? s.th - static_cast<std::uint32_t>(n) : 0u;
+    l.minu = s.minu >> n;
+    l.maxu = s.maxu >> n;
+    l.minv = s.minv >> n;
+    l.maxv = s.maxv >> n;
+    return l;
+}
+
+// The level of detail and what it picks (GS User's Manual, TEX1): LOD = K with LCM = 1, else (log2(1/|Q|) << L) + K, K a signed 7.4 number.
+// LOD <= 0 magnifies (filter MMAG, level 0); LOD > 0 reduces (filter MMIN): see docs/mipmap.md for why 0 counts as magnifying. The *_MIPMAP_NEAREST modes take the level nearest to LOD,
+// the *_MIPMAP_LINEAR modes blend the two levels around it by its fraction, never past MXL. NEAREST_* and LINEAR_* name the filter inside a level.
+struct Pick {
+    int level;
+    float frac;  // weight of level + 1 (0: one level)
+    bool linear;
+};
+
+Pick pick_level(const Setup &s, float q) {
+    const float lod = s.lcm ? s.lodk : std::log2(1.0f / std::fabs(q)) * static_cast<float>(1 << s.lodl) + s.lodk;
+    if (!(lod > 0.0f)) return {0, 0.0f, s.mmag != 0};
+    if (s.mmin < 2) return {0, 0.0f, (s.mmin & 1) != 0};
+    const bool linear = s.mmin >= 4;
+    if (s.mxl == 0) return {0, 0.0f, linear};
+    if (!(s.mmin & 1)) return {static_cast<int>(std::min(std::floor(lod + 0.5f), static_cast<float>(s.mxl))), 0.0f, linear};
+    const float whole = std::floor(lod);
+    if (whole >= static_cast<float>(s.mxl)) return {s.mxl, 0.0f, linear};
+    return {static_cast<int>(whole), lod - whole, linear};
+}
+
+std::uint32_t blend_levels(std::uint32_t a, std::uint32_t b, float f) {
+    std::uint32_t out = 0;
+    for (int ch = 0; ch < 32; ch += 8) {
+        const float x = static_cast<float>((a >> ch) & 0xFFu), y = static_cast<float>((b >> ch) & 0xFFu);
+        out |= static_cast<std::uint32_t>(std::clamp(x + (y - x) * f + 0.5f, 0.0f, 255.0f)) << ch;
+    }
+    return out;
+}
+
+// u, v: texel coordinates of level 0; nu, nv: the normalized coordinates S/Q and T/Q (STQ) that the levels scale by their own size.
+std::uint32_t sample_mip(const Setup &s, float u, float v, float nu, float nv, float q) {
+    const Pick p = pick_level(s, q);
+    const auto at = [&](int n) {
+        if (n == 0) return sample_with(s, u, v, p.linear);
+        const Setup l = level_setup(s, n);
+        if (s.fst) return sample_with(l, u / static_cast<float>(1 << n), v / static_cast<float>(1 << n), p.linear);
+        return sample_with(l, nu * static_cast<float>(1 << l.tw), nv * static_cast<float>(1 << l.th), p.linear);
+    };
+    const std::uint32_t c = at(p.level);
+    return p.frac > 0.0f ? blend_levels(c, at(p.level + 1), p.frac) : c;
+}
+
+std::uint32_t sample_with(const Setup &s, float u, float v, bool bilinear) {
+    if (!bilinear) return fetch(s, static_cast<int>(std::floor(u)), static_cast<int>(std::floor(v)));
     u -= 0.5f;
     v -= 0.5f;
     const int x0 = static_cast<int>(std::floor(u)), y0 = static_cast<int>(std::floor(v));
@@ -152,16 +222,18 @@ const char *shade(const Setup &s, int x, int y, const Attr &at) {
 
     int r = static_cast<int>(at.r), g = static_cast<int>(at.g), b = static_cast<int>(at.b), a = static_cast<int>(at.a);
     if (s.tme) {
-        float u, v;
+        float u, v, nu = 0.0f, nv = 0.0f, q = 1.0f;
         if (s.fst) {
             u = at.s / 16.0f;
             v = at.t / 16.0f;
         } else {
-            const float q = at.q != 0.0f ? at.q : 1.0f;
-            u = at.s / q * static_cast<float>(1 << s.tw);
-            v = at.t / q * static_cast<float>(1 << s.th);
+            q = at.q != 0.0f ? at.q : 1.0f;
+            nu = at.s / q;
+            nv = at.t / q;
+            u = nu * static_cast<float>(1 << s.tw);
+            v = nv * static_cast<float>(1 << s.th);
         }
-        const std::uint32_t t = sample(s, u, v);
+        const std::uint32_t t = s.mip ? sample_mip(s, u, v, nu, nv, q) : sample(s, u, v);
         const int tr = static_cast<int>(t & 0xFFu), tg = static_cast<int>((t >> 8) & 0xFFu), tb = static_cast<int>((t >> 16) & 0xFFu), ta = static_cast<int>(t >> 24);
         switch (s.tfx) {
         case 0:
@@ -347,6 +419,16 @@ Setup make_setup(const State &st) {
     s.cpsm = static_cast<std::uint32_t>(c.tex0 >> 51) & 0xFu;
     s.csa = static_cast<std::uint32_t>(c.tex0 >> 56) & 0x1Fu;
     s.bilinear = (c.tex1 >> 5) & 1u;
+    s.lcm = static_cast<int>(c.tex1 & 1u);
+    s.mxl = std::min(static_cast<int>(c.tex1 >> 2) & 7, 6);
+    s.mmag = static_cast<int>(c.tex1 >> 5) & 1;
+    s.mmin = static_cast<int>(c.tex1 >> 6) & 7;
+    s.lodl = static_cast<int>(c.tex1 >> 19) & 3;
+    s.lodk = static_cast<float>(static_cast<std::int32_t>(static_cast<std::uint32_t>(c.tex1 >> 32) << 20) >> 20) / 16.0f;
+    const bool min_linear = s.mmin == 1 || s.mmin >= 4;
+    static const bool off = std::getenv("PS2_MIPMAP") && std::getenv("PS2_MIPMAP")[0] == '0';  // as in gpu.cpp make_mip
+    s.mip = !off && (s.mmag != static_cast<int>(min_linear) || (s.mxl > 0 && s.mmin >= 2));
+    mip_levels(c, s.lbp, s.lbw);
     s.wms = static_cast<int>(c.clamp) & 3;
     s.wmt = static_cast<int>(c.clamp >> 2) & 3;
     s.minu = static_cast<std::uint32_t>(c.clamp >> 4) & 0x3FFu;

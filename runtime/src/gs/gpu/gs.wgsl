@@ -15,6 +15,10 @@ override SCALE: u32 = 1u;
 override TILE: u32 = 16u;
 
 override EXPLICIT_FMA: bool = false;
+// Mipmap levels (docs/mipmap.md). The program that reads them takes about twice as long to translate on FXC (Direct3D 12 without DXC), so
+// the host builds the draw program twice: HAS_MIP = false (plain, the one every draw without mipmap words uses, built at start) and
+// HAS_MIP = true (built in the background, used by the batches that carry a mipmap table). With false every use below folds away.
+override HAS_MIP: bool = false;
 
 // Where a*b+c is fused into one rounding differs between shader compilers: FXC and the graphics drivers fuse their own way and
 // Microsoft's DXC another, which moved a colour or a texel position by the last bit on a few pixels (docs/speed.md, section DXC).
@@ -474,6 +478,10 @@ struct Setup {
     tf: Fmt,
     ff: Fmt,
     zf: Fmt,
+    // Mipmapping (make_mip in gpu.cpp, docs/mipmap.md): 0 when the texture is sampled as before, else TEX1's fields; `mip_at` is where the
+    // setup's table entry starts (word 0 is `mip`, words 1 to 6 the base pointer and buffer width of levels 1 to 6).
+    mip: u32,
+    mip_at: u32,
 }
 
 const F_IIP: u32 = 1u;
@@ -529,6 +537,8 @@ fn load_setup(at: u32) -> Setup {
     s.tf = fmt_at(at + 25u);
     s.ff = fmt_at(at + 30u);
     s.zf = fmt_at(at + 35u);
+    s.mip = 0u;
+    s.mip_at = 0u;
     return s;
 }
 
@@ -739,6 +749,72 @@ fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
     return blend4(fetch_at(s, xa, ya, k), fetch_at(s, xb, ya, k), fetch_at(s, xa, yb, k), fetch_at(s, xb, yb, k), u - f32(x0), v - f32(y0));
 }
 
+// Mip level n of the texture as a setup of its own (raster.cpp, level_setup): its base pointer and buffer width from the table, its size
+// (TW and TH shifted by the level, at least one texel), the region of the clamp modes 2 and 3 shifted the same way, never the decoded copy.
+fn level_setup(s: Setup, n: u32) -> Setup {
+    var l = s;
+    let w = data[s.mip_at + n];
+    let bp = w & 0x3FFFu;
+    let bw = (w >> 14u) & 0x3Fu;
+    l.tbp = bp;
+    l.tbw = bw;
+    l.tf.base = bp * 256u;
+    l.tf.per_row = max(1u, (bw * 64u) >> (s.tf.bits & 15u));
+    l.tw = select(0u, s.tw - n, s.tw > n);
+    l.th = select(0u, s.th - n, s.th > n);
+    l.minu = s.minu >> n;
+    l.maxu = s.maxu >> n;
+    l.minv = s.minv >> n;
+    l.maxv = s.maxv >> n;
+    l.dec = 0xFFFFFFFFu;
+    return l;
+}
+
+fn blend_levels(a: u32, b: u32, f: f32) -> u32 {
+    let x = vec4<f32>(vec4<u32>(a & 0xFFu, (a >> 8u) & 0xFFu, (a >> 16u) & 0xFFu, a >> 24u));
+    let y = vec4<f32>(vec4<u32>(b & 0xFFu, (b >> 8u) & 0xFFu, (b >> 16u) & 0xFFu, b >> 24u));
+    let o = vec4<u32>(clamp(x + (y - x) * f + vec4<f32>(0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
+    return o.x | (o.y << 8u) | (o.z << 16u) | (o.w << 24u);
+}
+
+struct Pick {
+    level: u32,
+    frac: f32,
+    linear: u32,
+}
+
+// The GS's level of detail (GS User's Manual, TEX1; raster.cpp, pick_level): LOD = K with LCM = 1, else (log2(1/|Q|) << L) + K, K a signed
+// 7.4 number. LOD <= 0 magnifies (MMAG, level 0); LOD > 0 reduces (MMIN): *_MIPMAP_NEAREST take the level nearest to LOD, *_MIPMAP_LINEAR
+// blend the two levels around it by its fraction, never past MXL; NEAREST_* / LINEAR_* is the filter inside a level. Only the choice: the
+// sampling stays in one place in plot(), because every copy of sample() makes the program longer to translate (FXC took minutes with six).
+fn mip_pick(s: Setup, q: f32) -> Pick {
+    let lk = f32(bitcast<i32>(((s.mip >> 16u) & 0xFFFu) << 20u) >> 20u) / 16.0;
+    var lod = lk;
+    if ((s.mip & 1u) == 0u) {
+        lod = log2(1.0 / abs(q)) * f32(1u << ((s.mip >> 8u) & 3u)) + lk;
+    }
+    let mxl = (s.mip >> 1u) & 7u;
+    let mmin = (s.mip >> 5u) & 7u;
+    if (!(lod > 0.0)) {
+        return Pick(0u, 0.0, (s.mip >> 4u) & 1u);
+    }
+    if (mmin < 2u) {
+        return Pick(0u, 0.0, mmin & 1u);
+    }
+    let linear = select(0u, 1u, mmin >= 4u);
+    if (mxl == 0u) {
+        return Pick(0u, 0.0, linear);
+    }
+    if ((mmin & 1u) == 0u) {
+        return Pick(u32(min(floor(lod + 0.5), f32(mxl))), 0.0, linear);
+    }
+    let whole = floor(lod);
+    if (whole >= f32(mxl)) {
+        return Pick(mxl, 0.0, linear);
+    }
+    return Pick(u32(whole), lod - whole, linear);
+}
+
 fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
     let a = vec4<f32>(vec4<u32>(c00 & 0xFFu, (c00 >> 8u) & 0xFFu, (c00 >> 16u) & 0xFFu, c00 >> 24u));
     let b = vec4<f32>(vec4<u32>(c10 & 0xFFu, (c10 >> 8u) & 0xFFu, (c10 >> 16u) & 0xFFu, c10 >> 24u));
@@ -870,18 +946,57 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     if (has(s, F_TME)) {
         var u: f32;
         var v: f32;
+        var q = 1.0;
+        var nu = 0.0;
+        var nv = 0.0;
         if (has(s, F_FST)) {
             u = at.s / 16.0;
             v = at.t / 16.0;
         } else {
-            var q = at.q;
+            q = at.q;
             if (q == 0.0) {
                 q = 1.0;
             }
-            u = at.s / q * f32(1u << s.tw);
-            v = at.t / q * f32(1u << s.th);
+            nu = at.s / q;
+            nv = at.t / q;
+            u = nu * f32(1u << s.tw);
+            v = nv * f32(1u << s.th);
         }
-        let t = sample(s, u, v, k);
+        // One level (two when *_MIPMAP_LINEAR blends): without mipmap words that is level 0 with the setup as it is, as before.
+        var base = s;
+        var p = Pick(0u, 0.0, 0u);
+        if (HAS_MIP && s.mip != 0u) {
+            p = mip_pick(s, q);
+            if (p.linear != 0u) {
+                base.flags = base.flags | F_BILINEAR;
+            } else {
+                base.flags = base.flags & ~F_BILINEAR;
+            }
+        }
+        let levels = select(1u, 2u, p.frac > 0.0);
+        var t = 0u;
+        for (var i = 0u; i < levels; i = i + 1u) {
+            let n = p.level + i;
+            var l = base;
+            var lu = u;
+            var lv = v;
+            if (n != 0u) {
+                l = level_setup(base, n);
+                if (has(s, F_FST)) {
+                    lu = u / f32(1u << n);
+                    lv = v / f32(1u << n);
+                } else {
+                    lu = nu * f32(1u << l.tw);
+                    lv = nv * f32(1u << l.th);
+                }
+            }
+            let c = sample(l, lu, lv, k);
+            if (i == 0u) {
+                t = c;
+            } else {
+                t = blend_levels(t, c, p.frac);
+            }
+        }
         let tr = i32(t & 0xFFu);
         let tg = i32((t >> 8u) & 0xFFu);
         let tb = i32((t >> 16u) & 0xFFu);
@@ -1051,6 +1166,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
 
 const PRIM_WORDS: u32 = 28u;
 const SETUP_WORDS: u32 = 40u;
+const MIP_WORDS: u32 = 8u;
 
 fn fat(i: u32) -> f32 {
     return bitcast<f32>(data[i]);
@@ -1173,7 +1289,7 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             var ux = px;
             var uy = py;
             let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
-            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct);
+            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct) && s.mip == 0u;
             let near_x = abs(abs(du) - abs(dx)) <= abs(dx) * 0.05;
             let near_y = abs(abs(dv) - abs(dy)) <= abs(dy) * 0.05;
             let exact = abs(du) >= abs(dx) * 0.999 && abs(dv) >= abs(dy) * 0.999;
@@ -1307,6 +1423,7 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     let setups = prm(2u);
     snapshot_lo = prm(5u);
     snapshot_hi = prm(6u);
+    let mips = prm(9u);  // words 7 and 8 are not used here
     var last_setup = 0xFFFFFFFFu;
     var s: Setup;
     for (var i = 0u; i < count; i = i + 1u) {
@@ -1315,6 +1432,10 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
         let si = data[p];
         if (si != last_setup) {
             s = load_setup(setups + si * SETUP_WORDS);
+            if (HAS_MIP && mips != 0xFFFFFFFFu) {
+                s.mip_at = mips + si * MIP_WORDS;
+                s.mip = data[s.mip_at];
+            }
             last_setup = si;
         }
         let lo = data[p + 2u];

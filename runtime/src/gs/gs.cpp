@@ -435,6 +435,30 @@ void swizzle_tables(std::vector<std::uint32_t> &out) {
     for (auto &row : g_off4) out.insert(out.end(), std::begin(row), std::end(row));
 }
 
+// The base pointer (in 256-byte blocks) and buffer width of mip levels 0 to 6 (GS User's Manual: TEX0, TEX1 MTBA, MIPTBP1/2; docs/mipmap.md).
+// MIPTBP1 holds levels 1 to 3 and MIPTBP2 levels 4 to 6, each as a 14-bit base pointer and a 6-bit width, 20 bits a level.
+// With MTBA = 1 the chip works out levels 1 to 3 itself; the rule used here (each level right after the one before, the buffer width halved)
+// is the natural packing and a guess in its details: the manual's restrictions on that mode are not checked.
+void mip_levels(const Context &c, std::uint32_t bp[7], std::uint32_t bw[7]) {
+    bp[0] = static_cast<std::uint32_t>(c.tex0) & 0x3FFFu;
+    bw[0] = static_cast<std::uint32_t>(c.tex0 >> 14) & 0x3Fu;
+    for (int n = 1; n <= 6; ++n) {
+        const std::uint64_t r = n <= 3 ? c.miptbp1 : c.miptbp2;
+        const int shift = ((n - 1) % 3) * 20;
+        bp[n] = static_cast<std::uint32_t>(r >> shift) & 0x3FFFu;
+        bw[n] = static_cast<std::uint32_t>(r >> (shift + 14)) & 0x3Fu;
+    }
+    if (!((c.tex1 >> 9) & 1u)) return;
+    const std::uint32_t psm = static_cast<std::uint32_t>(c.tex0 >> 20) & 0x3Fu;
+    const std::uint32_t tw = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 26) & 0xFu, 10u), th = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 30) & 0xFu, 10u);
+    for (std::uint32_t n = 1; n <= 3; ++n) {
+        const std::uint32_t w = 1u << (tw > n - 1 ? tw - (n - 1) : 0u), h = 1u << (th > n - 1 ? th - (n - 1) : 0u);
+        const std::uint32_t bytes = w * h * bits_per_pixel(psm) / 8u;
+        bp[n] = (bp[n - 1] + std::max(1u, (bytes + 255u) / 256u)) & 0x3FFFu;
+        bw[n] = std::max(1u, bw[n - 1] / 2u);
+    }
+}
+
 std::uint32_t address32(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {
     return wrap(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]);
 }

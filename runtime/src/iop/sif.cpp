@@ -124,7 +124,14 @@ std::uint64_t g_boot_end = 0;
 std::uint32_t g_ee_recv = 0;
 std::uint32_t g_data_addr = 0;
 bool g_processed = true;
+// What the IOP sends the EE over SIF0, in order: command packets, and empty entries for an IOP sceSifSetDma with SIF_DMA_INT_O (see
+// pump). g_processed is false while the EE's SIF0 channel is stopped after an interrupt, until its handler calls isceSifSetDChain.
 std::deque<std::vector<std::uint8_t>> g_outgoing;
+// SifDmaTransfer_t.attr (ps2sdk sifman.h, AFL-2.0). INT_I (0x2) sets the IRQ bit of the IOP's own DMA tag (the IOP's SIF0 interrupt,
+// which here runs the sceSifSetDmaIntr callbacks anyway); INT_O sets the IRQ bit of the EE's tag (ps2sdk sifman.c sif_dma_setup_tag:
+// 0x80000000 in the tag's count word): the EE's channel 5 stops after that transfer and raises its interrupt (CIS5), the same as for
+// every command packet, which sceSifSendCmd sends with INT_O. ERT, SPR, BSN and TAG only mean something on the EE side.
+constexpr std::uint32_t kSifDmaIntO = 0x4u;
 // g_servers is the endpoint selected by SID for binding. Guest RPC calls carry
 // the server-data pointer returned by that bind, so retain every registered
 // guest endpoint independently instead of redirecting calls by SID.
@@ -701,20 +708,35 @@ void install_iop_side() {
     def("sifman", 6, "sceSifSetDChain", [](iop::Cpu &c) { c.r[2] = 0; });
     auto set_dma = [](iop::Cpu &c, std::uint32_t callback, std::uint32_t data) {
         const std::uint32_t list = arg(c, 0), count = arg(c, 1);
+        bool interrupt = false;
         for (std::uint32_t i = 0; i < count; ++i) {
             const std::uint32_t src = iop::read32(list + i * 16), dst = iop::read32(list + i * 16 + 4), size = iop::read32(list + i * 16 + 8);
+            const std::uint32_t attr = iop::read32(list + i * 16 + 12);
             if (g_options.trace_iop_hle) {
                 std::uint32_t nonzero = 0;
                 for (std::uint32_t k = 0; k < std::min(size, iop::kRamSize); ++k) nonzero += *iop::ram_ptr(src + k) != 0;
-                std::fprintf(stderr, "[sif] iop dma 0x%08X -> ee 0x%08X size 0x%X nonzero %u words %08X %08X %08X %08X\n", src, dst, size, nonzero,
-                             iop::read32(src), iop::read32(src + 4), iop::read32(src + 8), iop::read32(src + 12));
+                std::fprintf(stderr, "[sif] iop dma 0x%08X -> ee 0x%08X size 0x%X attr 0x%X nonzero %u words %08X %08X %08X %08X\n", src, dst, size, attr,
+                             nonzero, iop::read32(src), iop::read32(src + 4), iop::read32(src + 8), iop::read32(src + 12));
             }
             const std::uint32_t n = fit_copy("sceSifSetDma", dst, src, size);
             std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), n);
             watch_span(dst, n, "sif:iop_dma");
+            if (attr & kSifDmaIntO) {
+                // The data is in EE memory now (as before); the EE's channel 5 interrupt follows in order behind the command packets
+                // already on their way, when the EE's channel runs (pump).
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::fprintf(stderr, "[sif] an IOP sceSifSetDma asks for the EE's SIF0 interrupt (attr 0x%X, to EE 0x%08X, ra 0x%08X), shown once\n",
+                                 attr, dst, c.r[31]);
+                }
+                g_outgoing.emplace_back();
+                interrupt = true;
+            }
         }
         c.r[2] = g_iop_dma_id++;
         if (callback) iop::kernel::schedule(iop::kernel::now() + 32, iop::kernel::Job{iop::kernel::kJobSifDmaCallback, callback, data});
+        if (interrupt) pump();
     };
     def("sifman", 7, "sceSifSetDma", [set_dma](iop::Cpu &c) { set_dma(c, 0, 0); });
     def("sifman", 8, "sceSifDmaStat", [](iop::Cpu &c) { c.r[2] = static_cast<std::uint32_t>(-1); });
@@ -1305,6 +1327,16 @@ void pump() {
     }
     if (g_options.trace_iop_hle && !g_outgoing.empty() && !g_processed) std::fprintf(stderr, "[sif] %zu packets wait for the EE\n", g_outgoing.size());
     if (!g_processed || g_outgoing.empty() || !g_ee_recv) return;
+    if (g_outgoing.front().empty()) {
+        // An IOP sceSifSetDma with SIF_DMA_INT_O, its data already copied: only the interrupt. The EE's channel stops after it as after
+        // a packet; the game's own channel 5 handler starts it again with isceSifSetDChain (Sony's sifcmd handler does not when no packet
+        // came: it skips that call when the packet size is 0, seen in God of War II's EE code and in ps2sdk's _SifCmdIntHandler).
+        g_outgoing.pop_front();
+        if (g_options.trace_iop_modules) std::fprintf(stderr, "[sif] to EE: SIF0 interrupt of an IOP sceSifSetDma\n");
+        g_processed = false;
+        hw::dmac_raise(5);
+        return;
+    }
     // A polling server can return tens of thousands of ordinary RPC_END
     // packets during an intro. Trace requests and unusual commands instead.
     std::uint32_t outgoing_cid = 0;

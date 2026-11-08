@@ -1,8 +1,8 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 42 games work as far as they
-have been tested, 28 of them out of the box, with zero game-specific code. God of War II has been played from start to
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 45 games work as far as they
+have been tested, 30 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
 **How it works, from the disc to the picture: [read the explanation](#how-it-works).**
@@ -11,9 +11,9 @@ Built on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nu
 
 https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
 
-**28 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
+**30 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
 Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
-Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe, Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima, Robot Alchemic Drive, Altered Beast, Mister Moskeeto, Twisted Metal: Head-On and Quake III Revolution. *Out of the box* means nobody changed anything for these games: the
+Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe, Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima, Robot Alchemic Drive, Altered Beast, Mister Moskeeto, Twisted Metal: Head-On, Quake III Revolution, Sonic Heroes and Return to Castle Wolfenstein: Operation Resurrection. *Out of the box* means nobody changed anything for these games: the
 tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)). Gran Turismo 4 needs one small build step that
 unpacks its program; the runtime has no code for it.
 
@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 41
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 44
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -105,7 +105,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | The King of Fighters XI | plays well, not played through yet: works perfectly | TsimpleD (Reddit) |
 | God Hand | plays well, not played through yet: as far as the casino hub, no problems so far | theraineydaze (Reddit) |
 | Tekken 4 | plays well, not played through yet: fights in Story Battle at 60 fps, only a short stutter when a fight starts (Windows 11, a Radeon RX 6800 XT, keyboard and mouse; [#8](https://github.com/exoteric33/ps2-native-recomp/issues/8)) | DevCrashDay |
-| Tekken 5 | plays well, not played through yet: first a black screen, reported and tested by DevCrashDay and UserGit-2021 ([#6](https://github.com/exoteric33/ps2-native-recomp/issues/6)); after the fix I played a fight on Linux | DevCrashDay, UserGit-2021, me |
+| Tekken 5 | plays well, not played through yet: first a black screen, reported and tested by DevCrashDay and UserGit-2021 ([#6](https://github.com/exoteric33/ps2-native-recomp/issues/6)); after the fix I played a fight on Linux; a tester later played every mode for over 30 minutes at 60 fps, but the bonus games Tekken 3 (Arcade History) and Tekken: Devil Within close the program | DevCrashDay, UserGit-2021, me, Bugra06 |
 | Armored Trooper VOTOMS (Japan) | plays well, not played through yet: the tutorial and the first mission at about 60 fps, and saves work; it slowed down once, the first time a new part loaded (Windows 11, a laptop with Intel graphics, a game controller; [#5](https://github.com/exoteric33/ps2-native-recomp/issues/5)) | omegakatana92 |
 | Ben 10: Alien Force | plays well, not played through yet: works very well, no problems so far | Travani |
 | Samurai Western (Europe) | plays well, not played through yet: from the opening film into the game at 49 to 60 fps, with short slowdowns while new parts appear; the US disc gets there too but slows down more (Windows 11, a laptop with Intel graphics, a game controller; [#19](https://github.com/exoteric33/ps2-native-recomp/issues/19)) | omegakatana92 |
@@ -136,12 +136,15 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Mister Moskeeto (USA) | plays well, not played through yet: through the fourth level at full speed with a game controller; a blurry rectangle in the films before the levels ([#76](https://github.com/exoteric33/ps2-native-recomp/issues/76)) | m3tabolic |
 | Twisted Metal: Head-On (USA) | plays well, not played through yet: through the Cousin Eddy boss fight and levels of Lost at full speed with a game controller; one fire effect is wrong, small marks in films now and then ([#77](https://github.com/exoteric33/ps2-native-recomp/issues/77)) | m3tabolic |
 | Quake III Revolution (USA) | plays well, not played through yet: many matches on four maps at full speed; some textures look wrong far away and right up close ([#78](https://github.com/exoteric33/ps2-native-recomp/issues/78)) | m3tabolic |
+| Prince of Persia: Warrior Within (USA) | runs, not played through yet: through the opening on the ship to the first mini-boss at 60 fps (with a 60 fps patch); the sound stutters and lags while playing, the films are fine | Bugra06 |
+| Sonic Heroes (Europe) | runs, not played through yet: halfway through Seaside Hill at 60 fps; short stutters and freezes now and then, and a rattling sound in the Team Sonic film | Bugra06 |
+| Return to Castle Wolfenstein: Operation Resurrection (USA) | runs, not played through yet: into the first mission, smooth; many graphics bugs ([#79](https://github.com/exoteric33/ps2-native-recomp/issues/79)) | YaroslavValerySablin |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 
 | Game | What happens | Reported by |
 |---|---|---|
-| Ben 10: Alien Force - Vilgax Attacks | stops at "Checking memory card" right after the start and goes no further | Travani |
+| Ben 10: Alien Force - Vilgax Attacks | first stopped at "Checking memory card"; now the first level plays to its end, then the loading before the second level never ends; an "error reading disc" message shows up while playing, and the sound in films is out of step ([#80](https://github.com/exoteric33/ps2-native-recomp/issues/80)) | Travani, spideythewebster |
 
 54 of the 55 programs of the free [ps2autotests](https://github.com/unknownbrackets/ps2autotests) suite print exactly
 what the console prints (`python scripts/autotests.py`).

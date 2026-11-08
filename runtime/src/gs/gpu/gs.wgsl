@@ -311,7 +311,18 @@ fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         v = bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
     }
-    write_pixel(data[r + 2u], data[r], data[r + 1u], x, y, v);
+    let psm = data[r + 2u];
+    // A depth buffer that is put back as it was read (Digital Devil Saga reads its depth and writes it back in every frame)
+    // keeps its finer samples: a read gives the first sample of each pixel, and a write of that same value would otherwise
+    // replace the finer depth of a scaled picture with one value per pixel, and the shapes drawn against it afterwards (lights
+    // a hair in front of a slanted ceiling) would fail in stripes. A changed value is written to every sample as before.
+    if (SCALE > 1u && (psm == 0x30u || psm == 0x31u || psm == 0x32u || psm == 0x3Au)) {
+        let l = locate(psm, data[r], data[r + 1u], x, y);
+        if (((atomicLoad(&vram[l.word * SCALE * SCALE]) >> l.shift) & l.mask) == (v & l.mask)) {
+            return;
+        }
+    }
+    write_pixel(psm, data[r], data[r + 1u], x, y, v);
 }
 
 @compute @workgroup_size(64)

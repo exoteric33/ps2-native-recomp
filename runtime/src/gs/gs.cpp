@@ -1025,7 +1025,12 @@ void read_image(std::uint8_t *data, std::uint32_t qwords) {
     key.qwords = qwords;
     g_shadow.offset += qwords * 16;
     const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
-    {
+    // A depth buffer is always read as it is now: a game that reads its depth and writes it back (Digital Devil Saga does it in
+    // every frame) would otherwise put the depth of the frame before back and draw against it (lights that are tested against
+    // the ceiling go missing while the camera moves).
+    const std::uint32_t spsm = static_cast<std::uint32_t>(key.buf >> 24) & 0x3Fu;
+    const bool depth = spsm == PSMZ32 || spsm == PSMZ24 || spsm == PSMZ16 || spsm == PSMZ16S;
+    if (!depth) {
         std::lock_guard lock(g_cache_mutex);
         const auto it = std::find_if(g_download_cache.begin(), g_download_cache.end(), [&](const CachedDownload &c) { return c.key == key; });
         if (it != g_download_cache.end() && it->data.size() == bytes) {

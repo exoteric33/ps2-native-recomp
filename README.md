@@ -1,8 +1,8 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 39 games work as far as they
-have been tested, 25 of them out of the box, with zero game-specific code. God of War II has been played from start to
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 42 games work as far as they
+have been tested, 28 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
 **How it works, from the disc to the picture: [read the explanation](#how-it-works).**
@@ -11,9 +11,9 @@ Built on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nu
 
 https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
 
-**25 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
+**28 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
 Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
-Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe, Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima, Robot Alchemic Drive and Altered Beast. *Out of the box* means nobody changed anything for these games: the
+Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe, Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima, Robot Alchemic Drive, Altered Beast, Mister Moskeeto, Twisted Metal: Head-On and Quake III Revolution. *Out of the box* means nobody changed anything for these games: the
 tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)). Gran Turismo 4 needs one small build step that
 unpacks its program; the runtime has no code for it.
 
@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 38
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 41
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -133,6 +133,9 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima (Japan) | plays well, not played through yet: no bugs found | Bugra06 |
 | Robot Alchemic Drive | runs, not played through yet: "works fine" | a tester on Reddit |
 | Altered Beast (Europe) | runs, not played through yet: past the first enemy wave, smooth, slower around fire and smoke ([#68](https://github.com/exoteric33/ps2-native-recomp/issues/68)) | XOCX404 |
+| Mister Moskeeto (USA) | plays well, not played through yet: through the fourth level at full speed with a game controller; a blurry rectangle in the films before the levels ([#76](https://github.com/exoteric33/ps2-native-recomp/issues/76)) | m3tabolic |
+| Twisted Metal: Head-On (USA) | plays well, not played through yet: through the Cousin Eddy boss fight and levels of Lost at full speed with a game controller; one fire effect is wrong, small marks in films now and then ([#77](https://github.com/exoteric33/ps2-native-recomp/issues/77)) | m3tabolic |
+| Quake III Revolution (USA) | plays well, not played through yet: many matches on four maps at full speed; some textures look wrong far away and right up close ([#78](https://github.com/exoteric33/ps2-native-recomp/issues/78)) | m3tabolic |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

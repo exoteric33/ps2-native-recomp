@@ -1024,33 +1024,43 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let x2 = fat(p + 8u);
             let y2 = fat(p + 9u);
             let inv = fat(p + 10u);
-            let w0 = cross2(x1 - px, y2 - py, x2 - px, y1 - py) * inv;
-            let w1 = cross2(x2 - px, y0 - py, x0 - px, y2 - py) * inv;
+            let s0 = cross2(x1 - px, y2 - py, x2 - px, y1 - py) * inv;
+            let s1 = cross2(x2 - px, y0 - py, x0 - px, y2 - py) * inv;
             let c2 = cross2(x0 - px, y1 - py, x1 - px, y0 - py) * inv;
             let inclusive = data[p + 27u];
             // An edge that is exactly horizontal or vertical decides coverage at the console pixel's centre, as a sprite does
             // below: 2D pieces laid side by side for the console's grid (Digital Devil Saga's solar-noise dial is two
             // rectangles, x 27-56.5 and 57-86.5) leave a gap narrower than a pixel that covers no console pixel centre but
             // does cover the finer samples of a scaled picture (a seam). Slanted edges keep the finer samples.
-            var e0 = w0;
-            var e1 = w1;
-            var e2 = c2;
-            if (SCALE > 1u) {
-                let cx = f32(x);
-                let cy = f32(y);
-                if (x1 == x2 || y1 == y2) {
-                    e0 = cross2(x1 - cx, y2 - cy, x2 - cx, y1 - cy) * inv;
-                }
-                if (x2 == x0 || y2 == y0) {
-                    e1 = cross2(x2 - cx, y0 - cy, x0 - cx, y2 - cy) * inv;
-                }
-                if (x0 == x1 || y0 == y1) {
-                    e2 = cross2(x0 - cx, y1 - cy, x1 - cx, y0 - cy) * inv;
-                }
-            }
-            if (!edge_in(e0, inclusive & 1u) || !edge_in(e1, inclusive & 2u) || !edge_in(e2, inclusive & 4u)) {
+            let cx = f32(x);
+            let cy = f32(y);
+            let a0 = SCALE > 1u && (x1 == x2 || y1 == y2);
+            let a1 = SCALE > 1u && (x2 == x0 || y2 == y0);
+            let a2 = SCALE > 1u && (x0 == x1 || y0 == y1);
+            let ce0 = cross2(x1 - cx, y2 - cy, x2 - cx, y1 - cy) * inv;
+            let ce1 = cross2(x2 - cx, y0 - cy, x0 - cx, y2 - cy) * inv;
+            let ce2 = cross2(x0 - cx, y1 - cy, x1 - cx, y0 - cy) * inv;
+            let in0 = edge_in(select(s0, ce0, a0), inclusive & 1u);
+            let in1 = edge_in(select(s1, ce1, a1), inclusive & 2u);
+            let in2 = edge_in(select(c2, ce2, a2), inclusive & 4u);
+            if (!in0 || !in1 || !in2) {
                 return;
             }
+            // A sample outside such an edge is covered only when its console pixel is, i.e. when the pixel's centre is inside
+            // the whole triangle (as on the console); the slanted edges alone would let a sliver whose straight edge passes a
+            // pixel centre spread into the rows beyond it (lines along the rain ripples). Such a sample takes its colour,
+            // texture coordinates and depth from the pixel's centre, as the console's pixel does, not from beyond the shape.
+            let out0 = a0 && !edge_in(s0, inclusive & 1u);
+            let out1 = a1 && !edge_in(s1, inclusive & 2u);
+            let out2 = a2 && !edge_in(c2, inclusive & 4u);
+            if ((out0 || out1 || out2) && !(edge_in(ce0, inclusive & 1u) && edge_in(ce1, inclusive & 2u) && edge_in(ce2, inclusive & 4u))) {
+                return;
+            }
+            let extended = out0 || out1 || out2;
+            let qx = select(px, cx, extended);
+            let qy = select(py, cy, extended);
+            let w0 = cross2(x1 - qx, y2 - qy, x2 - qx, y1 - qy) * inv;
+            let w1 = cross2(x2 - qx, y0 - qy, x0 - qx, y2 - qy) * inv;
             let w2 = 1.0 - w0 - w1;
             // Colour and fog as the first vertex's value plus weighted differences, like the depth: a value that is the same
             // at all vertices (flat shading) comes out exactly instead of a hair below, which truncation would turn into one

@@ -521,7 +521,7 @@ namespace ps2 {
 alignas(64) std::uint8_t g_vu0_code[4096], g_vu0_mem[4096], g_vu1_code[16384], g_vu1_mem[16384];
 Cpu g_cpu;
 Options g_options;
-namespace gif { void transfer(int, const std::uint8_t *, std::uint32_t) {} }
+namespace gif { void transfer(int, const std::uint8_t *, std::uint32_t) {} void end_runaway_kick(std::uint32_t) {} }
 namespace gs::queue {
 Ring &vu() { static Ring ring; return ring; }
 Role &role() { static Role r = Role::Emulation; return r; }

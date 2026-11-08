@@ -125,6 +125,7 @@ struct IopBind {
 std::map<std::uint32_t, IopBind> g_iop_binds;  // by client
 constexpr std::uint64_t kIopBindRetryUsec = 1000;
 constexpr std::uint64_t kIopBindTimeoutUsec = 4000000;
+constexpr std::uint32_t kIopBindRetryJob = 1;  // Job::a of a kJobSifReply job that sends an IOP bind again (b client, c server)
 
 struct CmdHandler {
     std::uint32_t handler, data;
@@ -518,14 +519,10 @@ void command(std::uint32_t src, std::uint32_t size) {
                     }
                     // The client keeps its packet pointer (the released packet still reports the call as running to
                     // sceSifCheckStatRpc) and its thread stays blocked; the next request takes a packet again.
-                    iop::kernel::schedule(iop::kernel::now() + iop::kernel::usec_to_cycles(kIopBindRetryUsec), [client, server] {
-                        if (!g_iop_binds.count(client)) return;
-                        if (!send_iop_bind(client, server)) {
-                            std::fprintf(stderr, "[sif] IOP bind to EE server 0x%08X (client 0x%08X) has no request packet\n", server, client);
-                            g_iop_binds.erase(client);
-                            finish_iop_bind(client, 0, 0, 0);
-                        }
-                    });
+                    // A job, not a lambda: an IOP event that is a lambda cannot be saved, so a save state taken while the bind
+                    // waits would fail (kernel.cpp).
+                    iop::kernel::schedule(iop::kernel::now() + iop::kernel::usec_to_cycles(kIopBindRetryUsec),
+                                          iop::kernel::Job{iop::kernel::kJobSifReply, kIopBindRetryJob, client, server});
                     break;
                 }
                 if (!words[9]) std::fprintf(stderr, "[sif] IOP bind to EE server 0x%08X (client 0x%08X) timed out\n", server, client);
@@ -756,7 +753,19 @@ void exec_finish(iop::Cpu &c) {
 
 void install_iop_side() {
     iop::kernel::register_job(iop::kernel::kJobSifDmaCallback, [](const iop::kernel::Job &j) { iop::kernel::call_guest(j.a, j.b); });
-    iop::kernel::register_job(iop::kernel::kJobSifReply, [](const iop::kernel::Job &) {
+    iop::kernel::register_job(iop::kernel::kJobSifReply, [](const iop::kernel::Job &j) {
+        if (j.a == kIopBindRetryJob) {
+            const std::uint32_t client = j.b, server = j.c;
+            // A state saved while the bind waited does not hold g_iop_binds (the map is not in the state): wait again from here.
+            if (!g_iop_binds.count(client))
+                g_iop_binds[client] = IopBind{server, iop::kernel::now() + iop::kernel::usec_to_cycles(kIopBindTimeoutUsec), true};
+            if (!send_iop_bind(client, server)) {
+                std::fprintf(stderr, "[sif] IOP bind to EE server 0x%08X (client 0x%08X) has no request packet\n", server, client);
+                g_iop_binds.erase(client);
+                finish_iop_bind(client, 0, 0, 0);
+            }
+            return;
+        }
         if (g_hle_replies.empty()) return;
         const Call c = g_hle_replies.front();
         g_hle_replies.pop_front();

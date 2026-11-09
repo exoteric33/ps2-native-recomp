@@ -166,6 +166,7 @@ std::map<std::uint32_t, CmdHandler> g_cmd_handlers;
 std::map<std::uint32_t, std::uint64_t> g_ee_commands;
 std::map<std::uint32_t, std::uint64_t> g_unhandled_commands;
 std::map<std::uint32_t, std::uint64_t> g_ee_binds;
+std::map<std::uint32_t, std::uint64_t> g_ee_calls;  // RPC calls by server id (the server of an endpoint the EE called)
 std::uint32_t g_sreg[32] = {};
 std::map<std::uint32_t, int> g_iop_clients;
 std::uint32_t g_iop_rpc_id = 1;
@@ -341,6 +342,14 @@ const Server *first_guest_server(std::uint32_t sid) {
     return server != g_servers.end() && !server->second.hle ? &server->second : nullptr;
 }
 
+// The server id behind a call's endpoint: a module's own server has the address of its struct as endpoint, a built-in one sid ^ kServerXor
+// (0x2CACACAF is 0x80000003, the IOP heap). 0 when no server of ours has it. A log that shows the endpoint only has to be decoded by hand.
+std::uint32_t server_id_of_endpoint(std::uint32_t endpoint) {
+    if (const auto guest = g_guest_servers.find(endpoint); guest != g_guest_servers.end()) return guest->second.sid;
+    if (const auto hle = g_servers.find(endpoint ^ kServerXor); hle != g_servers.end()) return hle->second.sid;
+    return 0;
+}
+
 bool fill_bind_endpoint(Rend &reply, std::uint32_t sid) {
     if (const Server *server = first_guest_server(sid)) {
         reply.server_data = server->sd;
@@ -402,6 +411,7 @@ void call(const std::uint8_t *packet) {
             reply_call(c);
             return;
         }
+        ++g_ee_calls[sid];
         // The IOP runs behind the EE by up to a slice; catch it up so the reply
         // latency counts from the moment of the call.
         sync_iop();
@@ -414,6 +424,7 @@ void call(const std::uint8_t *packet) {
         return;
     }
     const Server &s = legacy ? *legacy : guest->second;
+    ++g_ee_calls[s.sid];
     Request request{c, c.send_size, {}};
     if (s.buf && legacy) {
         const std::uint32_t size = (c.send_size + 15u) & ~15u;
@@ -465,8 +476,11 @@ void command(std::uint32_t src, std::uint32_t size) {
             const auto endpoint = g_guest_servers.find(words[13]);
             const std::uint32_t iop_buffer = endpoint == g_guest_servers.end() ? 0u : endpoint->second.buf;
             const bool guest_buffer = iop_buffer != 0;
-            std::fprintf(stderr, "[sif] call endpoint 0x%08X fn %u send %u recv %u mode %u %s buffer 0x%08X args",
-                         words[13], words[8], words[9], words[11], words[12],
+            const std::uint32_t sid = server_id_of_endpoint(words[13]);
+            char server[32] = "unknown server";
+            if (sid) std::snprintf(server, sizeof server, "server 0x%08X", sid);
+            std::fprintf(stderr, "[sif] call endpoint 0x%08X (%s) fn %u send %u recv %u mode %u %s buffer 0x%08X args",
+                         words[13], server, words[8], words[9], words[11], words[12],
                          guest_buffer ? "IOP" : "EE", guest_buffer ? iop_buffer : g_data_addr);
             for (std::uint32_t i = 0; i < 8u && i * 4u < words[9]; ++i) {
                 const std::uint32_t value = guest_buffer ? iop::read32(iop_buffer + i * 4u)
@@ -705,10 +719,15 @@ void finish_request(iop::Cpu &c, iop::kernel::Thread &t) {
     const std::uint32_t result = c.r[2];
     if (iop::kernel::g_trace_modules && result && call.recv_size >= 4) {
         // --trace-iop: the first words the server answers with (the memory card's results are what a save is judged by)
-        std::fprintf(stderr, "[sif] reply server 0x%08X fn %u:", call.server_data ^ kServerXor, call.rpc_number);
+        std::fprintf(stderr, "[sif] reply server 0x%08X fn %u:", server_id_of_endpoint(call.server_data), call.rpc_number);
         for (std::uint32_t i = 0; i < std::min<std::uint32_t>(4, call.recv_size / 4); ++i)
             std::fprintf(stderr, " %08X", iop::read32(result + 4 * i));
         std::fprintf(stderr, "\n");
+    } else if (iop::kernel::g_trace_modules && !result && call.recv_size) {
+        // A function that returns 0 gives the EE nothing back (the receive buffer keeps what the EE had in it): shown, because the other
+        // way round, a long list of replies with no line for one call, reads like a call that was never answered.
+        std::fprintf(stderr, "[sif] reply server 0x%08X fn %u: the function returned 0, no data goes back (recv %u bytes)\n",
+                     server_id_of_endpoint(call.server_data), call.rpc_number, call.recv_size);
     }
     if (call.recv && result && call.recv_size) {
         const std::uint32_t n = fit_copy("SIF RPC reply", call.recv, result, (std::uint64_t{call.recv_size} + 3u) & ~std::uint64_t{3});
@@ -1469,6 +1488,7 @@ void dump() {
     counts("commands from the EE", g_ee_commands);
     counts("of them with no IOP handler (dropped)", g_unhandled_commands);
     counts("EE binds by server id", g_ee_binds);
+    counts("EE calls by server id", g_ee_calls);
     std::string line;
     char item[64];
     for (const auto &[cid, h] : g_cmd_handlers) {
@@ -1478,7 +1498,9 @@ void dump() {
     if (!line.empty()) std::fprintf(stderr, "[sif] command handlers of IOP modules:%s\n", line.c_str());
     line.clear();
     for (const auto &[sd, s] : g_guest_servers) {
-        std::snprintf(item, sizeof item, " 0x%08X (function 0x%08X)", s.sid, s.func);
+        const auto calls = g_ee_calls.find(s.sid);
+        std::snprintf(item, sizeof item, " 0x%08X (function 0x%08X, %llu EE calls)", s.sid, s.func,
+                      static_cast<unsigned long long>(calls == g_ee_calls.end() ? 0 : calls->second));
         line += item;
     }
     if (!line.empty()) std::fprintf(stderr, "[sif] RPC servers of IOP modules:%s\n", line.c_str());

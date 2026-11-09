@@ -283,6 +283,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2sifdmatest PRIVATE synchronization)
     endif()
+    # the SIF log names the server of an EE call and the run's summary counts the calls per server (public report 71, no game needed): ninja ps2sifcalllogtest
+    add_executable(ps2sifcalllogtest EXCLUDE_FROM_ALL tests/sif_call_log.cpp)
+    target_include_directories(ps2sifcalllogtest PRIVATE runtime/src)
+    target_link_libraries(ps2sifcalllogtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2sifcalllogtest PRIVATE synchronization)
+    endif()
     # ioman AddDrv and DelDrv call the driver's init and deinit and keep a table of its devices (no game needed): ninja ps2iomandrvtest
     add_executable(ps2iomandrvtest EXCLUDE_FROM_ALL tests/ioman_drivers.cpp)
     target_include_directories(ps2iomandrvtest PRIVATE runtime/src)

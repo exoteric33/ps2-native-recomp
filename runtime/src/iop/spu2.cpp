@@ -47,7 +47,10 @@ struct Envelope {
         if (++counter < cycles) return;
         counter = 0;
         int delta = (decrease ? -8 + (rate & 3) : 7 - (rate & 3)) << std::max(0, 11 - shift);
-        if (exponential && decrease) delta = delta * level / 0x8000;
+        // The chip scales an exponential decrease with a shift, which rounds down. A division rounds to 0, which made the step 0 once
+        // the step times the level fell under 0x8000, so a release stopped short (at 4095 for rates 44 and up, lower for faster ones) and the voice never
+        // went off: ENVX never read 0 and Digital Devil Saga's sound driver stopped starting effects (a wall switch made no sound).
+        if (exponential && decrease) delta = (delta * level) >> 15;
         level = std::clamp(level + delta, 0, 0x7FFF);
     }
 };

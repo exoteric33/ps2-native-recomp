@@ -290,6 +290,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2sifcalllogtest PRIVATE synchronization)
     endif()
+    # cdvdman's sceCdSC (#50) and sceCdRC (#51) answer like a drive with a disc (issue 57, no game needed): ninja ps2cdvdsctest
+    add_executable(ps2cdvdsctest EXCLUDE_FROM_ALL tests/cdvd_sc_rc.cpp)
+    target_include_directories(ps2cdvdsctest PRIVATE runtime/src)
+    target_link_libraries(ps2cdvdsctest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2cdvdsctest PRIVATE synchronization)
+    endif()
     # ioman AddDrv and DelDrv call the driver's init and deinit and keep a table of its devices (no game needed): ninja ps2iomandrvtest
     add_executable(ps2iomandrvtest EXCLUDE_FROM_ALL tests/ioman_drivers.cpp)
     target_include_directories(ps2iomandrvtest PRIVATE runtime/src)

@@ -47,6 +47,13 @@ struct CdState {
     // The running read, for sceCdGetReadPos only (not in save states: after loading one, the position of a read in flight reads as 0).
     std::uint64_t read_start = 0;
     std::uint32_t read_sectors = 0;
+    // What sceCdSC (#50) keeps for its callers, with the values cdvdman starts with (ps2sdk cdvdman.c, AFL-2.0).
+    std::uint32_t stream_flag = 0;
+    std::int32_t sync_timeout = 15000;    // milliseconds
+    std::int32_t stream_timeout = 5000;   // milliseconds
+    std::int32_t read_timeout = 0;
+    std::int32_t spin_control = 0;
+    std::int32_t ee_call = 0;             // the EE's N command that runs (cdvdfsv tells it with code 0xFFFFFFF6)
 } g_cd;
 
 // The disc stream of the IOP library (sceCdSt*). A game's own IOP module (Robotech: Battlecry's vcIOPFile) streams music and
@@ -83,6 +90,21 @@ std::uint64_t read_cycles(std::uint32_t sectors) {
 }
 
 bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, std::uint32_t mode, bool ee_memory);
+
+// The drive's clock as the S command 0x08 answers it (ps2sdk sceCdCLOCK): status 0 (read fine), second, minute, hour, 0, day, month,
+// year, each a BCD byte, in Japan time (UTC+9) as the console's clock chip keeps it. Month is written without its top bit.
+void write_clock(std::uint32_t p) {
+    const std::time_t t = static_cast<std::time_t>(rtc_seconds());
+    const std::tm *tm = std::gmtime(&t);
+    write8(p + 0, 0);
+    write8(p + 1, bcd(tm->tm_sec));
+    write8(p + 2, bcd(tm->tm_min));
+    write8(p + 3, bcd((tm->tm_hour + 9) % 24));
+    write8(p + 4, 0);
+    write8(p + 5, bcd(tm->tm_mday));
+    write8(p + 6, bcd(tm->tm_mon + 1));
+    write8(p + 7, bcd(tm->tm_year % 100));
+}
 
 }
 
@@ -168,17 +190,7 @@ void install_cdvd() {
         c.r[2] = 1;
     });
     def("cdvdman", 24, "sceCdReadClock", [](Cpu &c) {
-        const std::time_t t = static_cast<std::time_t>(rtc_seconds());
-        const std::tm *tm = std::gmtime(&t);
-        const std::uint32_t p = arg(c, 0);
-        write8(p + 0, 0);
-        write8(p + 1, bcd(tm->tm_sec));
-        write8(p + 2, bcd(tm->tm_min));
-        write8(p + 3, bcd((tm->tm_hour + 9) % 24));
-        write8(p + 4, 0);
-        write8(p + 5, bcd(tm->tm_mday));
-        write8(p + 6, bcd(tm->tm_mon + 1));
-        write8(p + 7, bcd(tm->tm_year % 100));
+        write_clock(arg(c, 0));
         c.r[2] = 1;
     });
     // #44 sceCdGetReadPos (ps2sdk iop/cdvd/cdvdman/src/exports.tab and cdvdman.c, AFL-2.0): how many bytes of the running sceCdRead have
@@ -190,6 +202,54 @@ void install_cdvd() {
         const std::uint64_t whole = read_cycles(g_cd.read_sectors), spent = now() > g_cd.read_start ? now() - g_cd.read_start : 0;
         const std::uint64_t done = std::min<std::uint64_t>(g_cd.read_sectors - 1, spent * g_cd.read_sectors / std::max<std::uint64_t>(whole, 1));
         c.r[2] = static_cast<std::uint32_t>(done * disc::kSector);
+    });
+    // #50 sceCdSC and #51 sceCdRC (ps2sdk iop/cdvd/cdvdman/src/exports.tab and cdvdman.c, AFL-2.0; the retail modules of the games keep the
+    // same two entries).
+    // sceCdSC(code, param) is cdvdman's back door for the other IOP modules of the disc system (cdvdstm, cdvdfsv, mcman, a game's own):
+    // `code` is a negative number that picks a value to read or set, `param` is a pointer to an int for some of them. The answers of the
+    // codes a disc in a working drive gives are here; a code that cdvdman does not know answers 0, as it does. Not answered (they hand out
+    // pointers into cdvdman's own variables, or event flags this driver does not create): 0xFFFFFFF0, 0xFFFFFFF2, 0xFFFFFFF5 (the
+    // interrupt event flag's id, what the stream module cdvdstm asks for when it starts, public issue 57), 0xFFFFFFE7 (the S command's flag)
+    // and 0xFFFFFFE9 (the second layer's sector change). They read 0, and a WaitEventFlag on 0 fails at once instead of waiting, which
+    // suits a drive that is always ready.
+    def("cdvdman", 50, "sceCdSC", [](Cpu &c) {
+        const std::uint32_t code = arg(c, 0), param = arg(c, 1);
+        c.r[2] = 0;
+        switch (code) {
+        case 0xFFFFFFFFu: case 0: case 1: case 2:  // the last error goes to *param; codes 0 to 2 also set the stream flag, -1 reads it
+            if (param) write32(param, g_cd.error & 0xFF);
+            if (code != 0xFFFFFFFFu) g_cd.stream_flag = code;
+            c.r[2] = g_cd.stream_flag;
+            break;
+        case 0xFFFFFFFEu:  // set the last error from the byte at *param
+            if (param) { g_cd.error = read8(param); c.r[2] = g_cd.error; }
+            break;
+        case 0xFFFFFFFDu: c.r[2] = g_cd.busy ? 1u : 0u; break;  // a read is running
+        case 0xFFFFFFFCu: c.r[2] = 0; break;                    // the disc's key is not set (no copy-protected disc here)
+        case 0xFFFFFFF8u: if (param) g_cd.spin_control = static_cast<std::int32_t>(read32(param)); c.r[2] = 1; break;
+        case 0xFFFFFFF7u: c.r[2] = 0x0226; break;               // cdvdman's version, 2.38 (IRX_ID("cdvd_driver", 2, 38))
+        case 0xFFFFFFF6u:                                       // cdvdfsv: the EE's N command that runs now, 0 when none
+            if (param) { g_cd.ee_call = static_cast<std::int32_t>(read32(param)); c.r[2] = static_cast<std::uint32_t>(g_cd.ee_call); }
+            break;
+        case 0xFFFFFFF4u: c.r[2] = 1; break;                    // the disc's kind fits the drive's mode: always
+        case 0xFFFFFFF3u: c.r[2] = 1; break;                    // set the drive's mode from the boot mode (nothing to set)
+        case 0xFFFFFFF1u: c.r[2] = static_cast<std::uint32_t>(g_cd.sync_timeout); break;
+        case 0xFFFFFFEFu: c.r[2] = static_cast<std::uint32_t>(g_cd.stream_timeout); break;
+        case 0xFFFFFFEEu: if (param) g_cd.read_timeout = static_cast<std::int32_t>(read32(param)); break;
+        case 0xFFFFFFEAu: c.r[2] = 1; break;                    // the disc's layer information was read
+        case 0xFFFFFFE6u: if (param) write32(param, 0); break;  // no power-off callback (sceCdPOffCallback); its user data is 0
+        default: break;
+        }
+    });
+    // sceCdRC(clock) is sceCdReadClock without the top bit of the month cleared (ps2sdk cdvdman.h: both send S command 0x08; in the newer
+    // modules sceCdReadClock cleans that bit and sceCdRC gives the drive's bytes as they are). The clock chip's month byte has it clear, so
+    // both answer alike. Returns 1 when the clock was read. mcman calls it (mcman_getmcrtime, ps2sdk mcman main.c) for the time it stamps
+    // on every directory entry it writes: up to 64 times until the answer is not 0, then it reads the bytes. With the call missing (answer
+    // 0) the card got a time from whatever the stack held (GTA III's save and Robotech's card format).
+    def("cdvdman", 51, "sceCdRC", [](Cpu &c) {
+        if (!arg(c, 0)) { c.r[2] = 0; return; }
+        write_clock(arg(c, 0));
+        c.r[2] = 1;
     });
     def("cdvdman", 28, "sceCdStatus", [](Cpu &c) { c.r[2] = g_cd.busy ? 0x06u : 0x0Au; });
     def("cdvdman", 37, "sceCdCallback", [](Cpu &c) { c.r[2] = g_cd.callback; g_cd.callback = arg(c, 0); });

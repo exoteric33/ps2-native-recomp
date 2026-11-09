@@ -777,6 +777,26 @@ fn blend_levels(a: u32, b: u32, f: f32) -> u32 {
     return o.x | (o.y << 8u) | (o.z << 16u) | (o.w << 24u);
 }
 
+// Whether a setup's pixels can read a mip level above 0 (as mip_top_of in gpu.cpp): MXL > 0, a *_MIPMAP_* reduction filter, and with LCM = 1 a
+// K above 0. A setup whose mipmap words only give reduction a filter of its own (MMIN 0 or 1, or MXL 0) reads level 0 like any other, and
+// sprites keep the console-centre sampling of `point` (shade_at): Digital Devil Saga squeezes a 384-line picture into 160 lines with LCM = 1,
+// K = 0, MMAG bilinear, MMIN nearest (so always MMAG, level 0), and without that sampling the finer rows of the last line blended in texture
+// row 384, memory past the picture (a line along the bottom of its movies at 2x and 3x).
+fn mip_levels(s: Setup) -> bool {
+    if (!HAS_MIP || s.mip == 0u) {
+        return false;
+    }
+    let mxl = (s.mip >> 1u) & 7u;
+    let mmin = (s.mip >> 5u) & 7u;
+    if (mxl == 0u || mmin < 2u) {
+        return false;
+    }
+    if ((s.mip & 1u) != 0u) {
+        return bitcast<i32>(((s.mip >> 16u) & 0xFFFu) << 20u) > 0;
+    }
+    return true;
+}
+
 struct Pick {
     level: u32,
     frac: f32,
@@ -1289,7 +1309,7 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             var ux = px;
             var uy = py;
             let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
-            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct) && s.mip == 0u;
+            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct) && !mip_levels(s);
             let near_x = abs(abs(du) - abs(dx)) <= abs(dx) * 0.05;
             let near_y = abs(abs(dv) - abs(dy)) <= abs(dy) * 0.05;
             let exact = abs(du) >= abs(dx) * 0.999 && abs(dv) >= abs(dy) * 0.999;

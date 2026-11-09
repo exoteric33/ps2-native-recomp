@@ -78,7 +78,8 @@ int main() {
     check(has(log, "EE calls by server id: " + hex(kHeap) + " x2 " + hex(kReady) + " x1\n"), "the summary counts the calls per server id");
     check(!has(log, hex(kNobody) + " x"), "a call to an unknown endpoint is not counted as a call to a server");
 
-    std::filesystem::remove(capture);
+    std::error_code still_open;  // Windows refuses while stderr has the file; the next run overwrites it
+    std::filesystem::remove(capture, still_open);
     std::printf("SIF call log: %d failed\n", failed);
     return failed ? 1 : 0;
 }

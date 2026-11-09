@@ -57,6 +57,7 @@ struct Interrupt {
 std::vector<HleEntry> g_hle;
 std::map<std::pair<std::string, std::uint32_t>, std::uint32_t> g_hle_ids;
 std::vector<std::pair<std::uint32_t, std::uint32_t>> g_hle_stubs;
+std::map<std::uint32_t, std::uint32_t> g_replaced;  // a loaded state's word at each stub place, before relink_hle_imports wrote the stub there
 std::map<std::string, std::uint32_t> g_hle_versions;
 std::map<std::string, std::uint32_t> g_libraries;
 std::map<std::string, HleModuleStart> g_hle_modules;
@@ -168,7 +169,11 @@ void relink_hle_imports() {
             }
         }
     }
-    for (const auto &[at, id] : g_hle_stubs) set_ram32(at, (kHleOpcode << 26) | id);
+    g_replaced.clear();
+    for (const auto &[at, id] : g_hle_stubs) {
+        g_replaced[at] = ram32(at);
+        set_ram32(at, (kHleOpcode << 26) | id);
+    }
 }
 
 // A module comes from the disc or from the game's memory, so it is untrusted: every read is checked against the file, and a read
@@ -502,6 +507,25 @@ std::uint32_t hle_stub(const HleFunction &function) {
     return at;
 }
 
+// A loaded state whose memory holds the stubs at other places than the ones they have now: put each stub where the state has it, and give
+// the old places back the words the state had there (they are data of the state, not stubs). All the old places are given back first and
+// the new ones written after, so a place that one stub leaves and another one takes ends up with the stub, in whatever order the moves come.
+void move_hle_stubs(const std::vector<std::pair<std::uint32_t, std::uint32_t>> &moves) {
+    std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t> *, std::uint32_t>> found;
+    for (const auto &[from, to] : moves)
+        for (auto &stub : g_hle_stubs)
+            if (stub.first == from) {
+                found.emplace_back(&stub, to);
+                break;
+            }
+    for (const auto &[stub, to] : found)
+        if (const auto kept = g_replaced.find(stub->first); kept != g_replaced.end()) set_ram32(stub->first, kept->second);
+    for (const auto &[stub, to] : found) {
+        stub->first = to;
+        set_ram32(to, (kHleOpcode << 26) | stub->second);
+    }
+}
+
 void register_library(const std::string &name, std::uint32_t table) {
     g_libraries[name] = table;
     if (g_trace_modules) std::fprintf(stderr, "[iop] library %s at 0x%08X\n", name.c_str(), table);
@@ -583,6 +607,7 @@ void boot() {
     install_io();
     install_cdvd();
     install_sif();
+    install_io_stubs();
 }
 
 }

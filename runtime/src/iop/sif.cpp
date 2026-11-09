@@ -271,6 +271,10 @@ bool send_iop_bind(std::uint32_t client, std::uint32_t server) {
 }
 
 std::uint32_t g_loop_stub = 0, g_finish_stub = 0, g_exec_stub = 0;
+// Where this boot made the loop stub, and whether the three stubs (and the two ioman stubs) sit in the other arrangement now. A loaded
+// state does not boot again, so the stubs stay where the last state put them until the next load moves them.
+std::uint32_t g_boot_loop_stub = 0;
+bool g_stubs_shifted = false;
 // A server thread that runs its own loop (sceSifGetNextRequest, then sceSifExecRequest, then SleepThread) instead of sceSifRpcLoop: the
 // requests it has taken but not run yet (by handle), and where each thread goes on after the request it runs.
 std::map<std::uint32_t, Request> g_taken;
@@ -793,6 +797,8 @@ void install_iop_side() {
     g_loop_stub = iop::kernel::hle_stub(rpc_loop);
     g_finish_stub = iop::kernel::hle_stub(rpc_finish);
     g_exec_stub = iop::kernel::hle_stub(exec_finish);
+    g_boot_loop_stub = g_loop_stub;
+    g_stubs_shifted = false;
     // The EE sends completion DMA to the request packet's pkt_addr. It must
     // never alias the caller's SifRpcClientData_t, whose buf field lives at +20.
     g_iop_rpc_packets = iop::kernel::kernel_alloc(kIopRpcPacketCount * kIopRpcPacketSize);
@@ -1612,8 +1618,29 @@ void state(ps2::state::Stream &s) {
         g_iop_rpc_packet_busy.fill(0);
         g_iop_rpc_packet_reply.fill(0);
     }
+    // The IOP's stubs sit where the boot that made the state put them, and the state's memory and threads point at those places. The
+    // boot hands out the kernel area one stub after the other. Builds from the AddDrv change (public v0.0.3 to v0.0.5) made the two
+    // ioman return stubs first, so the three stubs here lay 32 bytes further on: a state with the loop stub exactly 32 bytes past this
+    // boot's (and the finish stub right after it, the exec stub after that) is one of those. Any other state has them where this boot
+    // does. The state is judged against this boot's place, not the current one: after a load of the first kind the stubs stay in the
+    // shifted places, and a state of the other kind moves them back. Nothing moves when the arrangement is the one the state needs.
+    const std::uint32_t booted = g_boot_loop_stub;
     s.pod(g_loop_stub);
     s.pod(g_finish_stub);
+    if (s.loading() && booted) {
+        const bool shifted = g_loop_stub == booted + 32 && g_finish_stub == g_loop_stub + 16;
+        if (shifted != g_stubs_shifted) {
+            // Boot: loop, finish, exec at booted + 0, 16, 32 and the ioman stubs behind them; shifted: the ioman stubs first, then the
+            // three at booted + 32, 48, 64. All the old places get the state's words back before the new ones get their stubs.
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> moves;
+            const std::uint32_t from = shifted ? 0 : 32, to = shifted ? 32 : 0;
+            for (std::uint32_t i = 0; i < 3; ++i) moves.emplace_back(booted + from + 16 * i, booted + to + 16 * i);
+            iop::kernel::plan_io_stubs(moves, shifted ? booted : 0);
+            iop::kernel::move_hle_stubs(moves);
+            g_stubs_shifted = shifted;
+        }
+        g_exec_stub = g_finish_stub + 16;  // not in the state; right behind the finish stub in both arrangements
+    }
     s.pod(g_iop_dma_id);
     s.pod(g_ee_dma_id);
     s.pod(g_fileio_async);

@@ -95,6 +95,8 @@ std::uint32_t free_total();
 std::uint32_t free_max();
 std::uint32_t kernel_alloc(std::uint32_t size);
 std::uint32_t hle_stub(const HleFunction &function);
+void move_hle_stubs(const std::vector<std::pair<std::uint32_t, std::uint32_t>> &moves);  // state loading only: see sif.cpp
+void plan_io_stubs(std::vector<std::pair<std::uint32_t, std::uint32_t>> &moves, std::uint32_t first);  // ditto: see io.cpp
 
 void register_library(const std::string &name, std::uint32_t table);
 void register_hle_library(const std::string &name, std::uint32_t version);
@@ -122,6 +124,7 @@ void install_sif();
 void install_cdvdfsv();
 void install_cdvd();
 void install_io();
+void install_io_stubs();  // after every other install_*: see io.cpp
 
 void trace_hle(const char *library, const char *function, const Cpu &c);
 extern bool g_trace_hle;

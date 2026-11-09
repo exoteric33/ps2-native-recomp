@@ -184,6 +184,9 @@ void back_from_driver(Cpu &c, std::uint32_t &device) {
     c.npc = ra + 4;
 }
 
+std::uint32_t g_added_back = 0, g_deleted_back = 0;    // where the two return stubs are now
+std::uint32_t g_added_boot = 0, g_deleted_boot = 0;    // where this boot made them (set by install_io_stubs)
+
 }
 
 void install_io() {
@@ -218,33 +221,14 @@ void install_io() {
     });
     // AddDrv(device) and DelDrv(name) as ps2sdk's iomanX does them: a free place (16) or the name, then the driver's init (deinit), whose
     // result below 0 makes the call fail and keeps the table as it was. Every call is shown: a game adds few drivers, and a driver that is
-    // missing or fails is worth seeing in a tester's log.
-    static std::uint32_t added_back = 0, deleted_back = 0;
-    added_back = hle_stub([](Cpu &c) {
-        std::uint32_t device = 0;
-        back_from_driver(c, device);
-        const auto result = static_cast<std::int32_t>(c.r[2]);
-        if (result < 0) {
-            std::erase_if(io::g_devices, [&](const io::Device &d) { return d.address == device; });
-            std::fprintf(stderr, "[io] AddDrv: the init of driver 0x%08X failed (%d)\n", device, result);
-        }
-        c.r[2] = result < 0 ? static_cast<std::uint32_t>(-1) : 0;
-    });
-    deleted_back = hle_stub([](Cpu &c) {
-        std::uint32_t device = 0;
-        back_from_driver(c, device);
-        const auto result = static_cast<std::int32_t>(c.r[2]);
-        if (result < 0) std::fprintf(stderr, "[io] DelDrv: the deinit of driver 0x%08X failed (%d)\n", device, result);
-        else std::erase_if(io::g_devices, [&](const io::Device &d) { return d.address == device; });
-        c.r[2] = result < 0 ? static_cast<std::uint32_t>(-1) : 0;
-    });
+    // missing or fails is worth seeing in a tester's log. Their two return stubs come from install_io_stubs, after the rest of the boot.
     def("ioman", 20, "AddDrv", [](Cpu &c) {
         const std::uint32_t device = arg(c, 0), ops = read32(device + 16), init = ops ? read32(ops) : 0;
         const std::string name = ram_string(read32(device));
         std::fprintf(stderr, "[io] AddDrv %s (device 0x%08X, init 0x%08X, ra 0x%08X)\n", name.c_str(), device, init, c.r[31]);
         if (io::g_devices.size() >= io::kMaxDevices) { c.r[2] = static_cast<std::uint32_t>(-1); return; }
         io::g_devices.push_back(io::Device{name, device});
-        if (init) call_driver(c, init, device, added_back);
+        if (init) call_driver(c, init, device, g_added_back);
         else c.r[2] = 0;
     });
     def("ioman", 21, "DelDrv", [](Cpu &c) {
@@ -253,7 +237,7 @@ void install_io() {
         std::fprintf(stderr, "[io] DelDrv %s%s\n", name.c_str(), it == io::g_devices.end() ? ": no such driver" : "");
         if (it == io::g_devices.end()) { c.r[2] = static_cast<std::uint32_t>(-1); return; }
         const std::uint32_t device = it->address, ops = read32(device + 16), deinit = ops ? read32(ops + 4) : 0;
-        if (deinit) { call_driver(c, deinit, device, deleted_back); return; }
+        if (deinit) { call_driver(c, deinit, device, g_deleted_back); return; }
         io::g_devices.erase(it);
         c.r[2] = 0;
     });
@@ -277,6 +261,43 @@ void install_io() {
             }
             c.r[2] = static_cast<std::uint32_t>(-1);
         });
+}
+
+// The return stubs of AddDrv and DelDrv. The boot hands out the kernel area's stubs one after the other, and a saved state keeps
+// their addresses and the words in them in its memory image, so a stub that comes before the others moves all of them: a state
+// saved before these two existed then loaded with the RPC loop's stubs at other addresses and the IOP's sound and disc calls
+// never finished. These come last (after install_sif), so every older address stays where it was.
+void install_io_stubs() {
+    g_added_back = hle_stub([](Cpu &c) {
+        std::uint32_t device = 0;
+        back_from_driver(c, device);
+        const auto result = static_cast<std::int32_t>(c.r[2]);
+        if (result < 0) {
+            std::erase_if(io::g_devices, [&](const io::Device &d) { return d.address == device; });
+            std::fprintf(stderr, "[io] AddDrv: the init of driver 0x%08X failed (%d)\n", device, result);
+        }
+        c.r[2] = result < 0 ? static_cast<std::uint32_t>(-1) : 0;
+    });
+    g_deleted_back = hle_stub([](Cpu &c) {
+        std::uint32_t device = 0;
+        back_from_driver(c, device);
+        const auto result = static_cast<std::int32_t>(c.r[2]);
+        if (result < 0) std::fprintf(stderr, "[io] DelDrv: the deinit of driver 0x%08X failed (%d)\n", device, result);
+        else std::erase_if(io::g_devices, [&](const io::Device &d) { return d.address == device; });
+        c.r[2] = result < 0 ? static_cast<std::uint32_t>(-1) : 0;
+    });
+    g_added_boot = g_added_back;
+    g_deleted_boot = g_deleted_back;
+}
+
+// A state saved when these two stubs came first in the kernel area (before the RPC loop's) keeps them at `first` and `first + 16`; any
+// other state has them where this boot made them (`first` is 0). Adds the moves from where they are now, and notes the new places.
+void plan_io_stubs(std::vector<std::pair<std::uint32_t, std::uint32_t>> &moves, std::uint32_t first) {
+    const std::uint32_t added = first ? first : g_added_boot, deleted = first ? first + 16 : g_deleted_boot;
+    moves.emplace_back(g_added_back, added);
+    moves.emplace_back(g_deleted_back, deleted);
+    g_added_back = added;
+    g_deleted_back = deleted;
 }
 
 }

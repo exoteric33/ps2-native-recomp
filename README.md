@@ -1,7 +1,7 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 46 games work as far as they
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 47 games work as far as they
 have been tested, 30 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 45
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 46
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -140,6 +140,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Sonic Heroes (Europe) | runs, not played through yet: halfway through Seaside Hill at 60 fps; short stutters and freezes now and then, and a rattling sound in the Team Sonic film | Bugra06 |
 | Return to Castle Wolfenstein: Operation Resurrection (USA) | runs, not played through yet: into the first mission, smooth; many graphics bugs ([#79](https://github.com/exoteric33/ps2-native-recomp/issues/79)) | YaroslavValerySablin |
 | Urban Reign (Europe) | plays well, not played through yet: menus, versus and team fights with knockouts, pause and saves, all five languages, at 4x and full speed in 480p (Windows 11, an RTX 4080 SUPER, a game controller); two bugs of the game itself need a patch file ([#62](https://github.com/exoteric33/ps2-native-recomp/pull/62)) | RatchetCinemaESP |
+| Torrente 3: The Protector (Europe) | runs, not played through yet: the first part of the first level at 50 to 60 fps at twice the resolution, saves work; the first intro film plays at only 2 to 5 fps (tested with widescreen and NTSC patches) ([#85](https://github.com/exoteric33/ps2-native-recomp/issues/85)) | MrBinOff |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 
@@ -344,6 +345,12 @@ no graphics API can be opened.
 The gain is exactness: the program controls every bit of memory and every step of the arithmetic. The cost is that every pixel
 goes through a general-purpose program, with the scrambled address worked out before each read and write. That is the main
 reason it is [slower than PCSX2](#not-faster-than-pcsx2-yet) today.
+
+**An experimental second way to draw, for contributors.** There is also a path that hands the plain shapes to the graphics card's
+own triangle hardware, the way PC games draw, while the compute programs keep everything it cannot do. It is off by default
+(`PS2_GPU_HW=1` turns it on) because today it is slower than the compute programs and runs out of memory in some scenes. The top of
+`runtime/src/gs/gpu/hwdraw.cpp` explains how it works, what is known to be wrong and the first fix to try. If you want to help the
+PS2's graphics run as fast as in PCSX2, this is the place to start.
 
 ### Keeping everything in time
 

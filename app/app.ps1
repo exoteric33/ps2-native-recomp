@@ -401,7 +401,7 @@ $UpdateArchive = "https://github.com/$UpdateRepo/archive"
 if ($env:PS2APP_UPDATE_TEST -match '^http://(127\.0\.0\.1|localhost):\d+$') { $UpdateApi = $env:PS2APP_UPDATE_TEST + '/api'; $UpdateArchive = $env:PS2APP_UPDATE_TEST + '/archive' }
 $UpdateDir = Join-Path $Root 'tools\update'
 # What an update never touches: everything the player made or downloaded, and a git clone's own folder.
-$UpdateKeep = @('games', 'tools', 'build', 'generated', 'isos', 'third_party', 'wt', 'logs', '.git')
+$UpdateKeep = @('games', 'tools', 'build', 'generated', 'isos', 'third_party', 'wt', 'logs', 'downloads', '.git')
 
 function Get-InstalledVersion {
     $file = Join-Path $UpdateDir 'installed.txt'
@@ -2193,6 +2193,14 @@ function Complete-Stage($b) {
     Complete-Build $b
 }
 
+# A download that keeps failing (GitHub's servers are slow in some countries): the way out by hand, docs/fetch-retry.md.
+# The scripts retry by themselves; the hint shows only when the log says a download failed.
+function Get-DownloadHint($b) {
+    if (-not $b.ContainsKey('Stage') -or @('tools', 'setup') -notcontains $b.Stage.Id) { return '' }
+    if (($b.Tail -join "`n") -notmatch 'download failed|Could not reach|download of .* stopped') { return '' }
+    'Still failing? Open the link from Show details in a browser, save the file into ' + (Join-Path $Root 'downloads') + ', then press Try again.' + "`n"
+}
+
 function Get-FailureMessage($b) {
     $tail = ($b.Tail -join "`n")
     switch ($b.Stage.Id) {
@@ -2237,13 +2245,15 @@ function Set-BuildFailed($b, [string]$message) {
     $U.status.Text = $message
     $U.status.Height = S 84
     $U.detail.Top = S 100
-    $U.detail.Height = S 110
-    $U.buildCard.Height = S 232
+    $hint = Get-DownloadHint $b
+    $more = if ($hint) { 36 } else { 0 }   # room for the extra lines
+    $U.detail.Height = S (110 + $more)
+    $U.buildCard.Height = S (232 + $more)
     $U.buildExtras.Visible = $false
     Set-LogPlace
     $extra = if ($b.Error) { "$($b.Error)`n" } else { '' }
     $advice = if ($b.Batch) { 'Press Try again to go on with your games, or Back.' } else { 'Press Try again, or Back to choose another disc image or other extras.' }
-    $U.detail.Text = "${extra}${advice}`nThe full log is saved here (Show details has it too):`n$($b.LogFile)"
+    $U.detail.Text = "${extra}${hint}${advice}`nThe full log is saved here (Show details has it too):`n$($b.LogFile)"
     $U.bar.Visible = $false; $U.elapsed.Visible = $false; $U.percent.Visible = $false; $U.tip.Visible = $false
     $U.cancel.Visible = $false; $U.retry.Visible = $true; $U.buildBack.Visible = $true
     Flush-Log $b

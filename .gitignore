@@ -66,3 +66,6 @@ __pycache__/
 # Per-PC Claude Code settings and private notes.
 /.claude/settings.local.json
 /CLAUDE.local.md
+
+# Files saved by hand when a download fails (docs/fetch-retry.md); the app's Update keeps them.
+/downloads/

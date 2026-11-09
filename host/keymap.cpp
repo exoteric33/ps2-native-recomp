@@ -159,6 +159,13 @@ std::string with_look(const std::string &file_text, int look) { return with_line
 
 std::string with_scale(const std::string &file_text, int scale) { return with_line(file_text, "scale", "scale = " + std::to_string(scale)); }
 
+const char *sharp_2d_word(int sharp) {
+    static const char *const kWords[] = {"soft", "sharp", "sharpest"};
+    return kWords[sharp >= 0 && sharp <= 2 ? sharp : 1];
+}
+
+std::string with_sharp_2d(const std::string &file_text, int sharp) { return with_line(file_text, "sharp2d", std::string("sharp_2d = ") + sharp_2d_word(sharp)); }
+
 bool is_reserved(int input) {
     return input == SDL_SCANCODE_F1 || input == SDL_SCANCODE_F2 || input == SDL_SCANCODE_F5 || input == SDL_SCANCODE_F8 || input == SDL_SCANCODE_F9 || input == SDL_SCANCODE_F11;
 }
@@ -270,8 +277,17 @@ void parse(const std::string &text, Config &config, std::vector<std::string> &pr
         }
         if (name == "scale") {
             const std::string v = squash(value);
-            if (v == "1" || v == "2" || v == "3") config.scale = v[0] - '0';
-            else bad("scale is 1, 2 or 3, ignored");
+            if (v == "1" || v == "2" || v == "3" || v == "4") config.scale = v[0] - '0';
+            else bad("scale is 1, 2, 3 or 4, ignored");
+            continue;
+        }
+        if (name == "sharp2d") {
+            const std::string v = squash(value);
+            int found = -1;
+            for (int i = 0; i < 3; ++i)
+                if (v == squash(sharp_2d_word(i)) || v == std::to_string(i)) found = i;
+            if (found < 0) bad("sharp_2d is soft, sharp or sharpest, ignored");
+            else config.sharp_2d = found;
             continue;
         }
         if (name == "mousespeed") {
@@ -364,9 +380,13 @@ std::string default_file_text() {
         "#   soft          a smooth blend, like an old TV\n"
         "#   soft_edges    soft, and the jagged stairs along edges are smoothed\n"
         "look = " + std::string(look_word(kDefaultLook)) + "\n"
-        "\n# The inner resolution: 1, 2 or 3 times the console's (sharper, and more work for the graphics chip). Used when the game\n"
+        "\n# The inner resolution: 1, 2, 3 or 4 times the console's (sharper, and more work for the graphics chip). Used when the game\n"
         "# starts; the quick menu (F1) writes it here. The environment variable PS2_SCALE, when it is set, wins over this line.\n"
-        "# scale = 1\n";
+        "# scale = 1\n"
+        "\n# Text, icons and menus drawn at the console's own size, when the inner resolution is above 1: soft (plain bilinear, as\n"
+        "# before), sharp (the default: each texel keeps its colour, its edges stay smooth) or sharpest. Used when the game starts;\n"
+        "# the quick menu (F1) writes it here. PS2_SHARP_2D (0, 1, 2), when it is set, wins over this line.\n"
+        "# sharp_2d = sharp\n";
     return t;
 }
 

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -65,6 +66,9 @@ struct Card {
     bool looked = false;  // the card file was looked at (once per run: a game resets the IOP several times while it boots)
     std::string file;     // the file this run reads and writes: the one given with --memcard, or the fresh card beside it
     std::string crash_file;  // where the card goes after a crash (never over `file`)
+    os::FileLock owner;      // "<--memcard file>.lock", held for the whole run: no second run uses the same card
+    bool backed_up = false;  // a copy of the card file went to its backups folder on this run (or the newest one there was the same)
+    std::chrono::steady_clock::time_point backup_time{};
     std::vector<std::uint8_t> data;
     std::size_t address = 0;
     std::uint8_t term = 0x55;
@@ -243,11 +247,95 @@ bool exists(const std::string &file) {
     return std::filesystem::exists(os::path(file), error);
 }
 
-enum class CardFile { missing, good, bad };
+// ---- is a card whole? ----
 
-// Reads a card file into `data` only when it is a whole card: 16384 pages of 512 bytes data + 16 bytes spare (ECC), 8650752 bytes.
-// `why` says what is wrong with a file that is there but cannot be used (a raw image without the spare bytes, a bigger card, a
-// folder, a file another program holds open).
+// The three ECC bytes of 128 bytes of a page ([mymc] ps2mc_ecc.py _ecc_calculate, [mcman] McDataChecksum; scripts/mcformat.py has
+// the same in Python, with the sources): column parity from 0x77 over the bits of every byte under the masks 55 33 0F / AA CC F0,
+// line parity from 0x7F over the index of every byte whose bits have odd parity (~index for the first byte, index for the second).
+void chunk_ecc(const std::uint8_t *chunk, std::uint8_t *ecc) {
+    struct Tables {
+        std::uint8_t parity[256], column[256];
+    };
+    static const Tables t = [] {
+        Tables made{};
+        static const std::uint8_t kMasks[7] = {0x55, 0x33, 0x0F, 0x00, 0xAA, 0xCC, 0xF0};
+        for (int b = 0; b < 256; ++b) {
+            int bits = 0;
+            for (int v = b; v; v >>= 1) bits ^= v & 1;
+            made.parity[b] = static_cast<std::uint8_t>(bits);
+        }
+        for (int b = 0; b < 256; ++b)
+            for (int i = 0; i < 7; ++i) made.column[b] |= static_cast<std::uint8_t>(made.parity[b & kMasks[i]] << i);
+        return made;
+    }();
+    std::uint8_t column = 0x77, line0 = 0x7F, line1 = 0x7F;
+    for (int i = 0; i < 128; ++i) {
+        column ^= t.column[chunk[i]];
+        if (t.parity[chunk[i]]) {
+            line0 ^= static_cast<std::uint8_t>(~i);
+            line1 ^= static_cast<std::uint8_t>(i);
+        }
+    }
+    ecc[0] = column;
+    ecc[1] = line0 & 0x7F;
+    ecc[2] = line1 & 0x7F;
+}
+
+// Whether 128 bytes still fit their stored ECC, allowing the one wrong bit a card repairs when it reads the page ([mymc] _ecc_check,
+// [mcman] mcman_correctdata; mcformat.py ecc_verdict).
+bool chunk_readable(const std::uint8_t *chunk, const std::uint8_t *stored) {
+    std::uint8_t computed[3];
+    chunk_ecc(chunk, computed);
+    const int d0 = computed[0] ^ stored[0], d1 = computed[1] ^ stored[1], d2 = computed[2] ^ stored[2];
+    if (!d0 && !d1 && !d2) return true;
+    const int d3 = d1 ^ d2, d4 = ((d0 & 0x70) >> 4) ^ (d0 & 0x07);
+    if (d3 == 0x7F && d4 == 0x07) return true;
+    return __builtin_popcount(static_cast<unsigned>(d3)) + __builtin_popcount(static_cast<unsigned>(d4)) == 1;
+}
+
+}
+
+// The 16 spare bytes of a page: the ECC of its four 128-byte parts, then four zero bytes (what mcman writes).
+void page_ecc(const std::uint8_t *data, std::uint8_t *spare) {
+    for (int i = 0; i < 4; ++i) chunk_ecc(data + i * 128, spare + i * 3);
+    std::memset(spare + 12, 0, 4);
+}
+
+// What is wrong with a card image, empty when nothing is. A game reaches the card through mcman, which writes the ECC of every page
+// it writes and checks it on every read; so on a whole card each page that is not erased (the last spare byte 0xFF, which mcman does
+// not check either) fits its ECC, and page 0 is erased (a new card) or the superblock of a formatted 8 MB card. A file that was cut
+// short and padded, filled with zeros by a power cut, or written over by something else fails here; mymc and PCSX2 cards pass.
+std::string card_problem(const std::uint8_t *data, std::size_t size) {
+    if (size != kCardBytes) return "it has " + std::to_string(size) + " bytes, a card has " + std::to_string(kCardBytes);
+    std::size_t bad = 0, first_bad = 0;
+    for (std::size_t page = 0; page < kPages; ++page) {
+        const std::uint8_t *p = data + page * kPageBytes, *spare = p + 512;
+        if (spare[15] == 0xFF) continue;
+        for (int i = 0; i < 4; ++i)
+            if (!chunk_readable(p + i * 128, spare + i * 3)) {
+                if (!bad++) first_bad = page;
+                break;
+            }
+    }
+    if (bad) return std::to_string(bad) + " page(s) do not fit their error-check bytes (ECC), the first is page " + std::to_string(first_bad);
+    if (data[512 + 15] != 0xFF) {
+        static const char kMagic[] = "Sony PS2 Memory Card Format ";
+        const auto u16 = [&](std::size_t at) { return static_cast<unsigned>(data[at] | data[at + 1] << 8); };
+        const auto u32 = [&](std::size_t at) { return u16(at) | u16(at + 2) << 16; };
+        if (std::memcmp(data, kMagic, sizeof kMagic - 1) != 0) return "page 0 is neither erased nor the start of a formatted card";
+        if (u16(40) != 512 || u16(42) != 2 || u16(44) != kBlockPages || u32(48) != kPages / 2) return "the superblock (page 0) does not describe an 8 MB card";
+    }
+    return {};
+}
+
+namespace {
+
+enum class CardFile { missing, empty, good, unusable, damaged };
+
+// Reads a card file into `data` only when it is a whole card: 16384 pages of 512 bytes data + 16 bytes spare (ECC), 8650752 bytes,
+// that passes card_problem; `why` says what is wrong otherwise. unusable: the file cannot be read at all (a folder, a file another
+// program holds open). damaged: it was read, but is the wrong size (a raw image without the spare bytes, a bigger card, a file cut
+// short) or its pages do not fit their ECC; a damaged file of the right size is still put into `data`, for a copy. empty: 0 bytes.
 CardFile read_card_file(const std::string &file, std::vector<std::uint8_t> &data, std::string &why) {
     namespace fs = std::filesystem;
     const fs::path p = os::path(file);
@@ -256,34 +344,167 @@ CardFile read_card_file(const std::string &file, std::vector<std::uint8_t> &data
     if (status.type() == fs::file_type::not_found) return CardFile::missing;
     if (error) {
         why = "it cannot be looked at (" + error.message() + ")";
-        return CardFile::bad;
+        return CardFile::unusable;
     }
     if (!fs::is_regular_file(status)) {
         why = "it is not a file (a folder card of another emulator?)";
-        return CardFile::bad;
+        return CardFile::unusable;
     }
     const std::uintmax_t size = fs::file_size(p, error);
-    if (!error && size == 0) return CardFile::missing;  // an empty file holds no saves: it becomes a new card, as a missing one
-    if (error || size != kCardBytes) {
-        why = error ? "its size cannot be read (" + error.message() + ")"
-                    : "it has " + std::to_string(size) + " bytes, a card file has " + std::to_string(kCardBytes) +
-                          (size == static_cast<std::uintmax_t>(512) * kPages ? " (a raw image without the spare ECC bytes?)" : "");
-        return CardFile::bad;
+    if (error) {
+        why = "its size cannot be read (" + error.message() + ")";
+        return CardFile::unusable;
+    }
+    if (size == 0) return CardFile::empty;
+    if (size != kCardBytes) {
+        why = "it has " + std::to_string(size) + " bytes, a card file has " + std::to_string(kCardBytes) +
+              (size == static_cast<std::uintmax_t>(512) * kPages ? " (a raw image without the spare ECC bytes?)" : "");
+        return CardFile::damaged;
     }
     std::vector<std::uint8_t> got(kCardBytes);
     std::ifstream in(p, std::ios::binary);
     if (in) in.read(reinterpret_cast<char *>(got.data()), static_cast<std::streamsize>(kCardBytes));
     if (!in || in.gcount() != static_cast<std::streamsize>(kCardBytes)) {
         why = "it cannot be read (does another program have it open, or is it not allowed?)";
-        return CardFile::bad;
+        return CardFile::unusable;
     }
+    why = card_problem(got.data(), got.size());
     data.swap(got);
-    return CardFile::good;
+    return why.empty() ? CardFile::good : CardFile::damaged;
+}
+
+// ---- backups ----
+
+// Every card file has a folder of copies beside it: "<folder>/<name>.backups/<name>_<date>_<time>.ps2" (gow2.ps2 ->
+// gow2.backups/gow2_2026-11-06_20-36-07.ps2). A copy is made of the file as it is just before the runner replaces it: the first time
+// on each run (so the card as it was when the game started is kept) and then at most every kBackupEvery while the game goes on
+// saving. Only a file that passes card_problem is copied, a copy the same as the newest one is not made again, and the newest
+// kKeepBackups are kept. A card file found damaged when a run starts is replaced by the newest good copy (load_card).
+// Not in the browser build: its files live in the page's storage, where ten 8 MB copies would not fit.
+constexpr std::size_t kKeepBackups = 10;
+constexpr std::chrono::minutes kBackupEvery{15};
+
+std::filesystem::path backups_dir(const std::string &card) {
+    const std::filesystem::path p = os::path(card);
+    std::filesystem::path name = p.stem();
+    name += ".backups";
+    return p.parent_path() / name;
+}
+
+std::string now_text() {
+    const std::time_t t = std::time(nullptr);
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &t);
+#else
+    localtime_r(&t, &local);
+#endif
+    char text[32];
+    std::strftime(text, sizeof text, "%Y-%m-%d_%H-%M-%S", &local);
+    return text;
+}
+
+// the backups of a card, newest first (by the time the file was written, as quick saves: the clock goes back an hour once a year)
+std::vector<std::filesystem::path> list_backups(const std::string &card) {
+    namespace fs = std::filesystem;
+    const std::string prefix = os::utf8(os::path(card).stem()) + "_";
+    std::vector<std::pair<fs::file_time_type, fs::path>> found;
+    std::error_code error;
+    for (fs::directory_iterator it(backups_dir(card), error), end; !error && it != end; it.increment(error)) {
+        const std::string name = os::utf8(it->path().filename());
+        if (name.size() <= prefix.size() + 4 || name.compare(0, prefix.size(), prefix) != 0 || name.compare(name.size() - 4, 4, ".ps2") != 0) continue;
+        std::error_code time_error;
+        found.emplace_back(fs::last_write_time(it->path(), time_error), it->path());
+    }
+    std::sort(found.begin(), found.end(), [](const auto &a, const auto &b) { return a.first != b.first ? a.first > b.first : a.second > b.second; });
+    std::vector<fs::path> paths;
+    for (auto &entry : found) paths.push_back(std::move(entry.second));
+    return paths;
+}
+
+// Copies the card file as it is now into its backups folder (see above). `must`: whatever the time since the last copy (the card
+// about to be written fails the check, so the file there may be the last whole card). Called with the card lock held, before the
+// file is replaced; a copy that cannot be made is said once and does not stop the card write.
+void back_up(Card &c, bool must) {
+#ifdef __EMSCRIPTEN__
+    (void)c;
+    (void)must;
+#else
+    namespace fs = std::filesystem;
+    const auto now = std::chrono::steady_clock::now();
+    if (!must && c.backed_up && now - c.backup_time < kBackupEvery) return;
+    c.backed_up = true;
+    c.backup_time = now;
+    std::vector<std::uint8_t> current;
+    std::string why;
+    if (read_card_file(c.file, current, why) != CardFile::good) return;  // nothing there yet, or nothing worth keeping
+    const std::vector<fs::path> earlier = list_backups(c.file);
+    if (!earlier.empty()) {
+        std::vector<std::uint8_t> newest;
+        if (read_card_file(os::utf8(earlier.front()), newest, why) == CardFile::good && newest == current) return;
+    }
+    const fs::path dir = backups_dir(c.file);
+    std::error_code error;
+    fs::create_directories(dir, error);
+    const std::string base = os::utf8(os::path(c.file).stem()) + "_" + now_text();
+    fs::path target = dir / os::path(base + ".ps2");
+    for (int n = 2; fs::exists(target, error) && n < 100; ++n) target = dir / os::path(base + "_" + std::to_string(n) + ".ps2");
+    if (!os::replace_file(os::utf8(target), current.data(), current.size(), &why)) {
+        static bool complained = false;
+        if (!complained) std::fprintf(stderr, "[mc] warning: no backup of the card was made: %s\n", why.c_str());
+        complained = true;
+        return;
+    }
+    std::fprintf(stderr, "[mc] backup of the card file before it is replaced: %s\n", os::utf8(target).c_str());
+    const std::vector<fs::path> all = list_backups(c.file);
+    for (std::size_t i = kKeepBackups; i < all.size(); ++i) fs::remove(all[i], error);
+#endif
+}
+
+// The card file `named` is damaged (or empty) and must not be used: the newest backup that passes the check takes its place. A
+// damaged file is first moved aside to "<name>.damaged-<date>_<time>.ps2", never deleted (its newest saves may still be worth
+// something to a tool such as mymc). Returns false, with nothing changed, when there is no good backup or the file cannot be moved.
+bool restore_backup(const std::string &named, bool empty, std::vector<std::uint8_t> &data) {
+#ifdef __EMSCRIPTEN__
+    (void)named;
+    (void)empty;
+    (void)data;
+    return false;
+#else
+    std::string why;
+    for (const std::filesystem::path &backup : list_backups(named)) {
+        std::vector<std::uint8_t> got;
+        if (read_card_file(os::utf8(backup), got, why) != CardFile::good) {
+            std::fprintf(stderr, "[mc] the backup %s is damaged too (%s); trying an older one\n", os::utf8(backup).c_str(), why.c_str());
+            continue;
+        }
+        if (!empty) {
+            const std::string aside = beside(named, ("damaged-" + now_text()).c_str());
+            if (!os::move_replacing(named, aside, &why)) {
+                std::fprintf(stderr, "[mc]          It cannot be moved aside (%s), so it is not replaced by a backup.\n", why.c_str());
+                return false;
+            }
+            std::fprintf(stderr, "[mc]          The damaged file is kept as %s.\n", aside.c_str());
+        }
+        if (!os::replace_file(named, got.data(), got.size(), &why))
+            std::fprintf(stderr, "[mc] warning: the backup cannot be copied to %s (%s); it is used from memory and written there on the next save\n",
+                         named.c_str(), why.c_str());
+        std::fprintf(stderr, "[mc]          The card was restored from the backup %s.\n", os::utf8(backup).c_str());
+        data.swap(got);
+        return true;
+    }
+    return false;
+#endif
 }
 
 // A card file that is there but cannot be used is never taken as a blank card: the game would offer to format it, and the
-// formatted card would then be written over the file and the saves in it would be gone. Such a file is left exactly as it is,
-// and the run uses a fresh card beside it ("<name>.fresh.ps2", loaded if an earlier run made it), so the game can still save.
+// formatted card would then be written over the file and the saves in it would be gone. When the file is damaged (the wrong size,
+// pages that do not fit their ECC, or 0 bytes while backups exist) and a good backup exists, the backup takes its place and the
+// damaged file is kept beside it. A damaged file of the right size with no backup is still used (a page cut in half when a run
+// ended loses one save, not the card; mcman reports that page to the game), after a copy of it was put aside. Anything else that
+// cannot be used is left exactly as it is, and the run uses a fresh card beside it ("<name>.fresh.ps2", loaded if an earlier run
+// made it), so the game can still save. A second run with the same --memcard gets no card at all: two runs would each write their
+// own card over the other's saves.
 void load_card() {
     Card &c = g_card;
     if (c.present || c.looked || g_options.memcard_path.empty()) return;
@@ -291,16 +512,44 @@ void load_card() {
     c.looked = true;
     const std::string &named = g_options.memcard_path;
     const std::string fresh = beside(named, "fresh");
-    std::vector<std::uint8_t> data;
+    bool busy = false;
     std::string why;
+    if (!c.owner.take(named + ".lock", busy, why)) {
+        if (busy) {
+            std::fprintf(stderr, "[mc] warning: another copy of the game is running with the memory card %s.\n", named.c_str());
+            std::fprintf(stderr, "[mc]          Two runs would write their saves over each other's, so this run has no card in slot 1.\n");
+            return;
+        }
+        std::fprintf(stderr, "[mc] note: cannot make the lock file %s.lock (%s); the card is used without it.\n", named.c_str(), why.c_str());
+    }
+    std::vector<std::uint8_t> data;
     c.file = named;
     CardFile got = read_card_file(named, data, why);
-    if (got == CardFile::bad) {
+    const bool has_backups = !list_backups(named).empty();
+    if ((got == CardFile::damaged && (has_backups || data.size() == kCardBytes)) || (got == CardFile::empty && has_backups)) {
+        std::fprintf(stderr, "[mc] warning: the memory card %s is damaged: %s.\n", named.c_str(), got == CardFile::empty ? "the file is empty" : why.c_str());
+        std::vector<std::uint8_t> restored;
+        if (restore_backup(named, got == CardFile::empty, restored)) {
+            data.swap(restored);
+            got = CardFile::good;
+        } else if (got == CardFile::damaged && data.size() == kCardBytes) {
+            const std::string aside = beside(named, ("damaged-" + now_text()).c_str());
+            if (os::replace_file(aside, data.data(), data.size(), &why))
+                std::fprintf(stderr, "[mc]          There is no good backup, so it is used as it is; a copy of it is kept as %s.\n", aside.c_str());
+            else
+                std::fprintf(stderr, "[mc]          There is no good backup, so it is used as it is (no copy of it could be made: %s).\n", why.c_str());
+            got = CardFile::good;
+        } else if (got == CardFile::empty) {
+            got = CardFile::missing;
+        }
+    }
+    if (got == CardFile::damaged) got = CardFile::unusable;  // the wrong size, and no backup to go back to
+    if (got == CardFile::unusable) {
         std::fprintf(stderr, "[mc] warning: %s cannot be used as a memory card: %s.\n", named.c_str(), why.c_str());
         std::fprintf(stderr, "[mc]          It is left exactly as it is. This run uses the card %s instead, so saves go there.\n", fresh.c_str());
         c.file = fresh;
         got = read_card_file(fresh, data, why);
-        if (got == CardFile::bad) {
+        if (got == CardFile::unusable || got == CardFile::damaged) {
             std::fprintf(stderr, "[mc] warning: %s cannot be used either: %s. No card is in slot 1; nothing is written.\n", fresh.c_str(), why.c_str());
             return;
         }
@@ -315,7 +564,7 @@ void load_card() {
     if (got == CardFile::good) c.data.swap(data);
     else c.data.assign(kCardBytes, 0xFF);
     c.present = true;
-    std::fprintf(stderr, "[mc] card in slot 1: %s%s\n", c.file.c_str(), got == CardFile::missing ? " (new, unformatted)" : "");
+    std::fprintf(stderr, "[mc] card in slot 1: %s%s\n", c.file.c_str(), got == CardFile::good ? "" : " (new, unformatted)");
 }
 
 void memory_card(std::size_t at, std::uint32_t out_size) {
@@ -482,15 +731,27 @@ namespace {
 
 // Writes the card to its file so that the file is always a whole card, the old one or the new one: the bytes go to
 // "<file>.tmp", are forced to the disk, and the finished file then replaces the old one in one step (os::replace_file). A crash,
-// a kill or a full disk in the middle leaves the old card where it was (and a stray .tmp file that the next write overwrites).
-bool write_card_file(const Card &c) { return os::replace_file(c.file, c.data.data(), c.data.size()); }
+// a kill, a power cut or a full disk in the middle leaves the old card where it was (and a stray .tmp file that the next write
+// overwrites). Before that, a copy of the file there goes to the card's backups folder (back_up). A card that fails the check (the
+// run ends while the game is in the middle of a save, or something went wrong) is still written, since it is what the game has,
+// but only after the file it replaces was copied, whatever the time since the last copy: so a whole card is never replaced by a
+// broken one without a copy, and the next run finds the file damaged and goes back to that copy.
+bool write_card_file(Card &c, bool hurry) {
+    const std::string problem = card_problem(c.data.data(), c.data.size());
+    static bool said = false;
+    if (!problem.empty() && !said) std::fprintf(stderr, "[mc] warning: the card the game has now fails the check (%s); the card file is copied before it is replaced\n", problem.c_str());
+    said = said || !problem.empty();
+    if (!hurry || !problem.empty()) back_up(c, !problem.empty());
+    return os::replace_file(c.file, c.data.data(), c.data.size());
+}
 
 // PS2_TEST_CARD_DIRTY=<frame>[,stop][,hold][,crash] is a switch for scripts/test_memcard.py, not for players. At that frame a marker text is
 // put into page 4000 of the card, which counts as changed as if the game had just written it. With ",stop" the run ends in the same
 // frame, as if the game had quit, so only a write at the end of the run can save the card: the one 50 frames after the last change
 // has not had its time yet. With ",hold" the 50-frame write never comes, so a test can take its time to end the run from outside
 // (close the window, press Ctrl+Break) and the file can only be there if that way of ending wrote it. With ",crash" the program
-// writes to address 0 right after the change (a crash; on Windows the handler in host/main.cpp then writes the card).
+// writes to address 0 right after the change (a crash; on Windows the handler in host/main.cpp then writes the card). With ",raw"
+// the page's ECC is left as it was, so the card fails card_problem, as one cut in the middle of a page would.
 void test_hook(Card &c) {
     static const std::string spec = os::env("PS2_TEST_CARD_DIRTY");
     if (spec.empty() || !c.present) return;
@@ -501,7 +762,9 @@ void test_hook(Card &c) {
         std::lock_guard<std::mutex> hold(c.lock);
         char marker[64];
         std::snprintf(marker, sizeof marker, "ps2-native-recomp card flush test, frame %llu", static_cast<unsigned long long>(ps2::frames_run()));
-        std::memcpy(c.data.data() + static_cast<std::size_t>(4000) * kPageBytes, marker, std::strlen(marker) + 1);
+        std::uint8_t *page = c.data.data() + static_cast<std::size_t>(4000) * kPageBytes;
+        std::memcpy(page, marker, std::strlen(marker) + 1);
+        if (spec.find(",raw") == std::string::npos) page_ecc(page, page + 512);  // as mcman writes a page, so the card stays whole
         c.dirty = true;
         c.quiet = 0;
     }
@@ -529,7 +792,7 @@ void write_card(bool hurry) {
     }
     if (!c.dirty.exchange(false)) return;  // another thread wrote it in the meantime
     c.quiet = 0;
-    if (!write_card_file(c)) {
+    if (!write_card_file(c, hurry)) {
         static bool complained = false;
         if (!complained) std::fprintf(stderr, "[mc] cannot write %s (the card stays in memory and is tried again)\n", c.file.c_str());
         complained = true;

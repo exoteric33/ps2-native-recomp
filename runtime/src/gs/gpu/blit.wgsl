@@ -184,9 +184,41 @@ fn edge_aa(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
     return center + (select(b, a, lb < low || lb > high) - plain);
 }
 
+// A plain smooth blend of the four source pixels around p (in source pixels, from the corner of the first).
+fn smooth_at(p: vec2<f32>) -> vec3<f32> {
+    let origin = floor(p);
+    let f = p - origin;
+    let x = i32(origin.x);
+    let y = i32(origin.y);
+    let top = mix(scene_texel(x, y), scene_texel(x + 1, y), f.x);
+    let bottom = mix(scene_texel(x, y + 1), scene_texel(x + 1, y + 1), f.x);
+    return mix(top, bottom, f.y);
+}
+
+// A picture bigger than the window (an upscaled one in a smaller window): the looks above enlarge, and reading a few source pixels
+// per screen pixel skips the rest, which put jagged steps along thin edges such as text. Here every screen pixel is the average of
+// the source area it covers (2 to 6 smooth reads each way), the clean reduction that upscaling is for; it needs no edge smoothing.
+fn reduced_scene(uv: vec2<f32>) -> vec3<f32> {
+    let size = vec2<f32>(f32(blit.width), f32(blit.height));
+    let footprint = size / vec2<f32>(f32(blit.out_width), f32(blit.out_height));
+    let n = vec2<i32>(clamp(ceil(footprint) + 1.0, vec2<f32>(2.0), vec2<f32>(6.0)));
+    let centre = uv * size - 0.5;
+    var sum = vec3<f32>(0.0);
+    for (var j = 0; j < n.y; j = j + 1) {
+        for (var i = 0; i < n.x; i = i + 1) {
+            let offset = ((vec2<f32>(f32(i), f32(j)) + 0.5) / vec2<f32>(n) - 0.5) * footprint;
+            sum = sum + smooth_at(centre + offset);
+        }
+    }
+    return sum / f32(n.x * n.y);
+}
+
 @fragment
 fn fs(in: VertexOut) -> @location(0) vec4<f32> {
     var c: vec3<f32>;
+    if (blit.width > blit.out_width + blit.out_width / 16u || blit.height > blit.out_height + blit.out_height / 16u) {
+        return vec4<f32>(clamp(reduced_scene(in.uv), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    }
     if ((blit.options & 4u) != 0u) {
         c = sharp_scene(in.uv);
     } else {

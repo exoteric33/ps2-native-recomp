@@ -590,18 +590,41 @@ void write_voice(Core &k, std::uint32_t off, std::uint32_t value) {
     }
 }
 
+// PS2_TRACE_KON: key on/off events and the reads that see a voice's state before its key on took effect
+bool trace_kon() {
+    static const bool on = std::getenv("PS2_TRACE_KON") != nullptr;
+    return on;
+}
+double trace_time() { return g_first_tick ? static_cast<double>(kernel::now() - g_first_tick) / 36864000.0 : 0.0; }
+
+// The chip takes a key on within a sample: ENDX, ENVX and NAX of the voice start over at once. The sound driver may look at them
+// right after the key on (Urban Reign's NUSOUND does), and a voice still marked as ended there is taken for a free one and given to
+// the next sound, so the first sound (a fighter's cry when knocked out) never plays. PS2_SPU2_KON_LATE=1 keeps the old way (the key
+// on waits for the next batch of 32 samples), to compare.
+bool kon_late() {
+    static const bool on = std::getenv("PS2_SPU2_KON_LATE") != nullptr;
+    return on;
+}
+
 void key(Core &k, std::uint32_t mask, bool on) {
     for (int i = 0; i < 24; ++i) {
         if (!(mask & (1u << i))) continue;
         Voice &v = k.voices[i];
-        if (on) v.key_on = true;
-        else if (v.key_on) v.key_on = false;
+        if (trace_kon())
+            std::fprintf(stderr, "[kon] %.4f s core %d voice %d %s (pending %d phase %d env %d end %d ssa 0x%05X)\n", trace_time(), static_cast<int>(&k - g_cores), i,
+                         on ? "on" : "off", v.key_on ? 1 : 0, static_cast<int>(v.phase), v.env.level, v.end ? 1 : 0, v.ssa);
+        if (on) {
+            v.key_on = true;
+            if (!kon_late()) key_on(v);
+        } else if (v.key_on) v.key_on = false;
         else if (v.phase != kOff) v.phase = kRelease;
     }
 }
 
 std::uint32_t read_core(int core, std::uint32_t off) {
     Core &k = g_cores[core];
+    if (trace_kon() && off < 0x180u && (off & 0xFu) == 0xA && k.voices[off >> 4].key_on)
+        std::fprintf(stderr, "[kon] %.4f s core %d voice %u: ENVX read (%d) while its key on waits\n", trace_time(), core, off >> 4, k.voices[off >> 4].env.level);
     if (off < 0x180u || (off >= 0x1C0u && off < 0x2E0u)) return read_voice(k, off);
     switch (off) {
     case 0x19A: return k.attr;
@@ -615,6 +638,10 @@ std::uint32_t read_core(int core, std::uint32_t off) {
         std::uint32_t endx = 0;
         for (int i = 0; i < 24; ++i)
             if (k.voices[i].end) endx |= 1u << i;
+        if (trace_kon())
+            for (int i = 0; i < 24; ++i)
+                if (k.voices[i].key_on && k.voices[i].end)
+                    std::fprintf(stderr, "[kon] %.4f s core %d voice %d: ENDX read says ended while its key on waits\n", trace_time(), core, i);
         return off == 0x340 ? endx & 0xFFFFu : endx >> 16;
     }
     case 0x344:

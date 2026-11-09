@@ -43,6 +43,7 @@ struct Options {
     bool trace_threads = false;
     bool pal = true;
     bool widescreen = false;
+    unsigned language = 0;  // --language: the console's language the game reads (1 English ... 7 Portuguese); 0 leaves PS2_LANGUAGE in charge
     bool rate_forced = false;
     std::uint64_t max_frames = 0;
     std::string misses_path;

@@ -77,6 +77,27 @@ std::filesystem::path find_game_dir(const std::string &program_location, const s
     return {};
 }
 
+// --language: a two-letter code or the console's own number (1 to 7); 0 for anything else
+unsigned language_number(const std::string &text) {
+    static const char *const kCodes[] = {"ja", "en", "fr", "es", "de", "it", "nl", "pt"};
+    for (unsigned n = 1; n < 8; ++n)
+        if (text == kCodes[n]) return n;
+    const unsigned n = static_cast<unsigned>(std::strtoul(text.c_str(), nullptr, 10));
+    return n >= 1 && n <= 7 ? n : 0;
+}
+
+// The disc's serial from the name of its boot program (SCES_536.88 -> SCES-53688), or "" when the name is not one.
+std::string disc_serial(const std::string &path) {
+    std::string name = path.substr(path.find_last_of("/\\:") + 1);
+    name = name.substr(0, name.find(';'));
+    if (name.size() != 11 || name[4] != '_' || name[8] != '.') return {};
+    for (int i : {0, 1, 2, 3})
+        if (name[i] < 'A' || name[i] > 'Z') return {};
+    for (int i : {5, 6, 7, 9, 10})
+        if (name[i] < '0' || name[i] > '9') return {};
+    return name.substr(0, 4) + "-" + name.substr(5, 3) + name.substr(9, 2);
+}
+
 int usage() {
     std::fprintf(stderr,
                  "usage: ps2run [elf] [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
@@ -823,6 +844,11 @@ int main(int argc, char **argv) {
         else if (a == "--misses" && i + 1 < argc) ps2::g_options.misses_path = argv[++i];
         else if (a == "--trace-syscalls") ps2::g_options.trace_syscalls = true;
         else if (a == "--widescreen") ps2::g_options.widescreen = true;
+        else if (a == "--language" && i + 1 < argc) {
+            // the language the console is set to, which multi-language discs (Urban Reign PAL: en fr de es it) show their text in
+            ps2::g_options.language = language_number(argv[++i]);
+            if (!ps2::g_options.language) return usage();
+        }
         else if (a == "--patches" && i + 1 < argc) {
             if (!ps2::load_patches(argv[++i])) return usage();
         }
@@ -927,6 +953,9 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "[vu%d] recording vector programs that are not compiled yet into %s\n", unit, ps2::os::env(setting).c_str());
         }
     }
+    // The window says which game runs: PS2_WINDOW_TITLE when a launcher sets it, else the disc's serial.
+    if (window && ps2::os::env("PS2_WINDOW_TITLE").empty())
+        if (const std::string serial = disc_serial(program_location); !serial.empty()) ps2::os::set_env("PS2_WINDOW_TITLE", serial);
     if (window && !open_window(fullscreen)) return 1;
     if (window) name_thread(L"ps2 window");
 #endif

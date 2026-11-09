@@ -132,6 +132,19 @@ inline std::vector<Case> cases() {
     // written its flags (the ADD gives MAC 0xF0 and the sign flag 0x02, and used to bring the sticky 0x80 back after the FSSET).
     c.push_back({"FSSET clears the sticky flags the upper instruction of its pair set", finish({{fsflag(0x15, 0, 0), add(6, 2, 2)}, kNop}), 0, 2, 0, true, 0xF0, 0x02});
     c.push_back({"FSSET sets sticky flags next to an upper instruction that wrote flags", finish({{fsflag(0x15, 0, 0x40), add(6, 2, 2)}, kNop}), 0, 2, 0, true, 0xF0, 0x42});
+    // Champions of Norrath: 4-instruction SQI (vi2++) write chain before IBNE vi3, vi2 reads vi2 from 4 cycles back (4*k - 1 == 251).
+    const std::vector<Pair> sqi4 = {
+        {0x10010040u, kUnop},
+        {0x10020000u, kUnop},
+        {0x100310FBu, kUnop},
+        {0x81E20B7Du, kUnop},
+        {0x81E2137Du, kUnop},
+        {0x81E21B7Du, kUnop},
+        {0x52021FFCu, kUnop},
+        {0x81E2237Du, kUnop},
+        kNop,
+    };
+    c.push_back({"Champions of Norrath: 4-cycle SQI (vi2++) chain before IBNE", finish(sqi4), 0, 2, 256, true});
     return c;
 }
 

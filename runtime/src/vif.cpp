@@ -23,9 +23,9 @@ namespace {
 
 struct Unit {
     std::uint32_t stat = 0, err = 0, mark = 0, cycle = 0, mode = 0, num = 0, mask = 0, code = 0;
-    std::uint32_t itops = 0, base = 0, ofst = 0, tops = 0, itop = 0, top = 0;
+    std::uint32_t itops = 0, base = 0, ofst = 0, tops = 0, itop = 0, top = 0, vu_addr = 0;
     std::uint32_t row[4] = {}, col[4] = {};
-    bool dbf = false, stalled = false;
+    bool dbf = false, stalled = false, vu_pending = false;
     std::vector<std::uint32_t> pending;
 };
 
@@ -163,13 +163,29 @@ struct Ctx {
     bool dry;
 };
 
+void flush_vu(int unit) {
+    if (unit != 1) return;
+    Unit &u = state(1);
+    if (!u.vu_pending) return;
+    u.vu_pending = false;
+    if (shadow(1)) return;
+    vu::set_tops(u.top, u.itop);
+    vu::run(1, u.vu_addr);
+}
+
 void run_vu(int unit, std::uint32_t address, const Ctx &c) {
     Unit &u = c.u;
     if (unit == 1) {
+        flush_vu(1);
         u.top = u.tops;
         u.itop = u.itops;
         u.dbf = !u.dbf;
         u.tops = u.base + (u.dbf ? u.ofst : 0);
+        if (u.ofst != 0) {
+            u.vu_pending = true;
+            u.vu_addr = address;
+            return;
+        }
         if (c.dry) return;
         vu::set_tops(u.top, u.itop);
     } else {
@@ -416,11 +432,21 @@ std::uint32_t data_words(std::uint32_t cmd, const Unit &u) {
 void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c) {
     Unit &u = c.u;
     const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
+    if (unit == 1 && u.vu_pending) {
+        const bool skipping = (u.cycle & 0xFFu) > write_length(u);
+        const bool keep = op == 0x00 || op == 0x01 ||
+                          ((op == 0x05 || op == 0x20 || op == 0x30 || op == 0x31) && skipping) ||
+                          ((op & 0x60u) == 0x60u && skipping && ((cmd >> 15) & 1u) && u.ofst != 0);
+        if (!keep) flush_vu(1);
+    }
     u.code = cmd;
     if (!c.vu_thread) ++g_commands[unit][op];
     switch (op) {
     case 0x00: break;
-    case 0x01: u.cycle = imm; break;
+    case 0x01:
+        u.cycle = imm;
+        if (unit == 1 && u.vu_pending && (u.cycle & 0xFFu) <= write_length(u)) flush_vu(1);
+        break;
     case 0x02: u.ofst = imm & 0x3FFu; u.dbf = false; u.tops = u.base; break;
     case 0x03: u.base = imm & 0x3FFu; break;
     case 0x04: u.itops = imm & 0x3FFu; break;
@@ -458,6 +484,7 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &
         break;
     }
     if ((cmd & 0x80000000u) && !(u.err & 1u)) {
+        flush_vu(unit);
         // The interrupt bit raises INT and stalls the unit before the next command, except on MARK, which only raises INT.
         u.stat |= kStatInt;
         if (op != 0x07) {
@@ -636,11 +663,14 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
     }
 }
 
+void flush(int unit) { flush_vu(unit); }
+
 }
 
 namespace ps2::vif {
 
 void state(ps2::state::Stream &s) {
+    if (!s.loading()) flush_vu(1);
     s.tag("vif");
     for (Unit *u : {&g_units[0], &g_units[1], &g_vu_side}) {
         s.pod(u->stat);

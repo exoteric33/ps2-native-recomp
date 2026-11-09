@@ -2,6 +2,7 @@
 
 #include "gs.hpp"
 #include "queue.hpp"
+#include "../vif.hpp"
 
 #include "ps2/state.hpp"
 
@@ -395,6 +396,7 @@ void vif1_idle() {
         gs::queue::vu().post(gs::queue::kPath3Idle, 0, 0, nullptr, 0);
         return;
     }
+    vif::flush(1);
     Held &h = g_held;
     h.flowing = false;
     if (!h.masked) release(false);

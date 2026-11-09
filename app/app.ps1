@@ -385,8 +385,9 @@ function Test-GameRunning([string]$exe) {
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Updates (the Update button). The only network use is two small lookups at the start (the newest version of the public repo)
-# and, when the player presses Update, the download of that version's zip. Nothing is ever uploaded.
+# Updates. The only network use is two small lookups at the start (the newest version of the public repo) and, when a newer
+# version is out, the download of its zip: by itself when the app opens and nothing else is going on (docs/auto-update.md), or
+# when the player presses Update on the welcome card (a build or game was started first). Nothing is ever uploaded.
 #
 # How the versions are told apart: the newest one is the commit id GitHub names for the branch main of the public repo (a 40-digit
 # hex text, asked with the "sha" media type). The installed one is tools\update\installed.txt, written by an update. A copy that
@@ -401,6 +402,9 @@ $UpdateArchive = "https://github.com/$UpdateRepo/archive"
 if ($env:PS2APP_UPDATE_TEST -match '^http://(127\.0\.0\.1|localhost):\d+$') { $UpdateApi = $env:PS2APP_UPDATE_TEST + '/api'; $UpdateArchive = $env:PS2APP_UPDATE_TEST + '/archive' }
 $UpdateDir = Join-Path $Root 'tools\update'
 # What an update never touches: everything the player made or downloaded, and a git clone's own folder.
+# The look for a newer version gets 10 s to answer; comparing the app's own files (no network) gets 40 s in all.
+$CheckLimitSec = 10
+$CheckCompareLimitSec = 40
 $UpdateKeep = @('games', 'tools', 'build', 'generated', 'isos', 'third_party', 'wt', 'logs', 'downloads', '.git')
 
 function Get-InstalledVersion {
@@ -515,6 +519,7 @@ try {
         if ($installed -eq $newest) { $sh.Result = 'current'; return }
         # Not the version this app recorded (or none): are the files the same as the newest version's anyway?
         $tree = (Get-Text "$api/git/trees/${newest}?recursive=1" 'application/vnd.github+json') | ConvertFrom-Json
+        $sh.Phase = 'compare'   # the network part is over; hashing the own files is not held to the short limit
         $cmp = Compare-TreeToFiles $tree $root
         $same = $cmp.Same
         $count = $cmp.Count
@@ -706,7 +711,7 @@ if (-not $created) {
 # ---------------------------------------------------------------------------------------------------------------------
 # Child processes
 
-$State = @{ Build = $null; Image = ''; Name = ''; Game = $null; Playing = $null; PlayStarted = [datetime]::MinValue; Seq = 0; Patch = $null; Newest = ''; UpdateJob = $null; Batch = $null; Restarting = $false }
+$State = @{ Build = $null; Image = ''; Name = ''; Game = $null; Playing = $null; PlayStarted = [datetime]::MinValue; Seq = 0; Patch = $null; Newest = ''; UpdateJob = $null; Batch = $null; Restarting = $false; AutoUpdate = $false; CheckStarted = [datetime]::MinValue }
 
 # PCSX2 patches of the chosen game (optional). Status: idle (not asked yet), working, found, none (the collection has no file for
 # this game) or error. Chosen holds the ticked section names; Items the tick boxes (Key = section name, S = what pnach.py says).
@@ -946,6 +951,9 @@ $steps = @(
 )
 $x = 40
 $U.stepCards = @()
+# One plain line about the quiet look for a newer version (see Set-UpdateLine); right-aligned in the row of the title, on top of it.
+$U.updLine = Add-Label $w 'updLine' '' 380 44 380 22 (New-Font 10) $C.Muted 'TopRight'
+$U.updLine.BringToFront()
 foreach ($s in $steps) {
     $card = New-Glass $w "stepcard$($s[0])" $x 104 232 142
     $U.stepCards += $card
@@ -2502,6 +2510,11 @@ function Update-UpdateJob {
             $U.updCancel.Visible = $false
         }
     }
+    # The look for a newer version must never hold the app up: no answer in time counts as "could not check".
+    if ($job.Mode -eq 'check' -and $sh.Result -eq '') {
+        $limit = if ($sh.Phase -eq 'compare') { $CheckCompareLimitSec } else { $CheckLimitSec }
+        if (((Get-Date) - $State.CheckStarted).TotalSeconds -gt $limit) { $sh.Result = 'timeout'; $sh.Error = "no answer within $limit s" }
+    }
     if ($sh.Result -eq '') {
         # The worker ended without an answer: treat it as a failure.
         if ($job.Handle.IsCompleted) { $sh.Result = 'failed'; $sh.Error = 'the worker ended' } else { return }
@@ -2511,7 +2524,23 @@ function Update-UpdateJob {
     Close-UpdateJob
     $updTimer.Stop()
     if ($job.Mode -eq 'check') {
-        if ($result -eq 'newer') { $State.Newest = [string]$sh.Sha; if ($P['welcome'].Visible) { Update-Banner } }
+        switch ($result) {
+            'newer' {
+                $State.Newest = [string]$sh.Sha
+                # Update by itself only when nothing else is going on; otherwise the card with the Update button waits on the welcome screen.
+                if (Test-AutoUpdateNow) { Start-UpdateDownload -Auto }
+                else {
+                    Write-AppLog "A newer version is out ($($State.Newest.Substring(0, 7))); not updating now."
+                    Set-UpdateLine 'A newer version is out. It is installed at the next start.'
+                    if ($P['welcome'].Visible) { Update-Banner }
+                }
+            }
+            'current' { Set-UpdateLine '' }
+            default {
+                Write-AppLog "Could not look for a newer version ($result): $error_"
+                Set-UpdateLine 'Could not check for updates. Using this version.'
+            }
+        }
         return
     }
     switch ($result) {
@@ -2523,9 +2552,10 @@ function Update-UpdateJob {
                 Show-UpdateFailed 'The update could not be put in place, so nothing was changed.' "A file may be in use. Close other windows that show this folder, then try again.`n$($_.Exception.Message)"
                 return
             }
+            if ($State.AutoUpdate) { try { Set-Content -LiteralPath (Join-Path $UpdateDir 'auto.txt') -Value ([string]$sh.Sha) -Encoding ASCII } catch { } }
             Restart-App
         }
-        'cancelled' { Show-Screen 'welcome' }
+        'cancelled' { $State.AutoUpdate = $false; Show-Screen 'welcome' }
         'invalid' {
             Write-AppLog "Update refused: $error_"
             Show-UpdateFailed 'The downloaded file is not a version of this app, so it was not used.' 'Nothing was changed. If this happens again, download the zip from the project page by hand.'
@@ -2540,11 +2570,39 @@ function Update-UpdateJob {
         }
     }
 }
-$updTimer.Add_Tick({ try { Update-UpdateJob } catch { $updTimer.Stop(); Write-AppLog $_.Exception.ToString(); Close-UpdateJob; Show-UpdateFailed 'The update hit a problem, so nothing was changed.' $_.Exception.Message } })
+$updTimer.Add_Tick({ try { Update-UpdateJob } catch {
+    $updTimer.Stop(); Write-AppLog $_.Exception.ToString(); Close-UpdateJob
+    if ($P['update'].Visible) { Show-UpdateFailed 'The update hit a problem, so nothing was changed.' $_.Exception.Message }
+    else { Set-UpdateLine 'Could not check for updates. Using this version.' }   # the quiet look never opens a screen
+} })
 
 function Start-UpdateCheck {
     if (-not (Test-UpdateAllowed) -or $InstallProblem) { return }
-    try { $State.UpdateJob = Start-UpdateWorker 'check' ''; $updTimer.Start() } catch { Write-AppLog $_.Exception.ToString() }
+    try {
+        $State.CheckStarted = Get-Date
+        Set-UpdateLine 'Looking for a newer version...'
+        $State.UpdateJob = Start-UpdateWorker 'check' ''
+        $updTimer.Start()
+    } catch { Write-AppLog $_.Exception.ToString(); Set-UpdateLine '' }
+}
+
+# The line on the welcome screen about the quiet look (and the automatic update): one plain sentence, or nothing.
+function Set-UpdateLine([string]$text) { $U.updLine.Text = $text }
+
+# The file auto.txt in tools\update names the version an automatic update installed last. If the newest version is still that one after
+# the restart (something made the app think it is out of date although it was just installed), no second automatic update starts: no loop.
+function Get-AutoTried {
+    try { $t = (Get-Content -LiteralPath (Join-Path $UpdateDir 'auto.txt') -Raw).Trim(); if ($t -match '^[0-9a-f]{40}$') { return $t } } catch { }
+    ''
+}
+
+# Is it a good moment? Only on the welcome screen with the window free: no build, rebuild, patch run or game started from the app,
+# and no message box open (a window with a message box on top cannot take the focus).
+function Test-AutoUpdateNow {
+    if (-not $P['welcome'].Visible -or -not $form.CanFocus) { return $false }
+    if ($State.Build -or $State.Batch -or $State.Playing -or $State.Patch.Run) { return $false }
+    if ($State.Newest -and (Get-AutoTried) -eq $State.Newest) { return $false }
+    $true
 }
 
 # --- The update itself
@@ -2561,10 +2619,14 @@ function Show-UpdateScreen([string]$title, [string]$status, [string]$detail) {
     Show-Screen 'update'
 }
 
-function Start-UpdateDownload {
+function Start-UpdateDownload([switch]$Auto) {
     if (-not $State.Newest) { return }
     Close-UpdateJob
-    Show-UpdateScreen 'Updating the app' 'Downloading the newest version' 'Only the app''s own files are replaced. Your games, saves, quick saves and the build tools stay where they are.'
+    $State.AutoUpdate = [bool]$Auto
+    Set-UpdateLine ''
+    $detail = 'Only the app''s own files are replaced. Your games, saves, quick saves and the build tools stay where they are.'
+    if ($Auto) { Write-AppLog "Updating by itself to $($State.Newest)"; $detail = 'A newer version was found, so the app updates itself. ' + $detail }
+    Show-UpdateScreen 'Updating the app' 'Downloading the newest version' $detail
     $U.updCancel.Visible = $true
     try {
         $State.UpdateJob = Start-UpdateWorker 'download' $State.Newest
@@ -2577,6 +2639,14 @@ function Start-UpdateDownload {
 
 function Show-UpdateFailed([string]$message, [string]$detail) {
     $updTimer.Stop()
+    if ($State.AutoUpdate) {
+        # An update the player did not ask for never stops them: back to the welcome screen with the version they have.
+        $State.AutoUpdate = $false
+        Write-AppLog "Automatic update stopped: $message $detail"
+        Set-UpdateLine 'The update did not work. Using this version for now.'
+        Show-Screen 'welcome'
+        return
+    }
     Show-UpdateScreen 'The update stopped' $message $detail
     $U.updStatus.ForeColor = $C.Danger
     $U.updBar.Visible = $false
@@ -2606,7 +2676,11 @@ $U.noteLater.Add_Click({
     $answer = [Windows.Forms.MessageBox]::Show('Your games keep working as they are; only the new fixes are missing in them. Skip building them again?', $AppTitle, 'YesNo', 'Question')
     if ($answer -eq 'Yes') { Set-PendingRebuild @(); Update-Banner }
 })
-$U.updCancel.Add_Click({ Close-UpdateJob; $updTimer.Stop(); Show-Screen 'welcome' })
+$U.updCancel.Add_Click({
+    Close-UpdateJob; $updTimer.Stop()
+    if ($State.AutoUpdate) { $State.AutoUpdate = $false; Write-AppLog 'Automatic update cancelled.'; Set-UpdateLine 'Update cancelled. Using this version.' }
+    Show-Screen 'welcome'
+})
 $U.updRetry.Add_Click({ if ($State.Newest) { Start-UpdateDownload } else { Show-Screen 'welcome' } })
 $U.updBack.Add_Click({ Show-Screen 'welcome' })
 $U.updDone.Add_Click({ Show-Screen 'welcome' })

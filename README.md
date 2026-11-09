@@ -1,7 +1,7 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 45 games work as far as they
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 46 games work as far as they
 have been tested, 30 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 44
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 45
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -139,6 +139,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Prince of Persia: Warrior Within (USA) | runs, not played through yet: through the opening on the ship to the first mini-boss at 60 fps (with a 60 fps patch); the sound stutters and lags while playing, the films are fine | Bugra06 |
 | Sonic Heroes (Europe) | runs, not played through yet: halfway through Seaside Hill at 60 fps; short stutters and freezes now and then, and a rattling sound in the Team Sonic film | Bugra06 |
 | Return to Castle Wolfenstein: Operation Resurrection (USA) | runs, not played through yet: into the first mission, smooth; many graphics bugs ([#79](https://github.com/exoteric33/ps2-native-recomp/issues/79)) | YaroslavValerySablin |
+| Urban Reign (Europe) | plays well, not played through yet: menus, versus and team fights with knockouts, pause and saves, all five languages, at 4x and full speed in 480p (Windows 11, an RTX 4080 SUPER, a game controller); two bugs of the game itself need a patch file ([#62](https://github.com/exoteric33/ps2-native-recomp/pull/62)) | RatchetCinemaESP |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 
@@ -370,7 +371,10 @@ console's MPEG-2 decoder, which is rebuilt too: the game sends it the stream and
 ### Saves and checks
 
 A quick save is the whole machine in one file: memory, registers, all the chips. The game's own saves go to a memory card file,
-which is written through a temporary file, so it is always a whole card.
+which is written through a temporary file that is forced to the disk before it takes the old one's place, so it is always a whole
+card. Before the card file is replaced, a copy of it goes to `<card>.backups\` (once per run, then at most every 15 minutes; the
+newest 10 are kept). The card is checked when the game starts (the error-check bytes of every page): a damaged one is put aside as
+`<card>.damaged-<time>.ps2` and the newest good copy takes its place. Only one run at a time can use a card file.
 
 Every window run records the pad and, every 15 frames, a fingerprint of the machine. Playing that recording again without a
 window shows whether the game goes exactly the same way, and where it first differs. That, and comparing the whole machine and

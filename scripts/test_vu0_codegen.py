@@ -114,7 +114,7 @@ namespace ps2 {
 std::uint64_t frame_count() { return 0; } bool test_halted = false; bool halted() { return test_halted; }
 namespace vif {
 std::uint32_t test_itop[2] = {};
-std::uint32_t itop(int unit) { return test_itop[unit]; }
+std::uint32_t itop(int unit) { return test_itop[unit]; } void describe_vu1() {}
 }
 namespace vu::live {
 std::atomic<bool> g_ready{false}; bool active() { return false; }

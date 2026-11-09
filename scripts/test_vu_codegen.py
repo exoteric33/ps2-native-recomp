@@ -718,7 +718,7 @@ with tempfile.TemporaryDirectory(prefix='vu-codegen-') as tmp:
     tmp = pathlib.Path(tmp)
     (tmp / 'generator.cpp').write_text('#define RANDOM_PROGRAMS %d\n' % RANDOM_PROGRAMS + GENERATOR)
     (tmp / 'cases.h').write_text(CASES_H)
-    (tmp / 'interp.cpp').write_text('#define RANDOM_PROGRAMS %d\n#include <atomic>\n#include <vector>\n#include "ps2/vu_live.hpp"\nnamespace ps2 { std::uint64_t frame_count() { return 0; } bool halted() { return false; } namespace vif { std::uint32_t itop(int) { return 0; } } namespace vu::live { std::atomic<bool> g_ready{false}; bool active() { return false; } void note_call(std::uint64_t) {} std::vector<Program> take() { return {}; } void unknown(std::uint64_t, std::uint32_t, const std::uint8_t *) {} } }\n' % RANDOM_PROGRAMS + INTERP)
+    (tmp / 'interp.cpp').write_text('#define RANDOM_PROGRAMS %d\n#include <atomic>\n#include <vector>\n#include "ps2/vu_live.hpp"\nnamespace ps2 { std::uint64_t frame_count() { return 0; } bool halted() { return false; } namespace vif { std::uint32_t itop(int) { return 0; } void describe_vu1() {} } namespace vu::live { std::atomic<bool> g_ready{false}; bool active() { return false; } void note_call(std::uint64_t) {} std::vector<Program> take() { return {}; } void unknown(std::uint64_t, std::uint32_t, const std::uint8_t *) {} } }\n' % RANDOM_PROGRAMS + INTERP)
     base = [CXX, '-std=c++20', '-I.', '-Iruntime/include', f'-I{tmp}']
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
         interp = pool.submit(compile_, *base, '-O2' if os.environ.get('VU_BENCH') else '-O1', '-Iruntime/src', str(tmp / 'interp.cpp'), 'runtime/src/vu_micro.cpp', 'runtime/src/vu_jit_web.cpp', '-o', str(tmp / 'interp'))

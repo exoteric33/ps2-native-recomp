@@ -3,6 +3,7 @@
 #include "gs.hpp"
 #include "queue.hpp"
 #include "../vif.hpp"
+#include "../vu_micro.hpp"
 
 #include "ps2/state.hpp"
 
@@ -317,9 +318,9 @@ void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
 }
 
 // VU1's GIF reads a kicked packet round the data memory until a tag with EOP has had all its data, and the next XGKICK waits for
-// that and then starts with a tag of its own (EE manual, PATH1). vu::xgkick sends at most one pass over the memory; when the
-// packet has not ended by then (only a tag that is not one, such as vertex data, does that) this ends it, in order with the data,
-// so the next kick is read as a new packet instead of as more of this one. Without it one bad tag with a large NLOOP swallowed the
+// that and then starts with a tag of its own (EE manual, PATH1). vu::xgkick sends at most one pass over the memory and stops before a
+// tag whose data is more than the memory holds; when the packet has not ended by then (only a tag that is not one, such as vertex
+// data, does that) this ends it, in order with the data, so the next kick is read as a new packet instead of as more of this one. Without it one bad tag with a large NLOOP swallowed the
 // packets of many kicks after it and sprayed them over random GS registers.
 void end_runaway_kick(std::uint32_t address) {
     if (!gs::queue::active()) {
@@ -376,6 +377,7 @@ void stats() {
             std::fprintf(stderr, "[gif] path %d: %llu XGKICK packets did not end within VU1's data memory (the first about frame %u); each was cut there\n",
                          p, static_cast<unsigned long long>(o.count), o.frame);
     }
+    vu::runaway_summary();
 }
 
 std::uint32_t read(std::uint32_t a) {

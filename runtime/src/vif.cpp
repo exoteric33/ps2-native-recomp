@@ -9,7 +9,9 @@
 #include "ps2/state.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -35,6 +37,19 @@ constexpr std::uint32_t kFifoWords[2] = {16u, 32u};
 
 Unit g_units[2];
 Unit g_vu_side;
+// How many programs VIF1 started on VU1, and how many of those it held back until the UNPACKs behind the MSCAL were done (run_vu).
+// Only the thread that really runs VU1 counts; the emulation thread's shadow copy does not.
+std::atomic<std::uint64_t> g_vu_starts{0}, g_vu_held{0};  // one writer (the thread that runs VU1), read at the end of a run and in a report
+void count_up(std::atomic<std::uint64_t> &n) { n.store(n.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+// PS2_VIF_DEFER=0 starts every program at its MSCAL, as before the deferral (public pull request 64) was added: a way to tell whether
+// a game's trouble comes from it.
+bool defer_enabled() {
+    static const bool on = [] {
+        const char *e = std::getenv("PS2_VIF_DEFER");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 std::uint64_t g_commands[2][128];
 std::uint8_t g_dry_run[16384];
 
@@ -181,7 +196,9 @@ void run_vu(int unit, std::uint32_t address, const Ctx &c) {
         u.itop = u.itops;
         u.dbf = !u.dbf;
         u.tops = u.base + (u.dbf ? u.ofst : 0);
-        if (u.ofst != 0) {
+        if (!c.dry) count_up(g_vu_starts);
+        if (u.ofst != 0 && defer_enabled()) {
+            if (!c.dry) count_up(g_vu_held);
             u.vu_pending = true;
             u.vu_addr = address;
             return;
@@ -555,8 +572,28 @@ void stats() {
             if (g_commands[u][op]) std::fprintf(stderr, " %02X:%llu", op, static_cast<unsigned long long>(g_commands[u][op]));
         std::fprintf(stderr, "\n");
     }
+    if (const std::uint64_t held = g_vu_held.load(std::memory_order_relaxed))
+        std::fprintf(stderr, "[vif1] %llu programs started on VU1, %llu held back until the UNPACKs behind their MSCAL were done\n", static_cast<unsigned long long>(g_vu_starts.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(held));
     for (int i = 0; i < 3; ++i)
         if (g_hist[i].unknown) std::fprintf(stderr, "[%s] %llu unknown commands in this run\n", kLabel[i], static_cast<unsigned long long>(g_hist[i].unknown));
+}
+
+// What VIF1 looks like at the moment VU1 kicks a packet that does not end (vu_micro.cpp, the first one of a run): the double buffer, the
+// unpack settings, how many programs it held back, and the last commands it ran. Called on the thread that runs VU1.
+void describe_vu1() {
+    const Unit &u = state(1);
+    const History &h = g_hist[hist_index(1)];
+    std::fprintf(stderr, "[vif1] now: BASE %u OFFSET %u TOPS %u (%s), the running program got TOP %u ITOP %u; CYCLE CL %u WL %u, STMOD %u, MASK 0x%08X\n", u.base, u.ofst, u.tops,
+                 u.ofst ? "double buffer" : "single buffer", u.top, u.itop, u.cycle & 0xFFu, write_length(u), u.mode, u.mask);
+    std::fprintf(stderr, "[vif1] %llu programs started so far, %llu of them held back until the UNPACKs behind their MSCAL were done (PS2_VIF_DEFER=0 starts them at the MSCAL)\n",
+                 static_cast<unsigned long long>(g_vu_starts.load(std::memory_order_relaxed)), static_cast<unsigned long long>(g_vu_held.load(std::memory_order_relaxed)));
+    const std::uint32_t before = std::min<std::uint32_t>(h.head, 8u);
+    std::fprintf(stderr, "[vif1] the last %u commands it ran, oldest first:\n", before);
+    for (std::uint32_t i = before; i >= 1; --i) {
+        const Seen &s = h.last[(h.head - i) & 7u];
+        std::fprintf(stderr, "[vif1]   word %llu: 0x%08X %s, %u data words\n", static_cast<unsigned long long>(s.at), s.cmd, command_name(s.cmd), s.words);
+    }
 }
 
 // `count` words, not quadwords: the 64 bits of a DMA tag that a chain with the tag transfer enabled sends ahead of its data are two

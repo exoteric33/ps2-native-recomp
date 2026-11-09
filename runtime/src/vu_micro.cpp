@@ -31,6 +31,10 @@ namespace ps2::vu {
 
 std::uint32_t g_trace_vu1_pc = 0;  // entry of the vector program run last (shown by the GS draw trace)
 
+// The vector program that runs now: its entry, its key and whether it is a compiled one. For the report of a packet that does not end;
+// defined below, where the table of entries is.
+static void current_program(std::uint32_t &entry, std::uint64_t &key, bool &compiled);
+
 namespace {
 
 struct Unit {
@@ -440,6 +444,58 @@ void store_vi(Vu0Regs &r, unsigned index, std::uint32_t value) {
     if (index) r.vi[index] = static_cast<std::uint16_t>(value);
 }
 
+// The last kicks, oldest overwritten first, for the report of the first packet that does not end.
+struct KickNote {
+    std::uint32_t address = 0, qwords = 0, entry = 0;
+    bool cut = false;
+};
+KickNote g_kicks[8];
+std::uint32_t g_kick_count = 0;
+
+// The distinct (program, kick address) pairs of packets that did not end, and how often each came: the end-of-run summary says whether
+// it is one program or all of them (public issue #69, Nickelodeon Barnyard).
+struct RunawayRow {
+    std::uint64_t key = 0, count = 0;
+    std::uint32_t entry = 0, address = 0;
+    bool compiled = false;
+};
+constexpr std::uint32_t kRunawayRows = 24;
+RunawayRow g_runaway_rows[kRunawayRows];
+std::uint32_t g_runaway_used = 0;
+std::uint64_t g_runaway_total = 0, g_runaway_other = 0;
+
+// The first packet that does not end prints what a log needs to find out why: the program that kicked it, the tags the GIF walks
+// through, the kicks before it and VIF1's state; the next three print one line, then only the counts of the end-of-run summary.
+void note_runaway(std::uint32_t first) {
+    std::uint32_t entry = 0;
+    std::uint64_t key = 0;
+    bool compiled = false;
+    current_program(entry, key, compiled);
+    const std::uint64_t n = ++g_runaway_total;
+    RunawayRow *row = nullptr;
+    for (std::uint32_t i = 0; i < g_runaway_used; ++i)
+        if (g_runaway_rows[i].key == key && g_runaway_rows[i].entry == entry && g_runaway_rows[i].address == first) row = &g_runaway_rows[i];
+    if (!row && g_runaway_used < kRunawayRows) {
+        row = &g_runaway_rows[g_runaway_used++];
+        *row = RunawayRow{key, 0, entry, first, compiled};
+    }
+    if (row) ++row->count;
+    else ++g_runaway_other;
+    if (n > 4) return;
+    std::fprintf(stderr, "[vu1] XGKICK packet without an end, number %llu: kicked at 0x%03X by the program at entry 0x%04X (key %016llX, %s), TOP %u ITOP %u\n",
+                 static_cast<unsigned long long>(n), first, entry, static_cast<unsigned long long>(key), compiled ? "compiled" : "interpreted", g_top, g_itop);
+    if (n > 1) return;
+    std::fprintf(stderr, "[vu1] the GIF reads from there, tag by tag (it would stop at a tag with EOP 1):\n%s", describe_packet(first).c_str());
+    const std::uint32_t shown = std::min<std::uint32_t>(g_kick_count, 8u);
+    std::fprintf(stderr, "[vu1] the kicks before it, oldest first (address, qwords, program entry):");
+    for (std::uint32_t i = shown; i >= 1; --i) {
+        const KickNote &k = g_kicks[(g_kick_count - i) & 7u];
+        std::fprintf(stderr, " 0x%03X/%u/0x%04X%s", k.address, k.qwords, k.entry, k.cut ? "(cut)" : "");
+    }
+    std::fprintf(stderr, "\n");
+    vif::describe_vu1();
+}
+
 // A packet that runs past the end of the data memory goes on at its start; the queue wants it in one piece.
 __attribute__((noinline)) void xgkick_wrapped(Unit &u, std::uint32_t first, std::uint32_t count) {
     std::uint8_t buffer[16 * 1024 + 16];
@@ -467,17 +523,28 @@ void xgkick(Unit &u, std::uint32_t address) {
         std::uint32_t nreg = static_cast<std::uint32_t>(tag >> 60) & 0xFu;
         if (!nreg) nreg = 16;
         const std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
-        const std::uint32_t take = std::min(body, qwords - count);
-        cut = take < body;
-        q += take;
-        count += take;
+        if (body > qwords - count) {
+            // The data of this tag is more than the whole memory holds, so it is no tag but vertex data or other noise: the tag and what
+            // follows it are not sent (they only spray random GS registers); what came before it is a whole number of tags.
+            --count;
+            cut = true;
+            break;
+        }
+        q += body;
+        count += body;
         done = eop;
     }
-    if (first + count <= qwords) gif::transfer(1, u.data + first * 16, count);
-    else xgkick_wrapped(u, first, count);
-    // More than the whole memory is never a real packet: the GIF met a "tag" that is not one. It ends with this kick, as the console's
-    // next XGKICK starts a packet of its own (gif::end_runaway_kick).
-    if (cut || !done) [[unlikely]] gif::end_runaway_kick(first);
+    g_kicks[g_kick_count++ & 7u] = KickNote{first, count, g_trace_vu1_pc & 16383u, cut || !done};
+    if (count) {
+        if (first + count <= qwords) gif::transfer(1, u.data + first * 16, count);
+        else xgkick_wrapped(u, first, count);
+    }
+    // More than the whole memory is never a real packet: the GIF met a "tag" that is not one. The packet ends with this kick, as the
+    // console's next XGKICK starts a packet of its own (gif::end_runaway_kick).
+    if (cut || !done) [[unlikely]] {
+        note_runaway(first);
+        gif::end_runaway_kick(first);
+    }
 }
 
 // A VU branch that reads an integer register the instruction right before it
@@ -887,6 +954,56 @@ void kick(int unit, std::uint32_t address) {
     if (g_kick_log && unit == 1) g_kick_log->push_back(address);
     Unit u = unit_of(unit);
     xgkick(u, address);
+}
+
+static void current_program(std::uint32_t &entry, std::uint64_t &key, bool &compiled) {
+    entry = g_trace_vu1_pc & 16383u;
+    const EntryCache &e = g_entries[entry >> 3];
+    key = e.key;
+    compiled = e.function != nullptr;
+}
+
+// The GIF tags a kick at `address` walks through, as the console's GIF reads them (the same walk as xgkick's), up to ten, one line each.
+std::string describe_packet(std::uint32_t address) {
+    constexpr std::uint32_t qwords = 1024;
+    std::string out;
+    std::uint32_t q = address & (qwords - 1), count = 0;
+    for (int i = 0; i < 10 && count < qwords; ++i) {
+        std::uint64_t lo, hi;
+        std::memcpy(&lo, g_vu1_mem + q * 16, 8);
+        std::memcpy(&hi, g_vu1_mem + q * 16 + 8, 8);
+        const std::uint32_t nloop = static_cast<std::uint32_t>(lo) & 0x7FFFu, flg = static_cast<std::uint32_t>(lo >> 58) & 3u;
+        const bool eop = (lo >> 15) & 1u;
+        std::uint32_t nreg = static_cast<std::uint32_t>(lo >> 60) & 0xFu;
+        if (!nreg) nreg = 16;
+        const std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+        const std::uint32_t at = q;
+        ++count;
+        const std::uint32_t take = std::min(body, qwords - count);
+        count += take;
+        q = (q + 1 + take) & (qwords - 1);
+        char line[220];
+        std::snprintf(line, sizeof line, "[vu1]   tag at 0x%03X: %016llX %016llX  NLOOP %u EOP %u FLG %u NREG %u, %u data qwords, next tag at 0x%03X%s\n", at,
+                      static_cast<unsigned long long>(hi), static_cast<unsigned long long>(lo), nloop, eop ? 1u : 0u, flg, nreg, body, q, take < body ? " (past the end of the memory)" : "");
+        out += line;
+        if (eop) return out;
+    }
+    out += "[vu1]   (no tag with EOP 1 in the first ten)\n";
+    return out;
+}
+
+std::uint64_t runaway_kicks() { return g_runaway_total; }
+
+void runaway_summary() {
+    if (!g_runaway_total) return;
+    RunawayRow sorted[kRunawayRows];
+    std::copy(g_runaway_rows, g_runaway_rows + g_runaway_used, sorted);
+    std::sort(sorted, sorted + g_runaway_used, [](const RunawayRow &a, const RunawayRow &b) { return a.count > b.count; });
+    std::fprintf(stderr, "[vu1] %llu XGKICK packets without an end, from %u different (program, address) pairs%s; the most frequent:\n", static_cast<unsigned long long>(g_runaway_total),
+                 g_runaway_used, g_runaway_other ? " and more" : "");
+    for (std::uint32_t i = 0; i < g_runaway_used && i < 6; ++i)
+        std::fprintf(stderr, "[vu1]   %llu times: program at entry 0x%04X (key %016llX, %s) kicked at 0x%03X\n", static_cast<unsigned long long>(sorted[i].count), sorted[i].entry,
+                     static_cast<unsigned long long>(sorted[i].key), sorted[i].compiled ? "compiled" : "interpreted", sorted[i].address);
 }
 
 std::uint32_t top() { return g_top; }

@@ -1,4 +1,5 @@
 #include "gpu.hpp"
+#include "hwdraw.hpp"
 #include "overlay.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
@@ -26,6 +27,8 @@
 #include <thread>
 #include <unordered_map>
 
+#include "hwcache.hpp"
+#include "hwstat.hpp"
 
 extern const char kGsShader[];
 extern const char kBlitShader[];
@@ -55,6 +58,7 @@ constexpr std::uint32_t kDecodePrims = 64;
 
 
 Mode g_mode = Mode::off;
+bool g_live = false;  // PS2_GPU_HW=1 (experimental, off by default; see the top of hwdraw.cpp): the plain shapes go through the card path
 std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
 std::uint64_t g_mip_setups = 0, g_mip_shapes = 0, g_filter_setups = 0, g_filter_shapes = 0;  // the mipmaps line of stats(): setups and shapes that read levels above 0 / only pick the filter per pixel
 
@@ -173,8 +177,10 @@ std::uint64_t g_vblanks = 0;
 
 // PS2_BATCH_LOG=1: once per frame, why the drawing batches ended (docs/speed.md, "The arena dip")
 enum Why { kWhyKey, kWhyTexel, kWhyUnder, kWhyOverlap, kWhyZ, kWhyUpload, kWhyClut, kWhyCopy, kWhySize, kWhyFlush,
+kWhyRoute,
 kWhys };
 const char *const kWhyName[kWhys] = {"buffers", "texel", "drawn-under", "overlap", "depth", "upload", "palette", "copy", "size", "other"
+, "route"
 };
 Why g_why = kWhyFlush;
 std::uint32_t g_why_runs[kWhys] = {}, g_why_prims[kWhys] = {};
@@ -267,6 +273,7 @@ struct Batch {
     int minx = 1 << 30, miny = 1 << 30, maxx = -1, maxy = -1;
     std::uint32_t fbp = 0, fbw = 0, fpsm = 0, zbp = 0, zpsm = 0;
     bool zte = false, zwrite = false;
+    int route = 0;  // 1 when the card path draws this batch, else the painter
     std::uint32_t texflushes = 0;
     int rx0 = 0, ry0 = 0, rx1 = -2, ry1 = -2;
     Range fb_range, z_range;
@@ -281,6 +288,10 @@ struct SetupCache {
     std::uint32_t flags = 0;
     std::uint64_t key = 0;
     Range tex;
+    int route = 0;  // hw::live_route of this setup: 0 painter, 1 card, 2 either
+    int look = -1;  // hw::live_look of this setup
+    bool waits = false;  // routed to the painter only because a pipeline was still being made: ask again when one finishes
+    std::uint64_t ready_seen = 0;
 } g_setup_cache;
 
 struct PreOp {
@@ -986,6 +997,19 @@ void flush_batch() {
         return;
     }
     const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
+    if (g_live) {  // the card takes the batch, or the painter does and the card's pictures are told what it reads and writes
+        static_assert(sizeof(Range) == 16, "the card path reads the texture ranges as pairs of 64-bit numbers");
+        hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
+        const hw::LiveBatch lb{b.prims.data(), prims, b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords), b.fbp, b.fbw, b.fpsm, b.zbp, b.zpsm, b.zte, b.zwrite,
+                               b.minx, b.miny, b.maxx, b.maxy, reinterpret_cast<const std::uint64_t *>(g_batch_reads.data()), static_cast<std::uint32_t>(g_batch_reads.size()), frame_count()};
+        hw::pal_write(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);  // the palette record sees what this batch overwrites
+        if (b.zwrite) hw::pal_write(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
+        if (b.route == 1 && hw::live_batch(lb)) {
+            reset_batch();
+            return;
+        }
+        hw::live_painter(lb);
+    }
     // Count how many shapes touch each tile. `touched` lists the tiles in the order they are first touched. The tiles of a span are mostly one to four,
     // so the first four are done without a branch per tile (the extra ones only read and write back their own count); the old loop left after a
     // different number of rounds for every span, and that cost more than the tiles. g_tile_count, g_tile_fill and g_touched have 8 words to spare.
@@ -1022,6 +1046,13 @@ void flush_batch() {
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
     // The mipmap table only when a setup of the batch has one (the draw program then reads it for every setup; prm 9 is ~0 otherwise)
     const std::uint32_t mip_offset = b.any_mip && b.mips.size() / kMipWords == b.setups.size() / kSetupWords ? arena_append(b.mips.data(), b.mips.size() * 4) : 0xFFFFFFFFu;
+    if (g_bench.capturing && hw::enabled() && hw::match())  // PS2_GPU_HW_MATCH=1: neutralise the shapes the trial does not draw, so both pictures lack them
+        for (std::uint32_t i = 0; i < prims; ++i) {
+            const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
+            if (!hw::left_out(rec, b.setups.data() + rec[0] * kSetupWords)) continue;
+            g_arena[prim_offset + i * kPrimWords + 2] = 0x7FFF7FFFu;
+            g_arena[prim_offset + i * kPrimWords + 3] = 0;
+        }
     for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
     std::uint32_t total = 0;
     for (std::uint32_t n = 0; n < touched_n; ++n) total += count[touched[n]];
@@ -1070,15 +1101,25 @@ void flush_batch() {
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi, 1u, 0u, mip_offset});
     note_raster(prims, tiles, total, snapshot);
+    if (stat::g_on) {
+        stat::batch(prims, kWhyName[g_why]);
+        if (!g_batch_log) g_why = kWhyFlush;
+    }
     if (g_batch_log) {
         if (g_batch_log_frame > 1 && frame_count() == g_batch_log_frame) std::fprintf(stderr, "[break] %s %u\n", kWhyName[g_why], prims);
         ++g_why_runs[g_why];
         g_why_prims[g_why] += prims;
         g_why = kWhyFlush;
     }
+    if (g_bench.capturing && hw::enabled()) hw::capture_batch(static_cast<std::uint32_t>(g_bench.subs.size()), static_cast<std::uint32_t>(g_commands.size()), b.prims.data(), prims, b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords));
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param, mip_offset != 0xFFFFFFFFu});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
+    if (hwcache::g_on) {  // the texture cache (hwcache.hpp): this batch reads its textures as they are now, then its draws are writers
+        if (hwcache::counting()) hwcache::batch_textures(b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords), kSetupWords);
+        hwcache::write_region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy, hwcache::kDraw);
+        if (b.zwrite) hwcache::write_region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy, hwcache::kDraw);
+    }
     reset_batch();
 }
 
@@ -1128,11 +1169,23 @@ void emit_pre() {
                 total += g_pre[k].rec[7];
             }
         }
+        if (g_live) {  // the card's pictures are told at the point of the command stream where the upload (a writer) or the palette load (a reader) runs
+            hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
+            for (std::size_t k = i; k < j; ++k) clut ? hw::live_reader(g_pre[k].range.lo, g_pre[k].range.hi) : hw::live_writer(g_pre[k].range.lo, g_pre[k].range.hi);
+        }
+        const std::size_t before = g_commands.size();
         if (clut) g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
         else dispatch_linear(kUpload, total, push_params({offset, count, total}));
+        if (g_bench.capturing && hw::enabled() && g_commands.size() > before) {
+            Range both;
+            for (std::size_t k = i; k < j; ++k) both.add(g_pre[k].range.lo, g_pre[k].range.hi);
+            hw::capture_pre(static_cast<std::uint32_t>(g_bench.subs.size()), static_cast<std::uint32_t>(before), clut, both.lo, both.hi);
+            if (hwcache::g_on) hwcache::capture_pre(static_cast<std::uint32_t>(g_bench.subs.size()), static_cast<std::uint32_t>(before), i, j);
+        }
         i = j;
     }
     g_pre.clear();
+    if (hwcache::g_on) hwcache::pending_clear();
 }
 
 void emit_all() {
@@ -1187,7 +1240,12 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     op.y0 = im.dsay + first;
     op.y1 = im.dsay + last;
     op.image = im.id;
+    const Range pal_range_of_upload = op.range;
     queue_pre(op);
+    if (g_live) hw::pal_upload(im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, static_cast<std::uint32_t>(lead_bits), im.bpp, bytes, size, pal_range_of_upload.lo, pal_range_of_upload.hi);
+    if (hwcache::g_on)  // after queue_pre: a batch that reads this memory was flushed by it and saw the old numbers
+        hwcache::write_upload(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1), static_cast<int>(im.dsay + last),
+                               lead_bits == 0 && im.done % im.rrw == 0 && (pixels % im.rrw == 0 || im.done + pixels >= im.total), bytes, size);
     im.done += pixels;
     return used;
 }
@@ -1371,6 +1429,7 @@ void bench_capture() {
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
 void submit(WGPUTextureView present_view = nullptr) {
     if (g_commands.empty() && !present_view
+        && !(g_live && hw::live_pending())
         ) return;
     if (g_bench.capturing) bench_capture();
     if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
@@ -1378,6 +1437,8 @@ void submit(WGPUTextureView present_view = nullptr) {
         return;
     }
     ensure_capacity();
+    const bool card_work = g_live && hw::live_pending();
+    if (card_work) hw::live_prepare();
     if (ps2::hitch::on()) {
         for (const Command &c : g_commands) {
             ++g_hitch_now.commands[c.pipeline];
@@ -1402,6 +1463,7 @@ void submit(WGPUTextureView present_view = nullptr) {
         g_query_ready = g_query_pending = false;
     }
     const bool measure = g_timestamps && !g_query_pending
+        && !card_work
         ;
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
@@ -1422,7 +1484,16 @@ void submit(WGPUTextureView present_view = nullptr) {
             if (list.find(kEntryPoints[k]) != std::string::npos) mask |= 1u << k;
         return mask;
     }();
+    std::uint32_t command_index = 0;
     for (const Command &c : g_commands) {
+        if (card_work && hw::live_before(command_index)) {  // the card's work that goes before this command (the order of the command stream)
+            wgpuComputePassEncoderEnd(pass);
+            wgpuComputePassEncoderRelease(pass);
+            hw::live_encode(enc, command_index);
+            pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+            current = kPipelines;
+        }
+        ++command_index;
         ++g_dispatches[c.pipeline];
         if (skip & (1u << c.pipeline)) continue;
         if (c.pipeline != current || c.mip != current_mip) {
@@ -1436,6 +1507,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     }
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
+    if (card_work) hw::live_encode(enc, ~0u);
     if (measure) {
         wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
@@ -1473,6 +1545,8 @@ void submit(WGPUTextureView present_view = nullptr) {
     wgpuQueueSubmit(g_queue, 1, &cmd);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
+    if (g_live) hw::live_submitted();
+    hw::memlog_tick(g_instance, g_queue, frame_count());  // PS2_GPU_HW_MEMLOG=<n>
     if (measure) {
         g_query_pending = true;
         WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
@@ -1560,6 +1634,7 @@ void bench_start() {
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     g_bench.capturing = true;
+    if (hw::enabled()) hw::capture_begin();
     g_bench.subs.clear();
     g_bench_info.clear();
     std::fprintf(stderr, "[bench] capturing the chip work of vblank %llu (game frame %llu)\n", static_cast<unsigned long long>(g_bench.vblank),
@@ -1647,12 +1722,173 @@ std::uint64_t fnv_hash(const std::vector<std::uint32_t> &words, std::size_t firs
     return h;
 }
 
+// PS2_GPU_BENCH_SHOT=<prefix> (with PS2_GPU_HW=1): writes the picture in the frame buffer after a replay to <prefix>-<tag>.ppm. PS2_GPU_BENCH_SHOT_FB=fbp,fbw,width,height picks the buffer (256,8,512,448).
+void bench_shot(const char *tag) {
+    const std::string prefix = os::env("PS2_GPU_BENCH_SHOT");
+    if (prefix.empty()) return;
+    unsigned fbp = 256, fbw = 8, w = 512, h = 448;
+    if (const std::string spec = os::env("PS2_GPU_BENCH_SHOT_FB"); !spec.empty()) std::sscanf(spec.c_str(), "%u,%u,%u,%u", &fbp, &fbw, &w, &h);
+    std::vector<std::uint32_t> rgba;
+    std::uint32_t pw = 0, ph = 0;
+    display(DisplaySource{fbp, fbw, PSMCT32, 0, 0, w, h, false}, rgba, pw, ph);
+    if (std::FILE *f = os::open((prefix + "-" + tag + ".ppm").c_str(), "wb")) {
+        std::fprintf(f, "P6\n%u %u\n255\n", pw, ph);
+        for (std::uint32_t c : rgba) {
+            const unsigned char px[3] = {static_cast<unsigned char>(c), static_cast<unsigned char>(c >> 8), static_cast<unsigned char>(c >> 16)};
+            std::fwrite(px, 1, 3, f);
+        }
+        std::fclose(f);
+    }
+}
+
+std::uint64_t bytes_of_vram() { return static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale; }
+
+// PS2_GPU_HW_CLASS=1 (with PS2_GPU_BENCH): sorts every shape of the captured frame into the classes of hw::shape_class
+// (what a render pipeline could draw, and why not), counts shapes, covered pixels and drawing runs per class, and measures what the compute path
+// spends on each class: the replay is timed again with that class's shapes made invisible (their screen box is emptied, so the drawing program
+// skips them at the first test; the walk through the tile lists stays). The difference to the unchanged replay is the class's chip time.
+void bench_classes(const std::vector<BenchBuffers> &bufs, unsigned reps) {
+    const int kinds = hw::class_count();
+    struct Total {
+        std::uint64_t shapes = 0, runs = 0, only = 0;
+        double area = 0, ms = 0, ms_median = 0;
+    };
+    std::vector<Total> tot(kinds);
+    std::vector<std::vector<std::vector<std::uint32_t>>> where(g_bench.subs.size(), std::vector<std::vector<std::uint32_t>>(kinds));  // [submit][class] -> word offset of each shape's record
+    std::uint64_t runs = 0, hw_runs = 0, shapes = 0;
+    double area_all = 0;
+    for (std::size_t i = 0; i < g_bench.subs.size(); ++i) {
+        const BenchSubmit &sub = g_bench.subs[i];
+        std::size_t info = 0;
+        for (std::size_t n = 0; n < sub.commands.size(); ++n) {
+            const Command &c = sub.commands[n];
+            if (c.pipeline != kRaster) continue;
+            while (info < sub.info.size() && sub.info[info].index < n) ++info;
+            if (info >= sub.info.size() || sub.info[info].index != n) continue;
+            const BenchInfo &bi = sub.info[info];
+            const std::uint32_t *param = sub.params.data() + static_cast<std::size_t>(c.param) * (kParamStride / 4);
+            const std::uint32_t prim_offset = param[1], setup_offset = param[2];
+            std::vector<bool> seen(kinds, false);
+            int classes_in_run = 0;
+            for (std::uint32_t j = 0; j < bi.prims; ++j) {
+                const std::uint32_t at = prim_offset + j * kPrimWords;
+                const std::uint32_t *rec = sub.arena.data() + at;
+                const int k = hw::shape_class(rec, sub.arena.data() + setup_offset + rec[0] * kSetupWords);
+                const double bw = static_cast<double>((rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1), bh = static_cast<double>((rec[3] >> 16) - (rec[2] >> 16) + 1);
+                const double area = (rec[1] & kKindMask) == 0 ? std::fabs(0.5 / static_cast<double>(u2f(rec[10]))) : bw * bh;
+                ++tot[k].shapes;
+                tot[k].area += area;
+                area_all += area;
+                ++shapes;
+                where[i][k].push_back(at);
+                if (!seen[k]) {
+                    seen[k] = true;
+                    ++tot[k].runs;
+                    ++classes_in_run;
+                }
+            }
+            ++runs;
+            bool all_hw = true;
+            for (int k = 0; k < kinds; ++k) all_hw = all_hw && (!seen[k] || hw::class_is_hardware(k));
+            if (all_hw) ++hw_runs;
+            if (classes_in_run == 1)
+                for (int k = 0; k < kinds; ++k)
+                    if (seen[k]) ++tot[k].only;
+        }
+    }
+    const auto timed = [&](double &median) {
+        std::vector<double> t;
+        for (int trial = 0; trial < 5; ++trial) t.push_back(bench_time(bufs, 0, reps, true));
+        std::sort(t.begin(), t.end());
+        median = t[t.size() / 2];
+        return t.front();
+    };
+    const auto upload = [&](std::size_t i, const std::vector<std::uint32_t> &arena) {
+        if (!arena.empty()) wgpuQueueWriteBuffer(g_queue, bufs[i].data, 0, arena.data(), arena.size() * 4);
+    };
+    const auto hide = [&](std::vector<std::vector<std::uint32_t>> &copies, std::size_t i, const std::vector<std::uint32_t> &offsets) {
+        for (std::uint32_t at : offsets) copies[i][at + 2] = 0x7FFF7FFFu, copies[i][at + 3] = 0;  // the box test of the drawing program fails everywhere
+    };
+    double base_median = 0;
+    bench_time(bufs, 0, 3, true);
+    const double base = timed(base_median);
+    std::fprintf(stderr, "[class] the unchanged frame: best %.3f ms, median %.3f ms per frame (5 trials of %u replays)\n", base, base_median, reps);
+    std::vector<std::vector<std::uint32_t>> copies;
+    for (const BenchSubmit &sub : g_bench.subs) copies.push_back(sub.arena);
+    const auto run_without = [&](const std::vector<int> &which, double &median) {
+        for (std::size_t i = 0; i < copies.size(); ++i) {
+            copies[i] = g_bench.subs[i].arena;
+            for (int k : which) hide(copies, i, where[i][k]);
+            upload(i, copies[i]);
+        }
+        wait_gpu();
+        const double best = timed(median);
+        for (std::size_t i = 0; i < copies.size(); ++i) upload(i, g_bench.subs[i].arena);
+        wait_gpu();
+        return best;
+    };
+    {  // control: the arena uploaded again with nothing hidden must time like the unchanged frame, or the differences below are an artefact of the upload
+        double median = 0;
+        const double control = run_without({}, median);
+        std::fprintf(stderr, "[class] control (arena uploaded again, nothing hidden): best %.3f / median %.3f ms\n", control, median);
+    }
+    for (int k = 0; k < kinds; ++k) {
+        if (!tot[k].shapes) continue;
+        double median = 0;
+        const double without = run_without({k}, median);
+        tot[k].ms = base - without;
+        tot[k].ms_median = base_median - median;
+    }
+    std::vector<int> tricky, friendly;
+    for (int k = 0; k < kinds; ++k)
+        if (tot[k].shapes) (hw::class_is_hardware(k) ? friendly : tricky).push_back(k);
+    double only_hw = 0, only_hw_median = 0, only_tricky = 0, only_tricky_median = 0;
+    if (!tricky.empty()) only_hw = run_without(tricky, only_hw_median);
+    if (!friendly.empty()) only_tricky = run_without(friendly, only_tricky_median);
+    std::fprintf(stderr, "[class] %zu drawing runs, %llu shapes, %.0f covered pixels (before the depth test); runs with only card-friendly shapes: %llu (%.1f%%)\n", static_cast<std::size_t>(runs), static_cast<unsigned long long>(shapes), area_all, static_cast<unsigned long long>(hw_runs),
+                 100.0 * static_cast<double>(hw_runs) / static_cast<double>(std::max<std::uint64_t>(1, runs)));
+    for (int k = 0; k < kinds; ++k) {
+        if (!tot[k].shapes) continue;
+        std::fprintf(stderr, "[class] %-62s runs %4llu (only this: %4llu) shapes %6llu (%5.1f%%) pixels %10.0f (%5.1f%%) chip ms %6.3f best / %6.3f median\n", hw::class_name(k), static_cast<unsigned long long>(tot[k].runs), static_cast<unsigned long long>(tot[k].only),
+                     static_cast<unsigned long long>(tot[k].shapes), 100.0 * static_cast<double>(tot[k].shapes) / static_cast<double>(std::max<std::uint64_t>(1, shapes)), tot[k].area, 100.0 * tot[k].area / std::max(1.0, area_all), tot[k].ms, tot[k].ms_median);
+    }
+    std::fprintf(stderr, "[class] compute path, only the card-friendly shapes (the rest hidden): best %.3f / median %.3f ms; only the other shapes: best %.3f / median %.3f ms; the frame: best %.3f / median %.3f ms\n", only_hw, only_hw_median, only_tricky, only_tricky_median, base, base_median);
+}
+
+// The card path's replay of the captured frame; `vram` is the memory after the painter's replay of the same frame.
+void bench_card(const std::vector<std::uint32_t> &vram, std::vector<BenchBuffers> &bufs, unsigned reps, void (*shot)(const char *)) {
+    hw::Context ctx{g_device, g_queue, g_vram, g_tables, g_clut, g_scratch, g_cache, g_layout, {}, kUpload, kLoadClut, kRaster, kDecode, kSnapshot, g_scale, g_bench.vram_copy, bytes_of_vram(), kGsShader};
+    ctx.pipelines.assign(g_pipelines, g_pipelines + kPipelines);
+    ctx.read_vram = [](std::vector<std::uint32_t> &out) {
+        out.resize(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
+        read_back(g_vram, out.size() * 4, out.data());
+    };
+    ctx.read_before = [](std::vector<std::uint32_t> &out) {
+        out.resize(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
+        read_back(g_bench.vram_copy, out.size() * 4, out.data());
+    };
+    ctx.painter_vram = &vram;
+    std::vector<hw::Sub> subs;
+    for (std::size_t i = 0; i < g_bench.subs.size(); ++i) {
+        hw::Sub sub;
+        for (const Command &c : g_bench.subs[i].commands) sub.commands.push_back({static_cast<std::uint32_t>(c.pipeline), c.x, c.y, c.param});
+        sub.group = bufs[i].group;
+        subs.push_back(std::move(sub));
+    }
+    hw::run(ctx, subs, reps, [] { wait_gpu(); }, shot);
+}
 
 void bench_run() {
     g_bench.capturing = false;
     g_bench.done = true;
     if (g_bench.subs.empty()) {
         std::fprintf(stderr, "[bench] no chip work in that frame\n");
+        if (hw::enabled() && hw::diff_enabled()) {  // arm for the next frame
+            if (g_bench.vram_copy) wgpuBufferRelease(g_bench.vram_copy);
+            g_bench.vram_copy = nullptr;
+            g_bench.done = false;
+            g_bench.vblank = g_vblanks + 2;
+        }
         return;
     }
     wait_gpu();
@@ -1671,6 +1907,22 @@ void bench_run() {
         for (const Command &c : sub.commands) ++kind_count[c.pipeline];
     }
     wait_gpu();
+    if (hw::enabled() && hw::diff_enabled()) {  // tests/hwalpha.cpp: the painter once, the card path once, then arm the bench for the next frame
+        bench_time(bufs, 0, 1, true);
+        std::vector<std::uint32_t> painter(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
+        read_back(g_vram, painter.size() * 4, painter.data());
+        bench_card(painter, bufs, 1, nullptr);
+        for (BenchBuffers &b : bufs) {
+            wgpuBindGroupRelease(b.group);
+            wgpuBufferRelease(b.params);
+            wgpuBufferRelease(b.data);
+        }
+        wgpuBufferRelease(g_bench.vram_copy);
+        g_bench.vram_copy = nullptr;
+        g_bench.done = false;
+        g_bench.vblank = g_vblanks + 2;
+        return;
+    }
     std::fprintf(stderr, "[bench] %zu submits, %zu commands:", g_bench.subs.size(), total_commands);
     for (int k = 0; k < kPipelines; ++k) std::fprintf(stderr, " %s %llu", kEntryPoints[k], static_cast<unsigned long long>(kind_count[k]));
     std::fprintf(stderr, "\n");
@@ -1713,6 +1965,7 @@ void bench_run() {
         for (int trial = 0; trial < 3; ++trial) best = std::min(best, bench_time(bufs, v.skip, reps, v.restore, v.size_filter));
         std::fprintf(stderr, "[bench] %-32s %8.3f ms per frame\n", v.name, best);
     }
+    if (hw::class_enabled()) bench_classes(bufs, reps);
     // what one dispatch costs when it does next to nothing: 64 words copied by a snapshot
     {
         BenchBuffers micro;
@@ -1759,6 +2012,7 @@ void bench_run() {
     }
     // the memory after one more copy of the frame: a fingerprint to compare builds (and the whole memory in a file if asked for)
     bench_time(bufs, 0, 1, true);
+    if (hw::enabled()) bench_shot("compute");
     std::vector<std::uint32_t> vram(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
     read_back(g_vram, vram.size() * 4, vram.data());
     std::fprintf(stderr, "[bench] memory after the frame: hash %016llx\n", static_cast<unsigned long long>(fnv_hash(vram, 0, vram.size())));
@@ -1767,6 +2021,10 @@ void bench_run() {
             std::fwrite(vram.data(), 4, vram.size(), f);
             std::fclose(f);
         }
+    }
+    if (hw::enabled()) {
+        hw::survey_print();
+        bench_card(vram, bufs, reps, bench_shot);
     }
     for (BenchBuffers &b : bufs) {
         wgpuBindGroupRelease(b.group);
@@ -2237,6 +2495,7 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
     WGPUFeatureName features[2];
     g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
     if (g_timestamps) features[dd.requiredFeatureCount++] = WGPUFeatureName_TimestampQuery;
+    if (hw::enabled() && wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending)) features[dd.requiredFeatureCount++] = WGPUFeatureName_DualSourceBlending;  // stored alpha in one draw; asked for only when the card path is on and the adapter offers it
     dd.requiredFeatures = features;
     dd.uncapturedErrorCallbackInfo.callback = on_error;
     bool device_done = false;
@@ -2263,6 +2522,8 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
 
 bool init(Mode m) {
     if (m == Mode::off) return false;
+    stat::init();
+    hwcache::init();
     struct Try {
         std::uint32_t backends;  // WGPUInstanceBackend flags (the web build has none)
         const char *name;
@@ -2283,6 +2544,10 @@ bool init(Mode m) {
     }
     if (order.empty()) {
 #ifdef _WIN32
+        if (hw::enabled()) {  // PS2_GPU_HW=1: on the one Windows laptop tried the card path ran faster on Vulkan while the painter is faster on Direct3D 12; PS2_GPU_BACKEND still wins.
+            order.push_back({WGPUInstanceBackend_Vulkan, "Vulkan"});
+            order.push_back({WGPUInstanceBackend_DX12, "Direct3D 12"});
+        } else
         {
             order.push_back({WGPUInstanceBackend_DX12, "Direct3D 12"});
             order.push_back({WGPUInstanceBackend_Vulkan, "Vulkan"});
@@ -2318,6 +2583,7 @@ bool init(Mode m) {
     if (!chosen) return false;
     if (forced) std::fprintf(stderr, "[gpu] graphics API: %s (asked for by PS2_GPU_BACKEND)\n", chosen->name);
     else if (chosen == &order[0] && order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (the default on Windows%s; PS2_GPU_BACKEND=vulkan or dx12 picks)\n", chosen->name,
+                 hw::enabled() ? " with PS2_GPU_HW=1" :
                  "");
     else if (order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (%s could not be used, see above)\n", chosen->name, order[0].name);
     if (g_dx12_compiler) std::fprintf(stderr, "[gpu] Direct3D 12 shader compiler: %s (PS2_DX12_COMPILER=fxc|dxc picks)\n", g_dx12_compiler);
@@ -2491,6 +2757,10 @@ bool init(Mode m) {
 #endif
     release_module();
     ensure_capacity();
+    if (hw::enabled() && !g_bench.configured && os::env("PS2_GPU_HW_LIVE") != "0") {  // PS2_GPU_HW=1 without the bench draws the running game's plain shapes on the card
+        hw::Context hc{g_device, g_queue, g_vram, g_tables, g_clut, g_scratch, g_cache, g_layout, {}, kUpload, kLoadClut, kRaster, kDecode, kSnapshot, g_scale, nullptr, bytes_of_vram(), kGsShader};
+        g_live = hw::live_init(hc);
+    }
     g_mode = m;
     g_current_mode = m;
     return true;
@@ -2504,6 +2774,7 @@ void draw(const State &st, const Vertex *v, int count) {
     const Context &c = st.ctx[(attr >> 9) & 1u];
     SetupCache &cache = g_setup_cache;
     if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot
+        || (cache.waits && hw::live_ready_changed(cache.ready_seen))
         ) {
         cache.generation = g_setup_generation;
         cache.attr = attr;
@@ -2511,6 +2782,9 @@ void draw(const State &st, const Vertex *v, int count) {
         cache.serial = ++g_setup_serials;
         const std::uint32_t *w = cache.setup;
         cache.flags = make_setup(st, attr, cache.setup);
+        cache.route = g_live ? hw::live_route(cache.setup) : 0;
+        cache.look = g_live ? hw::live_look() : -1;
+        cache.waits = g_live && cache.route == 0 && hw::live_waits();
         cache.key = static_cast<std::uint64_t>(w[1]) | (static_cast<std::uint64_t>(w[2]) << 14) | (static_cast<std::uint64_t>(w[3]) << 20) |
                     (static_cast<std::uint64_t>(w[5]) << 26) | (static_cast<std::uint64_t>(w[6]) << 40);
         cache.mip_top = make_mip(st, attr, cache.mip);
@@ -2618,6 +2892,7 @@ void draw(const State &st, const Vertex *v, int count) {
     maxx = std::min(maxx, 2047);
     maxy = std::min(maxy, 2047);
     if (minx > maxx || miny > maxy) return;
+    if (stat::g_on) stat::shape(st, attr, v, count, flags, minx, miny, maxx, maxy, cache.tex.lo, cache.tex.hi);
     if (g_batch_log_frame > 1 && frame_count() == g_batch_log_frame) {  // PS2_BATCH_LOG=<frame>: every shape of that frame, for working out how the batches could be cut differently offline
         int r[4] = {0, 0, 0, 0};
         const bool ok = (flags & 2u) && texel_rect(setup, v, count, prim, fst, r);
@@ -2631,6 +2906,15 @@ void draw(const State &st, const Vertex *v, int count) {
     if (b.key != ~0ull && b.key != key) {
         g_why = kWhyKey;
         emit_all();
+    }
+    int sroute = 0;
+    if (g_live) {  // a batch is wholly card or wholly painter, cut at a switch; lines and points are the painter's, a shape the chip draws nothing for goes with the batch it is in
+        sroute = (rec[1] & kKindMask) > 1 ? 0 : cache.route;
+        if (sroute == 2) sroute = b.prims.empty() ? 0 : b.route;
+        if (!b.prims.empty() && sroute != b.route) {
+            g_why = kWhyRoute;
+            emit_all();
+        }
     }
     const Range &tex = cache.tex;
     if (flags & 2u) {
@@ -2700,6 +2984,7 @@ void draw(const State &st, const Vertex *v, int count) {
         b.zpsm = setup[6];
         b.zte = false;
         b.zwrite = false;
+        b.route = sroute;
         b.rx1 = -2;
     }
     b.zte = b.zte || zte;
@@ -2747,8 +3032,10 @@ void draw(const State &st, const Vertex *v, int count) {
     rec[0] = setup_index;
     rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
     rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
+    const bool fresh_batch = b.prims.empty();
     b.prims.append(rec, kPrimWords);
     exact_follow(rec, setup);
+    if (g_live && b.route == 1) hw::live_shape(cache.look, setup, rec, fresh_batch);  // the card's checks start now
     b.minx = std::min(b.minx, minx);
     b.miny = std::min(b.miny, miny);
     b.maxx = std::max(b.maxx, maxx);
@@ -2774,6 +3061,7 @@ void image_begin(const State &s) {
     im.bpp = bits_per_pixel(im.dpsm);
     im.id = ++g_image_ids ? g_image_ids : ++g_image_ids;
     im.active = im.total != 0;
+    if (stat::g_on && im.active) stat::upload(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay), im.rrw, im.total / im.rrw, static_cast<std::uint64_t>(im.total) * im.bpp / 8);
 }
 
 void image_data(const std::uint8_t *data, std::size_t bytes) {
@@ -2797,6 +3085,21 @@ void local_copy(const State &s) {
     const std::uint64_t buf = s.bitbltbuf, pos = s.trxpos, reg = s.trxreg;
     const std::uint32_t w = static_cast<std::uint32_t>(reg) & 0xFFFu, h = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
     if (!w || !h) return;
+    if (g_live) {  // the copy reads the source rectangle and overwrites the destination rectangle
+        const int sx = static_cast<int>(pos) & 0x7FF, sy = static_cast<int>(pos >> 16) & 0x7FF, dx = static_cast<int>(pos >> 32) & 0x7FF, dy = static_cast<int>(pos >> 48) & 0x7FF;
+        const Range from = pages(static_cast<std::uint32_t>(buf) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 16) & 0x3Fu, static_cast<std::uint32_t>(buf >> 24) & 0x3Fu, sx, sy, sx + static_cast<int>(w) - 1, sy + static_cast<int>(h) - 1);
+        const Range to = pages(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu, dx, dy, dx + static_cast<int>(w) - 1, dy + static_cast<int>(h) - 1);
+        hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
+        hw::live_reader(from.lo, from.hi);
+        hw::live_writer(to.lo, to.hi);
+        hw::pal_write(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu, dx, dy, dx + static_cast<int>(w) - 1, dy + static_cast<int>(h) - 1);
+    }
+    if (hwcache::g_on)
+        hwcache::write_region(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
+                              static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, (static_cast<int>(pos >> 32) & 0x7FF) + static_cast<int>(w) - 1,
+                              (static_cast<int>(pos >> 48) & 0x7FF) + static_cast<int>(h) - 1, hwcache::kCopy);
+    if (stat::g_on) stat::local_copy(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
+                                     static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, w, h);
     mark_rendered(pages(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
                         static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, (static_cast<int>(pos >> 32) & 0x7FF) + static_cast<int>(w) - 1,
                         (static_cast<int>(pos >> 48) & 0x7FF) + static_cast<int>(h) - 1));
@@ -2821,6 +3124,7 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     const std::uint32_t tc = static_cast<std::uint32_t>(texclut);
     const std::uint32_t cbp = static_cast<std::uint32_t>(tex0 >> 37) & 0x3FFFu, csm = static_cast<std::uint32_t>(tex0 >> 55) & 1u;
     const std::uint32_t cbw = tc & 0x3Fu, cou = (tc >> 6) & 0x3Fu, cov = (tc >> 12) & 0x3FFu;
+    if (stat::g_on) stat::clut_load();
     PreOp op;
     op.clut = true;
     const std::uint32_t rec[10] = {g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u, cbw, cou, cov};
@@ -2828,6 +3132,8 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
+    if (g_live) hw::pal_clut(g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, psm == PSMT8 || psm == PSMT8H);  // after queue_pre (a pending batch that overwrites the palette was flushed by it)
+    if (hwcache::g_on) hwcache::clut_load(g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u, cbw, cou, cov);
     g_clut_slot = next;
     ++g_clut_loads;
 }
@@ -2838,6 +3144,15 @@ void flush() {
     if (g_mode == Mode::off) return;
     flush_all();
     submit();
+    if (stat::g_on) stat::frame_end();
+    if (hwcache::g_on && hwcache::counting()) {
+        if (hwcache::verify_on()) {
+            static std::vector<std::uint8_t> memory(kMemorySize);
+            download(memory.data(), 0, kMemorySize);
+            hwcache::verify(memory.data());
+        }
+        hwcache::frame_end();
+    }
     if (g_batch_log) {
         std::uint32_t runs = 0, prims = 0;
         for (int w = 0; w < kWhys; ++w) runs += g_why_runs[w], prims += g_why_prims[w];
@@ -2895,6 +3210,7 @@ bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t by
         g_pending.buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
     flush_all();
+    if (g_live) hw::live_position(static_cast<std::uint32_t>(g_commands.size())), hw::live_reader(offset, static_cast<std::uint64_t>(offset) + bytes);
     if (g_scale != 1) dispatch_linear(kResolve, bytes / 4, push_params({offset / 4}));
     submit();
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
@@ -2933,6 +3249,7 @@ bool finish_download(std::uint32_t serial) {
 
 void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
     flush_all();
+    if (g_live) hw::live_position(static_cast<std::uint32_t>(g_commands.size())), hw::live_reader(offset, static_cast<std::uint64_t>(offset) + bytes);
     if (g_scale == 1) {
         submit();
         read_back(g_vram, bytes, memory + offset, offset);
@@ -2945,6 +3262,7 @@ void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
 
 void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut) {
     flush_all();
+    if (g_live) hw::live_position(static_cast<std::uint32_t>(g_commands.size())), hw::live_reader(0, kMemorySize);  // states are the judge: everything the card holds goes back first
     submit();
     scale = g_scale;
     vram.resize(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
@@ -2955,6 +3273,8 @@ void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vec
 
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut) {
     wait_idle();
+    if (stat::g_on) stat::state_loaded();
+    if (hwcache::g_on) hwcache::state_loaded();
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
     // A page counts as drawn by the GS when its samples differ within a texel; one that is the same in all of them was uploaded (or
@@ -2977,11 +3297,16 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
         wgpuQueueWriteBuffer(g_queue, g_vram, 0, layers.data(), layers.size() * 4);
     }
     if (clut.size() >= kClutEntries) wgpuQueueWriteBuffer(g_queue, g_clut, static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4, clut.data(), kClutEntries * 4);
+    if (g_live) hw::pal_state(from == to && to == 1 && vram.size() == words ? vram.data() : nullptr, vram.size());
+    if (g_live) hw::live_state_loaded();  // memory is the truth: the card's pictures are dropped, nothing is written back
     wait_idle();
 }
 
 void stats() {
     if (g_mode == Mode::off) return;
+    if (g_live) hw::live_stats();
+    stat::report();
+    hwcache::report();
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
@@ -3245,7 +3570,23 @@ struct FakeStatus {
 
 // The parameters of the display kernel (gs.wgsl): the picture of the main read circuit, where to put it in the scratch buffer, and the
 // rectangle of the second read circuit that goes over it (all zero when there is none).
+// The display kernel's work: the picture comes from a card target when one holds it current, else from memory (after what the card holds newer there is written back).
 void push_display(const DisplaySource &src, std::uint32_t scratch_at, std::uint32_t param) {
+    if (g_live) {
+        const DisplayOverlay &o = src.overlay;
+        hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
+        const std::uint32_t words[19] = {src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, scratch_at,
+                                         o.active ? 1u : 0u, o.fbp, o.fbw, o.psm, o.dbx, o.dby, static_cast<std::uint32_t>(o.x), static_cast<std::uint32_t>(o.y), o.width, o.height};
+        const hw::LiveDisplay d{src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, scratch_at, src.halved, o.active};
+        if (hw::live_display(d, words, 19)) return;
+        const int rows = src.halved ? static_cast<int>((src.height + 1) / 2) : static_cast<int>(src.height);
+        const Range r = pages(src.fbp, src.fbw, src.psm, static_cast<int>(src.dbx), static_cast<int>(src.dby), static_cast<int>(src.dbx + src.width) - 1, static_cast<int>(src.dby) + rows - 1);
+        hw::live_reader(r.lo, r.hi);
+        if (o.active) {
+            const Range q = pages(o.fbp, o.fbw, o.psm, static_cast<int>(o.dbx), static_cast<int>(o.dby), static_cast<int>(o.dbx + o.width) - 1, static_cast<int>(o.dby + o.height) - 1);
+            hw::live_reader(q.lo, q.hi);
+        }
+    }
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
 }
 

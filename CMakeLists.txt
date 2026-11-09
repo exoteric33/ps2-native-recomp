@@ -150,9 +150,26 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
     add_custom_command(OUTPUT "${PS2_BLIT_WGSL}"
         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/blit.wgsl -DOUT=${PS2_BLIT_WGSL} -DNAME=kBlitShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         DEPENDS runtime/src/gs/gpu/blit.wgsl cmake/embed.cmake)
+    # The experimental hardware drawing path (hwdraw*, hwcache*, hwstat*): off unless PS2_GPU_HW=1 is set. The browser build
+    # compiles the three files as empty stubs and embeds none of its shaders.
+    set(PS2_HW_SOURCES runtime/src/gs/gpu/hwdraw.cpp runtime/src/gs/gpu/hwstat.cpp runtime/src/gs/gpu/hwcache.cpp)
+    if(NOT EMSCRIPTEN)
+        set(PS2_HW_WGSL "${CMAKE_BINARY_DIR}/hw_wgsl.cpp")
+        add_custom_command(OUTPUT "${PS2_HW_WGSL}"
+            COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/hwdraw.wgsl -DOUT=${PS2_HW_WGSL} -DNAME=kHwShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+            DEPENDS runtime/src/gs/gpu/hwdraw.wgsl cmake/embed.cmake)
+        set(PS2_CACHE_WGSL "${CMAKE_BINARY_DIR}/cache_wgsl.cpp")
+        add_custom_command(OUTPUT "${PS2_CACHE_WGSL}"
+            COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/hwcache.wgsl -DOUT=${PS2_CACHE_WGSL} -DNAME=kCacheShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+            DEPENDS runtime/src/gs/gpu/hwcache.wgsl cmake/embed.cmake)
+        set(PS2_HW_SYNC_WGSL "${CMAKE_BINARY_DIR}/hw_sync_wgsl.cpp")
+        add_custom_command(OUTPUT "${PS2_HW_SYNC_WGSL}"
+            COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/hwdraw_sync.wgsl -DOUT=${PS2_HW_SYNC_WGSL} -DNAME=kHwSyncShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+            DEPENDS runtime/src/gs/gpu/hwdraw_sync.wgsl cmake/embed.cmake)
+        list(APPEND PS2_HW_SOURCES "${PS2_HW_WGSL}" "${PS2_HW_SYNC_WGSL}" "${PS2_CACHE_WGSL}")
+    endif()
     if(NOT PS2_PREBUILT)
-        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}"
-            )
+        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" ${PS2_HW_SOURCES})
     endif()
     target_compile_definitions(ps2runtime ${PS2_API} PS2_GPU)
     if(EMSCRIPTEN)
@@ -179,6 +196,29 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
     endif()
 endif()
 
+# Differential test of the experimental card path (hwdraw.cpp) against the painter: ninja ps2hwalpha. Links the runtime (the draw path is the game's own).
+if(NOT EMSCRIPTEN AND EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
+    add_executable(ps2hwalpha EXCLUDE_FROM_ALL tests/hwalpha.cpp)
+    target_include_directories(ps2hwalpha PRIVATE runtime/src "${PS2_WGPU_DIR}/include")
+    target_link_libraries(ps2hwalpha PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2hwalpha PRIVATE synchronization)
+    endif()
+endif()
+
+# Stand-alone measurements of what the card path asks of a graphics card: ninja ps2hwprobe. Uses wgpu only, not the runtime.
+if(NOT EMSCRIPTEN AND EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
+    add_executable(ps2hwprobe EXCLUDE_FROM_ALL tests/hwprobe.cpp)
+    target_include_directories(ps2hwprobe PRIVATE "${PS2_WGPU_DIR}/include")
+    if(WIN32)
+        target_link_libraries(ps2hwprobe PRIVATE "${PS2_WGPU_DIR}/lib/libwgpu_native.a" ws2_32 userenv ntdll synchronization pthread m)
+    else()
+        target_link_libraries(ps2hwprobe PRIVATE "${PS2_WGPU_DIR}/lib/libwgpu_native.a" dl pthread m)
+    endif()
+    if(APPLE)
+        target_link_libraries(ps2hwprobe PRIVATE "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework CoreFoundation" "-framework IOKit" "-framework IOSurface" objc)
+    endif()
+endif()
 
 if(NOT EMSCRIPTEN)
     add_executable(ps2sifcmdtest EXCLUDE_FROM_ALL tests/sif_cmd_intr.cpp)

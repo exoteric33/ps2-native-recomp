@@ -1,8 +1,8 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 47 games work as far as they
-have been tested, 30 of them out of the box, with zero game-specific code. God of War II has been played from start to
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 49 games work as far as they
+have been tested, 31 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
 **How it works, from the disc to the picture: [read the explanation](#how-it-works).**
@@ -11,9 +11,9 @@ Built on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nu
 
 https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
 
-**30 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
+**31 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
 Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
-Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe, Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima, Robot Alchemic Drive, Altered Beast, Mister Moskeeto, Twisted Metal: Head-On, Quake III Revolution, Sonic Heroes and Return to Castle Wolfenstein: Operation Resurrection. *Out of the box* means nobody changed anything for these games: the
+Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe, Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima, Robot Alchemic Drive, Altered Beast, Mister Moskeeto, Twisted Metal: Head-On, Quake III Revolution, Sonic Heroes, Return to Castle Wolfenstein: Operation Resurrection and SpongeBob SquarePants: Battle for Bikini Bottom. *Out of the box* means nobody changed anything for these games: the
 tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)). Gran Turismo 4 needs one small build step that
 unpacks its program; the runtime has no code for it.
 
@@ -141,6 +141,8 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Return to Castle Wolfenstein: Operation Resurrection (USA) | runs, not played through yet: into the first mission, smooth; many graphics bugs ([#79](https://github.com/exoteric33/ps2-native-recomp/issues/79)) | YaroslavValerySablin |
 | Urban Reign (Europe) | plays well, not played through yet: menus, versus and team fights with knockouts, pause and saves, all five languages, at 4x and full speed in 480p (Windows 11, an RTX 4080 SUPER, a game controller); two bugs of the game itself need a patch file ([#62](https://github.com/exoteric33/ps2-native-recomp/pull/62)) | RatchetCinemaESP |
 | Torrente 3: The Protector (Europe) | runs, not played through yet: the first part of the first level at 50 to 60 fps at twice the resolution, saves work; the first intro film plays at only 2 to 5 fps (tested with widescreen and NTSC patches) ([#85](https://github.com/exoteric33/ps2-native-recomp/issues/85)) | MrBinOff |
+| SpongeBob SquarePants: Battle for Bikini Bottom (USA) | plays well, not played through yet: two hours at full speed (50 to 60 fps) with a game controller, through most of Downtown Bikini Bottom with the King Jellyfish boss beaten; no problems found ([#88](https://github.com/exoteric33/ps2-native-recomp/issues/88)) | m3tabolic |
+| Cold Winter (USA) | runs, not played through yet: to the second level with a game controller; some visual bugs ([#55](https://github.com/exoteric33/ps2-native-recomp/issues/55)) | Rello00 |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

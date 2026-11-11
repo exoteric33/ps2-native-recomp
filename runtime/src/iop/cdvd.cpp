@@ -92,14 +92,16 @@ std::uint64_t read_cycles(std::uint32_t sectors) {
 bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, std::uint32_t mode, bool ee_memory);
 
 // The drive's clock as the S command 0x08 answers it (ps2sdk sceCdCLOCK): status 0 (read fine), second, minute, hour, 0, day, month,
-// year, each a BCD byte, in Japan time (UTC+9) as the console's clock chip keeps it. Month is written without its top bit.
+// year, each a BCD byte, in Japan time (UTC+9) as the console's clock chip keeps it. Month is written without its top bit. The whole date
+// is shifted to Japan time, not only the hour: from 15:00 to 24:00 UTC the day there is already the next one (GTA III's save of
+// 2026-10-29 19:01 UTC was stamped 10-29 04:01 instead of 10-30 04:01).
 void write_clock(std::uint32_t p) {
-    const std::time_t t = static_cast<std::time_t>(rtc_seconds());
+    const std::time_t t = static_cast<std::time_t>(rtc_seconds() + 9 * 3600);
     const std::tm *tm = std::gmtime(&t);
     write8(p + 0, 0);
     write8(p + 1, bcd(tm->tm_sec));
     write8(p + 2, bcd(tm->tm_min));
-    write8(p + 3, bcd((tm->tm_hour + 9) % 24));
+    write8(p + 3, bcd(tm->tm_hour));
     write8(p + 4, 0);
     write8(p + 5, bcd(tm->tm_mday));
     write8(p + 6, bcd(tm->tm_mon + 1));

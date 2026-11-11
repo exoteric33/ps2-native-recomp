@@ -112,14 +112,15 @@ void install_cdvdfsv() {
     sif::register_hle_server(0x80000593u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t ret_size) {
         switch (method) {
         case 0x01: {
-            const std::time_t t = static_cast<std::time_t>(rtc_seconds());
+            // in Japan time (UTC+9) as the console's clock chip keeps it, the whole date shifted (cdvd.cpp write_clock)
+            const std::time_t t = static_cast<std::time_t>(rtc_seconds() + 9 * 3600);
             const std::tm *tm = std::gmtime(&t);
             set_ee32(ret, 1);
             std::uint8_t *clock = ps2::g_ram + ret + 4;
             clock[0] = 0;
             clock[1] = bcd(tm->tm_sec);
             clock[2] = bcd(tm->tm_min);
-            clock[3] = bcd((tm->tm_hour + 9) % 24);
+            clock[3] = bcd(tm->tm_hour);
             clock[4] = 0;
             clock[5] = bcd(tm->tm_mday);
             clock[6] = bcd(tm->tm_mon + 1);

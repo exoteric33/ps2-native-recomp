@@ -245,6 +245,48 @@ bool has_delay_slot(Op op) {
     return f != Flow::None && f != Flow::Stop;
 }
 
+Vu0Flags vu0_flag_effect(const Insn &insn) {
+    switch (insn.op) {
+    case Vaddbc: case Vsubbc: case Vmaddbc: case Vmsubbc: case Vmulbc: case Vmulq: case Vmuli:
+    case Vaddq: case Vmaddq: case Vaddi: case Vmaddi: case Vsubq: case Vmsubq: case Vsubi: case Vmsubi:
+    case Vadd: case Vmadd: case Vmul: case Vsub: case Vmsub: case Vopmsub:
+    case Vaddabc: case Vsubabc: case Vmaddabc: case Vmsubabc: case Vmulabc: case Vmulaq: case Vmulai:
+    case Vaddaq: case Vmaddaq: case Vaddai: case Vmaddai: case Vsubaq: case Vmsubaq: case Vsubai: case Vmsubai:
+    case Vadda: case Vmadda: case Vmula: case Vsuba: case Vmsuba: case Vopmula:
+        return Vu0Flags::Sets;
+
+    // The vector unit's instructions that work on its registers only. VDIV, VSQRT and VRSQRT change the two division
+    // bits of the status register and leave the others as they are; VCLIP has its own register.
+    case Vmaxbc: case Vminibc: case Vmaxi: case Vminii: case Vmax: case Vmini:
+    case Viadd: case Visub: case Viaddi: case Viand: case Vior:
+    case Vitof0: case Vitof4: case Vitof12: case Vitof15: case Vftoi0: case Vftoi4: case Vftoi12: case Vftoi15:
+    case Vabs: case Vclip: case Vnop: case Vmove: case Vmr32: case Vdiv: case Vsqrt: case Vrsqrt: case Vwaitq:
+    case Vmtir: case Vmfir: case Vrnext: case Vrget: case Vrinit: case Vrxor:
+        return Vu0Flags::Keeps;
+    // With the interlock bit they wait for a running vector program, which can read the flags.
+    case Qmfc2: case Qmtc2:
+        return (insn.word & 1u) ? Vu0Flags::Reads : Vu0Flags::Keeps;
+    // The integer registers are plain registers; from 16 up they are the control registers, the flags among them.
+    case Cfc2: case Ctc2:
+        return insn.fs() < 16 ? Vu0Flags::Keeps : Vu0Flags::Reads;
+
+    // Integer work on registers, without the instructions that can trap.
+    case Sll: case Srl: case Sra: case Sllv: case Srlv: case Srav: case Movz: case Movn:
+    case Mfhi: case Mthi: case Mflo: case Mtlo: case Dsllv: case Dsrlv: case Dsrav:
+    case Addu: case Subu: case And: case Or: case Xor: case Nor: case Slt: case Sltu: case Daddu: case Dsubu:
+    case Dsll: case Dsrl: case Dsra: case Dsll32: case Dsrl32: case Dsra32:
+    case Addiu: case Slti: case Sltiu: case Andi: case Ori: case Xori: case Lui: case Daddiu:
+    // The main processor's own float unit: its registers and its own flag register.
+    case Mfc1: case Mtc1: case AddS: case SubS: case MulS: case DivS: case SqrtS: case AbsS: case MovS: case NegS: case RsqrtS:
+    case AddaS: case SubaS: case MulaS: case MaddS: case MsubS: case MaddaS: case MsubaS: case CvtWS: case CvtSW:
+    case MaxS: case MinS: case CF: case CEq: case CLt: case CLe:
+        return Vu0Flags::Keeps;
+
+    default:
+        return Vu0Flags::Reads;
+    }
+}
+
 std::string disassemble(const Insn &insn) {
     char text[96];
     std::snprintf(text, sizeof text, "%08X: %08X %s", insn.pc, insn.word, name(insn.op));

@@ -227,12 +227,23 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2sifcmdtest PRIVATE synchronization)  # the GS queue's WaitOnAddress, which the wgpu line above adds only with wgpu
     endif()
+    # the four-lane VU0 macro helpers the recompiler calls against the one-lane ones, and the flag liveness that goes with
+    # them (headers and the decoder only, no game needed): ninja ps2vu0inlinetest && ./ps2vu0inlinetest [rounds]
+    add_executable(ps2vu0inlinetest EXCLUDE_FROM_ALL tests/vu0_inline.cpp recomp/r5900.cpp)
+    target_include_directories(ps2vu0inlinetest PRIVATE runtime/include recomp)
     # VU control-flow, E-bit return, and ILW/branch-register timing regression fixture: ninja ps2vuregtest
     add_executable(ps2vuregtest EXCLUDE_FROM_ALL tests/test_vu_regression.cpp)
     target_include_directories(ps2vuregtest PRIVATE runtime/src)
     target_link_libraries(ps2vuregtest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2vuregtest PRIVATE synchronization)
+    endif()
+    # the late float clean-up of the compiled VU1 programs against the old one, on every bit pattern and with the processor's
+    # "denormals are zero" bit set (ps2/vu_ops.hpp), no game needed: ninja ps2vucleanuptest
+    add_executable(ps2vucleanuptest EXCLUDE_FROM_ALL tests/test_vu_cleanup.cpp)
+    target_include_directories(ps2vucleanuptest PRIVATE runtime/include)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        target_compile_options(ps2vucleanuptest PRIVATE -msse4.1)
     endif()
     # damaged disc images, IOP modules and boot ELFs refused cleanly, no game needed: ninja ps2discinputtest
     add_executable(ps2discinputtest EXCLUDE_FROM_ALL tests/disc_input.cpp)

@@ -3,6 +3,7 @@
 #include "ps2/os.hpp"
 
 #include <bit>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -13,6 +14,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace recomp {
@@ -248,8 +250,13 @@ private:
             const Insn i = at(a);
             const Flow fl = flow(i.op);
             if (fl == Flow::None) {
-                if (const auto t = options_.toggles.find(a); t != options_.toggles.end()) toggled(i, t->second);
-                else simple(i);
+                if (const auto t = options_.toggles.find(a); t != options_.toggles.end()) {
+                    toggled(i, t->second);
+                } else {
+                    flags_dead_ = vu0_flags_unseen(i);
+                    simple(i);
+                    flags_dead_ = false;
+                }
                 ++pending_;
                 falls = true;
             } else if (i.op == Eret) {
@@ -609,20 +616,48 @@ private:
 
     std::string dest_reg(const Insn &i) { return i.rd() ? reg(i.rd()) : "scratch"; }
 
+    // True when nothing can see the MAC register and the low status bits that this instruction of the first vector unit
+    // sets: on the straight line after it, inside this unit, another instruction sets them again before anything that
+    // could read them (recomp::vu0_flags_dead). The line ends at everything the code can be entered at or leaves through,
+    // at a probe and at a switched instruction. Only write_unit asks, for an instruction it writes in its place: a delay
+    // slot keeps its flags, the branch it belongs to comes between it and whatever follows.
+    bool vu0_flags_unseen(const Insn &i) {
+        if (vu0_old_ || vu0_flag_effect(i) != Vu0Flags::Sets) return false;
+        return vu0_flags_dead(i.pc, [&](std::uint32_t a, Insn &next) {
+            if (!in_unit(a) || !p_.is_code(a) || labels_.count(a) || options_.probes.count(a) || options_.toggles.count(a)) return false;
+            next = at(a);
+            return flow(next.op) == Flow::None;
+        });
+    }
+
+    // The name of a helper of the first vector unit (runtime/include/ps2/vu.hpp). The four-lane forms end in 4; the ones
+    // that set flags take whether the flags are wanted as a template argument. PS2_VU0_HELPERS=old in the environment
+    // writes the calls of the one-lane helpers as before (to compare the two, or to rule the new ones out).
+    std::string vu_name(const char *op, bool sets_flags = true) const {
+        if (vu0_old_) return op;
+        const std::string_view o = op;
+        const std::string name = o == "mr32" ? "mr32_4" : std::string(o) + "4";
+        return sets_flags ? name + (flags_dead_ ? "<0>" : "<1>") : name;
+    }
+    static bool vu_sets_flags(const char *op) {
+        const std::string_view o = op;
+        return !o.starts_with("max") && !o.starts_with("mini");
+    }
+
     void vec(const char *op, const Insn &i) {
-        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {}u);", op, i.dest(), i.fd(), i.fs(), i.ft()));
+        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {}u);", vu_name(op, vu_sets_flags(op)), i.dest(), i.fd(), i.fs(), i.ft()));
     }
 
     void vecbc(const char *op, const Insn &i, const std::string &t) {
-        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {});", op, i.dest(), i.fd(), i.fs(), t));
+        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {});", vu_name(op, vu_sets_flags(op)), i.dest(), i.fd(), i.fs(), t));
     }
 
     void vacc(const char *op, const Insn &i) {
-        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", op, i.dest(), i.fs(), i.ft()));
+        line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name(op), i.dest(), i.fs(), i.ft()));
     }
 
     void vaccbc(const char *op, const Insn &i, const std::string &t) {
-        line(std::format("vu::{}(c.vu0, {}u, {}u, {});", op, i.dest(), i.fs(), t));
+        line(std::format("vu::{}(c.vu0, {}u, {}u, {});", vu_name(op), i.dest(), i.fs(), t));
     }
 
     std::string bcv(const Insn &i) { return std::format("{}.w[{}]", vf(i.ft()), i.bc()); }
@@ -922,7 +957,7 @@ private:
         case Vsub: vec("sub", i); break;
         case Vmsub: vec("msub", i); break;
         case Vmini: vec("mini", i); break;
-        case Vopmsub: line(std::format("vu::opmsub(c.vu0, {}u, {}u, {}u);", i.fd(), i.fs(), i.ft())); break;
+        case Vopmsub: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("opmsub"), i.fd(), i.fs(), i.ft())); break;
         case Viadd: line(std::format("vu::set_vi(c.vu0, {}u, {} + {});", i.fd(), vi(i.fs()), vi(i.ft()))); break;
         case Visub: line(std::format("vu::set_vi(c.vu0, {}u, {} - {});", i.fd(), vi(i.fs()), vi(i.ft()))); break;
         case Viaddi: line(std::format("vu::set_vi(c.vu0, {}u, {} + {});", i.ft(), vi(i.fs()), i.imm5())); break;
@@ -950,7 +985,7 @@ private:
         case Vmula: vacc("mula", i); break;
         case Vsuba: vacc("suba", i); break;
         case Vmsuba: vacc("msuba", i); break;
-        case Vopmula: line(std::format("vu::opmula(c.vu0, {}u, {}u);", i.fs(), i.ft())); break;
+        case Vopmula: line(std::format("vu::{}(c.vu0, {}u, {}u);", vu_name("opmula"), i.fs(), i.ft())); break;
         case Vitof0: case Vitof4: case Vitof12: case Vitof15: {
             const int frac = i.op == Vitof0 ? 0 : i.op == Vitof4 ? 4 : i.op == Vitof12 ? 12 : 15;
             line(std::format("vu::itof(c.vu0, {}u, {}u, {}u, {});", i.dest(), i.ft(), i.fs(), frac));
@@ -961,9 +996,9 @@ private:
             line(std::format("vu::ftoi(c.vu0, {}u, {}u, {}u, {});", i.dest(), i.ft(), i.fs(), frac));
             break;
         }
-        case Vabs: line(std::format("vu::abs(c.vu0, {}u, {}u, {}u);", i.dest(), i.ft(), i.fs())); break;
-        case Vmove: line(std::format("vu::move(c.vu0, {}u, {}u, {}u);", i.dest(), i.ft(), i.fs())); break;
-        case Vmr32: line(std::format("vu::mr32(c.vu0, {}u, {}u, {}u);", i.dest(), i.ft(), i.fs())); break;
+        case Vabs: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("abs", false), i.dest(), i.ft(), i.fs())); break;
+        case Vmove: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("move", false), i.dest(), i.ft(), i.fs())); break;
+        case Vmr32: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("mr32", false), i.dest(), i.ft(), i.fs())); break;
         case Vclip: line(std::format("vu::clip(c.vu0, {}u, {}u);", i.fs(), i.ft())); break;
         case Vnop: case Vwaitq: break;
         case Vlqi: line(std::format("lqc2_vu(c, {}u, {}u, {}); vu::set_vi(c.vu0, {}u, {} + 1u);", i.dest(), i.ft(), vi(i.fs()), i.fs(), vi(i.fs()))); break;
@@ -1007,6 +1042,8 @@ private:
     std::vector<bool> has_code_;
     std::uint32_t base_{};
     std::set<std::uint32_t> labels_;
+    bool flags_dead_{};  // the instruction simple() is writing sets vector-unit flags that nothing can see (vu0_flags_unseen)
+    const bool vu0_old_ = [] { const char *e = std::getenv("PS2_VU0_HELPERS"); return e && std::string_view(e) == "old"; }();
     std::size_t unserved_{};  // branch targets without a label that left through the dispatcher (see unserved())
     std::string *capture_{};
     bool collecting_{};

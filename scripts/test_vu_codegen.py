@@ -19,7 +19,8 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CXX = sys.argv[1] if len(sys.argv) > 1 else 'clang++'
-RANDOM_PROGRAMS = 150
+RANDOM_PROGRAMS = 450
+CLASSIC = 150  # kClassic below
 
 CASES_H = r'''
 #pragma once
@@ -65,6 +66,21 @@ inline Word waitq() { return (0x40u << 25) | (0xEu << 6) | 0x3F; }
 // nearest agree, and that rarely run into overflow, where the exact interpreter answers 7FFFFFFF and the SIMD code 7F7FFFFF.
 constexpr std::uint32_t kPool[12] = {0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x40000000, 0xC0000000, 0x3F000000, 0xBF000000,
                                      0x40800000, 0xC0800000, 0x3E800000, 0x3F800000};
+// The first kClassic random programs keep the old value pool and instruction mix and are compared with both interpreters. The later
+// ones ("wide") are there for the float clean-up of the compiled programs: they also use MAX, MINI, the Q forms, FTOI/ITOF with a
+// fraction, the stores and loads with a moving address, the elementary functions and the random-number register, and their values
+// come from kEdge as well: denormals, the smallest normal numbers, the largest floats, infinities and NaN patterns, and numbers whose
+// sums and products land on the edges (0x3F7FFFFF * 0x00800000 is just below the smallest normal number and rounds up to it,
+// 2^-64 * 2^-64 is a denormal with no rounding, 0x00800001 - 0x00800000 is the smallest denormal, 2^64 * 2^64 overflows). Each wide
+// program runs from kInits register and memory states (run index = program + 100000 * state) and is compared with unit 1 only.
+constexpr unsigned kClassic = 150, kInits = 4, kRunStep = 100000;
+constexpr std::uint32_t kEdge[] = {0x00000000, 0x80000000, 0x3F800000, 0xBF800000, 0x00000001, 0x80000001, 0x007FFFFF, 0x807FFFFF, 0x00800000, 0x80800000,
+                                   0x00800001, 0x80800001, 0x00FFFFFF, 0x7F7FFFFF, 0xFF7FFFFF, 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFFFFFFF, 0x7FFFFFFF,
+                                   0x7F800001, 0x3F7FFFFF, 0xBF7FFFFF, 0x3F800001, 0x3F000000, 0x40000000, 0x1F800000, 0x9F800000, 0x20000000, 0x5F800000,
+                                   0xDF800000, 0x5F000000, 0x1FFFFFFF, 0x00000005, 0x3EFFFFFF, 0x01000000, 0x7E800000, 0x7F000000, 0x00400000, 0x80400000,
+                                   0x34000000, 0x4B000000, 0xC0400000, 0x00800002, 0x3FC00000, 0x3F400000, 0x1F000000, 0x60000000, 0x00C00000, 0x3FFFFFFF};
+constexpr unsigned kEdges = sizeof kEdge / sizeof kEdge[0];
+inline unsigned run_inits(unsigned program) { return program < kClassic ? 1u : kInits; }
 
 inline void init(ps2::Vu0Regs &r, unsigned vi1) {
     std::memset(&r, 0, sizeof r);
@@ -153,7 +169,61 @@ inline std::vector<Case> cases() {
 inline std::vector<Pair> random_program(unsigned seed) {
     std::mt19937 g(seed * 2654435761u + 12345u);
     const auto R = [&](unsigned n) { return static_cast<unsigned>(g() % n); };
+    const bool wide = seed >= kClassic;
+    const auto wide_upper = [&]() -> Word {
+        const unsigned k = R(22), dest = 1 + R(15), fd = R(7), fs = R(7), ft = R(7), bc = R(4);
+        // The interpreter of the micro programs and the compiled code order a -0 against a +0 differently in MAX and MINI (fp::max
+        // against fp::vu_max; older than this test). The programs with an odd number are compared with the
+        // interpreter and only take the forms that cannot show it (a register against itself: the bits are read and come out as
+        // they are); the even ones take every form and are compared between the builds of the compiled code only.
+        if (k < 6 && (seed & 1u)) return fmac(k & 1u ? 0x2F : 0x2B, dest, fd, fs, fs);
+        switch (k) {
+        case 0: return fmac(0x2B, dest, fd, fs, ft);          // MAX
+        case 1: return fmac(0x2F, dest, fd, fs, ft);          // MINI
+        case 2: return fmac(0x10 + bc, dest, fd, fs, ft);     // MAXbc
+        case 3: return fmac(0x14 + bc, dest, fd, fs, ft);     // MINIbc
+        case 4: return fmac(0x1D, dest, fd, fs, 0);           // MAXi
+        case 5: return fmac(0x1F, dest, fd, fs, 0);           // MINIi
+        case 6: return fmac(0x1C, dest, fd, fs, 0);           // MULq
+        case 7: return fmac(0x20, dest, fd, fs, 0);           // ADDq
+        case 8: return fmac(0x24, dest, fd, fs, 0);           // SUBq
+        case 9: return fmac(0x21, dest, fd, fs, 0);           // MADDq
+        case 10: return fmac(0x25, dest, fd, fs, 0);          // MSUBq
+        case 11: return special(0x1C, dest, 0, fs);           // MULAq
+        case 12: return special(0x20 + R(2), dest, 0, fs);    // ADDAq, MADDAq
+        case 13: return special(0x14 + R(4), dest, ft, fs);   // FTOI0/4/12/15
+        case 14: return special(0x10 + R(4), dest, ft, fs);   // ITOF0/4/12/15
+        case 15: return special(0x1D, dest, ft, fs);          // ABS
+        case 16: return special(0x08 + bc, dest, ft, fs);     // MADDAbc
+        case 17: return special(0x0C + bc, dest, ft, fs);     // MSUBAbc
+        case 18: return special(0x18 + bc, dest, ft, fs);     // MULAbc
+        case 19: return fmac(0x27, dest, fd, fs, 0);          // MSUBi
+        case 20: return special(0x1E, dest, 0, fs);           // MULAi
+        default: return special(0x2A, dest, ft, fs);          // MULA
+        }
+    };
+    const auto wide_lower = [&]() -> Word {
+        const unsigned k = R(15), dest = 1 + R(15), f = R(7), f2 = R(7), v = 1 + R(6);
+        switch (k) {
+        case 0: return lower_special(0x34, dest, f, v);            // LQI
+        case 1: return lower_special(0x35, dest, v, f);            // SQI
+        case 2: return lower_special(0x36, dest, f, v);            // LQD
+        case 3: return lower_special(0x37, dest, v, f);            // SQD
+        case 4: return lower_special(0x70 + R(4), 0, 0, f);        // ESADD, ERSADD, ELENG, ERLENG
+        case 5: return lower_special(0x78 + R(3), R(4), 0, f);     // ESQRT, ERSQRT, ERCPR
+        case 6: return lower_special(0x64, dest, f, 0);            // MFP
+        case 7: return lower_special(0x40, dest, f, 0);            // RNEXT
+        case 8: return lower_special(0x42, R(4), 0, f);            // RINIT
+        case 9: return lower_special(0x43, R(4), 0, f);            // RXOR
+        case 10: return lower_special(0x41, dest, f, 0);           // RGET
+        case 11: return sq(dest, f, 0, R(40));
+        case 12: return lower_special(0x31, dest, f, f2);          // MR32
+        case 13: return lower_special(0x30, dest, f, f2);          // MOVE
+        default: return lower_special(0x3C, R(4), 7 + R(7), f);    // MTIR
+        }
+    };
     const auto upper = [&]() -> Word {
+        if (wide && R(3) == 0) return wide_upper();
         const unsigned c = R(100), dest = 1 + R(15), fd = R(7), fs = R(7), ft = R(7), bc = R(4);
         if (c < 16) return kUnop;
         if (c < 46) {
@@ -179,6 +249,7 @@ inline std::vector<Pair> random_program(unsigned seed) {
         return fmac(f[R(4)], dest, fd, fs, ft);
     };
     const auto lower = [&]() -> Word {
+        if (wide && R(3) == 0) return wide_lower();
         const unsigned c = R(100), dest = 1 + R(15), v = 1 + R(6), w = 1 + R(6), res = 7 + R(7), f = R(7), f2 = R(7);
         if (c < 20) return kLnop;
         if (c < 28) return R(2) ? lq(dest, f, 0, R(40)) : sq(dest, f, 0, R(40));
@@ -230,7 +301,7 @@ inline std::vector<Pair> random_program(unsigned seed) {
     const auto pair = [&]() -> Pair {
         Pair p = {lower(), upper()};
         if (R(40) == 0) {
-            p[0] = kPool[g() % 12];  // a loaded I constant in place of the lower instruction
+            p[0] = wide && R(3) ? kEdge[g() % kEdges] : kPool[g() % 12];  // a loaded I constant in place of the lower instruction
             p[1] |= kLoi;
         }
         return p;
@@ -266,9 +337,44 @@ inline std::vector<Pair> random_program(unsigned seed) {
     return p;
 }
 
+// The same program reading the MAC flags but never the status (vurecomp 11, FlagPipeV): FSEQ, FSAND and FSOR become FMEQ,
+// FMAND and FMOR of the same registers, FSSET a no-op, and the closing FSAND an FMOR of the whole MAC.
+inline std::vector<Pair> mac_only(std::vector<Pair> p) {
+    for (Pair &x : p) {
+        if (x[1] & kLoi) continue;
+        const Word op = x[0] >> 25, it = (x[0] >> 16) & 15u, is = (x[0] >> 11) & 15u;
+        if (op == 0x14) x[0] = fmflag(0x18, it, is);
+        else if (op == 0x16) x[0] = fmflag(0x1A, it, is);
+        else if (op == 0x17) x[0] = fmflag(0x1B, it, is);
+        else if (op == 0x15) x[0] = kLnop;
+    }
+    return p;
+}
+
 inline void random_init(ps2::Vu0Regs &r, std::uint8_t *mem, unsigned seed) {
     std::mt19937 g(seed * 40503u + 7u);
     std::memset(&r, 0, sizeof r);
+    if (seed % kRunStep >= kClassic) {
+        const auto pick = [&]() { return g() % 3 ? kEdge[g() % kEdges] : kPool[g() % 12]; };
+        for (auto &q : r.vf)
+            for (auto &x : q.w) x = pick();
+        for (auto &x : r.acc.w) x = pick();
+        r.vf[0] = {};
+        r.vf[0].w[3] = 0x3F800000u;
+        for (int i = 1; i < 16; ++i) r.vi[i] = static_cast<std::uint16_t>(g() % 8);
+        r.q = pick();
+        r.i = pick();
+        r.p = pick();
+        r.r = 0x3F800000u | (g() & 0x7FFFFFu);
+        r.clip = g() & 0xFFFFFFu;
+        r.status = g() & 0xFFFu;
+        r.mac = g() & 0xFFFFu;
+        for (int i = 0; i < 256 * 4; ++i) {
+            const std::uint32_t x = pick();
+            std::memcpy(mem + i * 4, &x, 4);
+        }
+        return;
+    }
     for (auto &q : r.vf)
         for (auto &x : q.w) x = kPool[g() % 12];
     for (auto &x : r.acc.w) x = kPool[g() % 12];
@@ -410,7 +516,7 @@ int main(int argc, char **argv) {
         if (ps2::vu::jit::translate(p.code.data(), 0, {0x1000}, wasm) == at_entry) { std::fprintf(stderr, "Wasm translation of a double branch %s\n", at_entry ? "worked at the entry" : "failed further in"); return 1; }
         std::string name;
         const std::string text = generate(p, name);
-        if (text.find(std::format("vu::interpret(1, {}u)", at)) == std::string::npos) { std::fprintf(stderr, "the double branch at %u is not left to the interpreter\n", at); return 1; }
+        if (text.find(std::format("vhop(hop, {}u)", at)) == std::string::npos && text.find(std::format("vu::interpret(1, {}u)", at)) == std::string::npos) { std::fprintf(stderr, "the double branch at %u is not left to the interpreter\n", at); return 1; }
     }
 
     // The pipeline stall cases: compiled here, run by the interpreter harness, the native main and node.
@@ -451,6 +557,50 @@ int main(int argc, char **argv) {
     }
     std::fprintf(stderr, "%u of %u random programs have an instruction whose stall depends on the path\n", tracked, static_cast<unsigned>(RANDOM_PROGRAMS));
     native << case_table << "};\n" << rand_table << "};\n";
+    // The random programs once more, reading only the MAC flags: compiled with the flags worked out where they are read
+    // (FlagPipeV) and, as the reference, at every flag site (g_eager_flags, the code before vurecomp 11). Both must leave the same
+    // registers, flags and memory (main below).
+    std::string late_table = "static void (*const kLateFns[])(Vu0Regs &, std::uint8_t *) = {\n", eager_table = "static void (*const kEagerFns[])(Vu0Regs &, std::uint8_t *) = {\n";
+    unsigned late = 0;
+    for (unsigned i = 0; i < RANDOM_PROGRAMS; ++i) {
+        const std::vector<tc::Pair> pairs = tc::mac_only(tc::random_program(i));
+        std::string name;
+        const std::string text = generate(programs(pairs, 300000 + i), name);
+        if (name.empty()) { std::fprintf(stderr, "MAC-only random program %u: no plan\n", i); return 1; }
+        late += text.find("FlagPipeV fl;") != std::string::npos;
+        native << text;
+        late_table += "    " + name + ",\n";
+        g_eager_flags = true;
+        native << generate(programs(pairs, 400000 + i), name);
+        g_eager_flags = false;
+        eager_table += "    " + name + ",\n";
+    }
+    if (late < RANDOM_PROGRAMS / 2) { std::fprintf(stderr, "only %u MAC-only random programs work out their flags late\n", late); return 1; }
+    std::fprintf(stderr, "%u of %u MAC-only random programs work out their flags late\n", late, static_cast<unsigned>(RANDOM_PROGRAMS));
+    native << late_table << "};\n" << eager_table << "};\n";
+    native << R"(
+static int run_late_flags() {
+    int failures = 0, runs = 0;
+    for (unsigned p = 0; p < sizeof kLateFns / sizeof kLateFns[0]; ++p)
+        for (unsigned k = 0; k < tc::kInits; ++k) {
+            const unsigned i = p + k * tc::kRunStep;
+            Vu0Regs a, b;
+            static std::uint8_t ma[16384], mb[16384];
+            std::memset(ma, 0, sizeof ma);
+            std::memset(mb, 0, sizeof mb);
+            tc::random_init(a, ma, i);
+            tc::random_init(b, mb, i);
+            kLateFns[p](a, ma);
+            kEagerFns[p](b, mb);
+            ++runs;
+            if (std::memcmp(&a, &b, sizeof a) != 0 || std::memcmp(ma, mb, sizeof ma) != 0) {
+                if (++failures <= 5) std::printf("FAIL MAC-only random run %u: late flags mac %04X status %03X vi13 %04X, at every site mac %04X status %03X vi13 %04X\n", i, a.mac, a.status, a.vi[13], b.mac, b.status, b.vi[13]);
+            }
+        }
+    std::printf("%d of %d MAC-only random runs leave the same state with the flags worked out late and at every site\n", runs - failures, runs);
+    return failures;
+}
+)";
 
     native << R"(
 static int run_cases() {
@@ -475,15 +625,20 @@ static void bench() {
     static Vu0Regs init[N];
     static std::uint8_t mem[N][16384];
     for (unsigned i = 0; i < N; ++i) tc::random_init(init[i], mem[i], i);
-    std::uint64_t sink = 0;
-    const auto start = std::chrono::steady_clock::now();
-    for (int round = 0; round < 4000; ++round)
-        for (unsigned i = 0; i < N; ++i) {
-            Vu0Regs r = init[i];
-            kRandFns[i](r, mem[i]);
-            sink += r.vi[7] + r.mac;
-        }
-    std::printf("%.1f ms (%llu)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), static_cast<unsigned long long>(sink));
+    // the classic programs (ordinary numbers) and the wide ones (numbers on the edges of the clean-up), each on its own
+    for (int part = 0; part < 2; ++part) {
+        const unsigned first = part ? tc::kClassic : 0u, last = part ? N : std::min<unsigned>(N, tc::kClassic);
+        std::uint64_t sink = 0;
+        const auto start = std::chrono::steady_clock::now();
+        for (int round = 0; round < 4000; ++round)
+            for (unsigned i = first; i < last; ++i) {
+                Vu0Regs r = init[i];
+                kRandFns[i](r, mem[i]);
+                sink += r.vi[7] + r.mac;
+            }
+        std::printf("%s%.1f ms [%llu]", part ? ", wide " : "classic ", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), static_cast<unsigned long long>(sink));
+    }
+    std::printf("\n");
 }
 )";
     native << "int main(int argc, char **argv) {\n"
@@ -491,19 +646,22 @@ static void bench() {
               "    if (argc > 2) {\n"
               "        const unsigned i = std::atoi(argv[2]);\n"
               "        Vu0Regs r; std::uint8_t mem[16384] = {};\n"
-              "        tc::random_init(r, mem, i); kRandFns[i](r, mem);\n"
+              "        tc::random_init(r, mem, i); kRandFns[i % tc::kRunStep](r, mem);\n"
               "        std::fputs(tc::describe(r, mem).c_str(), stdout);\n"
               "        return 0;\n"
               "    }\n"
               "    if (argc > 1) {\n"
-              "        for (unsigned i = 0; i < " << RANDOM_PROGRAMS << "; ++i) {\n"
+              "        for (unsigned p = 0; p < " << RANDOM_PROGRAMS << "; ++p)\n"
+              "        for (unsigned k = 0; k < tc::run_inits(p); ++k) {\n"
+              "            const unsigned i = p + k * tc::kRunStep;\n"
               "            Vu0Regs r; std::uint8_t mem[16384] = {};\n"
-              "            tc::random_init(r, mem, i); kRandFns[i](r, mem);\n"
+              "            tc::random_init(r, mem, i); kRandFns[p](r, mem);\n"
               "            std::printf(\"%u %s\\n\", i, tc::digests(tc::describe(r, mem)).c_str());\n"
               "        }\n"
               "        return 0;\n"
               "    }\n"
-              "    if (run_cases()) return 1;\n";
+              "    if (run_cases()) return 1;\n"
+              "    if (run_late_flags()) return 1;\n";
     for (int test = 0; test < 8; ++test) {
         native << "{ Vu0Regs r{}; std::uint8_t mem[16384]{}; r.vi[1]=2; r.vi[3]=2; r.clip=1;"
                   "for (int i=0;i<4;++i) r.vf[1].w[i]=0xBF800000; r.vf[0].w[3]=0x3F800000;\n";
@@ -600,7 +758,7 @@ int main(int argc, char **argv) {
         const unsigned i = std::atoi(argv[2]);
         Vu0Regs r;
         std::uint8_t mem[4096];
-        run(std::atoi(argv[1]), tc::random_program(i), [](Vu0Regs &r, std::uint8_t *m, unsigned seed) { tc::random_init(r, m, seed); }, i, r, mem);
+        run(std::atoi(argv[1]), tc::random_program(i % tc::kRunStep), [](Vu0Regs &r, std::uint8_t *m, unsigned seed) { tc::random_init(r, m, seed); }, i, r, mem);
         std::fputs(tc::describe(r, mem).c_str(), stdout);
         return 0;
     }
@@ -615,13 +773,15 @@ int main(int argc, char **argv) {
             std::printf("%s interpreter %d %s: vi%u = %04X, want %04X, mac %04X status %03X\n", ok ? "ok  " : "FAIL", unit, cases[i].name, cases[i].check, r.vi[cases[i].check], cases[i].want, r.mac, r.status);
         }
     if (argc > 1) {
-        for (unsigned i = 0; i < RANDOM_PROGRAMS; ++i)
-            for (int unit = 0; unit < 2; ++unit) {
-                Vu0Regs r;
-                std::uint8_t mem[4096];
-                run(unit, tc::random_program(i), [](Vu0Regs &r, std::uint8_t *m, unsigned seed) { tc::random_init(r, m, seed); }, i, r, mem);
-                std::printf("%d %u %s\n", unit, i, tc::digests(tc::describe(r, mem)).c_str());
-            }
+        for (unsigned p = 0; p < RANDOM_PROGRAMS; ++p)
+            for (unsigned k = 0; k < tc::run_inits(p); ++k)
+                for (int unit = p < tc::kClassic ? 0 : 1; unit < 2; ++unit) {
+                    const unsigned i = p + k * tc::kRunStep;
+                    Vu0Regs r;
+                    std::uint8_t mem[4096];
+                    run(unit, tc::random_program(p), [](Vu0Regs &r, std::uint8_t *m, unsigned seed) { tc::random_init(r, m, seed); }, i, r, mem);
+                    std::printf("%d %u %s\n", unit, i, tc::digests(tc::describe(r, mem)).c_str());
+                }
     }
     return failures ? 1 : 0;
 }
@@ -729,10 +889,33 @@ with tempfile.TemporaryDirectory(prefix='vu-codegen-') as tmp:
             except subprocess.CalledProcessError as e:
                 sys.exit(e.stderr or str(e))
     run(str(tmp / 'generator'), str(tmp))
-    run(CXX, '-std=c++20', '-O2' if os.environ.get('VU_BENCH') else '-O1', '-w', '-Iruntime/include', f'-I{tmp}', str(tmp / 'native.cpp'), '-o', str(tmp / 'native'))
-    run(str(tmp / 'native'))
+    # The compiled programs are built several ways: plainly (on x86-64 that is SSE2, where the float clean-up is done at once, as on
+    # every other processor), and where this PC can run them with SSE4.1 and with AVX2, where it is done late with the processor's
+    # "denormals are zero" bit (ps2/vu_ops.hpp). All of them must leave the same state. With VU_BENCH=1 the two late builds are also
+    # built with -DPS2_VU_NO_DAZ, which is the old clean-up with the same instruction set, to time one against the other.
+    macros = subprocess.run([CXX, '-march=native', '-dM', '-E', '-x', 'c++', os.devnull], capture_output=True, text=True).stdout
+    variants = {'native': []}
+    if '__x86_64__' in macros and '__SSE4_1__' in macros:
+        variants['native-sse41'] = ['-msse4.1']
+    if '__x86_64__' in macros and '__AVX2__' in macros:
+        variants['native-avx2'] = ['-mavx2', '-ffp-contract=off']
+    if os.environ.get('VU_BENCH'):
+        for name in [n for n in variants if n != 'native']:
+            variants[name + '-eager'] = variants[name] + ['-DPS2_VU_NO_DAZ']
+    with concurrent.futures.ThreadPoolExecutor(3) as pool:
+        jobs = [pool.submit(compile_, CXX, '-std=c++20', '-O2' if os.environ.get('VU_BENCH') else '-O1', '-w', *flags, '-Iruntime/include', f'-I{tmp}', str(tmp / 'native.cpp'), '-o', str(tmp / name))
+                for name, flags in variants.items()]
+        for job in jobs:
+            try:
+                job.result()
+            except subprocess.CalledProcessError as e:
+                sys.exit(e.stderr or str(e))
+    for name in variants:
+        run(str(tmp / name))
     for _ in range(5 if os.environ.get('VU_BENCH') else 0):
-        run(str(tmp / 'native'), 'bench')
+        for name in variants:
+            print(f'{name:20}', end=' ', flush=True)
+            run(str(tmp / name), 'bench')
         run(str(tmp / 'interp'), 'bench')
     interpreter = subprocess.run([str(tmp / 'interp')], cwd=ROOT, capture_output=True, text=True)
     sys.stdout.write(interpreter.stdout)
@@ -741,6 +924,19 @@ with tempfile.TemporaryDirectory(prefix='vu-codegen-') as tmp:
     print('%d stall cases passed in both interpreters' % (len([x for x in interpreter.stdout.splitlines() if x.startswith('ok')]) // 2))
     # Random microprograms: the compiled program must leave the same registers and memory as both interpreters.
     compiled = subprocess.run([str(tmp / 'native'), 'random'], cwd=ROOT, capture_output=True, text=True, check=True).stdout.split('\n')
+    for name in variants:
+        other = subprocess.run([str(tmp / name), 'random'], cwd=ROOT, capture_output=True, text=True, check=True).stdout.split('\n')
+        differ = [a.split()[0] for a, b in zip(compiled, other) if a != b]
+        if differ or len(other) != len(compiled):
+            for i in differ[:5]:
+                a = subprocess.run([str(tmp / 'native'), 'random', i], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
+                b = subprocess.run([str(tmp / name), 'random', i], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
+                print(f'random run {i}: native and {name} differ')
+                for x, y in zip(a, b):
+                    if x != y:
+                        print(f'  native {x}\n  {name} {y}')
+            sys.exit(f'{len(differ)} random program runs differ between the plain build and {name}')
+    print('the compiled random programs leave the same state in the builds ' + ', '.join(variants))
     interpreted = subprocess.run([str(tmp / 'interp'), 'random'], cwd=ROOT, capture_output=True, text=True, check=True).stdout.split('\n')
     want = {int(l.split()[0]): l.split()[1:] for l in compiled if l.strip()}
     got = {}
@@ -754,9 +950,12 @@ with tempfile.TemporaryDirectory(prefix='vu-codegen-') as tmp:
     bad = []
     skipped = 0
     for i in sorted(want):
+        program = i % 100000
+        if program >= CLASSIC and program % 2 == 0:
+            continue  # the wide programs with every form of MAX and MINI: compared between the builds above (see wide_upper)
         if got.get((1, i)) != want[i]:
             bad.append((i, 1))
-        if got.get((0, i)) != want[i]:
+        if i < CLASSIC and got.get((0, i)) != want[i]:
             if got[(0, i)][0] == want[i][0]:
                 bad.append((i, 0))
             else:
@@ -770,6 +969,7 @@ with tempfile.TemporaryDirectory(prefix='vu-codegen-') as tmp:
                 if x != y:
                     print(f'  compiled    {x}\n  interpreter {y}')
         sys.exit(f'{len(bad)} random program runs differ')
-    print(f'{len(want)} random microprograms leave the same state compiled and in the interpreters ({skipped} not compared with unit 0: its truncating arithmetic gives other numbers)')
+    compared = len([i for i in want if i % 100000 < CLASSIC or i % 2])
+    print(f'{compared} runs of the random microprograms (of {len(want)}; the others have MAX and MINI forms the interpreter orders differently) leave the same state compiled and in the interpreters ({skipped} not compared with unit 0: its truncating arithmetic gives other numbers)')
     (tmp / 'wasm.cjs').write_text(WASM_TEST)
     run('node', str(tmp / 'wasm.cjs'), str(tmp))

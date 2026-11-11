@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -845,6 +846,87 @@ struct FlagPipe {
     }
 };
 
+// The MAC and status flags of a compiled VU1 program, worked out where they are read instead of where they are set
+// (recomp/vurecomp_gen.cpp). Used for programs that read the MAC flags (FMAND, FMEQ, FMOR) but never the
+// status register (no FSAND, FSEQ, FSOR, FSSET): there the status is only seen after the program, by the next program or
+// by the interpreter at a hop. The generator pushes at exactly the instructions where it would otherwise call flags() and
+// set_mac(), and calls finish() at every way out of the program; the MAC a reader gets and the MAC and status left in the
+// registers are the same bits as with flags() + set_mac():
+//  - push() keeps the result instead of its flags, with the lanes the instruction does not write set to 1.0 (exponent 127,
+//    no sign, not the largest magnitude: it sets none of the flags). The MAC of a kept value is flags()' MAC of the result
+//    for its dest (mac_of, the same three tests).
+//  - mac() picks the slot exactly as FlagPipe::mac_slot() does (the slots of before the program start as r.mac, at cycle 0).
+//  - flags() leaves status = (status before & 0xFF0) | low | low << 6, where low is the zero (1), sign (2) and overflow (8)
+//    bits of that result; so after n results it is (status at the start & 0xFF0) | (OR of every low) << 6 | the last low.
+//    The OR of every low is kept as three running lanes: the smallest magnitude (zero: one below 2^-126, the exponent
+//    field is 0), the OR of the sign bits, the largest magnitude (overflow: 0x7FFFFFFF).
+// A push is about five vector instructions and two stores, against about fifty for flags() + set_mac().
+struct FlagPipeV : FlagPipe {
+    v4u fv[8];
+    std::uint32_t fts[8];
+    unsigned fn = 0;
+    std::uint32_t mac0 = 0;
+    v4i lo_mag = (v4i){0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF}, hi_mag = (v4i){0, 0, 0, 0};
+    v4u signs = v4u{0u, 0u, 0u, 0u};
+
+    void start(const Vu0Regs &r) {
+        for (int i = 0; i < 8; ++i) {
+            clip_ts[i] = 0;
+            clip_v[i] = r.clip;
+        }
+        mac0 = r.mac;
+    }
+    static PS2_VU_INLINE std::uint32_t mac_of(v4u v) {
+#if defined(__SSE2__)
+        const __m128i x = (__m128i)v;
+        const unsigned zero = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128()))));
+        const unsigned sign = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(x)));
+        const unsigned over = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(0x7FFFFFFF)))));
+        return kReverse4[zero] | (static_cast<std::uint32_t>(kReverse4[sign]) << 4) | (static_cast<std::uint32_t>(kReverse4[over]) << 12);
+#else
+        Vu0Regs t{};
+        Reg128 u;
+        std::memcpy(&u, &v, 16);
+        flags(t, u, 15u);
+        return t.mac;
+#endif
+    }
+    template <unsigned D>
+    PS2_VU_INLINE void push(v4u v) {
+        if constexpr (D != 15u)
+            v = vsel(vsplat(0x3F800000u), v, v4u{D & 8u ? ~0u : 0u, D & 4u ? ~0u : 0u, D & 2u ? ~0u : 0u, D & 1u ? ~0u : 0u});
+        const unsigned i = fn++ & 7u;
+        fv[i] = v;
+        fts[i] = t;
+        const v4i m = (v4i)(v & 0x7FFFFFFFu);
+        lo_mag = __builtin_elementwise_min(lo_mag, m);
+        hi_mag = __builtin_elementwise_max(hi_mag, m);
+        signs |= v;
+    }
+    PS2_VU_INLINE std::uint32_t mac() const {
+        for (unsigned k = 1; k <= 8; ++k) {
+            if (k > fn) return mac0;
+            const unsigned i = (fn - k) & 7u;
+            if (fts[i] + 4u <= t) return mac_of(fv[i]);
+        }
+        return mac_of(fv[(fn - 8) & 7u]);
+    }
+    std::uint32_t status() const = delete;  // a program that reads the status keeps FlagPipe
+    PS2_VU_INLINE void finish(Vu0Regs &r) const {
+        if (!fn) return;
+        const std::uint32_t mac = mac_of(fv[(fn - 1) & 7u]);
+        r.mac = mac;
+        std::uint32_t status = r.status & 0xFF0u;
+        if (mac & 0x000Fu) status |= 0x1u;
+        if (mac & 0x00F0u) status |= 0x2u;
+        if (mac & 0xF000u) status |= 0x8u;
+        if (__builtin_reduce_or((v4u)(lo_mag < 0x00800000))) status |= 0x40u;
+        if (__builtin_reduce_or(signs) & 0x80000000u) status |= 0x80u;
+        if (__builtin_reduce_or((v4u)(hi_mag == 0x7FFFFFFF))) status |= 0x200u;
+        r.status = status;
+    }
+};
+
 template <std::uint32_t Mask = 1023u>
 PS2_VU_INLINE std::uint8_t *qword(std::uint8_t *mem, std::uint32_t index) { return mem + (index & Mask) * 16u; }
 PS2_VU_INLINE void set_vi(Vu0Regs &r, unsigned i, std::uint32_t v) {
@@ -999,5 +1081,152 @@ inline void efu(Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) {
     default: break;
     }
 }
+
+// ---- The clean-up of the compiled VU1 programs, done late ----
+//
+// vfix does two things: an exponent of 255 becomes the largest float, and a denormal becomes a zero with its sign. The processor can do
+// the second one by itself: with the DAZ bit of MXCSR set ("denormals are zero"), every float instruction reads a denormal operand as a
+// zero with its sign. So inside a compiled program, which runs with DAZ set, a result only needs the first half at once (vclamp, two
+// instructions instead of six); a denormal may stay in the value, because every add, subtract and multiply that reads it sees the zero
+// it stands for. The flags see the same too (zero is "exponent 0", the sign bit is the same). Only where the bits themselves are read
+// (a store to memory, MAX, MINI, ABS, ITOF, MOVE, MTIR, the end of the program ...) the generator puts the second half first (vflush),
+// for exactly the lanes an add, subtract or multiply wrote since. Rounding is untouched: DAZ changes how operands are read, never how a
+// result is rounded (the flush-to-zero bit, which does, stays off: it disagrees with vfix for products just below the smallest normal
+// number).
+//
+// What keeps this exact against the compiler, which assumes the default MXCSR:
+//  - every float instruction of a program is in its body function, which is never inlined into the function that sets and restores
+//    MXCSR, and the calls that leave the body (XGKICK, the elementary-function unit) go through functions that put MXCSR back for the
+//    time of the call; a hop to the interpreter is done after the body has returned;
+//  - the compiler works out arithmetic on constants with the default rules, so no denormal constant may reach a float instruction:
+//    every value that becomes an operand goes through vopaque (no instruction, but the compiler no longer knows the value), except the
+//    constant vf00 and what comes from it alone (whole numbers) and the I register after a full vfix.
+// Without SSE4.1 (and on other processors) nothing changes: the helpers below are the old eager ones and vflush does nothing.
+#if defined(__SSE4_1__) && !defined(PS2_VU_NO_DAZ)
+#define PS2_VU_DAZ 1
+#else
+#define PS2_VU_DAZ 0
+#endif
+
+inline constexpr std::uint32_t kNoHop = 0xFFFFFFFFu;
+// The operands of a program that cleans every result at once (vurecomp_gen.cpp, `worth`), with or without SSE4.1.
+PS2_VU_INLINE v4u vshadow_eager(const Reg128 &r) { return vfix(vload(r)); }
+PS2_VU_INLINE v4u vqd_eager(std::uint32_t q) { return vfix(vsplat(q)); }
+PS2_VU_INLINE void vhop(std::uint32_t &hop, std::uint32_t pc) { hop = pc; }
+
+#if PS2_VU_DAZ
+#define PS2_VU_BODY static __attribute__((noinline))
+inline constexpr unsigned kMxcsrDaz = 0x0040u;
+PS2_VU_INLINE v4u vopaque(v4u x) {
+    __m128i t = (__m128i)x;
+    __asm__("" : "+x"(t));
+    return (v4u)t;
+}
+// An exponent of 255 (any mantissa) becomes the largest float with the same sign; everything else, denormals included, is left alone.
+// Unsigned, only a negative number with exponent 255 is above 0xFF7FFFFF; signed, only a positive one is above 0x7F7FFFFF.
+// vflush_value(vclamp(x)) is vfix(x) on every one of the 2^32 inputs (tests/test_vu_cleanup.cpp).
+PS2_VU_INLINE v4u vclamp(v4u x) {
+    return (v4u)_mm_min_epi32(_mm_min_epu32((__m128i)x, _mm_set1_epi32(static_cast<int>(0xFF7FFFFFu))), _mm_set1_epi32(0x7F7FFFFF));
+}
+// The same for the result of an add, subtract or multiply, done with float instructions (MINPS, MAXPS), so that a result on its way
+// from one float instruction to the next does not go through the integer side of the processor and back (a cycle each way on
+// today's processors; measured on a Zen 3, a multiply-add chain takes 9.1 instead of 13.0 ticks per step). Such a result is never
+// a NaN: no operand of the arithmetic has an exponent of 255 (every one of them went through vclamp, vfix or this), and without an
+// infinity among the operands a sum or product is a finite number or an infinity. So the two instructions only pick: plus infinity
+// becomes the largest float, minus infinity the largest negative one, everything else is below and above the limits and stays (a
+// zero keeps its sign; a denormal counts as zero in the comparison and comes out as itself or as that zero, which is the same to
+// everything after it). vflush_value(vclamp_result(x)) is vfix(x) on every input that is not a NaN, with the denormals-are-zero
+// bit set (tests/test_vu_cleanup.cpp). Never for a value loaded from a register or from memory: that may be a NaN, which MINPS
+// would turn into the positive limit whatever its sign.
+PS2_VU_INLINE v4u vclamp_result(v4f x) {
+    return (v4u)_mm_max_ps(_mm_min_ps((__m128)x, _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF))), _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0xFF7FFFFFu))));
+}
+// The second half, for the lanes in `lanes` (all bits of a lane set): exponent 0 becomes a zero with its sign.
+PS2_VU_INLINE v4u vflush_value(v4u x, v4u lanes) {
+    const __m128i xi = (__m128i)x;
+    const __m128i tiny = _mm_cmpgt_epi32(_mm_set1_epi32(0x00800000), _mm_and_si128(xi, _mm_set1_epi32(0x7FFFFFFF)));
+    return (v4u)_mm_andnot_si128(_mm_and_si128(tiny, (__m128i)(lanes & 0x7FFFFFFFu)), xi);
+}
+PS2_VU_INLINE void vflush(Reg128 &r, v4u lanes) { vstore(r, vflush_value(vload(r), lanes)); }
+// The second half done by the processor itself, where the generator knows the "denormals are zero" bit is set (`daz_in`): a
+// multiply by one reads a denormal as the zero with its sign it stands for and gives that zero; every other number comes out as
+// it went in (a multiply by one is exact, and the value is never a NaN or an infinity: the lanes flushed hold results of vclamp_result
+// only). One float instruction, and a blend for some of the lanes, instead of four integer ones. The one is opaque, or the
+// compiler would drop the multiply. vflush_mul_value(x, lanes) is vflush_value(x, lanes) on every input whose exponent is not 255,
+// with the bit set (tests/test_vu_cleanup.cpp).
+PS2_VU_INLINE v4u vflush_mul_value(v4u x, v4u lanes) { return vsel(x, (v4u)((v4f)x * (v4f)vopaque(vsplat(0x3F800000u))), lanes); }
+PS2_VU_INLINE void vflushd(Reg128 &r, v4u lanes) { vstore(r, vflush_mul_value(vload(r), lanes)); }
+PS2_VU_INLINE v4u vshadow(const Reg128 &r) { return vopaque(vclamp(vload(r))); }
+PS2_VU_INLINE v4u vqd(std::uint32_t q) { return vopaque(vclamp(vsplat(q))); }
+PS2_VU_INLINE v4u vaddd(v4u a, v4u b) { return vopaque(vclamp_result((v4f)a + (v4f)b)); }
+PS2_VU_INLINE v4u vsubd(v4u a, v4u b) { return vopaque(vclamp_result((v4f)a - (v4f)b)); }
+PS2_VU_INLINE v4u vmuld(v4u a, v4u b) { return vopaque(vclamp_result((v4f)a * (v4f)b)); }
+PS2_VU_INLINE v4u vmaddd(v4u acc, v4u a, v4u b) { return vaddd(acc, vclamp_result((v4f)a * (v4f)b)); }
+PS2_VU_INLINE v4u vmsubd(v4u acc, v4u a, v4u b) { return vsubd(acc, vclamp_result((v4f)a * (v4f)b)); }
+// MXCSR as the caller of a program has it. Reading it (STMXCSR) costs far more than the instruction: it has to wait until every float
+// instruction before it has left the processor, and with the value coming out of it the program's own float instructions cannot start
+// before that either (measured on a Zen 3: about 50 cycles per program call, more than the late clean-up saves in a short program).
+// So it is read once per thread and kept; writing a value that is already known costs next to nothing. This rests on the calling
+// conventions of x86-64 (System V and Windows alike): the control bits of MXCSR belong to the caller and every function leaves them
+// as it found them, so on one thread they are the same at every call unless some code switches the float mode of the thread for good,
+// and nothing in the runtime touches MXCSR. Builds with assertions check it at every call. The six status bits are free for any
+// function to change, so putting old ones back is allowed. (A value of 0, every float exception switched on, is read every time.)
+inline constexpr unsigned kMxcsrStatus = 0x003Fu;
+inline thread_local unsigned t_vu_csr = 0;
+PS2_VU_INLINE unsigned vcsr() {
+    if (t_vu_csr == 0) [[unlikely]] t_vu_csr = _mm_getcsr();
+    assert((_mm_getcsr() | kMxcsrStatus) == (t_vu_csr | kMxcsrStatus));
+    return t_vu_csr;
+}
+struct VuDaz {
+    unsigned csr;
+    bool on = true;  // false once the body has put MXCSR back itself (vkick_last)
+    VuDaz() : csr(vcsr()) { _mm_setcsr(csr | kMxcsrDaz); }
+    ~VuDaz() {
+        if (on) _mm_setcsr(csr);
+    }
+    VuDaz(const VuDaz &) = delete;
+    VuDaz &operator=(const VuDaz &) = delete;
+};
+inline __attribute__((noinline)) void vkick(unsigned csr, int unit, std::uint32_t address) {
+    _mm_setcsr(csr);
+    vu::kick(unit, address);
+    _mm_setcsr(csr | kMxcsrDaz);
+}
+// The last XGKICK of a run: no add, subtract or multiply follows it on any path (the generator says so), so MXCSR stays as the caller
+// has it for the rest of the body.
+inline __attribute__((noinline)) void vkick_last(VuDaz &daz, int unit, std::uint32_t address) {
+    _mm_setcsr(daz.csr);
+    daz.on = false;
+    vu::kick(unit, address);
+}
+inline __attribute__((noinline)) void vefu(unsigned csr, Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) {
+    _mm_setcsr(csr);
+    efu(r, index, fs, fsf);
+    _mm_setcsr(csr | kMxcsrDaz);
+}
+#else
+#define PS2_VU_BODY static inline __attribute__((always_inline))
+PS2_VU_INLINE v4u vopaque(v4u x) { return x; }
+PS2_VU_INLINE v4u vclamp(v4u x) { return vfix(x); }
+PS2_VU_INLINE v4u vclamp_result(v4f x) { return vfix((v4u)x); }
+PS2_VU_INLINE v4u vflush_value(v4u x, v4u) { return x; }
+PS2_VU_INLINE void vflush(Reg128 &, v4u) {}
+PS2_VU_INLINE v4u vflush_mul_value(v4u x, v4u) { return x; }
+PS2_VU_INLINE void vflushd(Reg128 &, v4u) {}
+PS2_VU_INLINE v4u vshadow(const Reg128 &r) { return vfix(vload(r)); }
+PS2_VU_INLINE v4u vqd(std::uint32_t q) { return vfix(vsplat(q)); }
+PS2_VU_INLINE v4u vaddd(v4u a, v4u b) { return vaddn(a, b); }
+PS2_VU_INLINE v4u vsubd(v4u a, v4u b) { return vsubn(a, b); }
+PS2_VU_INLINE v4u vmuld(v4u a, v4u b) { return vmuln(a, b); }
+PS2_VU_INLINE v4u vmaddd(v4u acc, v4u a, v4u b) { return vmaddn(acc, a, b); }
+PS2_VU_INLINE v4u vmsubd(v4u acc, v4u a, v4u b) { return vmsubn(acc, a, b); }
+struct VuDaz {
+    unsigned csr = 0;
+};
+PS2_VU_INLINE void vkick(unsigned, int unit, std::uint32_t address) { vu::kick(unit, address); }
+PS2_VU_INLINE void vkick_last(VuDaz &, int unit, std::uint32_t address) { vu::kick(unit, address); }
+PS2_VU_INLINE void vefu(unsigned, Vu0Regs &r, unsigned index, unsigned fs, unsigned fsf) { efu(r, index, fs, fsf); }
+#endif
 
 }

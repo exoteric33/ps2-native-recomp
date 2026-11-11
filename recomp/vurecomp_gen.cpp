@@ -4,6 +4,7 @@
 #include "ps2/vu_ops.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,6 +49,10 @@ struct Upper {
     unsigned mask = 0;
     bool normalized = false;
     std::vector<int> shadow_reads;
+    // The lazy clean-up (generate()): `arith` is an add, subtract or multiply done as float instructions, whose result may hold a
+    // denormal that stands for a zero; `raw_reads` are the registers and lanes whose bits this instruction reads as they are.
+    bool arith = false;
+    std::vector<std::pair<int, unsigned>> raw_reads;
 };
 
 std::string vf(unsigned i, int lane_index) {
@@ -66,8 +71,13 @@ std::string lane_mask(unsigned d) {
     return mask + "}";
 }
 
-Upper upper(std::uint32_t hi, bool flags_live, bool exact = false) {
+Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, bool late_flags = false) {
     Upper u;
+    // late_flags: the program reads the MAC flags but never the status (see FlagPipeV in vu_ops.hpp): a live flag site keeps its
+    // result in the flag pipe, and the MAC and status are worked out where a reader or a way out of the program needs them.
+    const auto set_flags = [&](const std::string &value, unsigned d) {
+        return late_flags ? std::format("fl.push<{}u>({}); ", d, value) : std::format("flags(r, {}, {}u); fl.set_mac(r.mac, r.status); ", value, d);
+    };
     const unsigned dest = (hi >> 21) & 15u, ft = (hi >> 16) & 31u, fs = (hi >> 11) & 31u, fd = (hi >> 6) & 31u, bc = hi & 3u;
     const unsigned funct = hi & 63u;
     enum Kind { Nop, Add, Sub, Madd, Msub, Max, Min, Mul, Abs, Ftoi, Itof, Clip, Opmula, Opmsub } kind = Nop;
@@ -170,6 +180,7 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false) {
         u.normalized = vector && arithmetic;
     }
     if (arithmetic && !exact) {
+        u.arith = true;
         const auto operand = [&](unsigned reg) -> std::string {
             if (!reg) return vreg(0);
             u.shadow_reads.push_back(static_cast<int>(reg));
@@ -182,7 +193,7 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false) {
             if (ft) u.shadow_reads.push_back(static_cast<int>(ft));
             nb = ft ? std::format("vsplat(n{}[{}])", ft, bc) : std::format("vsplat({})", vf(0, static_cast<int>(bc)));
             break;
-        case Q: nb = "vfix(vsplat(r.q))"; break;
+        case Q: nb = "vqd(r.q)"; break;
         default: nb = "vfix(vsplat(r.i))"; break;
         }
         const std::string ns = operand(fs);
@@ -196,11 +207,11 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false) {
         // (vf00 as one of the two registers makes every lane constant, so the lanes written do not matter here.)
         const bool constant_lanes = vf0_operand(false) || vf0_operand(true);
         switch (kind) {
-        case Add: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} + (v4f){}); ", ns, nb) : std::format("const v4u uv = vaddn({}, {}); ", ns, nb); break;
-        case Sub: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} - (v4f){}); ", ns, nb) : std::format("const v4u uv = vsubn({}, {}); ", ns, nb); break;
-        case Mul: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} * (v4f){}); ", ns, nb) : std::format("const v4u uv = vmuln({}, {}); ", ns, nb); break;
-        case Madd: u.pre += constant_lanes ? std::format("const v4u uv = vaddn(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmaddn(nacc, {}, {}); ", ns, nb); break;
-        default: u.pre += constant_lanes ? std::format("const v4u uv = vsubn(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmsubn(nacc, {}, {}); ", ns, nb); break;
+        case Add: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} + (v4f){}); ", ns, nb) : std::format("const v4u uv = vaddd({}, {}); ", ns, nb); break;
+        case Sub: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} - (v4f){}); ", ns, nb) : std::format("const v4u uv = vsubd({}, {}); ", ns, nb); break;
+        case Mul: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} * (v4f){}); ", ns, nb) : std::format("const v4u uv = vmuld({}, {}); ", ns, nb); break;
+        case Madd: u.pre += constant_lanes ? std::format("const v4u uv = vaddd(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmaddd(nacc, {}, {}); ", ns, nb); break;
+        default: u.pre += constant_lanes ? std::format("const v4u uv = vsubd(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmsubd(nacc, {}, {}); ", ns, nb); break;
         }
     }
     if (vector) {
@@ -212,6 +223,16 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false) {
         default: vb = "vsplat(r.i)"; break;
         }
         const std::string vs = vreg(fs);
+        // MAX, MINI, ABS and ITOF take the bits as they are (FTOI cleans its operand itself, so it does not care).
+        const auto reads = [&](unsigned reg, unsigned lanes) {
+            if (reg && lanes) u.raw_reads.emplace_back(static_cast<int>(reg), lanes);
+        };
+        if (kind == Max || kind == Min) {
+            reads(fs, d);
+            if (src == Vec) reads(ft, d);
+            else if (src == Bc) reads(ft, 8u >> bc);
+        }
+        if (kind == Abs || kind == Itof) reads(fs, d);
         std::string e;
         switch (kind) {
         case Max: e = std::format("vmax({}, {})", vs, vb); break;
@@ -223,14 +244,14 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false) {
         }
         if (!e.empty()) u.pre += std::format("const v4u uv = {}; ", e);
         if (target == 0) {
-            u.post = std::format("{{ flags(r, uv, {}u); fl.set_mac(r.mac, r.status); }} ", d);
+            u.post = "{ " + set_flags("uv", d) + "} ";
             u.sets_flags = true;
             return u;
         }
         if (d == 0xF) u.post += std::format("vstore({}, uv); ", dst);
         else u.post += std::format("vstore({0}, vsel(vload({0}), uv, {1})); ", dst, lane_mask(d));
         u.sets_flags = flags;
-        if (flags && flags_live) u.post += std::format("flags(r, uv, {}u); fl.set_mac(r.mac, r.status); ", d);
+        if (flags && flags_live) u.post += set_flags("uv", d);
         return u;
     }
     for (int i = 0; i < 4; ++i) {
@@ -265,14 +286,14 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false) {
         u.post = "{ Reg128 uf{}; ";
         for (int i = 0; i < 4; ++i)
             if (lane(d, i)) u.post += std::format("uf.w[{}] = u{}; ", i, kLane[i]);
-        u.post += std::format("flags(r, uf, {}u); fl.set_mac(r.mac, r.status); }} ", d);
+        u.post += set_flags(late_flags ? "vload(uf)" : "uf", d) + "} ";
         u.sets_flags = true;
         return u;
     }
     for (int i = 0; i < 4; ++i)
         if (lane(d, i)) u.post += std::format("{}.w[{}] = u{}; ", dst, i, kLane[i]);
     u.sets_flags = flags;
-    if (flags && flags_live) u.post += std::format("flags(r, {}, {}u); fl.set_mac(r.mac, r.status); ", dst, d);
+    if (flags && flags_live) u.post += set_flags(late_flags ? std::format("vload({})", dst) : dst, d);
     return u;
 }
 
@@ -301,6 +322,8 @@ struct Lower {
     bool branch = false, jump = false;
     std::uint32_t target = 0;
     bool supported = true;
+    // Registers and lanes whose bits the instruction reads as they are (see Upper::raw_reads).
+    std::vector<std::pair<int, unsigned>> raw_reads;
 };
 
 Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, bool unit0 = false) {
@@ -310,6 +333,9 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
     const unsigned ft = (w >> 16) & 31u, fs = (w >> 11) & 31u;
     const std::int32_t imm11 = static_cast<std::int32_t>(w << 21) >> 21;
     std::string &c = l.code;
+    const auto reads = [&](unsigned reg, unsigned lanes) {
+        if (reg && lanes) l.raw_reads.emplace_back(static_cast<int>(reg), lanes);
+    };
     if ((w >> 25) == 0x40u) {
         const unsigned funct = w & 63u;
         if (funct < 0x3C) {
@@ -329,9 +355,11 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
         case 0x30:
             if (ft) l.writes = static_cast<int>(ft);
             if (ft && dest) c = std::format("vstore(r.vf[{0}], vsel(vload(r.vf[{0}]), vload(r.vf[{1}]), {2})); ", ft, fs, lane_mask(dest));
+            if (ft && dest) reads(fs, dest);
             break;
         case 0x31:
             if (ft) l.writes = static_cast<int>(ft);
+            if (ft && dest) reads(fs, 0xFu);
             if (ft && dest) {
                 // the lanes turned by one place: x gets y, y gets z, z gets w, w gets x
                 c = std::format("{{ const v4u m = vload(r.vf[{1}]); vstore(r.vf[{0}], vsel(vload(r.vf[{0}]), v4u{{m[1], m[2], m[3], m[0]}}, {2})); }} ", ft, fs, lane_mask(dest));
@@ -344,6 +372,7 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
             c += std::format("set_vi(r, {}, r.vi[{}] + 1u); }} ", is, is);
             break;
         case 0x35:
+            reads(fs, dest);
             c = std::format("{{ std::uint8_t *q = qword(mem, r.vi[{}]); ", it) + lanes_store(dest, "q", std::format("r.vf[{}]", fs)) +
                 std::format("set_vi(r, {}, r.vi[{}] + 1u); }} ", it, it);
             break;
@@ -354,6 +383,7 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
             c += "} ";
             break;
         case 0x37:
+            reads(fs, dest);
             c = std::format("{{ set_vi(r, {}, r.vi[{}] - 1u); std::uint8_t *q = qword(mem, r.vi[{}]); ", it, it, it) +
                 lanes_store(dest, "q", std::format("r.vf[{}]", fs)) + "} ";
             break;
@@ -361,7 +391,7 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
         case 0x39: c = std::format("{{ const std::uint32_t qb = fl.begin_q(r); vu::sqrt(r, r.vf[{}].w[{}]); fl.end_q(r, qb, 7u); }} ", ft, ftf); break;
         case 0x3A: c = std::format("{{ const std::uint32_t qb = fl.begin_q(r); vu::rsqrt(r, r.vf[{}].w[{}], r.vf[{}].w[{}]); fl.end_q(r, qb, 13u); }} ", fs, fsf, ft, ftf); break;
         case 0x3B: c = "fl.flush_q(r); "; break;
-        case 0x3C: c = std::format("set_vi(r, {}, r.vf[{}].w[{}]); ", it, fs, fsf); break;
+        case 0x3C: reads(fs, 8u >> fsf); c = std::format("set_vi(r, {}, r.vf[{}].w[{}]); ", it, fs, fsf); break;
         case 0x3D:
             if (ft) l.writes = static_cast<int>(ft);
             if (ft) {
@@ -391,8 +421,8 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
             if (ft) l.writes = static_cast<int>(ft);
             if (ft) for (int i = 0; i < 4; ++i) if (lane(dest, i)) c += std::format("r.vf[{}].w[{}] = (r.r & 0x7FFFFFu) | fp::kOne; ", ft, i);
             break;
-        case 0x42: c = std::format("r.r = r.vf[{}].w[{}] & 0x7FFFFFu; ", fs, fsf); break;
-        case 0x43: c = std::format("r.r = (r.r ^ r.vf[{}].w[{}]) & 0x7FFFFFu; ", fs, fsf); break;
+        case 0x42: reads(fs, 8u >> fsf); c = std::format("r.r = r.vf[{}].w[{}] & 0x7FFFFFu; ", fs, fsf); break;
+        case 0x43: reads(fs, 8u >> fsf); c = std::format("r.r = (r.r ^ r.vf[{}].w[{}]) & 0x7FFFFFu; ", fs, fsf); break;
         case 0x64:
             if (ft) l.writes = static_cast<int>(ft);
             if (ft) for (int i = 0; i < 4; ++i) if (lane(dest, i)) c += std::format("r.vf[{}].w[{}] = r.p; ", ft, i); break;
@@ -402,6 +432,7 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
         case 0x69: c = std::format("set_vi(r, {}, {}); ", it, unit0 ? "vu::itop(0)" : "vu::itop()"); break;
         case 0x6C: c = std::format("vu::kick(1, r.vi[{}]); ", is); break;
         case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x78: case 0x79: case 0x7A: case 0x7C: case 0x7D: case 0x7E:
+            reads(fs, 0xFu);
             c = std::format("efu(r, {}u, {}u, {}u); ", index, fs, fsf);
             break;
         case 0x7B: break;
@@ -420,6 +451,7 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
         c += "} ";
         break;
     case 0x01:
+        reads(fs, dest);
         c = std::format("{{ std::uint8_t *q = qword(mem, r.vi[{}] + {}u); ", it, static_cast<std::uint32_t>(imm11)) + lanes_store(dest, "q", std::format("r.vf[{}]", fs)) + "} ";
         break;
     case 0x04:
@@ -497,6 +529,9 @@ int vi_written(const std::string &code) {
     if (at == std::string::npos) return -1;
     return std::atoi(code.c_str() + at + 10);
 }
+
+// Tests only: the MAC flags of every flag site worked out at once, as before vurecomp 11 (the reference for FlagPipeV).
+bool g_eager_flags = false;
 
 std::string generate(const Program &p, std::string &name) {
     name.clear();
@@ -603,9 +638,181 @@ std::string generate(const Program &p, std::string &name) {
     std::set<int> shadowed;
     for (std::uint32_t pc : pcs)
         for (int reg : upper(word(p.code, pc + 4), true, p.unit == 0).shadow_reads) shadowed.insert(reg);
+    // The lazy clean-up of unit 1 (ps2/vu_ops.hpp, "done late"): an add, subtract or multiply leaves its result clamped but possibly
+    // with a denormal in it, in the register as in its shadow. `a_in`/`a_out` say for every instruction pair which lanes of which
+    // register hold such a result for certain (on every path); where a pair reads the bits of such a lane, and where the program
+    // leaves, a vflush comes first. Where two paths meet and only one of them has the lane in that state, that path flushes it on its
+    // way, unless nothing can read the lane before it is written again (`raw_live`): a register a loop computes anew every round is
+    // then flushed once, after the loop.
+    using Lanes = std::array<std::uint8_t, 33>;  // by register (1 to 31, 32 = ACC); bit 8 is x, bit 1 is w
+    struct Effect {
+        Lanes observed{}, kill{}, gen{};
+        bool stops = false;
+    };
+    // Setting the bit and putting it back are two writes of MXCSR per call, which cost far more than an instruction: the processor
+    // waits at each of them (measured on a Zen 3: a short program of 15 multiplies and adds took more than twice as long with them).
+    // So a program gets the late clean-up only where its arithmetic makes up for that: an estimate of the adds, subtracts and
+    // multiplies one call runs, each one in a loop counted as kLoopRounds. Every other program of unit 1 cleans each result at once,
+    // as before (the same code as without SSE4.1; both ways give the same bits, so the choice only changes the speed).
+    constexpr int kLoopRounds = 8, kDazWorth = 40;
+    int worth = 0;
+    if (p.unit != 0) {
+        for (std::uint32_t pc : pcs) {
+            const std::uint32_t hi = word(p.code, pc + 4);
+            const bool has_lower = !(hi & 0x80000000u);
+            if (has_lower && !lowers[pc].supported) continue;
+            if (!upper(hi, true, false).arith) continue;
+            // in a loop when the pair can reach itself again
+            std::set<std::uint32_t> seen;
+            std::vector<std::uint32_t> todo{pc};
+            bool loop = false;
+            while (!todo.empty() && !loop) {
+                const std::uint32_t q = todo.back();
+                todo.pop_back();
+                for (std::int64_t s : successors(q)) {
+                    if (s < 0 || !in.count(static_cast<std::uint32_t>(s))) continue;
+                    if (static_cast<std::uint32_t>(s) == pc) loop = true;
+                    else if (seen.insert(static_cast<std::uint32_t>(s)).second) todo.push_back(static_cast<std::uint32_t>(s));
+                }
+            }
+            worth += loop ? kLoopRounds : 1;
+        }
+    }
+    const bool lazy = p.unit != 0 && worth >= kDazWorth;
+    bool any_arith = false;
+    std::map<std::uint32_t, Effect> effect;
+    std::map<std::uint32_t, Lanes> a_in, a_out, raw_live;
+    if (lazy) {
+        for (std::uint32_t pc : pcs) {
+            const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
+            const Upper u = upper(hi, true, false);
+            const Lower &l = lowers[pc];
+            const bool has_lower = !(hi & 0x80000000u);
+            Effect e;
+            if (has_lower && !l.supported) {
+                // the pair is handed to the interpreter as it is: everything is read, nothing is done here
+                e.observed.fill(0xF);
+                e.stops = true;
+            } else {
+                any_arith = any_arith || u.arith;
+                for (const auto &[reg, lanes] : u.raw_reads) e.observed[reg] |= lanes;
+                if (has_lower)
+                    for (const auto &[reg, lanes] : l.raw_reads) e.observed[reg] |= lanes;
+                // the store of the lower instruction comes first in the generated code, the store of the upper one after it
+                if (has_lower && l.writes > 0) e.kill[l.writes] |= (lo >> 21) & 15u;
+                if (u.target > 0) {
+                    e.kill[u.target] |= u.mask;
+                    if (u.normalized) e.gen[u.target] |= u.mask;
+                }
+            }
+            effect[pc] = e;
+            raw_live[pc] = Lanes{};
+            a_in[pc] = Lanes{};
+            a_out[pc].fill(0xF);
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (auto it = pcs.rbegin(); it != pcs.rend(); ++it) {
+                const Effect &e = effect[*it];
+                Lanes out{};
+                for (std::int64_t s : successors(*it)) {
+                    if (s < 0 || !in.count(static_cast<std::uint32_t>(s))) out.fill(0xF);
+                    else
+                        for (int reg = 1; reg <= 32; ++reg) out[reg] |= raw_live[static_cast<std::uint32_t>(s)][reg];
+                }
+                Lanes v{};
+                for (int reg = 1; reg <= 32; ++reg) v[reg] = e.stops ? 0xF : static_cast<std::uint8_t>(e.observed[reg] | (out[reg] & ~e.kill[reg]));
+                if (v != raw_live[*it]) {
+                    raw_live[*it] = v;
+                    changed = true;
+                }
+            }
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (std::uint32_t pc : pcs) {
+                Lanes v{};
+                if (pc != (p.entry & kMask) && !preds[pc].empty()) {
+                    v.fill(0xF);
+                    for (std::uint32_t q : preds[pc])
+                        for (int reg = 1; reg <= 32; ++reg) v[reg] &= a_out[q][reg];
+                }
+                const Effect &e = effect[pc];
+                Lanes out{};
+                for (int reg = 1; reg <= 32; ++reg) out[reg] = static_cast<std::uint8_t>(((v[reg] & ~e.observed[reg]) & ~e.kill[reg]) | e.gen[reg]);
+                if (v != a_in[pc] || out != a_out[pc]) {
+                    a_in[pc] = v;
+                    a_out[pc] = out;
+                    changed = true;
+                }
+            }
+        }
+    }
+    // The last XGKICK of a run. A kick leaves the body with MXCSR put back (vkick) and sets the bit again afterwards, for the float
+    // arithmetic still to come. Where none can come any more (`daz_out`: no add, subtract, multiply or EFU call on any way from the
+    // pair to the end of the program; everything else does not care about the bit, see ps2/vu_ops.hpp), MXCSR simply stays as the
+    // caller has it (vkick_last) and the function around the body has nothing to put back: two writes of MXCSR less per call.
+    // Every result of the arithmetic before the kick is in the register file by then (each pair stores what it computes), so no
+    // float instruction of it can be left to run after the kick. The pair after one with the E bit ends the program when it can
+    // only be reached through that pair; a jump (JR, JALR) and a pair outside the program leave the body.
+    std::map<std::uint32_t, bool> daz_use, daz_in, daz_out;
+    const auto ends_after = [&](std::uint32_t pc) {
+        const std::uint32_t prev = (pc - 8u) & kMask;
+        return in.count(prev) && (word(p.code, prev + 4) & 0x40000000u) && pc != (p.entry & kMask) && preds[pc] == std::vector<std::uint32_t>{prev};
+    };
+    if (lazy) {
+        for (std::uint32_t pc : pcs) {
+            const std::uint32_t hi = word(p.code, pc + 4);
+            const bool has_lower = !(hi & 0x80000000u);
+            daz_use[pc] = upper(hi, true, false).arith || (has_lower && lowers[pc].code.find("efu(r, ") != std::string::npos);
+            daz_in[pc] = daz_out[pc] = false;
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (auto it = pcs.rbegin(); it != pcs.rend(); ++it) {
+                bool out = false;
+                if (!ends_after(*it))
+                    for (std::int64_t s : successors(*it)) out = out || (s >= 0 && in.count(static_cast<std::uint32_t>(s)) && daz_in[static_cast<std::uint32_t>(s)]);
+                const bool v = daz_use[*it] || out;
+                if (out != daz_out[*it] || v != daz_in[*it]) {
+                    daz_out[*it] = out;
+                    daz_in[*it] = v;
+                    changed = true;
+                }
+            }
+        }
+    }
+    // A flush at the start of pair `pc`, or right after it. Where `daz_in[pc]` holds, the "denormals are zero" bit is set there for
+    // certain: the bit is set when the body starts, and only a vkick_last clears it, at a pair q with !daz_in[q]; any pair reached
+    // after q (the program not having ended) is a successor of a successor ... of q, and daz_in[q] is true when it is true for any of
+    // them. The pair `pc` itself has no vkick_last then either. There the processor does the flush (vflushd, a multiply by one);
+    // elsewhere it is done with integer instructions.
+    const auto flush = [&](const Lanes &lanes, std::uint32_t pc) {
+        const bool daz = any_arith && daz_in.count(pc) && daz_in[pc];
+        std::string text;
+        for (int reg = 1; reg <= 32; ++reg)
+            if (lanes[reg]) text += std::format("{}({}, {}); ", daz ? "vflushd" : "vflush", raw(reg), lane_mask(lanes[reg]));
+        return text;
+    };
+    // What has to be flushed where a pair leaves for the interpreter or ends the program, and on the way from one pair to another.
+    const auto leave = [&](std::uint32_t pc) { return lazy ? flush(a_out[pc], pc) : std::string(); };
+    const auto meet = [&](std::uint32_t from, std::uint32_t to) {
+        if (!lazy || !in.count(to)) return std::string();
+        Lanes lanes{};
+        for (int reg = 1; reg <= 32; ++reg) lanes[reg] = static_cast<std::uint8_t>(a_out[from][reg] & ~a_in[to][reg] & raw_live[to][reg]);
+        return flush(lanes, from);
+    };
     name = std::format("vu{}_{:016X}", p.unit, p.key);
-    std::string o = std::format("void {}(Vu0Regs &r, std::uint8_t *mem) {{\n    FlagPipe fl;\n    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n",
-                                name);
+    // Unit 1: the program is a body that every float instruction lives in, and a small function around it that sets the "denormals
+    // are zero" bit of the processor for the body (when the program has float arithmetic at all) and does a hop to the interpreter
+    // after it.
+    const std::string head = !lazy ? std::format("void {}(Vu0Regs &r, std::uint8_t *mem) {{\n", name)
+                             : any_arith ? std::format("PS2_VU_BODY void {}_b(Vu0Regs &r, std::uint8_t *mem, VuDaz &daz, std::uint32_t &hop) {{\n    (void)daz;\n", name)
+                                         : std::format("static inline __attribute__((always_inline)) void {}_b(Vu0Regs &r, std::uint8_t *mem, std::uint32_t &hop) {{\n", name);
+    // The MAC flags worked out where they are read (vu-sticky): for VU1 programs that read the MAC flags but not the status. The
+    // flag sites stay the same (live_in above), so the reader, the next program and the interpreter see the same bits.
+    const bool late_flags = p.unit != 0 && any_flags && !any_status && !g_eager_flags;
+    std::string o = head + std::string(late_flags ? "    FlagPipeV fl;\n" : "    FlagPipe fl;\n") + std::string("    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n");
     if (p.unit == 0) o += "    std::uint32_t steps = 0;\n";
     if (!delay.empty()) o += "    std::uint16_t bk = 0, next_bk = 0;\n    unsigned bi = 0;\n    (void)bk;\n    (void)next_bk;\n    (void)bi;\n";
     // An instruction whose stall depends on the path that led to it reads the pipeline state index `st` the edges set.
@@ -621,15 +828,20 @@ std::string generate(const Program &p, std::string &name) {
         for (const auto &e : plan.edges)
             if (plan.tracked[e.from >> 3]) o += std::format("    static constexpr std::uint8_t ke_{:04X}_{:04X}[] = {{{}}};\n", e.from, e.to, list(e.next));
     }
-    for (int reg : shadowed) o += std::format("    v4u {} = vfix(vload({}));\n", shadow(reg), raw(reg));
+    for (int reg : shadowed) o += std::format("    v4u {} = vshadow({});\n", shadow(reg), raw(reg));
     o += std::format("    goto {};\n", label(p.entry & kMask));
     for (std::uint32_t pc : pcs) {
         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
         bool out_live = false;
         for (std::int64_t s : successors(pc)) out_live = out_live || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
-        const Upper u = upper(hi, any_status ? true : (any_flags && out_live), p.unit == 0);
+        const Upper u = upper(hi, any_status ? true : (any_flags && out_live), p.unit == 0, late_flags);
         const Lower &l = lowers[pc];
         std::string body;
+        if (lazy) {
+            Lanes lanes{};
+            for (int reg = 1; reg <= 32; ++reg) lanes[reg] = a_in[pc][reg] & effect[pc].observed[reg];
+            body += flush(lanes, pc);
+        }
         if (const auto kb = keep_bk.find(pc); kb != keep_bk.end()) body += std::format("next_bk = r.vi[{}]; ", kb->second);
         body += u.pre;
         std::string lcode = l.code;
@@ -641,7 +853,10 @@ std::string generate(const Program &p, std::string &name) {
         }
         if (hi & 0x80000000u) body += std::format("r.i = {}u; ", lo);
         else if (!l.supported) body += std::format("vu::interpret(1, {}u); return; ", pc);
-        else body += lcode;
+        else {
+            if (lazy && any_arith && !daz_in[pc]) replace_all(lcode, "vu::kick(1, ", "vkick_last(daz, 1, ");
+            body += lcode;
+        }
         if (keep_bk.count(pc)) body += "bk = next_bk; ";
         if (set_bi.count(pc)) body += std::format("bi = {}u; ", std::max(def[pc], 0));
         body += u.post;
@@ -662,9 +877,9 @@ std::string generate(const Program &p, std::string &name) {
         }
         o += body;
         const int lower_write = (hi & 0x80000000u) || !l.supported ? -1 : l.writes;
-        if (lower_write >= 0 && shadowed.count(lower_write)) o += std::format("{} = vfix(vload({})); ", shadow(lower_write), raw(lower_write));
+        if (lower_write >= 0 && shadowed.count(lower_write)) o += std::format("{} = vshadow({}); ", shadow(lower_write), raw(lower_write));
         if (u.target >= 0 && u.target != lower_write && shadowed.count(u.target)) {
-            if (!u.normalized) o += std::format("{} = vfix(vload({})); ", shadow(u.target), raw(u.target));
+            if (!u.normalized) o += std::format("{} = vshadow({}); ", shadow(u.target), raw(u.target));
             else if (u.mask == 0xF) o += std::format("{} = uv; ", shadow(u.target));
             else o += std::format("{0} = vsel({0}, uv, {1}); ", shadow(u.target), lane_mask(u.mask));
         }
@@ -683,16 +898,22 @@ std::string generate(const Program &p, std::string &name) {
             if (phi & 0x40000000u) {
                 const std::string after = std::format("{}u", (pc + 8u) & kMask);
                 const std::string tpc = pl.branch ? std::format("pend ? {}u : {}", pl.target & kMask, after) : pl.jump ? "pendj ? jpc : " + after : after;
-                o += std::format("    if (ending) {{ r.tpc = {}; return; }}\n", tpc);
+                o += std::format("    if (ending) {{ {}r.tpc = {}; return; }}\n", leave(pc), tpc);
             }
-            if (pl.branch) o += std::format("    if (pend) {{ pend = false; {}goto {}; }}\n", edge(pl.target & kMask), label(pl.target));
-            if (pl.jump) o += "    if (pendj) { pendj = false; goto dispatch; }\n";
+            if (pl.branch) o += std::format("    if (pend) {{ pend = false; {}{}goto {}; }}\n", meet(pc, pl.target & kMask), edge(pl.target & kMask), label(pl.target));
+            if (pl.jump) o += std::format("    if (pendj) {{ pendj = false; {}goto dispatch; }}\n", leave(pc));
         }
         const std::uint32_t next = (pc + 8u) & kMask;
-        if (!in.count(next)) o += std::format("    vu::interpret(1, {}u);\n    return;\n", next);
-        else if (const std::string e = edge(next); !e.empty()) o += "    " + e + "\n";
+        if (!in.count(next)) o += std::format("    {}vu::interpret(1, {}u);\n    return;\n", leave(pc), next);
+        else if (const std::string e = meet(pc, next) + edge(next); !e.empty()) o += "    " + e + "\n";
     }
     o += "dispatch:\n    vu::interpret(1, jpc);\n    return;\n}\n\n";
+    if (late_flags) {
+        // every way out: the end of the program, a hop to the interpreter (an unknown jump, an unsupported instruction, code
+        // outside the program) leaves the MAC and status in the registers
+        replace_all(o, "vu::interpret(", "fl.finish(r); vu::interpret(");
+        replace_all(o, "r.tpc = ", "fl.finish(r); r.tpc = ");
+    }
     if (any_q) {
         replace_all(o, "vu::interpret(", "fl.flush_q(r); vu::interpret(");
         replace_all(o, "r.tpc = ", "fl.flush_q(r); r.tpc = ");
@@ -703,7 +924,24 @@ std::string generate(const Program &p, std::string &name) {
         replace_all(o, "vu::interpret(1,", "vu::interpret(0,");
     }
     // Keep VI state in the register file for VU0 early-stop/budget exits.
-    return p.unit == 0 ? o : local_vi(o);
+    if (p.unit == 0) return o;
+    if (!lazy) {
+        // the clean-up at once (see `worth` above): every operand and every result goes through the whole vfix
+        for (const auto &[from, to] : std::initializer_list<std::pair<const char *, const char *>>{
+                 {"vaddd(", "vaddn("}, {"vsubd(", "vsubn("}, {"vmuld(", "vmuln("}, {"vmaddd(", "vmaddn("}, {"vmsubd(", "vmsubn("}, {"vshadow(", "vshadow_eager("}, {"vqd(", "vqd_eager("}})
+            replace_all(o, from, to);
+        return local_vi(o);
+    }
+    o = local_vi(o);
+    replace_all(o, "vu::interpret(1, ", "vhop(hop, ");
+    if (any_arith) {
+        replace_all(o, "vu::kick(1, ", "vkick(daz.csr, 1, ");
+        replace_all(o, "efu(r, ", "vefu(daz.csr, r, ");
+    }
+    o.erase(o.size() - 1);  // one empty line after the two functions, not between them
+    o += std::format("void {0}(Vu0Regs &r, std::uint8_t *mem) {{\n    std::uint32_t hop = kNoHop;\n    {1}\n    if (hop != kNoHop) vu::interpret(1, hop);\n}}\n\n", name,
+                     any_arith ? std::format("{{ VuDaz daz; {}_b(r, mem, daz, hop); }}", name) : std::format("{}_b(r, mem, hop);", name));
+    return o;
 }
 
 }
@@ -712,7 +950,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp).
-const char *const kGeneratorVersion = "vurecomp 6";
+const char *const kGeneratorVersion = "vurecomp 11";
 
 Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
     std::vector<Program> programs;

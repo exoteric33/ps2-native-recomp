@@ -83,4 +83,32 @@ Flow flow(Op op);
 bool has_delay_slot(Op op);
 std::string disassemble(const Insn &insn);
 
+// What an instruction does to the flags of the first vector unit that its macro instructions set (the MAC register
+// and the low four bits of the status register; the sticky status bits are not part of this, they are always kept):
+//   Sets   it writes all of them, whatever they were (the arithmetic of COP2, with any destination mask);
+//   Keeps  it cannot read them, cannot leave the straight line and cannot let anything else look at the machine: work
+//          on registers only (the vector unit's other instructions, plain integer and float arithmetic);
+//   Reads  everything else. Not only CFC2, CTC2 and VCALLMS: also every load and store (a hardware register can start
+//          anything), every syscall, trap and branch, and whatever this list does not know.
+enum class Vu0Flags { Sets, Keeps, Reads };
+Vu0Flags vu0_flag_effect(const Insn &insn);
+
+// True when the flags that the instruction at `pc` sets cannot be seen by anything: on the straight line after it
+// another instruction sets them again, with nothing but Keeps instructions in between. `next(pc, insn)` fills in the
+// instruction at an address and answers false where the straight line ends (a label, a branch, the end of the code).
+template <typename Next>
+bool vu0_flags_dead(std::uint32_t pc, Next &&next) {
+    for (int k = 0; k < 64; ++k) {
+        pc += 4u;
+        Insn insn;
+        if (!next(pc, insn)) return false;
+        switch (vu0_flag_effect(insn)) {
+        case Vu0Flags::Sets: return true;
+        case Vu0Flags::Keeps: break;
+        case Vu0Flags::Reads: return false;
+        }
+    }
+    return false;
+}
+
 }

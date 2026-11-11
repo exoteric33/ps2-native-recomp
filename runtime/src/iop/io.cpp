@@ -6,6 +6,7 @@
 #include "ps2/state.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <map>
 
@@ -49,6 +50,32 @@ std::string device_of(const std::string &path) {
     return lower_device(colon == std::string::npos ? "" : path.substr(0, colon));
 }
 
+// The region letter of rom0:ROMVER ("0220EC20060210": version 2.20, region E, retail, built 2006-02-10) follows the disc: the game
+// ID in front of the boot file in SYSTEM.CNF's BOOT2 line says where a disc was sold (SCUS, SLUS, PBPX: America; SLES, SCES, PCPX:
+// Europe; SLPS, SCPS, SLPM, PAPX: Japan; SLKA, SCKA: Korea (K); SLAJ, SCAJ: Asia (H)). A game reads it to pick its language or video mode.
+// Without a disc or a name this tells nothing and the European one stays, as before.
+char disc_region() {
+    const auto cnf = disc::find("SYSTEM.CNF");
+    if (!cnf || cnf->directory || cnf->size == 0 || cnf->size > 65536) return 'E';
+    std::vector<std::uint8_t> bytes((cnf->size + disc::kSector - 1) / disc::kSector * disc::kSector);
+    if (!disc::read(cnf->sector, static_cast<std::uint32_t>(bytes.size() / disc::kSector), bytes.data())) return 'E';
+    std::string text(bytes.begin(), bytes.begin() + cnf->size);
+    for (char &ch : text) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    const auto boot = text.find("BOOT2");
+    const auto colon = boot == std::string::npos ? boot : text.find(':', boot);
+    if (colon == std::string::npos) return 'E';
+    auto at = colon + 1;
+    while (at < text.size() && (text[at] == '\\' || text[at] == '/' || text[at] == ' ')) ++at;
+    const std::string id = text.substr(at, 4);
+    static const struct { const char *prefix; char region; } kRegions[] = {
+        {"SCUS", 'A'}, {"SLUS", 'A'}, {"PBPX", 'A'}, {"SLES", 'E'}, {"SCES", 'E'}, {"SLED", 'E'}, {"SCED", 'E'}, {"PCPX", 'E'},
+        {"SLPS", 'J'}, {"SCPS", 'J'}, {"SLPM", 'J'}, {"SCPM", 'J'}, {"PAPX", 'J'}, {"SLKA", 'K'}, {"SCKA", 'K'}, {"SLAJ", 'H'}, {"SCAJ", 'H'},
+    };
+    for (const auto &r : kRegions)
+        if (id == r.prefix) return r.region;
+    return 'E';
+}
+
 int allocate() {
     for (int fd = 3; fd < 64; ++fd)
         if (!g_files.count(fd)) return fd;
@@ -68,7 +95,8 @@ int open(const std::string &path, std::uint32_t flags) {
     } else if (device == "rom") {
         std::string name = path.substr(path.find(':') + 1);
         if (name == "ROMVER") {
-            const std::string text = "0220EC20060210\n";
+            std::string text = "0220EC20060210\n";
+            text[4] = disc_region();
             f.memory.assign(text.begin(), text.end());
         } else if (name == "OSDSYS" || name.rfind("rom0:", 0) == 0) {
             return kNoEntry;

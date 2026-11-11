@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -1153,6 +1154,41 @@ bool fileio_async(std::uint32_t method, std::uint32_t args, std::uint32_t, std::
     }
 }
 
+// The FILEIO calls come in two packet layouts. The old one is what ps2sdk's EE library sends (fileio.c, AFL-2.0: struct _fio_open_arg
+// is the mode at +0 and the name at +4, _fio_close_arg the fd, _fio_read_arg and _fio_write_arg the fd, the address and the size, _fio_lseek_arg
+// the fd, the offset and the whence, _fio_getstat_arg the address of the result at +0 and the name at +4; the answer is the call's own
+// reply). The newer one, which the runtime has used since it saw FILEIO 2.05, has a header of three words in front: fd, address, size at
+// +12, +16, +20, the open's mode at +12 and name at +20, the stat's result address at +12 and name at +16; it answers into the buffer
+// the EE gave with call 255 and announces it with command 0x80000011. A game library can speak the old layout to a FILEIO 2.05
+// (Quake III Revolution: "rom0:ROMVER" with "VER" read as the mode), so every packet is told apart by what it holds.
+// A device name: letters or digits, at least two, then ':' (rom0:, cdrom0:, mc0:, host:).
+bool ee_device_path(std::uint32_t at) {
+    std::size_t length = 0;
+    for (; length < 16; ++length) {
+        const unsigned char ch = g_ram[(at + length) & (kRamSize - 1)];
+        if (ch == ':') return length >= 2;
+        if (!std::isalnum(ch)) return false;
+    }
+    return false;
+}
+
+// Open and stat carry a name: the old layout has a device name at +4 and no device name where the newer one keeps its name. The calls with
+// only numbers (close, read, write, lseek) are old when the packet is too short for the newer layout (or, for write, no longer than the
+// old one's 28 bytes), the word at +0 can be a descriptor (the newer layout has the buffer's address there) and it is not that buffer.
+bool fileio_old_layout(std::uint32_t method, std::uint32_t args, std::uint32_t size) {
+    const std::uint32_t first = ee_read<std::uint32_t>(args);
+    const bool descriptor = first < 256 && !(g_fileio_result && first == g_fileio_result);
+    switch (method) {
+    case 0: return ee_device_path(args + 4) && !ee_device_path(args + 20);
+    case 12: return ee_device_path(args + 4) && !ee_device_path(args + 16);
+    case 1: return descriptor && size < 16;
+    case 2:
+    case 4: return descriptor && size < 24;
+    case 3: return descriptor && size <= 28;
+    default: return false;
+    }
+}
+
 void install_servers() {
     register_hle_server(0x80000006u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
         if (method == 0x00) {
@@ -1244,7 +1280,11 @@ void install_servers() {
         return true;
     });
     register_hle_server(0x80000001u, [](std::uint32_t method, std::uint32_t args, std::uint32_t size, std::uint32_t ret, std::uint32_t ret_size) {
-        if (g_fileio_async) return fileio_async(method, args, size, ret, ret_size);
+        if (g_fileio_async) {
+            if (!fileio_old_layout(method, args, size)) return fileio_async(method, args, size, ret, ret_size);
+            static bool told = false;
+            if (!told) { told = true; std::fprintf(stderr, "[fileio] a call in the old packet layout under the asynchronous protocol: answered the old way\n"); }
+        }
         const auto word = [args](int i) { return ee_read<std::uint32_t>(args + 4u * static_cast<std::uint32_t>(i)); };
         const auto text = [args](int i) { return ee_text(args + 4u * static_cast<std::uint32_t>(i)); };
         std::int32_t result = 0;

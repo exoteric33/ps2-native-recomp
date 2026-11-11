@@ -304,6 +304,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2disclayerstest PRIVATE synchronization)
     endif()
+    # the EE's FILEIO calls in the old and the newer packet layout, rom0:ROMVER (issue 78, no game needed): ninja ps2fileiolayoutstest
+    add_executable(ps2fileiolayoutstest EXCLUDE_FROM_ALL tests/fileio_layouts.cpp)
+    target_include_directories(ps2fileiolayoutstest PRIVATE runtime/src)
+    target_link_libraries(ps2fileiolayoutstest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2fileiolayoutstest PRIVATE synchronization)
+    endif()
     # ioman AddDrv and DelDrv call the driver's init and deinit and keep a table of its devices (no game needed): ninja ps2iomandrvtest
     add_executable(ps2iomandrvtest EXCLUDE_FROM_ALL tests/ioman_drivers.cpp)
     target_include_directories(ps2iomandrvtest PRIVATE runtime/src)

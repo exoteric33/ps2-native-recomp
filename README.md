@@ -1,7 +1,7 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 52 games work as far as they
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 53 games work as far as they
 have been tested, 34 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
@@ -146,6 +146,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Tony Hawk's Pro Skater 3 (USA) | plays well: all levels played at full speed (60 fps) with a game controller; no problems found ([#92](https://github.com/exoteric33/ps2-native-recomp/issues/92)) | m3tabolic |
 | Peter Jackson's King Kong (USA) | plays well: all levels and the dinosaur fights, about three hours, mostly at 60 fps with a game controller; the opening boat scene runs slow with stretched sound, and small horizontal lines show up ([#93](https://github.com/exoteric33/ps2-native-recomp/issues/93)) | m3tabolic |
 | No One Lives Forever (USA) | plays well, not played through yet: to scene 7 at 60 fps with occasional dips, with a game controller; no problems found ([#94](https://github.com/exoteric33/ps2-native-recomp/issues/94)) | m3tabolic |
+| Champions of Norrath (USA) | runs, not played through yet: into the game and playing; heavy slowdown in places with many torches and fire effects ([#57](https://github.com/exoteric33/ps2-native-recomp/issues/57)) | davidsdullea |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

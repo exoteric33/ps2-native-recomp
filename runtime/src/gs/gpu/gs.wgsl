@@ -340,6 +340,11 @@ fn copy_read(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pixel = i / n;
     let x = (prm(3u) + pixel % w) & 0x7FFu;
     let y = (prm(4u) + pixel / w) & 0x7FFu;
+    // TRXREG allows up to 4095 x 4095 pixels, more than the copy area of `scratch` holds: such a copy keeps what fits (an explicit
+    // bound, so the draw program needs no run-time checks from wgpu, gpu.cpp PS2_GPU_TRUSTED)
+    if (i >= arrayLength(&scratch)) {
+        return;
+    }
     scratch[i] = read_sample(prm(2u), prm(0u), prm(1u), x, y, i % n);
 }
 
@@ -364,7 +369,11 @@ fn copy_write(@builtin(global_invocation_id) gid: vec3<u32>) {
     if ((dir & 2u) != 0u) {
         sy = h - 1u - y;
     }
-    write_sample(prm(2u), prm(0u), prm(1u), (prm(3u) + x) & 0x7FFu, (prm(4u) + y) & 0x7FFu, k, scratch[(sy * w + sx) * n + k]);
+    let src_at = (sy * w + sx) * n + k;
+    if (src_at >= arrayLength(&scratch)) {
+        return;
+    }
+    write_sample(prm(2u), prm(0u), prm(1u), (prm(3u) + x) & 0x7FFu, (prm(4u) + y) & 0x7FFu, k, scratch[src_at]);
 }
 
 @compute @workgroup_size(256)
@@ -440,7 +449,11 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
             c = o | 0xFF000000u;
         }
     }
-    scratch[prm(8u) + gid.y * w + gid.x] = c;
+    // DISPLAY allows pictures up to 2048 x 2048, more than a field's area of `scratch` holds: never write past its end
+    let at = prm(8u) + gid.y * w + gid.x;
+    if (at < arrayLength(&scratch)) {
+        scratch[at] = c;
+    }
 }
 
 struct Setup {
@@ -660,7 +673,9 @@ fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
 
 fn fetch_at(s: Setup, x: u32, y: u32, k: u32) -> u32 {
     if (s.dec != 0xFFFFFFFFu) {
-        return decoded[s.dec + (y << s.tw) + x];
+        // plan_decodes (gpu.cpp) gives a decoded texture only to a setup whose clamp or repeat region lies inside it, so x and y stay inside the
+        // texture; the bound keeps the index inside the buffer in any case (in place of wgpu's run-time check, PS2_GPU_TRUSTED)
+        return decoded[min(s.dec + (y << s.tw) + x, arrayLength(&decoded) - 1u)];
     }
     return convert(s, load_texel(addr(s.tf, x, y), k));
 }

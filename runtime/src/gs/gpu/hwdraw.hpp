@@ -104,7 +104,10 @@ void pal_state(const std::uint32_t *words, std::size_t count);  // a saved state
 bool live_pending();                           // card work waits for the next submit
 bool live_before(std::uint32_t command);       // card work waits that goes before compute command `command`
 void live_prepare();                           // submit: the data of the card's work goes to the card
-void live_encode(WGPUCommandEncoder enc, std::uint32_t upto);  // submit: encode the card's work that goes before compute command `upto`
+// submit: encode the card's work that goes before compute command `upto`. `pass` is the caller's open compute pass (or null): the card's own compute work (loads,
+// write-backs) goes into it instead of a pass of its own. Returns the compute pass that is open afterwards (the same, another one, or null after a render pass);
+// the caller goes on with it or begins a new one.
+WGPUComputePassEncoder live_encode(WGPUCommandEncoder enc, std::uint32_t upto, WGPUComputePassEncoder pass);
 void live_submitted();                         // submit: the work is handed over
 void live_stats();
 

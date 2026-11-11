@@ -114,6 +114,8 @@ struct State {
     std::atomic<std::uint64_t> submits{0}, done{0};  // queue submits, and how many of them the card has finished (an OnSubmittedWorkDone callback per submit)
     std::uint64_t upload_bytes = 0;                  // bytes the card path wrote with wgpuQueueWriteBuffer (vertices, setups, parameters) since the last line
     std::uint64_t max_inflight = 0;                  // the most submits waiting for the card at the end of any submit since the last line
+    std::uint64_t sub_passes = 0, max_passes = 0;    // the card path's render and compute passes in this submit, and the most in any one submit since the last line
+    std::uint64_t sub_upload = 0, max_upload = 0;    // the same for the bytes uploaded
     std::unordered_map<const void *, std::uint64_t> size;  // bytes of every live texture and buffer made through the wrappers
 } S;
 
@@ -179,11 +181,11 @@ inline WGPUCommandEncoder new_encoder(WGPUDevice d, const WGPUCommandEncoderDesc
     return wgpuDeviceCreateCommandEncoder(d, ed);
 }
 inline WGPURenderPassEncoder begin_render(WGPUCommandEncoder e, const WGPURenderPassDescriptor *rd) {
-    if (g_memlog) note(S.rp, nullptr, 0);
+    if (g_memlog) note(S.rp, nullptr, 0), ++S.sub_passes;
     return wgpuCommandEncoderBeginRenderPass(e, rd);
 }
 inline WGPUComputePassEncoder begin_compute(WGPUCommandEncoder e, const WGPUComputePassDescriptor *cd) {
-    if (g_memlog) note(S.cp, nullptr, 0);
+    if (g_memlog) note(S.cp, nullptr, 0), ++S.sub_passes;
     return wgpuCommandEncoderBeginComputePass(e, cd);
 }
 
@@ -268,6 +270,11 @@ struct Pre {
 bool g_enabled = false, g_capturing = false;
 bool g_pal_refine = true;  // PS2_GPU_HW_PAL=0: no palette record, no refined looks
 bool g_dual = false;  // the device has dual-source blending: shapes with a stored-alpha rule draw once (fs_dual), else the alpha channel gets a draw of its own
+// Dual-source blending is used when the device has it (PS2_GPU_HW_DUAL=0: the fallback). On an Intel laptop (Vulkan, Windows) it is not repeatable: a draw call
+// with dual-source blending whose shapes overlap gave pixels one step apart from run to run with identical input (a God of War II arena scene: one or two words of
+// the 4 MB, about one run in two); with the fallback, or with one draw call per shape, every run gave the same memory. It stays on because the fallback costs
+// the window thread about 9 ms a frame in a God of War ship fight on that laptop (31 against 22 ms); scripts/hwjudge.py turns it off, so its memory judges repeat.
+bool want_dual(WGPUDevice device) { return os::env("PS2_GPU_HW_DUAL") != "0" && wgpuDeviceHasFeature(device, WGPUFeatureName_DualSourceBlending); }
 bool g_cache = false;  // PS2_GPU_HW_CACHE=1: decoded textures stay between replays while the memory they came from holds the same bytes
 std::vector<hwcache::Request> g_dec_req;  // per entry of the plan's params that is a decode: what to ask the cache
 bool g_direct = false;  // PS2_GPU_HW_DIRECT=1: the fragment shader reads the textures from graphics memory, no decode step
@@ -2574,7 +2581,7 @@ void run(Context &ctx, std::vector<Sub> &subs, unsigned reps, void (*wait)(), vo
         std::fprintf(stderr, "[hw] no drawing in that frame\n");
         return;
     }
-    g_dual = os::env("PS2_GPU_HW_DUAL") != "0" && wgpuDeviceHasFeature(ctx.device, WGPUFeatureName_DualSourceBlending);  // PS2_GPU_HW_DUAL=0: the fallback (a draw of its own for the alpha channel)
+    g_dual = want_dual(ctx.device);  // PS2_GPU_HW_DUAL=0: the fallback (a draw of its own for the alpha channel)
     g_direct = os::env("PS2_GPU_HW_DIRECT") == "1";
     g_probe = static_cast<unsigned>(std::atoi(os::env("PS2_GPU_HW_PROBE").c_str()));
     if (const std::string r = os::env("PS2_GPU_HW_ROUND"); !r.empty()) g_round = static_cast<float>(std::atof(r.c_str()));
@@ -2883,6 +2890,7 @@ std::uint32_t add_p(std::initializer_list<std::uint32_t> values) {
     return static_cast<std::uint32_t>(LV.params.size() - 1);
 }
 
+std::uint64_t g_before_draw[10] = {};  // PS2_GPU_HW_LOG=1: the op before each draw (kinds 0-5; 6-9: a draw, same/other picture, same/later point)
 LOp &push_op(LOp::Kind kind, Gen *g) {
     LV.ops.emplace_back();
     LOp &o = LV.ops.back();
@@ -3840,6 +3848,91 @@ void pal_state(const std::uint32_t *words, std::size_t count) {
 bool live_pending() { return live::LV.on && live::LV.cursor < live::LV.ops.size(); }
 bool live_before(std::uint32_t command) { return live::LV.cursor < live::LV.ops.size() && live::LV.ops[live::LV.cursor].after <= command; }
 
+// ---------------------------------------------------------------- uploads through a ring of persistent staging buffers
+// A busy fight sends 3 to 19 MB of vertices, setups and parameters to the card every frame. wgpuQueueWriteBuffer makes a new staging allocation for every
+// such write and frees it once the card is done with it; on a Windows laptop with Intel graphics (Vulkan) the God of War II hall then stopped after 13 to 28 s
+// with "Not enough memory left". So the frame's data goes through a few staging buffers that live for the whole run: the processor writes into one the card has
+// finished with (it is mapped), it is unmapped, copied into the vertex, setup and parameter buffers at the start of the submit's card work (live_encode), and
+// asked to be mapped again right after the submit (live_submitted). A buffer is only made anew when a frame needs more than it holds (then twice as much).
+// PS2_GPU_HW_STAGE=0 goes back to one queue write per kind.
+namespace live {
+
+struct Stage {
+    WGPUBuffer buf = nullptr;
+    std::uint64_t cap = 0;
+    bool mapped = false;  // set by the map callback: the card is done with it and the processor may write it
+    bool lost = false;    // the map failed (the device is gone): never wait for it again
+};
+constexpr int kStages = 4;  // the card works up to three submits behind the processor
+Stage g_stage[kStages];
+int g_stage_next = 0, g_stage_now = -1;      // the stage to use next; the stage of this submit (copied in live_encode, mapped again in live_submitted)
+std::uint64_t g_stage_v = 0, g_stage_s = 0, g_stage_p = 0, g_stage_soff = 0, g_stage_poff = 0;
+bool g_stage_copy = false;                   // the copies of this submit are still to be recorded
+const bool g_staging = os::env("PS2_GPU_HW_STAGE") != "0";
+
+std::uint64_t stage_bytes() {
+    std::uint64_t n = 0;
+    for (const Stage &s : g_stage) n += s.buf ? s.cap : 0;
+    return n;
+}
+
+void stage_map(Stage &s) {
+    WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+    cb.mode = WGPUCallbackMode_AllowProcessEvents;
+    cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *u1, void *) {
+        Stage *st = static_cast<Stage *>(u1);
+        st->mapped = status == WGPUMapAsyncStatus_Success;
+        st->lost = !st->mapped;
+    };
+    cb.userdata1 = &s;
+    wgpuBufferMapAsync(s.buf, WGPUMapMode_Write, 0, s.cap, cb);
+}
+
+}  // namespace live
+
+// Writes the frame's vertices, setups and parameters into a staging buffer; false when the old queue writes have to do it.
+bool stage_write(std::uint64_t vb, std::uint64_t sb, std::uint64_t pb) {
+    using namespace live;
+    g_stage_copy = false;
+    g_stage_now = -1;
+    if (!g_staging || (!vb && !sb && !pb)) return !g_staging ? false : true;
+    Context &c = *g_gpu.ctx;
+    const auto up = [](std::uint64_t n) { return (n + 255) & ~std::uint64_t(255); };
+    const std::uint64_t soff = up(vb), poff = soff + up(sb), need = poff + up(pb);
+    const int i = g_stage_next;
+    Stage &s = g_stage[i];
+    if (s.buf && s.cap >= need) {
+        while (!s.mapped && !s.lost) wgpuDevicePoll(c.device, true, nullptr);  // the card is still reading it (three submits ago)
+        if (s.lost) return false;
+    } else {
+        if (s.buf) {
+            while (!s.mapped && !s.lost) wgpuDevicePoll(c.device, true, nullptr);  // a callback must not outlive the buffer it names
+            memlog::del_buffer(s.buf);
+        }
+        WGPUBufferDescriptor d = WGPU_BUFFER_DESCRIPTOR_INIT;
+        d.size = std::max<std::uint64_t>(std::max<std::uint64_t>(s.cap * 2, 1u << 20), need);
+        d.usage = static_cast<WGPUBufferUsage>(WGPUBufferUsage_MapWrite | WGPUBufferUsage_CopySrc);
+        d.mappedAtCreation = true;
+        s.buf = memlog::new_buffer(c.device, &d);
+        s.cap = d.size;
+        s.mapped = s.buf != nullptr;
+        s.lost = !s.mapped;
+        if (s.lost) return false;
+    }
+    auto *p = static_cast<std::uint8_t *>(wgpuBufferGetMappedRange(s.buf, 0, need));
+    if (!p) return false;
+    if (vb) std::memcpy(p, LV.vertices.data(), vb);
+    if (sb) std::memcpy(p + soff, LV.setups.data(), sb);
+    if (pb) std::memcpy(p + poff, LV.params.data(), pb);
+    wgpuBufferUnmap(s.buf);
+    s.mapped = false;
+    g_stage_next = (i + 1) % kStages;
+    g_stage_now = i;
+    g_stage_v = vb, g_stage_s = sb, g_stage_p = pb, g_stage_soff = soff, g_stage_poff = poff;
+    g_stage_copy = true;
+    return true;
+}
+
 void live_prepare() {
     using namespace live;
     Tm tm(5);
@@ -3872,10 +3965,24 @@ void live_prepare() {
         LV.group = memlog::new_group(c.device, &d);
         ++LV.render_gen;
     }
-    if (!LV.vertices.empty()) wgpuQueueWriteBuffer(c.queue, LV.vbuf, 0, LV.vertices.data(), LV.vertices.size() * sizeof(Vtx));
-    if (!LV.setups.empty()) wgpuQueueWriteBuffer(c.queue, LV.sbuf, 0, LV.setups.data(), LV.setups.size() * 4);
-    if (!LV.params.empty()) wgpuQueueWriteBuffer(c.queue, LV.pbuf, 0, LV.params.data(), LV.params.size() * 256);
-    if (g_memlog) memlog::S.upload_bytes += LV.vertices.size() * sizeof(Vtx) + LV.setups.size() * 4 + LV.params.size() * 256;
+    const std::uint64_t vb = LV.vertices.size() * sizeof(Vtx), sb = LV.setups.size() * 4, pb = LV.params.size() * 256;
+    if (!os::env("PS2_GPU_HW_WATCH").empty()) {  // the test aid of watch_word: a hash of the bytes this submit sends, to compare runs
+        const auto hash = [](const void *data, std::uint64_t n) {
+            std::uint64_t h = 1469598103934665603ull;
+            const auto *b = static_cast<const std::uint8_t *>(data);
+            for (std::uint64_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+            return h;
+        };
+        std::fprintf(stderr, "[hw-watch] data serial %llu v %llu %016llx s %llu %016llx p %llu %016llx\n", static_cast<unsigned long long>(LV.serial), static_cast<unsigned long long>(vb),
+                     static_cast<unsigned long long>(hash(LV.vertices.data(), vb)), static_cast<unsigned long long>(sb), static_cast<unsigned long long>(hash(LV.setups.data(), sb)),
+                     static_cast<unsigned long long>(pb), static_cast<unsigned long long>(hash(LV.params.data(), pb)));
+    }
+    if (g_memlog) memlog::S.upload_bytes += vb + sb + pb, memlog::S.sub_upload += vb + sb + pb;
+    if (!stage_write(vb, sb, pb)) {  // the old way (PS2_GPU_HW_STAGE=0, or a staging buffer could not be had): one queue write per kind
+        if (vb) wgpuQueueWriteBuffer(c.queue, LV.vbuf, 0, LV.vertices.data(), vb);
+        if (sb) wgpuQueueWriteBuffer(c.queue, LV.sbuf, 0, LV.setups.data(), sb);
+        if (pb) wgpuQueueWriteBuffer(c.queue, LV.pbuf, 0, LV.params.data(), pb);
+    }
 }
 
 namespace live {
@@ -3909,11 +4016,16 @@ std::vector<WGPUBuffer> g_temp_buffers;
 
 }  // namespace live
 
-void live_encode(WGPUCommandEncoder enc, std::uint32_t upto) {
+// Every pass costs the window thread time in wgpu and in the driver (a new command buffer and its barriers), whatever is in it. PS2_GPU_HW_SHARE=1 lets the
+// card's loads and write-backs (compute work) share the caller's compute pass with the painter's commands around them, so only a render pass ends it.
+// Off by default: on an Intel laptop it saved no measurable time.
+const bool g_share_pass = os::env("PS2_GPU_HW_SHARE") == "1";
+
+WGPUComputePassEncoder live_encode(WGPUCommandEncoder enc, std::uint32_t upto, WGPUComputePassEncoder pass) {
     using namespace live;
     Tm tm(6);
     Context &c = *g_gpu.ctx;
-    WGPUComputePassEncoder cp = nullptr;
+    WGPUComputePassEncoder cp = pass;
     const auto open = [&] {
         if (!cp) cp = memlog::begin_compute(enc, nullptr);
     };
@@ -3924,6 +4036,15 @@ void live_encode(WGPUCommandEncoder enc, std::uint32_t upto) {
             cp = nullptr;
         }
     };
+    if (!g_share_pass) close();
+    if (g_stage_copy) {  // the frame's data from the staging buffer, before the first of the card's passes that reads it (a copy cannot be inside a pass)
+        close();
+        WGPUBuffer from = g_stage[g_stage_now].buf;
+        if (g_stage_v) wgpuCommandEncoderCopyBufferToBuffer(enc, from, 0, LV.vbuf, 0, g_stage_v);
+        if (g_stage_s) wgpuCommandEncoderCopyBufferToBuffer(enc, from, g_stage_soff, LV.sbuf, 0, g_stage_s);
+        if (g_stage_p) wgpuCommandEncoderCopyBufferToBuffer(enc, from, g_stage_poff, LV.pbuf, 0, g_stage_p);
+        g_stage_copy = false;
+    }
     while (LV.cursor < LV.ops.size() && LV.ops[LV.cursor].after <= upto) {
         const LOp &op = LV.ops[LV.cursor++];
         switch (op.kind) {
@@ -4008,7 +4129,11 @@ void live_encode(WGPUCommandEncoder enc, std::uint32_t upto) {
                     draw(false, false, first, vertices);
                     if (r.look.two_pass) draw(true, false, first, vertices);
                 };
-                if (r.cuts.empty()) {
+                static const bool one_by_one = os::env("PS2_GPU_HW_ONE_DRAW") == "1";  // a test aid: one draw call per shape
+                if (one_by_one) {
+                    std::uint32_t at = r.first_vertex;
+                    for (std::uint32_t sh = 0; sh < r.shapes; ++sh) piece(at, r.counts[sh]), at += r.counts[sh];
+                } else if (r.cuts.empty()) {
                     piece(r.first_vertex, r.vertices);
                 } else {  // the independent segments one after the other: a cut shape starts the next one
                     std::uint32_t at = r.first_vertex, first = at, ci = 0;
@@ -4035,13 +4160,75 @@ void live_encode(WGPUCommandEncoder enc, std::uint32_t upto) {
         }
         }
     }
-    close();
+    if (!g_share_pass) close();
+    return cp;
+}
+
+// PS2_GPU_HW_WATCH=<word>: a test aid. After every submit, wait for the card and read that 32-bit word of graphics memory back; print it with the submit's
+// card ops (L load, S store, Z depth store, l depth load, D draw, P display; the number is the painter commands before it) whenever it changed.
+void watch_word() {
+    static const long long word = os::env("PS2_GPU_HW_WATCH").empty() ? -1 : std::strtoll(os::env("PS2_GPU_HW_WATCH").c_str(), nullptr, 10);
+    static std::uint32_t last = 0;
+    static std::uint64_t submits = 0;
+    if (word < 0) return;
+    ++submits;
+    Context &c = *g_gpu.ctx;
+    const std::uint64_t off = static_cast<std::uint64_t>(word) * 4 & ~std::uint64_t(255);
+    WGPUBufferDescriptor d = WGPU_BUFFER_DESCRIPTOR_INIT;
+    d.size = 256;
+    d.usage = static_cast<WGPUBufferUsage>(WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+    WGPUBuffer rb = wgpuDeviceCreateBuffer(c.device, &d);
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(c.device, nullptr);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, c.vram, off, rb, 0, 256);
+    WGPUCommandBuffer cb = wgpuCommandEncoderFinish(enc, nullptr);
+    wgpuQueueSubmit(c.queue, 1, &cb);
+    wgpuCommandBufferRelease(cb);
+    wgpuCommandEncoderRelease(enc);
+    bool done = false;
+    WGPUBufferMapCallbackInfo mi = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+    mi.mode = WGPUCallbackMode_AllowProcessEvents;
+    mi.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
+    mi.userdata1 = &done;
+    wgpuBufferMapAsync(rb, WGPUMapMode_Read, 0, 256, mi);
+    while (!done) wgpuDevicePoll(c.device, true, nullptr);
+    std::uint32_t v = 0;
+    if (const void *p = wgpuBufferGetConstMappedRange(rb, 0, 256)) std::memcpy(&v, static_cast<const std::uint8_t *>(p) + (word * 4 - off), 4);
+    wgpuBufferUnmap(rb);
+    wgpuBufferRelease(rb);
+    if (v == last) return;
+    last = v;
+    std::string ops;
+    for (const live::LOp &o : live::LV.ops) {
+        static const char kinds[] = "LSZlDP";
+        char b[32];
+        std::snprintf(b, sizeof b, " %c%u%s", kinds[o.kind], o.after, o.g ? "" : "?");
+        ops += b;
+        if (ops.size() > 400) {
+            ops += " ...";
+            break;
+        }
+    }
+    std::fprintf(stderr, "[hw-watch] submit %llu serial %llu word %08x ops%s\n", static_cast<unsigned long long>(submits), static_cast<unsigned long long>(live::LV.serial), v, ops.c_str());
 }
 
 void live_submitted() {
     using namespace live;
     if (!LV.on) return;
     Tm tm(7);
+    watch_word();
+    if (g_log) {  // what comes before each draw (PS2_GPU_HW_LOG=1): the previous op's kind, and for a draw whether it is on the same picture and at the same point
+        for (std::size_t i = 1; i < LV.ops.size(); ++i) {
+            const LOp &a = LV.ops[i - 1], &b = LV.ops[i];
+            if (b.kind != LOp::Draw) continue;
+            const int k = a.kind != LOp::Draw ? a.kind : 6 + (a.g == b.g ? 0 : 2) + (a.after == b.after ? 0 : 1);
+            ++g_before_draw[k];
+        }
+    }
+    if (g_stage_now >= 0) {  // the submit that reads the staging buffer is on the queue: map it again (the callback comes once the card has finished it)
+        stage_map(g_stage[g_stage_now]);
+        g_stage_now = -1;
+        g_stage_copy = false;
+    }
     LV.ops.clear();
     LV.cursor = 0;
     LV.vertices.clear();
@@ -4059,6 +4246,11 @@ void live_submitted() {
 void live_stats() {
     using namespace live;
     if (!LV.on) return;
+    if (g_log) {
+        std::fprintf(stderr, "[hw-live] before a draw:");
+        for (std::uint64_t n : g_before_draw) std::fprintf(stderr, " %llu", static_cast<unsigned long long>(n));
+        std::fprintf(stderr, " (load, store, depth store, depth load, -, display, draw same picture, same picture later, other picture, other picture later)\n");
+    }
     const Stats &s = LV.st;
     std::fprintf(stderr, "[hw-live] batches: card %llu (%llu shapes, %llu runs, %llu draws), painter %llu (%llu shapes), fallbacks %llu\n", static_cast<unsigned long long>(s.card_batches),
                  static_cast<unsigned long long>(s.card_shapes), static_cast<unsigned long long>(s.runs), static_cast<unsigned long long>(s.draws), static_cast<unsigned long long>(s.painter_batches),
@@ -4102,6 +4294,9 @@ void memlog_report(void *instance, void *queue, std::uint64_t frame) {
         wgpuQueueOnSubmittedWorkDone(static_cast<WGPUQueue>(queue), cb);
         const std::uint64_t sub = memlog::S.submits.fetch_add(1) + 1, done = memlog::S.done.load();
         if (sub > done) memlog::S.max_inflight = std::max(memlog::S.max_inflight, sub - done);
+        memlog::S.max_passes = std::max(memlog::S.max_passes, memlog::S.sub_passes);
+        memlog::S.max_upload = std::max(memlog::S.max_upload, memlog::S.sub_upload);
+        memlog::S.sub_passes = memlog::S.sub_upload = 0;
     }
     static std::uint64_t next = 0;
     static const auto t0 = std::chrono::steady_clock::now();
@@ -4135,8 +4330,9 @@ void memlog_report(void *instance, void *queue, std::uint64_t frame) {
         std::fprintf(stderr, " live_targets=%zu live_retired=%zu live_heights=%zu live_pictures_mb=%.1f live_pipes=%zu live_vtx_mb=%.1f live_setups_mb=%.1f live_params_mb=%.1f live_ops=%zu live_runs_mb=%.1f",
                      LV.targets.size(), LV.retired.size(), LV.heights.size(), mb(LV.bytes), g_gpu.pipelines.size(), mb(LV.vertices.capacity() * sizeof(Vtx)), mb(LV.setups.capacity() * 4),
                      mb(LV.params.capacity() * 256), LV.ops.capacity(), mb(LV.runs.capacity() * sizeof(Run)));
-    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, " max_passes=%llu max_upload_mb=%.1f stage_mb=%.1f\n", ull(memlog::S.max_passes), mb(memlog::S.max_upload), mb(live::stage_bytes()));
     p_tex = tex, p_buf = buf, p_grp = grp, p_rpipe = rpipe, p_enc = enc, p_rp = rp, p_cp = cp;
+    memlog::S.max_passes = memlog::S.max_upload = 0;
     memlog::S.max_inflight = 0;
     memlog::S.upload_bytes = 0;
 }
@@ -4149,7 +4345,7 @@ bool live_init(Context &ctx) {
     }
     LV.ctx = ctx;
     g_gpu.ctx = &LV.ctx;
-    g_dual = os::env("PS2_GPU_HW_DUAL") != "0" && wgpuDeviceHasFeature(ctx.device, WGPUFeatureName_DualSourceBlending);
+    g_dual = want_dual(ctx.device);
     pal::on = g_pal_refine = os::env("PS2_GPU_HW_PAL") != "0";
     g_direct = true;
     g_linear = true;
@@ -4286,7 +4482,7 @@ void pal_state(const std::uint32_t *, std::size_t) {}
 bool live_pending() { return false; }
 bool live_before(std::uint32_t) { return false; }
 void live_prepare() {}
-void live_encode(WGPUCommandEncoder, std::uint32_t) {}
+WGPUComputePassEncoder live_encode(WGPUCommandEncoder, std::uint32_t, WGPUComputePassEncoder pass) { return pass; }
 void live_submitted() {}
 void live_stats() {}
 void memlog_report(void *, void *, std::uint64_t) {}

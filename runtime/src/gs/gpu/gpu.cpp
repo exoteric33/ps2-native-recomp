@@ -1,6 +1,8 @@
 #include "gpu.hpp"
 #include "hwdraw.hpp"
 #include "overlay.hpp"
+#include "setup.hpp"
+#include "tiles.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
 #include "ps2/system.hpp"
@@ -48,9 +50,11 @@ constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
+static_assert(kPrimWords == tiles::kPrimWords, "the tile lists (tiles.cpp) read the shape records");
 // word 1 of a shape: its kind (0 triangle, 1 sprite, 2 line, 3 point) in the low byte, and kUpscaledSource when its texture is an
 // upscaled picture the GS drew (gs.wgsl reads both)
 constexpr std::uint32_t kKindMask = 0xFFu, kUpscaledSource = 0x100u;
+static_assert(kKindMask == tiles::kKindMask, "the tile lists (tiles.cpp) read the shape records");
 constexpr std::uint32_t kSetupWords = 40;  // 25 fields, then the texture, frame and depth formats as the shader needs them (fmt_words)
 constexpr std::uint32_t kMipWords = 8;     // the mipmap words of a setup, in a table beside the setups (Batch::mips, make_mip)
 constexpr std::uint32_t kDecodedWords = 4u << 20;
@@ -235,36 +239,58 @@ struct Range {
     }
 };
 
-// A growing array of 32-bit words for the shape records of the open batch. std::vector's insert costs more than the copy it makes
-// (it runs once per shape, about 50,000 times a frame), and growing it by hand does not zero the new words first.
-struct Words {
-    std::unique_ptr<std::uint32_t[]> words;
-    std::size_t used = 0, capacity = 0;
+using tiles::Words;
+
+// The shape records of the frame, in the order the batches were flushed, followed by the records of the open batch. draw() writes a record here once
+// and the chip reads it from here: at submit this array goes into the data buffer right after the arena (place_shapes), so the records are not copied
+// into the arena at flush any more. The open batch sees only its own records (`data()`, `size()` count from `begin`).
+// The tile helper reads the records of the batches it builds while this thread goes on appending; when the array has to move to grow, the old block is
+// kept until the next submit, where every job is finished (`retired`).
+struct Shapes {
+    Words words;
+    std::size_t begin = 0;  // the first word of the open batch
+    std::vector<std::unique_ptr<std::uint32_t[]>> retired;
 
     void append(const std::uint32_t *from, std::size_t count) {
-        if (used + count > capacity) grow(used + count);
-        std::memcpy(words.get() + used, from, count * 4);
-        used += count;
+        if (words.used + count > words.capacity) {
+            std::size_t next = std::max<std::size_t>(words.capacity * 2, 1u << 20);
+            while (next < words.used + count) next *= 2;
+            auto bigger = std::make_unique_for_overwrite<std::uint32_t[]>(next);
+            if (words.used) std::memcpy(bigger.get(), words.words.get(), words.used * 4);
+            if (tiles::backlog()) retired.push_back(std::move(words.words));  // a job may still read the old block: keep it until submit
+            words.words = std::move(bigger);
+            words.capacity = next;
+        }
+        std::memcpy(words.words.get() + words.used, from, count * 4);
+        words.used += count;
     }
-    void grow(std::size_t need) {
-        std::size_t next = std::max<std::size_t>(capacity * 2, 1u << 16);
-        while (next < need) next *= 2;
-        auto bigger = std::make_unique_for_overwrite<std::uint32_t[]>(next);
-        if (used) std::memcpy(bigger.get(), words.get(), used * 4);
-        words = std::move(bigger);
-        capacity = next;
+    // the open batch
+    std::size_t size() const { return words.used - begin; }
+    bool empty() const { return words.used == begin; }
+    std::uint32_t *data() { return words.data() + begin; }
+    const std::uint32_t *data() const { return words.data() + begin; }
+    std::uint32_t &operator[](std::size_t i) { return words[begin + i]; }
+    const std::uint32_t &operator[](std::size_t i) const { return words[begin + i]; }
+    void clear() { words.used = begin; }  // drops the open batch's records (a batch the card took, a test)
+    // flush: the open batch's records stay for the chip; returns their first word
+    std::uint32_t commit() {
+        const std::size_t at = begin;
+        begin = words.used;
+        return static_cast<std::uint32_t>(at);
     }
-    std::size_t size() const { return used; }
-    bool empty() const { return !used; }
-    void clear() { used = 0; }
-    std::uint32_t *data() { return words.get(); }
-    const std::uint32_t *data() const { return words.get(); }
-    std::uint32_t &operator[](std::size_t i) { return words[i]; }
-    const std::uint32_t &operator[](std::size_t i) const { return words[i]; }
-};
+    // submit, once every tile job is finished: the flushed records have been uploaded; the open batch's (if any) move to the front
+    void restart() {
+        const std::size_t open = size();
+        if (open && begin) std::memmove(words.data(), words.data() + begin, open * 4);
+        words.used = open;
+        begin = 0;
+        retired.clear();
+    }
+} g_shapes;
+std::vector<std::uint32_t> g_shape_params;  // the parameter records of this submit's raster commands: word 1 (the records' offset) gets the arena's size added at submit
 
 struct Batch {
-    Words prims;
+    Shapes &prims = g_shapes;
     std::vector<std::uint32_t> setups;
     std::vector<std::uint32_t> mips;  // kMipWords per setup, the same index as `setups` (make_mip)
     bool any_mip = false;             // a setup of the batch has mipmap words that are not zero: the table goes to the chip
@@ -553,9 +579,6 @@ bool exact_clear(const std::uint32_t *rec, const std::uint32_t *setup, int minx,
 }
 
 int g_tile = 8;  // pixels along one side of a screen tile (one workgroup of the raster program): 8 was the cheaper of 16, 8 and 4 on the arena and hall test frames; PS2_TILE=4, 8 or 16 to try others
-int g_tiles_per_row = 128;
-std::vector<std::uint32_t> g_tile_count(128 * 128 + 8), g_tile_fill(128 * 128 + 8);
-std::vector<std::uint32_t> g_touched(128 * 128 + 16);
 
 WGPUStringView view(const char *s) { return WGPUStringView{s, WGPU_STRLEN}; }
 
@@ -626,6 +649,7 @@ struct CacheEntry {
     std::uint32_t offset, words;
     std::size_t bytes;
     std::uint64_t used;
+    std::uint64_t uid;  // a number no other entry ever had: two uploads that find the same entry uploaded the same bytes (the decode cache's identities)
 };
 
 WGPUBuffer g_cache = nullptr;
@@ -635,6 +659,7 @@ std::unordered_multimap<std::uint64_t, CacheEntry *> g_cache_index;
 std::unordered_map<std::uint64_t, std::uint32_t> g_cache_seen;
 std::uint32_t g_cache_head = 0;
 std::uint64_t g_serial = 1;
+std::uint64_t g_cache_uids = 0, g_cache_uid = 0;  // entries made so far; the uid of the entry the last cache_find / cache_insert gave
 
 std::uint64_t content_key(const std::uint8_t *p, std::size_t n) {
     std::uint64_t h = static_cast<std::uint64_t>(n) * 0x9E3779B97F4A7C15ull;
@@ -661,6 +686,7 @@ bool cache_find(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std
         if (e.bytes != n || std::memcmp(g_cache_copy.data() + e.offset, bytes, n) != 0) continue;
         e.used = g_serial;
         offset = e.offset;
+        g_cache_uid = e.uid;
         return true;
     }
     return false;
@@ -694,7 +720,8 @@ bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, s
     to[words - 2] = 0;
     std::memcpy(to, bytes, n);
     wgpuQueueWriteBuffer(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
-    g_cache_ring.push_back({key, offset, words, n, g_serial});
+    g_cache_ring.push_back({key, offset, words, n, g_serial, ++g_cache_uids});
+    g_cache_uid = g_cache_uids;
     g_cache_index.emplace(key, &g_cache_ring.back());
     g_cache_head += words;
     return true;
@@ -714,89 +741,6 @@ float u2f(std::uint32_t u) {
     float f;
     std::memcpy(&f, &u, 4);
     return f;
-}
-
-struct Span {
-    std::int16_t ty, tx0, tx1;
-    std::uint16_t prim;  // index of the shape in the batch (a batch has at most 65536 shapes)
-};
-// The spans of the open batch's shapes, in order (add_spans). Filled by hand: the capacity is made sure of once per shape, not checked at every push.
-struct SpanBuf {
-    std::unique_ptr<Span[]> spans;
-    std::size_t used = 0, capacity = 0;
-
-    void ensure(std::size_t extra) {
-        if (used + extra <= capacity) return;
-        std::size_t next = std::max<std::size_t>(capacity * 2, 1u << 14);
-        while (next < used + extra) next *= 2;
-        auto bigger = std::make_unique_for_overwrite<Span[]>(next);
-        if (used) std::memcpy(bigger.get(), spans.get(), used * sizeof(Span));
-        spans = std::move(bigger);
-        capacity = next;
-    }
-    void push_back(Span s) { spans[used++] = s; }
-    std::size_t size() const { return used; }
-    void clear() { used = 0; }
-    Span &operator[](std::size_t i) { return spans[i]; }
-} g_spans;
-
-void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi, std::uint16_t prim) {
-    const int sc = static_cast<int>(g_scale);
-    const int tx0 = static_cast<int>(lo & 0xFFFFu) * sc / g_tile, ty0 = static_cast<int>(lo >> 16) * sc / g_tile;
-    const int tx1 = (static_cast<int>(hi & 0xFFFFu) * sc + sc - 1) / g_tile, ty1 = (static_cast<int>(hi >> 16) * sc + sc - 1) / g_tile;
-    g_spans.ensure(static_cast<std::size_t>(std::max(ty1 - ty0 + 1, 0)));  // at most one span per tile row
-    const auto whole = [&] {
-        for (int ty = ty0; ty <= ty1; ++ty) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(tx0), static_cast<std::int16_t>(tx1), prim});
-    };
-    if ((rec[1] & kKindMask) != 0 || tx1 - tx0 < 2) {
-        whole();
-        return;
-    }
-    // The three edges of the triangle are the lanes of a vector (lane 3 repeats lane 0 and is not used). Every lane does the same double
-    // operations, in the same order and without fused multiply-add, as the scalar loop of the earlier versions did, so the spans are the same.
-    typedef double V4 __attribute__((vector_size(32)));
-    typedef long long M4 __attribute__((vector_size(32)));
-    const double px0 = u2f(rec[4]), px1 = u2f(rec[6]), px2 = u2f(rec[8]), py0 = u2f(rec[5]), py1 = u2f(rec[7]), py2 = u2f(rec[9]);
-    const double inv = u2f(rec[10]);
-    const V4 xa = {px1, px2, px0, px0}, xb = {px2, px0, px1, px0}, ya = {py1, py2, py0, py0}, yb = {py2, py0, py1, py0};  // edge e runs from point a to point b: {1, 2}, {2, 0}, {0, 1}
-    const V4 ca = (ya - yb) * inv, cb = (xb - xa) * inv, cc = (xa * yb - xb * ya) * inv;
-    const V4 limit = {1.7976931348623157e308, 1.7976931348623157e308, 1.7976931348623157e308, 1.7976931348623157e308};  // DBL_MAX: a value is finite when |v| <= it
-    const M4 finite = (__builtin_elementwise_abs(ca) <= limit) & (__builtin_elementwise_abs(cb) <= limit) & (__builtin_elementwise_abs(cc) <= limit);
-    if (!(finite[0] & finite[1] & finite[2])) {
-        whole();
-        return;
-    }
-    const V4 zero = {0.0, 0.0, 0.0, 0.0};
-    const M4 positive = ca > zero, negative = ca < zero, slanted = positive | negative;
-    const V4 divided_m = (-cb) / ca, divided_q = (-cc) / ca;  // the lanes of a vertical edge (ca == 0) are not used
-    const V4 vm = (V4)(((M4)divided_m & slanted) | ((M4)cb & ~slanted)), vq = (V4)(((M4)divided_q & slanted) | ((M4)cc & ~slanted));
-    const M4 kind_v = negative - positive;  // +1 for an edge that bounds the triangle on the left, -1 on the right, 0 for a vertical one
-    const int kind[3] = {static_cast<int>(kind_v[0]), static_cast<int>(kind_v[1]), static_cast<int>(kind_v[2])};
-    const double span = static_cast<double>(g_tile) / static_cast<double>(sc);
-    // x / span is exactly x * (1 / span) when span is a power of two (4, 8, 2, 16 ...: every scale but 3), and a multiplication is cheaper than a division
-    const bool span_pow2 = g_tile % sc == 0 && ((g_tile / sc) & (g_tile / sc - 1)) == 0;
-    const double span_inverse = 1.0 / span;
-    for (int ty = ty0; ty <= ty1; ++ty) {
-        const double y0 = ty * span - 1.0, y1 = (ty + 1) * span + 1.0;
-        const V4 a0 = vm * y0, a1 = vm * y1;
-        // std::min(a0, a1) is (a1 < a0 ? a1 : a0), std::max(a0, a1) is (a0 < a1 ? a1 : a0)
-        const M4 smaller = a1 < a0, larger = a0 < a1;
-        const V4 low = (V4)(((M4)a1 & smaller) | ((M4)a0 & ~smaller)) + vq, high = (V4)(((M4)a1 & larger) | ((M4)a0 & ~larger)) + vq;
-        double left = -1e30, right = 1e30;
-        bool empty = false;
-        for (int e = 0; e < 3; ++e) {
-            if (kind[e] == 0) empty = empty || high[e] < 0.0;
-            else if (kind[e] > 0) left = std::max(left, low[e]);
-            else right = std::min(right, high[e]);
-        }
-        left -= 1.0;
-        right += 1.0;
-        if (empty || left > right) continue;
-        const double lo_x = std::max(left, -1.0), hi_x = std::min(right, 4096.0);
-        const int rx0 = std::max(tx0, static_cast<int>(std::floor(span_pow2 ? lo_x * span_inverse : lo_x / span)));
-        const int rx1 = std::min(tx1, static_cast<int>(std::floor(span_pow2 ? hi_x * span_inverse : hi_x / span)));
-        if (rx0 <= rx1) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(rx0), static_cast<std::int16_t>(rx1), prim});
-    }
 }
 
 bool reads_own_word(const std::uint32_t *rec, const std::uint32_t *setup) {
@@ -859,22 +803,347 @@ bool rendered(const Range &r) {
     return false;
 }
 
+// ---- The decode cache -----------------------------------------------------------------------------------------------------
+// Decoded textures stay in the first part of the decoded buffer (kCachedWords) across batches, submits and frames, and are used again while what
+// they were decoded from is unchanged. "Unchanged" is decided by identities, the idea of the card path's texture identities (hwcache.cpp) written
+// again here for the painter: every 256-byte block of graphics memory has a number that is equal when its bytes are equal.
+// - A host-to-local upload gives every block it writes completely a number made of where it wrote and which bytes: the upload cache's entry when
+//   the bytes are in it (found there byte for byte), a hash of the bytes when the upload is too small for that cache, else a new number. So the same
+//   upload again gives the same number whatever happened in between. A block it writes in part (an edge of the rectangle, or a format that keeps
+//   bits of the word: 24-bit, 8H, 4HL, 4HH) mixes its old number in.
+// - A draw, a local-to-local copy and a loaded state give every page they write a number nobody had (whole pages, a superset of what they write:
+//   cheaper than blocks for the full-screen passes). Pages last written by a draw or a copy hold pictures: textures there are decoded per submit as
+//   before (the transient part of the buffer) and not kept.
+// - A palette load gives the groups of 16 entries it writes in its slot a number made of its parameters and the numbers of the blocks it reads; the
+//   slot starts as a copy of the slot before it, as the load program does.
+// A decoded texture is found again by its set-up words (base, width, format, size, palette format and start, TEXA, AEM), the folded numbers of every
+// block its texels lie in and the numbers of the palette groups it reads. The numbers change in the order of the command stream: an upload or a palette
+// load when it is queued (emit_all dispatches every queued one before the batch whose decodes are then planned), a draw after its batch, a copy when it
+// is dispatched. Off with PS2_DECODE_CACHE=0; PS2_DECODE_CACHE_STAT=1 prints what it did every 300 frames.
+constexpr std::uint32_t kCachedOrder = 23;  // 8 Mi words (32 MB), handed out in powers of two (a decoded texture is 2^(tw + th) words)
+constexpr std::uint32_t kCachedWords = 1u << kCachedOrder;
+bool g_dec_on = true, g_dec_small = true, g_dec_stat = false;
+
+void fmt_words(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t *out);
+
+std::uint64_t mix64(std::uint64_t a, std::uint64_t b) {
+    std::uint64_t z = a ^ (b + 0x9E3779B97F4A7C15ull + (a << 6) + (a >> 2));
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+struct DecStat {
+    std::uint64_t walks = 0, cells = 0, picture_walks = 0, asked = 0, found = 0, decoded = 0, decoded_words = 0, pictures = 0, picture_words = 0, evicted = 0, refused = 0;
+} g_dec_count;
+
+struct Identities {
+    std::uint64_t block[16384] = {}, block_seq[16384] = {};  // a block's own number and when it was set
+    std::uint64_t page[512] = {}, page_seq[512] = {};        // a page's number and when it was set: newer than a block's own, it is the block's
+    std::uint64_t touched[512] = {};                         // the last write of any kind into the page
+    std::uint64_t block_write[512] = {};                     // the last write of a block's own number in the page
+    bool page_drawn[512] = {};
+    std::uint64_t seq = 0, fresh = 0;
+    std::vector<std::array<std::uint64_t, 32>> slot;  // palette slots: the number of each group of 16 entries
+} g_id;
+
+std::uint64_t fresh_id() { return mix64(0xF7E5Bull, ++g_id.fresh) | 1; }
+
+inline std::uint64_t block_id(std::uint32_t b, bool &drawn) {
+    const std::uint32_t p = b >> 5;
+    if (g_id.page_seq[p] > g_id.block_seq[b]) {
+        drawn = drawn || g_id.page_drawn[p];
+        return mix64(g_id.page[p], b);
+    }
+    return g_id.block[b];
+}
+
+// Every page the bytes lo .. hi - 1 lie in gets a new number.
+void stamp_pages(const Range &r, bool drawn) {
+    if (r.hi <= r.lo) return;
+    const std::uint64_t first = r.lo >> 13, last = (r.hi - 1) >> 13;
+    for (std::uint64_t q = first; q <= last && q - first < 512; ++q) {
+        const std::uint32_t p = static_cast<std::uint32_t>(q & 511u);
+        g_id.page[p] = fresh_id();
+        g_id.page_seq[p] = g_id.touched[p] = ++g_id.seq;
+        g_id.page_drawn[p] = drawn;
+    }
+}
+
+// The blocks of the rectangle x0..x1, y0..y1 of a format (fmt_words `f`), one call per block-sized cell: fn(block, cell x0, y0, x1, y1). A block of
+// the GS holds a whole aligned cell of 8 x 8 (32-bit), 16 x 8 (16-bit), 16 x 16 (8-bit) or 32 x 16 (4-bit) pixels.
+template <typename Fn> void for_cells(const std::uint32_t *f, std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1, Fn &&fn) {
+    const std::uint32_t pws = f[3] & 15u, phs = (f[3] >> 4) & 15u;
+    const std::uint32_t bw = pws == 7 ? (phs == 7 ? 32u : 16u) : (phs == 6 ? 16u : 8u), bh = pws == 7 ? 16u : 8u;
+    for (std::uint32_t cy = y0 / bh; cy <= y1 / bh; ++cy)
+        for (std::uint32_t cx = x0 / bw; cx <= x1 / bw; ++cx) fn(word_at(f, cx * bw, cy * bh) >> 6, cx * bw, cy * bh, cx * bw + bw - 1, cy * bh + bh - 1);
+}
+
+void everything_fresh() {
+    stamp_pages(Range{0, kMemorySize}, false);
+    for (auto &s : g_id.slot)
+        for (auto &g : s) g = fresh_id();
+}
+
+// A host-to-local upload (`rec` as queue_upload builds it: dbp, dbw, dpsm, dsax, dsay, rrw, done, pixels, offset, lead bits, bits per pixel) of
+// bytes whose number is `content`.
+void id_upload(const std::uint32_t *rec, std::uint64_t content) {
+    const std::uint32_t rrw = rec[5], done = rec[6], pixels = rec[7], psm = rec[2];
+    if (!rrw || !pixels) return;
+    const std::uint32_t x0 = rec[3], x1 = rec[3] + rrw - 1, y0 = rec[4] + done / rrw, y1 = rec[4] + (done + pixels - 1) / rrw;
+    if (x1 > 2047 || y1 > 2047) {  // wraps around the 2048 x 2048 space: not followed, everything counts as written
+        everything_fresh();
+        return;
+    }
+    const std::uint32_t full0 = rec[4] + (done + rrw - 1) / rrw, full_end = rec[4] + (done + pixels) / rrw;  // the rows written whole
+    const bool whole_words = psm != 0x01 && psm != 0x31 && psm != 0x1B && psm != 0x24 && psm != 0x2C;
+    std::uint64_t chunk = mix64(content, 0x0B10Cull);
+    for (int k : {0, 1, 2, 3, 4, 5, 6, 7, 9}) chunk = mix64(chunk, rec[k]);
+    chunk = mix64(chunk, rec[10] & 0x7FFFFFFFu);
+    std::uint32_t f[5];
+    fmt_words(psm, rec[0], rec[1], f);
+    for_cells(f, x0, y0, x1, y1, [&](std::uint32_t b, std::uint32_t cx0, std::uint32_t cy0, std::uint32_t cx1, std::uint32_t cy1) {
+        const bool full = whole_words && cx0 >= x0 && cx1 <= x1 && cy0 >= full0 && cy1 < full_end;
+        bool drawn = false;
+        g_id.block[b] = (full ? mix64(chunk, b) : mix64(mix64(block_id(b, drawn), chunk), b)) | 1;
+        g_id.block_seq[b] = ++g_id.seq;
+        g_id.touched[b >> 5] = g_id.block_write[b >> 5] = g_id.seq;
+    });
+}
+
+std::uint64_t bytes_id(const std::uint8_t *p, std::size_t n) {
+    std::uint64_t h = mix64(0xB17E5ull, n), v;
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        std::memcpy(&v, p + i, 8);
+        h = mix64(h, v);
+    }
+    v = 0;
+    std::memcpy(&v, p + i, n - i);
+    return mix64(h, v) | 1;
+}
+
+// A palette load (`rec` as load_clut builds it: from slot, to slot, cbp, cpsm, csm, csa, 8-bit, cbw, cou, cov), as the load program in gs.wgsl does it.
+void id_clut(const std::uint32_t *rec) {
+    const std::uint32_t cpsm = rec[3], csm = rec[4], csa = rec[5], entries = rec[6] ? 256u : 16u;
+    std::uint64_t h = 0xC1u;
+    for (int k = 2; k < 10; ++k) h = mix64(h, rec[k]);
+    std::uint32_t f[5];
+    fmt_words(cpsm, rec[2], csm ? rec[7] : 1u, f);
+    const auto fold = [&](std::uint32_t b, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {
+        bool drawn = false;
+        h = mix64(h, block_id(b, drawn));
+    };
+    if (csm) for_cells(f, rec[8] * 16, rec[9], rec[8] * 16 + entries - 1, rec[9], fold);
+    else if (entries == 256) for_cells(f, 0, 0, 15, 15, fold);
+    else for_cells(f, 0, 0, 7, 1, fold);
+    h |= 1;
+    std::array<std::uint64_t, 32> next = g_id.slot[rec[0] % kClutSlots];
+    if (csm)
+        for (std::uint32_t g = 0; g < entries / 16; ++g) next[(csa + g) & 31u] = mix64(h, g);
+    else if (entries == 256)
+        for (std::uint32_t g = 0; g < 16; ++g) next[g] = mix64(h, g);
+    else next[csa & 15u] = h;
+    g_id.slot[rec[1] % kClutSlots] = next;
+}
+
+// The palette groups a set-up's texture reads (convert in gs.wgsl): 0 to 255 for 8-bit indices, the 16 entries at CSA for 4-bit ones.
+std::uint64_t palette_id(const std::uint32_t *w) {
+    const std::uint32_t psm = w[14];
+    const bool eight = psm == 0x13 || psm == 0x1B, four = psm == 0x14 || psm == 0x24 || psm == 0x2C;
+    if (!eight && !four) return 0;
+    const std::array<std::uint64_t, 32> &s = g_id.slot[w[22] % kClutSlots];
+    if (four) return mix64(s[w[17] & 15u], 4);
+    std::uint64_t h = 8;
+    for (std::uint32_t g = 0; g < 16; ++g) h = mix64(h, s[g]);
+    return h;
+}
+
+// The folded numbers of the blocks a texture's texels lie in (2^tw x 2^th from its base); false when one of them holds a picture. A texture asked for
+// again while none of its pages was written since gives the remembered answer; one that has a page drawn over as a whole since is a picture at once
+// (the pages a texture lies in are remembered, they depend only on its base, width, format and size).
+struct TexMemo {
+    std::uint64_t ident = 0, seq = 0;
+    bool picture = false;
+    std::vector<std::uint16_t> pages;
+};
+std::unordered_map<std::uint64_t, TexMemo> g_tex_memo;
+
+bool texture_id(const std::uint32_t *w, std::uint64_t &ident) {
+    const std::uint64_t key = mix64(mix64(mix64(w[12], w[13]), w[14]), w[15]);
+    auto it = g_tex_memo.find(key);
+    if (it != g_tex_memo.end()) {
+        const TexMemo &m = it->second;
+        bool valid = true;
+        for (std::uint16_t p : m.pages) {
+            if (g_id.page_drawn[p] && g_id.page_seq[p] > g_id.block_write[p]) return false;  // every block of the page is drawn
+            valid = valid && g_id.touched[p] <= m.seq;
+        }
+        if (valid) {
+            ident = m.ident;
+            return !m.picture;
+        }
+    } else {
+        if (g_tex_memo.size() >= 4096) g_tex_memo.clear();
+        it = g_tex_memo.emplace(key, TexMemo{}).first;
+    }
+    TexMemo &m = it->second;
+    m.pages.clear();
+    m.seq = g_id.seq;
+    std::uint64_t h = key;
+    bool drawn = false;
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    const std::uint32_t *f = w + 25;  // the texture's format words (fmt_words)
+    for_cells(f, 0, 0, (1u << tw) - 1, (1u << th) - 1, [&](std::uint32_t b, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {
+        h = mix64(h, block_id(b, drawn));
+        const std::uint16_t p = static_cast<std::uint16_t>(b >> 5);
+        if (m.pages.empty() || m.pages.back() != p) m.pages.push_back(p);
+    });
+    std::sort(m.pages.begin(), m.pages.end());
+    m.pages.erase(std::unique(m.pages.begin(), m.pages.end()), m.pages.end());
+    m.ident = ident = h;
+    m.picture = drawn;
+    ++g_dec_count.walks;
+    g_dec_count.picture_walks += drawn;
+    g_dec_count.cells += (1ull << (tw + th)) * 32 / ((1ull << (f[3] & 15u)) << ((f[3] >> 4) & 15u));
+    return !drawn;
+}
+
+// The decoded textures kept, and the free space of the kept part (a buddy allocator: a free block of 2^k words at an offset that is a multiple of it).
+struct Kept {
+    std::uint32_t key[8];
+    std::uint64_t pal, ident, used, batch;
+    std::uint32_t offset, order;
+    bool live;
+};
+std::vector<Kept> g_kept;
+std::vector<std::uint32_t> g_kept_free;
+std::unordered_multimap<std::uint64_t, std::uint32_t> g_kept_index;
+std::vector<std::uint32_t> g_space[kCachedOrder + 1];
+std::uint64_t g_dec_batch = 0;
+
+void key_of(const std::uint32_t *w, std::uint32_t *key) {
+    static const int kWords[] = {12, 13, 14, 15, 16, 17, 20};
+    for (int k = 0; k < 7; ++k) key[k] = w[kWords[k]];
+    key[7] = w[0] & 32768u;  // AEM
+}
+
+std::uint64_t kept_hash(const std::uint32_t *key, std::uint64_t pal, std::uint64_t ident) {
+    std::uint64_t h = mix64(pal, ident);
+    for (int k = 0; k < 8; ++k) h = mix64(h, key[k]);
+    return h;
+}
+
+void space_free(std::uint32_t offset, std::uint32_t order) {
+    while (order < kCachedOrder) {
+        std::vector<std::uint32_t> &list = g_space[order];
+        const auto buddy = std::find(list.begin(), list.end(), offset ^ (1u << order));
+        if (buddy == list.end()) break;
+        *buddy = list.back();
+        list.pop_back();
+        offset &= ~(1u << order);
+        ++order;
+    }
+    g_space[order].push_back(offset);
+}
+
+bool space_take(std::uint32_t order, std::uint32_t &offset) {
+    std::uint32_t k = order;
+    while (k <= kCachedOrder && g_space[k].empty()) ++k;
+    if (k > kCachedOrder) return false;
+    offset = g_space[k].back();
+    g_space[k].pop_back();
+    while (k > order) {  // split, keep the lower half
+        --k;
+        g_space[k].push_back(offset + (1u << k));
+    }
+    return true;
+}
+
+void kept_drop(std::uint32_t i) {
+    Kept &e = g_kept[i];
+    const auto [first, last] = g_kept_index.equal_range(kept_hash(e.key, e.pal, e.ident));
+    for (auto it = first; it != last; ++it)
+        if (it->second == i) {
+            g_kept_index.erase(it);
+            break;
+        }
+    space_free(e.offset, e.order);
+    e.live = false;
+    g_kept_free.push_back(i);
+}
+
+void dec_reset() {
+    g_kept.clear();
+    g_kept_free.clear();
+    g_kept_index.clear();
+    for (auto &list : g_space) list.clear();
+    g_space[kCachedOrder].push_back(0);
+    g_tex_memo.clear();
+    if (g_id.slot.empty()) g_id.slot.assign(kClutSlots, {});
+    everything_fresh();
+}
+
+// Room for 2^order words: the least recently used textures leave as needed (never one this batch reads; none at all while the frame is captured for
+// PS2_GPU_BENCH, whose replays use what was kept before the frame and must find it unchanged).
+bool kept_room(std::uint32_t order, std::uint32_t &offset) {
+    for (;;) {
+        if (space_take(order, offset)) return true;
+        if (g_bench.capturing) return false;
+        std::uint32_t victim = ~0u;
+        for (std::uint32_t i = 0; i < g_kept.size(); ++i) {
+            const Kept &e = g_kept[i];
+            if (e.live && e.batch != g_dec_batch && (victim == ~0u || e.used < g_kept[victim].used)) victim = i;
+        }
+        if (victim == ~0u) return false;
+        kept_drop(victim);
+        ++g_dec_count.evicted;
+    }
+}
+
+void dec_stat_frame() {
+    if (!g_dec_stat || frame_count() % 300 != 0) return;
+    const DecStat &c = g_dec_count;
+    std::uint64_t live = 0, words = 0;
+    for (const Kept &e : g_kept)
+        if (e.live) ++live, words += 1ull << e.order;
+    std::fprintf(stderr, "[decode-cache] frame %llu, last 300 frames: %llu asked, %llu found (%.1f %%), %llu decoded (%.1f MB), %llu pictures decoded (%.1f MB), %llu evicted, "
+                         "%llu refused; kept %llu (%.1f MB); %llu walks (%llu of pictures), %llu cells\n",
+                 static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(c.asked), static_cast<unsigned long long>(c.found),
+                 c.asked ? 100.0 * static_cast<double>(c.found) / static_cast<double>(c.asked) : 0.0, static_cast<unsigned long long>(c.decoded),
+                 static_cast<double>(c.decoded_words) * 4 / 1e6, static_cast<unsigned long long>(c.pictures), static_cast<double>(c.picture_words) * 4 / 1e6,
+                 static_cast<unsigned long long>(c.evicted), static_cast<unsigned long long>(c.refused), static_cast<unsigned long long>(live),
+                 static_cast<double>(words) * 4 / 1e6, static_cast<unsigned long long>(c.walks), static_cast<unsigned long long>(c.picture_walks),
+                 static_cast<unsigned long long>(c.cells));
+    g_dec_count = DecStat{};
+}
+
 struct Decode {
     std::uint32_t setup, offset, words;
 };
-std::vector<Decode> g_decodes;
+std::vector<Decode> g_decodes;   // the decodes this batch dispatches
+std::vector<Decode> g_assigned;  // every decoded texture a setup of this batch reads, dispatched or kept, for setups that share it
 
 void plan_decodes(std::uint32_t prims) {
     Batch &b = g_batch;
     g_decodes.clear();
-    if (!g_decode || prims <= kDecodePrims) return;
+    g_assigned.clear();
+    if (!g_decode) return;
+    const bool big = prims > kDecodePrims, cache = g_dec_on && !hw::enabled();
+    if (!big && !(cache && g_dec_small)) return;  // a small batch decodes nothing, but may read what is kept
+    ++g_dec_batch;
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
     static const int kKey[] = {12, 13, 14, 15, 16, 17, 20, 22};
     for (std::uint32_t i = 0; i < setups; ++i) {
         std::uint32_t *w = b.setups.data() + i * kSetupWords;
         if (!(w[0] & 2u)) continue;
+        const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+        const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
+        const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
+        // every set-up checks its own clamp or repeat region against the texture, also one that would share a decode (it reads past it otherwise)
+        if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
         bool shared = false;
-        for (const Decode &d : g_decodes) {
+        for (const Decode &d : g_assigned) {
             const std::uint32_t *o = b.setups.data() + d.setup * kSetupWords;
             bool same = (o[0] & 32768u) == (w[0] & 32768u);
             for (int k : kKey) same = same && o[k] == w[k];
@@ -885,15 +1154,62 @@ void plan_decodes(std::uint32_t prims) {
             }
         }
         if (shared) continue;
-        const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
-        const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
-        const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
-        if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
         const std::uint32_t words = 1u << (tw + th);
+        if (cache && tw <= 10 && th <= 10) {
+            std::uint64_t ident;
+            if (texture_id(w, ident) && !(g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1)))) {
+                ++g_dec_count.asked;
+                std::uint32_t key[8];
+                key_of(w, key);
+                const std::uint64_t pal = palette_id(w);
+                const auto [first, last] = g_kept_index.equal_range(kept_hash(key, pal, ident));
+                Kept *found = nullptr;
+                for (auto it = first; it != last && !found; ++it) {
+                    Kept &e = g_kept[it->second];
+                    if (e.pal == pal && e.ident == ident && std::equal(key, key + 8, e.key)) found = &e;
+                }
+                if (found) {
+                    ++g_dec_count.found;
+                    found->used = g_serial;
+                    found->batch = g_dec_batch;
+                    w[24] = found->offset;
+                    g_assigned.push_back({i, found->offset, words});
+                    continue;
+                }
+                if (!big) continue;
+                std::uint32_t offset;
+                if (kept_room(tw + th, offset)) {
+                    std::uint32_t at;
+                    if (!g_kept_free.empty()) {
+                        at = g_kept_free.back();
+                        g_kept_free.pop_back();
+                    } else {
+                        at = static_cast<std::uint32_t>(g_kept.size());
+                        g_kept.emplace_back();
+                    }
+                    Kept &e = g_kept[at];
+                    std::copy(key, key + 8, e.key);
+                    e.pal = pal, e.ident = ident, e.used = g_serial, e.batch = g_dec_batch, e.offset = offset, e.order = tw + th, e.live = true;
+                    g_kept_index.emplace(kept_hash(key, pal, ident), at);
+                    ++g_dec_count.decoded;
+                    g_dec_count.decoded_words += words;
+                    w[24] = offset;
+                    g_decodes.push_back({i, offset, words});
+                    g_assigned.push_back({i, offset, words});
+                    continue;
+                }
+                ++g_dec_count.refused;
+            }
+        }
+        if (!big) continue;
+        // a picture (or no room): decoded for this submit only, after the kept part
         if (g_decoded_used + words > kDecodedWords) continue;
         if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) continue;
-        w[24] = g_decoded_used;
-        g_decodes.push_back({i, g_decoded_used, words});
+        ++g_dec_count.pictures;
+        g_dec_count.picture_words += words;
+        w[24] = kCachedWords + g_decoded_used;
+        g_decodes.push_back({i, w[24], words});
+        g_assigned.push_back({i, w[24], words});
         g_decoded_used += words;
     }
 }
@@ -990,6 +1306,32 @@ void reset_batch() {
     b.maxx = b.maxy = -1;
 }
 
+// Puts the lists of a job the helper has finished into the arena and fills in the parameter record and the command that flush_batch left open for them.
+void place_tiles(tiles::Job *job) {
+    const tiles::Lists &lists = job->result;
+    if (job->param >= g_param_records.size() || job->command >= g_commands.size()) {  // cannot happen; a started job always has its slots before it is finished
+        std::fprintf(stderr, "[tiles] BAD job: parameter record %u of %zu, command %u of %zu\n", job->param, g_param_records.size(), job->command, g_commands.size());
+        std::abort();
+    }
+    const std::uint32_t tile_offset = static_cast<std::uint32_t>(g_arena.size());
+    std::memcpy(g_arena.grow(lists.words), job->lists.data(), static_cast<std::size_t>(lists.words) * 4);
+    if (tiles::logging()) tiles::note_lists(job->lists.data(), lists);
+    std::array<std::uint32_t, kParamStride / 4> &record = g_param_records[job->param];
+    record[0] = tile_offset;
+    record[3] = lists.tiles;
+    record[4] = tile_offset + lists.tiles * 2 + 2;
+    Command &c = g_commands[job->command];
+    c.x = std::min(lists.tiles, 1024u);
+    c.y = (lists.tiles + 1023) / 1024;
+    tiles::release(job);
+}
+
+// Places the finished jobs, oldest first; with `all` it waits for the jobs that are not done yet.
+void finish_tiles(bool all) {
+    if (all) tiles::build_waiting();  // the jobs the helper has not reached: built here rather than waited for
+    while (tiles::Job *job = tiles::next_finished(all)) place_tiles(job);
+}
+
 void flush_batch() {
     Batch &b = g_batch;
     if (b.prims.empty()) {
@@ -1010,97 +1352,30 @@ void flush_batch() {
         }
         hw::live_painter(lb);
     }
-    // Count how many shapes touch each tile. `touched` lists the tiles in the order they are first touched. The tiles of a span are mostly one to four,
-    // so the first four are done without a branch per tile (the extra ones only read and write back their own count); the old loop left after a
-    // different number of rounds for every span, and that cost more than the tiles. g_tile_count, g_tile_fill and g_touched have 8 words to spare.
-    std::uint32_t *const count = g_tile_count.data();
-    std::uint32_t *const touched = g_touched.data();
-    std::uint32_t touched_n = 0;
-    const std::int32_t tiles_per_row = g_tiles_per_row;
-    g_spans.clear();
-    for (std::uint32_t i = 0; i < prims; ++i)
-        add_spans(b.prims.data() + i * kPrimWords, b.prims[i * kPrimWords + 2], b.prims[i * kPrimWords + 3], static_cast<std::uint16_t>(i));
-    // One loop over all the spans of the batch (not one per shape): its exits are easy to predict.
-    const Span *const spans = g_spans.spans.get();
-    const std::size_t span_count = g_spans.size();
-    for (std::size_t k = 0; k < span_count; ++k) {
-        const Span sp = spans[k];
-        const std::uint32_t t = static_cast<std::uint32_t>(sp.ty * tiles_per_row + sp.tx0);
-        const std::int32_t len = sp.tx1 - sp.tx0 + 1;
-        for (std::int32_t j = 0; j < 4; ++j) {
-            const std::uint32_t valid = j < len ? 1u : 0u;
-            const std::uint32_t c = count[t + j];
-            touched[touched_n] = t + j;
-            touched_n += valid & (c == 0 ? 1u : 0u);
-            count[t + j] = c + valid;
-        }
-        for (std::int32_t j = 4; j < len; ++j) {
-            const std::uint32_t c = count[t + j];
-            touched[touched_n] = t + j;
-            touched_n += c == 0 ? 1u : 0u;
-            count[t + j] = c + 1;
-        }
-    }
+    // The tile lists (tiles.cpp): which tiles every shape touches, and the table and lists the raster program reads. On a threaded run the helper builds them
+    // while this thread goes on with the batch, and finish_tiles fills in what they are for (the numbers in the parameter record and the command) when they are
+    // done; else they are built here, as they always were. The card path and the replay capture (PS2_GPU_BENCH) want the numbers at once, so they build here.
+    finish_tiles(false);
+    while (tiles::backlog() >= tiles::kMaxBacklog) place_tiles(tiles::next_finished(true));  // only the oldest: the helper keeps the rest
+    tiles::Job *const job = tiles::threaded() && !g_live && !g_bench.capturing && !g_profile_out && !hw::enabled() ? tiles::start(b.prims.data(), prims) : nullptr;
     plan_decodes(prims);
-    const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
+    const std::uint32_t prim_offset = static_cast<std::uint32_t>(b.prims.begin);  // the records stay where draw() wrote them (g_shapes, kept by commit() below); place_shapes adds the arena's size at submit
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
     // The mipmap table only when a setup of the batch has one (the draw program then reads it for every setup; prm 9 is ~0 otherwise)
     const std::uint32_t mip_offset = b.any_mip && b.mips.size() / kMipWords == b.setups.size() / kSetupWords ? arena_append(b.mips.data(), b.mips.size() * 4) : 0xFFFFFFFFu;
-    if (g_bench.capturing && hw::enabled() && hw::match())  // PS2_GPU_HW_MATCH=1: neutralise the shapes the trial does not draw, so both pictures lack them
-        for (std::uint32_t i = 0; i < prims; ++i) {
-            const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
-            if (!hw::left_out(rec, b.setups.data() + rec[0] * kSetupWords)) continue;
-            g_arena[prim_offset + i * kPrimWords + 2] = 0x7FFF7FFFu;
-            g_arena[prim_offset + i * kPrimWords + 3] = 0;
-        }
     for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
-    std::uint32_t total = 0;
-    for (std::uint32_t n = 0; n < touched_n; ++n) total += count[touched[n]];
-    const std::uint32_t tiles = touched_n;
-    const std::uint32_t tile_offset = static_cast<std::uint32_t>(g_arena.size());
-    const std::uint32_t list_offset = tile_offset + tiles * 2 + 2;
-    const std::uint32_t list_words = (total + 1) / 2;
-    std::uint32_t *grown = g_arena.grow(tiles * 2 + 2 + list_words);
-    if (list_words) grown[tiles * 2 + 2 + list_words - 1] = 0;
-    std::uint32_t cursor = 0;
-    std::uint32_t *const fill = g_tile_fill.data();
-    const std::uint32_t row_width = static_cast<std::uint32_t>(tiles_per_row);
-    const bool row_pow2 = (row_width & (row_width - 1)) == 0;
-    const std::uint32_t row_mask = row_width - 1, row_shift = static_cast<std::uint32_t>(__builtin_ctz(row_width));
-    for (std::uint32_t i = 0; i < tiles; ++i) {
-        const std::uint32_t t = touched[i];
-        const std::uint32_t tx = row_pow2 ? (t & row_mask) : (t % row_width), ty = row_pow2 ? (t >> row_shift) : (t / row_width);
-        grown[i * 2] = tx | (ty << 16);
-        grown[i * 2 + 1] = cursor;
-        fill[t] = cursor;
-        cursor += count[t];
+    std::uint32_t tile_offset = 0;
+    tiles::Lists lists;
+    if (!job) {
+        tile_offset = static_cast<std::uint32_t>(g_arena.size());
+        lists = tiles::build_now(b.prims.data(), prims, [](void *, std::size_t words) { return g_arena.grow(words); }, nullptr);
+        if (tiles::logging()) tiles::note_lists(g_arena.data() + tile_offset, lists);
     }
-    grown[tiles * 2] = 0;
-    grown[tiles * 2 + 1] = cursor;
-    auto *halves = reinterpret_cast<unsigned char *>(grown + tiles * 2 + 2);
-    unsigned char scratch[2];  // where the unused rounds of the unrolled part below put their index
-    for (std::size_t k = 0; k < span_count; ++k) {
-        const Span sp = spans[k];
-        const std::uint16_t index = sp.prim;
-        const std::uint32_t t = static_cast<std::uint32_t>(sp.ty * tiles_per_row + sp.tx0);
-        const std::int32_t len = sp.tx1 - sp.tx0 + 1;
-        for (std::int32_t j = 0; j < 4; ++j) {
-            const std::uint32_t valid = j < len ? 1u : 0u;
-            const std::uint32_t f = fill[t + j];
-            fill[t + j] = f + valid;
-            unsigned char *const to = valid ? halves + 2u * f : scratch;
-            std::memcpy(to, &index, 2);
-        }
-        for (std::int32_t j = 4; j < len; ++j) {
-            const std::uint32_t f = fill[t + j]++;
-            std::memcpy(halves + 2u * f, &index, 2);
-        }
-    }
-    for (std::uint32_t n = 0; n < touched_n; ++n) count[touched[n]] = 0;
+    const std::uint32_t list_offset = tile_offset + lists.tiles * 2 + 2;
     std::uint32_t snapshot_lo, snapshot_hi;
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
-    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi, 1u, 0u, mip_offset});
-    note_raster(prims, tiles, total, snapshot);
+    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, lists.tiles, list_offset, snapshot_lo, snapshot_hi, 1u, 0u, mip_offset});
+    note_raster(prims, lists.tiles, lists.total, snapshot);
     if (stat::g_on) {
         stat::batch(prims, kWhyName[g_why]);
         if (!g_batch_log) g_why = kWhyFlush;
@@ -1112,14 +1387,31 @@ void flush_batch() {
         g_why = kWhyFlush;
     }
     if (g_bench.capturing && hw::enabled()) hw::capture_batch(static_cast<std::uint32_t>(g_bench.subs.size()), static_cast<std::uint32_t>(g_commands.size()), b.prims.data(), prims, b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords));
-    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param, mip_offset != 0xFFFFFFFFu});
+    g_commands.push_back({kRaster, std::min(lists.tiles, 1024u), (lists.tiles + 1023) / 1024, param, mip_offset != 0xFFFFFFFFu});
+    g_shape_params.push_back(param);
+    if (job) {  // the helper has the records; the slots wait for its numbers
+        job->param = param;
+        job->command = static_cast<std::uint32_t>(g_commands.size() - 1);
+    }
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
+    if (g_dec_on) {  // the decode cache: this batch's decodes saw memory as it was, its draws are writers
+        stamp_pages(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy), true);
+        if (b.zwrite) stamp_pages(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy), true);
+    }
     if (hwcache::g_on) {  // the texture cache (hwcache.hpp): this batch reads its textures as they are now, then its draws are writers
         if (hwcache::counting()) hwcache::batch_textures(b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords), kSetupWords);
         hwcache::write_region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy, hwcache::kDraw);
         if (b.zwrite) hwcache::write_region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy, hwcache::kDraw);
     }
+    if (g_bench.capturing && hw::enabled() && hw::match())  // PS2_GPU_HW_MATCH=1: neutralise the shapes the trial does not draw, so both pictures lack them (after
+        for (std::uint32_t i = 0; i < prims; ++i) {           // everything above has read the records as they were)
+            std::uint32_t *rec = b.prims.data() + i * kPrimWords;
+            if (!hw::left_out(rec, b.setups.data() + rec[0] * kSetupWords)) continue;
+            rec[2] = 0x7FFF7FFFu;
+            rec[3] = 0;
+        }
+    b.prims.commit();
     reset_batch();
 }
 
@@ -1242,6 +1534,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     op.image = im.id;
     const Range pal_range_of_upload = op.range;
     queue_pre(op);
+    if (g_dec_on) id_upload(op.rec, source ? mix64(g_cache_uid, 0xCAC4Eull) : n < kCacheMinBytes ? bytes_id(bytes, n) : fresh_id());  // after queue_pre, as hwcache below
     if (g_live) hw::pal_upload(im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, static_cast<std::uint32_t>(lead_bits), im.bpp, bytes, size, pal_range_of_upload.lo, pal_range_of_upload.hi);
     if (hwcache::g_on)  // after queue_pre: a batch that reads this memory was flushed by it and saw the old numbers
         hwcache::write_upload(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1), static_cast<int>(im.dsay + last),
@@ -1329,9 +1622,23 @@ void rebuild_group() {
     g_group = make_group(g_params, g_data);
 }
 
+// The data buffer holds the arena and then the frame's shape records (g_shapes): the raster commands' parameter word 1 (where their records start)
+// gets the arena's size added. Called once per submit, after the tile jobs are placed (they add to the arena).
+void place_shapes() {
+    const std::uint32_t base = static_cast<std::uint32_t>(g_arena.size());
+    for (const std::uint32_t p : g_shape_params) g_param_records[p][1] += base;
+    g_shape_params.clear();
+}
+
+// One write each: the arena, and the shape records right after it, from where draw() put them.
+void upload_data() {
+    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    if (g_shapes.begin) wgpuQueueWriteBuffer(g_queue, g_data, g_arena.size() * 4, g_shapes.words.data(), g_shapes.begin * 4);
+}
+
 void ensure_capacity() {
     bool changed = false;
-    const std::uint64_t data_bytes = std::max<std::uint64_t>(g_arena.size() * 4, 16);
+    const std::uint64_t data_bytes = std::max<std::uint64_t>((g_arena.size() + g_shapes.begin) * 4, 16);
     if (data_bytes > g_data_size) {
         if (g_data) wgpuBufferRelease(g_data);
         g_data_size = std::max<std::uint64_t>(g_data_size * 2, (data_bytes + (4u << 20) - 1) & ~((4ull << 20) - 1));
@@ -1359,7 +1666,7 @@ void profile_submit() {
         g_profile_read = make_buffer(kMax * 16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
     ensure_capacity();
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    upload_data();
     wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
@@ -1412,6 +1719,7 @@ void profile_submit() {
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
+    g_shapes.restart();
     g_decoded_used = 0;
     g_clut_loads = 0;
 }
@@ -1422,6 +1730,7 @@ void bench_capture() {
     sub.params.resize(g_param_records.size() * (kParamStride / 4));
     if (!g_param_records.empty()) std::memcpy(sub.params.data(), g_param_records.data(), g_param_records.size() * kParamStride);
     sub.arena.assign(g_arena.data(), g_arena.data() + g_arena.size());
+    sub.arena.insert(sub.arena.end(), g_shapes.words.data(), g_shapes.words.data() + g_shapes.begin);  // as the chip gets them (place_shapes)
     sub.info = std::move(g_bench_info);
     g_bench_info.clear();
 }
@@ -1431,6 +1740,8 @@ void submit(WGPUTextureView present_view = nullptr) {
     if (g_commands.empty() && !present_view
         && !(g_live && hw::live_pending())
         ) return;
+    finish_tiles(true);  // the helper's lists go into the arena before it is measured, copied or uploaded
+    place_shapes();
     if (g_bench.capturing) bench_capture();
     if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
         profile_submit();
@@ -1444,10 +1755,10 @@ void submit(WGPUTextureView present_view = nullptr) {
             ++g_hitch_now.commands[c.pipeline];
             g_hitch_now.groups[c.pipeline] += static_cast<std::uint64_t>(c.x) * c.y;
         }
-        g_hitch_now.arena_bytes += g_arena.size() * 4;
+        g_hitch_now.arena_bytes += (g_arena.size() + g_shapes.begin) * 4;
         ++g_hitch_now.submits;
     }
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    upload_data();
     wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     if (g_query_ready) {
         const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
@@ -1487,10 +1798,8 @@ void submit(WGPUTextureView present_view = nullptr) {
     std::uint32_t command_index = 0;
     for (const Command &c : g_commands) {
         if (card_work && hw::live_before(command_index)) {  // the card's work that goes before this command (the order of the command stream)
-            wgpuComputePassEncoderEnd(pass);
-            wgpuComputePassEncoderRelease(pass);
-            hw::live_encode(enc, command_index);
-            pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+            pass = hw::live_encode(enc, command_index, pass);  // may go on in this compute pass or end it
+            if (!pass) pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
             current = kPipelines;
         }
         ++command_index;
@@ -1505,9 +1814,11 @@ void submit(WGPUTextureView present_view = nullptr) {
         wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
     }
-    wgpuComputePassEncoderEnd(pass);
-    wgpuComputePassEncoderRelease(pass);
-    if (card_work) hw::live_encode(enc, ~0u);
+    if (card_work) pass = hw::live_encode(enc, ~0u, pass);
+    if (pass) {
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+    }
     if (measure) {
         wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
@@ -1567,6 +1878,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
+    g_shapes.restart();
     g_decoded_used = 0;
     g_clut_loads = 0;
 }
@@ -2612,10 +2924,7 @@ bool init(Mode m) {
     if (const char *sharp = std::getenv("PS2_SHARP_2D")) g_sharp_2d = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(sharp)), 0u, 2u);
     g_copy_words = (1u << 20) * g_scale * g_scale;
     if (const int tile = std::atoi(os::env("PS2_TILE").c_str()); tile == 4 || tile == 8 || tile == 16) g_tile = tile;
-    g_tiles_per_row = (2048 * static_cast<int>(g_scale) + g_tile - 1) / g_tile;
-    g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row + 8, 0);
-    g_tile_fill.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row + 8, 0);
-    g_touched.assign(g_tile_count.size() + 8, 0);
+    tiles::configure(static_cast<int>(g_scale), g_tile);
     g_field_words = (1u << 19) * g_scale * g_scale;
     g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     std::vector<std::uint32_t> tables;
@@ -2627,8 +2936,11 @@ bool init(Mode m) {
     g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
-    g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
+    g_decoded = make_buffer((static_cast<std::uint64_t>(kCachedWords) + kDecodedWords) * 4, WGPUBufferUsage_Storage);  // the kept textures, then this submit's pictures
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
+    if (const char *cache = std::getenv("PS2_DECODE_CACHE")) g_dec_on = std::atoi(cache) != 0, g_dec_small = std::atoi(cache) != 2;  // 0 off, 2 not for small batches
+    g_dec_stat = !os::env("PS2_DECODE_CACHE_STAT").empty();
+    dec_reset();
     g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     if (g_timestamps) {
@@ -2687,7 +2999,18 @@ bool init(Mode m) {
     const bool explicit_fma = g_dx12_compiler && std::strcmp(g_dx12_compiler, "DXC") == 0 && os::env("PS2_EXPLICIT_FMA") != "0";
     if (explicit_fma) std::fprintf(stderr, "[gpu] shader sums written as fma() (DXC)\n");
     const auto compile_start = std::chrono::steady_clock::now();
+#ifdef __EMSCRIPTEN__
     WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
+#else
+    // wgpu normally adds its own run-time checks to the shader: every buffer index clamped where the graphics API does not
+    // bound it already, and a counter in every loop that breaks out after very many rounds. gs.wgsl keeps its indices inside
+    // its buffers itself (the explicit bounds there) and all its loops end, so PS2_GPU_TRUSTED=1 makes
+    // the built-in draw program without them (wgpu-native's wgpuDeviceCreateShaderModuleTrusted). Off by default until the
+    // laptop has measured it; a shader loaded with PS2_GS_SHADER always keeps the checks.
+    const bool trusted = shader_text.empty() && os::env("PS2_GPU_TRUSTED") == "1";
+    if (trusted) std::fprintf(stderr, "[gpu] draw program without wgpu's run-time checks (PS2_GPU_TRUSTED=1)\n");
+    WGPUShaderModule module = trusted ? wgpuDeviceCreateShaderModuleTrusted(g_device, &md, WGPUShaderRuntimeChecks_None) : wgpuDeviceCreateShaderModule(g_device, &md);
+#endif
     // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE, EXPLICIT_FMA, SHARP and HAS_MIP are listed only when it declares them
     const bool has_tile = shader_text.empty() || shader_text.find("override TILE") != std::string::npos;
     const bool has_fma = shader_text.empty() || shader_text.find("override EXPLICIT_FMA") != std::string::npos;
@@ -2807,34 +3130,19 @@ void draw(const State &st, const Vertex *v, int count) {
     const auto sx = [&](const Vertex &p) { return (static_cast<float>(p.x) - static_cast<float>(ofx)) / 16.0f; };
     const auto sy = [&](const Vertex &p) { return (static_cast<float>(p.y) - static_cast<float>(ofy)) / 16.0f; };
     const float samples = static_cast<float>(g_scale);
-    const auto first = [&](float lo) { return static_cast<int>(std::floor(std::ceil(lo * samples) / samples)); };
 
     std::uint32_t rec[kPrimWords] = {};
     int minx, miny, maxx, maxy;
     switch (prim) {
     case 3: case 4: case 5: {
         if (count < 3) return;
-        const float x0 = sx(v[0]), y0 = sy(v[0]), x1 = sx(v[1]), y1 = sy(v[1]), x2 = sx(v[2]), y2 = sy(v[2]);
-        const float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
-        if (area == 0.0f) return;
-        minx = std::max(scax0, first(std::min({x0, x1, x2})));
-        maxx = std::min(scax1, static_cast<int>(std::ceil(std::max({x0, x1, x2}))) - 1);
-        miny = std::max(scay0, first(std::min({y0, y1, y2})));
-        maxy = std::min(scay1, static_cast<int>(std::ceil(std::max({y0, y1, y2}))) - 1);
-        rec[1] = 0;
-        const float xy[6] = {x0, y0, x1, y1, x2, y2};
-        for (int i = 0; i < 6; ++i) rec[4 + i] = f2u(xy[i]);
-        rec[10] = f2u(1.0f / area);
-        const float sg = area > 0.0f ? 1.0f : -1.0f;
-        const auto inclusive = [&](float ax, float ay, float bx, float by) {
-            const float gx = (ay - by) * sg, gy = (bx - ax) * sg;
-            return gx > 0.0f || (gx == 0.0f && gy > 0.0f);
-        };
-        rec[27] = (inclusive(x1, y1, x2, y2) ? 1u : 0u) | (inclusive(x2, y2, x0, y0) ? 2u : 0u) | (inclusive(x0, y0, x1, y1) ? 4u : 0u);
-        for (int i = 0; i < 3; ++i) attrs(rec, i, v[i], fst, iip ? nullptr : &v[2]);
-        rec[24] = v[0].z;
-        rec[25] = f2u(static_cast<float>(static_cast<std::int64_t>(v[1].z) - static_cast<std::int64_t>(v[0].z)));
-        rec[26] = f2u(static_cast<float>(static_cast<std::int64_t>(v[2].z) - static_cast<std::int64_t>(v[0].z)));
+        // the corners, the edge rule and the box as vectors (setup.hpp; tests/draw_setup.cpp checks it against the scalar arithmetic)
+        int box[4];
+        if (!prim_setup::triangle(rec, box, v, ofx, ofy, samples, setup[10], setup[11], fst, iip)) return;
+        minx = box[0];
+        miny = box[1];
+        maxx = box[2];
+        maxy = box[3];
         break;
     }
     case 6: {
@@ -3103,6 +3411,11 @@ void local_copy(const State &s) {
     mark_rendered(pages(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
                         static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, (static_cast<int>(pos >> 32) & 0x7FF) + static_cast<int>(w) - 1,
                         (static_cast<int>(pos >> 48) & 0x7FF) + static_cast<int>(h) - 1));
+    if (g_dec_on)
+        stamp_pages(pages(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
+                          static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, (static_cast<int>(pos >> 32) & 0x7FF) + static_cast<int>(w) - 1,
+                          (static_cast<int>(pos >> 48) & 0x7FF) + static_cast<int>(h) - 1),
+                    true);
     const std::uint32_t read = push_params({static_cast<std::uint32_t>(buf) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 16) & 0x3Fu, static_cast<std::uint32_t>(buf >> 24) & 0x3Fu,
                                             static_cast<std::uint32_t>(pos) & 0x7FFu, static_cast<std::uint32_t>(pos >> 16) & 0x7FFu, w, h});
     const std::uint32_t write = push_params({static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
@@ -3132,6 +3445,7 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
+    if (g_dec_on) id_clut(op.rec);
     if (g_live) hw::pal_clut(g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, psm == PSMT8 || psm == PSMT8H);  // after queue_pre (a pending batch that overwrites the palette was flushed by it)
     if (hwcache::g_on) hwcache::clut_load(g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u, cbw, cou, cov);
     g_clut_slot = next;
@@ -3145,6 +3459,7 @@ void flush() {
     flush_all();
     submit();
     if (stat::g_on) stat::frame_end();
+    dec_stat_frame();
     if (hwcache::g_on && hwcache::counting()) {
         if (hwcache::verify_on()) {
             static std::vector<std::uint8_t> memory(kMemorySize);
@@ -3275,6 +3590,7 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     wait_idle();
     if (stat::g_on) stat::state_loaded();
     if (hwcache::g_on) hwcache::state_loaded();
+    dec_reset();  // memory and palette are new: nothing kept is valid
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
     // A page counts as drawn by the GS when its samples differ within a texel; one that is the same in all of them was uploaded (or
@@ -3305,6 +3621,9 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
 void stats() {
     if (g_mode == Mode::off) return;
     if (g_live) hw::live_stats();
+    if (tiles::owner()) finish_tiles(true);  // the lists of the batches that were flushed but not submitted yet count in the fingerprint below; not from the emulation thread,
+                                             // which calls this at the end of a run while the window thread may still be placing jobs (a crash at the end, 2026-11-11)
+    tiles::report();
     stat::report();
     hwcache::report();
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));

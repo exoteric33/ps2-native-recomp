@@ -169,7 +169,7 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
         list(APPEND PS2_HW_SOURCES "${PS2_HW_WGSL}" "${PS2_HW_SYNC_WGSL}" "${PS2_CACHE_WGSL}")
     endif()
     if(NOT PS2_PREBUILT)
-        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" ${PS2_HW_SOURCES})
+        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp runtime/src/gs/gpu/tiles.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" ${PS2_HW_SOURCES})
     endif()
     target_compile_definitions(ps2runtime ${PS2_API} PS2_GPU)
     if(EMSCRIPTEN)
@@ -245,6 +245,13 @@ if(NOT EMSCRIPTEN)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
         target_compile_options(ps2vucleanuptest PRIVATE -msse4.1)
     endif()
+    # the decode cache's blocks (runtime/src/gs/gpu/gpu.cpp, for_cells) against the drawing program's address tables, no game needed: ninja ps2decodecachetest
+    add_executable(ps2decodecachetest EXCLUDE_FROM_ALL tests/decode_cache.cpp)
+    target_link_libraries(ps2decodecachetest PRIVATE ps2runtime)
+    # the triangle set-up of the drawing thread (vectors, runtime/src/gs/gpu/setup.hpp) against the scalar arithmetic, bit for bit,
+    # no game needed: ninja ps2drawsetuptest
+    add_executable(ps2drawsetuptest EXCLUDE_FROM_ALL tests/draw_setup.cpp)
+    target_include_directories(ps2drawsetuptest PRIVATE runtime/include runtime/src)
     # damaged disc images, IOP modules and boot ELFs refused cleanly, no game needed: ninja ps2discinputtest
     add_executable(ps2discinputtest EXCLUDE_FROM_ALL tests/disc_input.cpp)
     target_include_directories(ps2discinputtest PRIVATE runtime/src)

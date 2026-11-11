@@ -311,6 +311,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2fileiolayoutstest PRIVATE synchronization)
     endif()
+    # the stream command sceCdStStat answers the sectors in the stream buffer (issue 44, no game needed): ninja ps2cdvdstreamstattest
+    add_executable(ps2cdvdstreamstattest EXCLUDE_FROM_ALL tests/cdvd_stream_stat.cpp)
+    target_include_directories(ps2cdvdstreamstattest PRIVATE runtime/src)
+    target_link_libraries(ps2cdvdstreamstattest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2cdvdstreamstattest PRIVATE synchronization)
+    endif()
     # ioman AddDrv and DelDrv call the driver's init and deinit and keep a table of its devices (no game needed): ninja ps2iomandrvtest
     add_executable(ps2iomandrvtest EXCLUDE_FROM_ALL tests/ioman_drivers.cpp)
     target_include_directories(ps2iomandrvtest PRIVATE runtime/src)

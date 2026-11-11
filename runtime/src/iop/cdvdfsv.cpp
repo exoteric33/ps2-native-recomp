@@ -54,6 +54,19 @@ std::uint8_t bcd(int v) { return static_cast<std::uint8_t>(((v / 10) << 4) | (v 
 
 bool g_streaming = false;
 std::uint32_t g_stream_pos = 0;
+// The stream buffer the game set up with sceCdStInit (ps2sdk cdvdstm.c, command 5: the buffer's size in sectors and its number of banks);
+// not part of a save state (0 after loading one: sceCdStStat then answers kStreamBufferDefault until the game sets the stream up again).
+std::uint32_t g_stream_buffer = 0;
+std::uint32_t g_stream_banks = 0;
+constexpr std::uint32_t kStreamBufferDefault = 16;
+
+// sceCdStStat of a full buffer. cdvdstm.c fills one bank after the other and never the bank the reader is in, so a full buffer holds all
+// banks but one: (banks - 1) times the sectors of a bank.
+std::uint32_t stream_full() {
+    if (!g_stream_buffer) return kStreamBufferDefault;
+    if (g_stream_banks < 2) return g_stream_buffer;
+    return (g_stream_banks - 1) * (g_stream_buffer / g_stream_banks);
+}
 
 std::uint64_t delay(std::uint32_t sectors) { return usec_to_cycles(400) + static_cast<std::uint64_t>(sectors) * usec_to_cycles(200); }
 
@@ -70,6 +83,8 @@ void read_to_ee(std::uint32_t sector, std::uint32_t count, std::uint32_t dst) {
 void install_cdvdfsv() {
     g_streaming = false;
     g_stream_pos = 0;
+    g_stream_buffer = 0;
+    g_stream_banks = 0;
     register_job(kJobFsvRead, [](const Job &j) {
         if (g_trace_hle) std::fprintf(stderr, "[cdvdfsv] stream write lsn %u count %u to 0x%08X\n", j.a, j.b, j.c);
         if (!disc::ready(j.a, j.b)) {
@@ -162,8 +177,11 @@ void install_cdvdfsv() {
             }
             case 3: g_streaming = false; set_ee32(ret, 1); return true;
             case 4: case 9: g_stream_pos = sector; set_ee32(ret, 1); return true;
-            case 5: set_ee32(ret, 1); return true;
-            case 6: set_ee32(ret, sector); return true;
+            case 5: g_stream_buffer = sector; g_stream_banks = count; set_ee32(ret, 1); return true;
+            // sceCdStStat: how many sectors the stream buffer holds now (ps2sdk cdvdstm.c, command 6: the filled banks times the sectors
+            // per bank). The disc is always ahead here, so a started stream has its buffer full, a stopped one nothing.
+            // This used to answer the lbn field of the call, which is 0, so a game waiting for data in the buffer waited for ever.
+            case 6: set_ee32(ret, g_streaming ? stream_full() : 0u); return true;
             default: set_ee32(ret, 1); return true;
             }
         }

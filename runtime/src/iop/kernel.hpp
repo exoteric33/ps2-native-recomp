@@ -45,7 +45,11 @@ void fault(const char *reason);
 std::uint32_t fetch_special(std::uint32_t pc);
 void syscall(Cpu &c, std::uint32_t pc);
 void set_status(Cpu &c, std::uint32_t value);
-bool switch_pending();
+extern bool g_switch;
+extern int g_nesting;
+extern bool g_nested_done;
+// asked after every IOP instruction, so inline
+inline bool switch_pending() { return g_switch || (g_nesting && g_nested_done); }
 
 std::uint64_t now();
 std::uint64_t usec_to_cycles(std::uint64_t usec);

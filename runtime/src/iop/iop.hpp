@@ -58,6 +58,8 @@ void write8(std::uint32_t a, std::uint8_t v);
 void write16(std::uint32_t a, std::uint16_t v);
 void write32(std::uint32_t a, std::uint32_t v);
 // PS2_WATCH_IOP (hw.cpp): the library functions that write memory on the IOP's behalf say so here
+// PS2_WATCH_IOP's range (0 and 0 when off); the interpreter's inline stores go the slow way while it is set
+extern std::uint32_t g_watch_lo, g_watch_hi;
 void watch_copy(const char *what, std::uint32_t dst, std::uint32_t src, std::uint32_t bytes, std::uint32_t caller);
 
 using HleFunction = std::function<void(Cpu &)>;

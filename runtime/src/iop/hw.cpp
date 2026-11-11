@@ -21,10 +21,14 @@ alignas(16) std::uint8_t g_scratchpad[1024];
 bool is_ram(std::uint32_t p) { return p < 0x00800000u; }
 bool is_scratchpad(std::uint32_t p) { return (p & ~0x3FFu) == 0x1F800000u; }
 
+}
+
 // PS2_WATCH_IOP=<first>:<last> (hex, IOP RAM addresses): porting work, prints every store of the IOP's own code into that range with
 // the time (seconds of IOP time), the program counter, the return address and the value. Stores of the emulator itself (the disc
 // reads, the DMA) are not seen here.
 std::uint32_t g_watch_lo = 0, g_watch_hi = 0;
+
+namespace {
 
 void watch_store(std::uint32_t p, unsigned size, std::uint32_t v) {
     if (p + size <= g_watch_lo || p >= g_watch_hi) return;

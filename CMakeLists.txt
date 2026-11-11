@@ -259,6 +259,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2iopboundstest PRIVATE synchronization)
     endif()
+    # the IOP interpreter's decode table against the interpreter before it, and code that changes under it (no game needed): ninja ps2iopdecodetest
+    add_executable(ps2iopdecodetest EXCLUDE_FROM_ALL tests/iop_decode.cpp)
+    target_include_directories(ps2iopdecodetest PRIVATE runtime/src)
+    target_link_libraries(ps2iopdecodetest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2iopdecodetest PRIVATE synchronization)
+    endif()
     # modload #9 and cdvdman #44 (Tales of Destiny 2 / Director's Cut, no game needed): ninja ps2talestest
     add_executable(ps2talestest EXCLUDE_FROM_ALL tests/iop_tales.cpp)
     target_include_directories(ps2talestest PRIVATE runtime/src)

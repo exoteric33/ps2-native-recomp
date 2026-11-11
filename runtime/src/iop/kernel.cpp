@@ -25,6 +25,10 @@ namespace kernel {
 
 bool g_trace_hle = false;
 bool g_trace_modules = false;
+// read by the interpreter's inline switch_pending() (kernel.hpp)
+bool g_switch = false;
+int g_nesting = 0;
+bool g_nested_done = false;
 
 namespace {
 
@@ -69,7 +73,6 @@ std::map<int, Thread> g_threads;
 int g_current = 0;
 int g_next_thread = 1;
 std::uint64_t g_order = 0;
-bool g_switch = false;
 std::uint64_t g_switch_count = 0;  // thread switches so far (statistics for ReferSystemStatus; not part of the save state)
 
 std::map<std::uint32_t, std::uint32_t> g_used;
@@ -83,8 +86,6 @@ std::uint64_t g_ee_remainder = 0;
 
 std::map<unsigned, Interrupt> g_interrupts;
 bool g_suspended = false;
-int g_nesting = 0;
-bool g_nested_done = false;
 std::uint32_t g_return_stub = 0;
 std::uint32_t g_exit_stub = 0;
 std::set<std::pair<std::string, std::uint32_t>> g_missing_reported;
@@ -290,8 +291,6 @@ void syscall(Cpu &c, std::uint32_t pc) {
 }
 
 void set_status(Cpu &c, std::uint32_t value) { c.status = value; }
-
-bool switch_pending() { return g_switch || (g_nesting && g_nested_done); }
 
 std::uint64_t now() { return g_now; }
 std::uint64_t usec_to_cycles(std::uint64_t usec) { return usec * 36864u / 1000u; }

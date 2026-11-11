@@ -278,27 +278,44 @@ __attribute__((always_inline)) inline __m128i unpack_element(const std::uint8_t 
     }
 }
 
-template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
-void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
-    constexpr std::size_t stride = static_cast<std::size_t>(Components) * Bits / 8;
-    if (skip == 0) {
-        for (std::uint32_t n = 0; n < num; ++n)
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>((addr + n) & mask) * 16), unpack_element<Bits, Components, Usn>(bytes + n * stride));
-        return;
-    }
-    std::uint32_t cycle = 0;
-    for (std::uint32_t n = 0; n < num; ++n) {
-        _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>(addr & mask) * 16), unpack_element<Bits, Components, Usn>(bytes + n * stride));
-        ++addr;
-        if (++cycle >= wl) {
-            addr += skip;
-            cycle = 0;
-        }
+// STMOD applied to one unpacked element when no lane is masked: mode 1 adds the row registers, mode 2 adds them and keeps the sum
+// as the new row, mode 3 keeps the element as the new row (the generic loop below does the same lane by lane).
+template <std::uint32_t Mode>
+__attribute__((always_inline)) inline __m128i apply_mode(__m128i v, __m128i &row) {
+    if constexpr (Mode == 1) {
+        return _mm_add_epi32(v, row);
+    } else if constexpr (Mode == 2) {
+        row = _mm_add_epi32(v, row);
+        return row;
+    } else {
+        if constexpr (Mode == 3) row = v;
+        return v;
     }
 }
+
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn, std::uint32_t Mode>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num, std::uint32_t *row_regs) {
+    constexpr std::size_t stride = static_cast<std::size_t>(Components) * Bits / 8;
+    __m128i row = Mode ? _mm_loadu_si128(reinterpret_cast<const __m128i *>(row_regs)) : _mm_setzero_si128();
+    if (skip == 0) {
+        for (std::uint32_t n = 0; n < num; ++n)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>((addr + n) & mask) * 16), apply_mode<Mode>(unpack_element<Bits, Components, Usn>(bytes + n * stride), row));
+    } else {
+        std::uint32_t cycle = 0;
+        for (std::uint32_t n = 0; n < num; ++n) {
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>(addr & mask) * 16), apply_mode<Mode>(unpack_element<Bits, Components, Usn>(bytes + n * stride), row));
+            ++addr;
+            if (++cycle >= wl) {
+                addr += skip;
+                cycle = 0;
+            }
+        }
+    }
+    if constexpr (Mode >= 2) _mm_storeu_si128(reinterpret_cast<__m128i *>(row_regs), row);
+}
 #else
-template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
-void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn, std::uint32_t Mode>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num, std::uint32_t *row) {
     std::uint32_t cycle = 0;
     for (std::uint32_t n = 0; n < num; ++n) {
         std::uint32_t value[4];
@@ -322,6 +339,16 @@ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std:
         } else if constexpr (Components == 3) {
             value[3] = 0;
         }
+        for (std::uint32_t j = 0; j < 4; ++j) {
+            if constexpr (Mode == 1) {
+                value[j] += row[j];
+            } else if constexpr (Mode == 2) {
+                value[j] += row[j];
+                row[j] = value[j];
+            } else if constexpr (Mode == 3) {
+                row[j] = value[j];
+            }
+        }
         std::memcpy(mem + (addr & mask) * 16, value, 16);
         ++addr;
         if (++cycle >= wl) {
@@ -333,24 +360,28 @@ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std:
 
 #endif
 
-using FastUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t);
+using FastUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t, std::uint32_t *);
 
-template <std::uint32_t Bits>
+template <std::uint32_t Bits, std::uint32_t Mode>
 constexpr FastUnpack fast_pair(std::uint32_t components, bool usn) {
     switch (components) {
-    case 1: return usn ? unpack_fast<Bits, 1, true> : unpack_fast<Bits, 1, false>;
-    case 2: return usn ? unpack_fast<Bits, 2, true> : unpack_fast<Bits, 2, false>;
-    case 3: return usn ? unpack_fast<Bits, 3, true> : unpack_fast<Bits, 3, false>;
-    default: return usn ? unpack_fast<Bits, 4, true> : unpack_fast<Bits, 4, false>;
+    case 1: return usn ? unpack_fast<Bits, 1, true, Mode> : unpack_fast<Bits, 1, false, Mode>;
+    case 2: return usn ? unpack_fast<Bits, 2, true, Mode> : unpack_fast<Bits, 2, false, Mode>;
+    case 3: return usn ? unpack_fast<Bits, 3, true, Mode> : unpack_fast<Bits, 3, false, Mode>;
+    default: return usn ? unpack_fast<Bits, 4, true, Mode> : unpack_fast<Bits, 4, false, Mode>;
     }
 }
 
-constexpr FastUnpack kFastUnpack[4][4][2] = {
-    {{fast_pair<32>(1, false), fast_pair<32>(1, true)}, {fast_pair<32>(2, false), fast_pair<32>(2, true)}, {fast_pair<32>(3, false), fast_pair<32>(3, true)}, {fast_pair<32>(4, false), fast_pair<32>(4, true)}},
-    {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
-    {{fast_pair<8>(1, false), fast_pair<8>(1, true)}, {fast_pair<8>(2, false), fast_pair<8>(2, true)}, {fast_pair<8>(3, false), fast_pair<8>(3, true)}, {fast_pair<8>(4, false), fast_pair<8>(4, true)}},
-    {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
+// [STMOD][VL][VN][USN]; VL 3 (V4-5) is not a fast form, its row repeats the 16-bit one only to fill the table.
+template <std::uint32_t Mode>
+constexpr FastUnpack kFastMode[4][4][2] = {
+    {{fast_pair<32, Mode>(1, false), fast_pair<32, Mode>(1, true)}, {fast_pair<32, Mode>(2, false), fast_pair<32, Mode>(2, true)}, {fast_pair<32, Mode>(3, false), fast_pair<32, Mode>(3, true)}, {fast_pair<32, Mode>(4, false), fast_pair<32, Mode>(4, true)}},
+    {{fast_pair<16, Mode>(1, false), fast_pair<16, Mode>(1, true)}, {fast_pair<16, Mode>(2, false), fast_pair<16, Mode>(2, true)}, {fast_pair<16, Mode>(3, false), fast_pair<16, Mode>(3, true)}, {fast_pair<16, Mode>(4, false), fast_pair<16, Mode>(4, true)}},
+    {{fast_pair<8, Mode>(1, false), fast_pair<8, Mode>(1, true)}, {fast_pair<8, Mode>(2, false), fast_pair<8, Mode>(2, true)}, {fast_pair<8, Mode>(3, false), fast_pair<8, Mode>(3, true)}, {fast_pair<8, Mode>(4, false), fast_pair<8, Mode>(4, true)}},
+    {{fast_pair<16, Mode>(1, false), fast_pair<16, Mode>(1, true)}, {fast_pair<16, Mode>(2, false), fast_pair<16, Mode>(2, true)}, {fast_pair<16, Mode>(3, false), fast_pair<16, Mode>(3, true)}, {fast_pair<16, Mode>(4, false), fast_pair<16, Mode>(4, true)}},
 };
+
+constexpr const FastUnpack (*kFastUnpack[4])[4][2] = {kFastMode<0>, kFastMode<1>, kFastMode<2>, kFastMode<3>};
 
 void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c) {
     Unit &u = c.u;
@@ -382,8 +413,8 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c
     std::uint32_t cycle = 0;
     std::uint8_t *mem = dry ? g_dry_run : vu_data(unit);
     const std::uint32_t wrap = vu_qwords(unit);
-    if (!masked && u.mode == 0 && !(wl > cl) && !(vn == 3 && vl == 3)) {
-        kFastUnpack[vl][vn][usn ? 1 : 0](mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num);
+    if (!masked && !(wl > cl) && !(vn == 3 && vl == 3)) {
+        kFastUnpack[u.mode][vl][vn][usn ? 1 : 0](mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num, u.row);
         u.num = 0;
         return;
     }

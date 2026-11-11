@@ -350,6 +350,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2viftest PRIVATE synchronization)
     endif()
+    # every UNPACK form under every STMOD, mask and write cycle equals the lane-by-lane rules, no game needed: ninja ps2vifunpacktest
+    add_executable(ps2vifunpacktest EXCLUDE_FROM_ALL tests/vif_unpack_modes.cpp)
+    target_include_directories(ps2vifunpacktest PRIVATE runtime/src)
+    target_link_libraries(ps2vifunpacktest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2vifunpacktest PRIVATE synchronization)
+    endif()
     # an XGKICK packet without an end does not swallow the next kick's packet (public issue 69), no game needed: ninja ps2gifrunawaytest
     add_executable(ps2gifrunawaytest EXCLUDE_FROM_ALL tests/gif_runaway.cpp)
     target_include_directories(ps2gifrunawaytest PRIVATE runtime/src)

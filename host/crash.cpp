@@ -1,3 +1,8 @@
+// macOS hides the ucontext routines (the crash report reads the registers from them) unless _XOPEN_SOURCE is defined; _DARWIN_C_SOURCE keeps the rest visible.
+#if defined(__APPLE__)
+#define _XOPEN_SOURCE 600
+#define _DARWIN_C_SOURCE
+#endif
 #include "crash.hpp"
 
 #include "ps2/crash.hpp"

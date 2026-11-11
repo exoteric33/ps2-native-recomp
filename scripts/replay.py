@@ -106,6 +106,8 @@ def main():
     ap.add_argument("--exe", help="ps2run (default: build/native-<game>/ps2run)")
     ap.add_argument("--card", help="the memory card the recording began with: none, new (an empty new card) or a file (default: from the recording)")
     ap.add_argument("--log", help="keep the full log in this file")
+    ap.add_argument("--keep-card", help="copy the memory card as the game left it at the end of the replay to this file (to look at a save "
+                                        "the recording makes)")
     ap.add_argument("--continue", dest="go_on", action="store_true",
                     help="after a checkpoint that differs, play on to the end of the recording (for a recording that cannot replay exactly, "
                          "like the ones made before 2026-10-28, which left the game's clock to the host)")
@@ -190,6 +192,12 @@ def main():
         with open(log_path, "wb") as log:
             code = subprocess.run(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env).returncode
         text = log_path.read_text(encoding="utf-8", errors="replace")
+        if args.keep_card:
+            if (work / "card.ps2").exists():
+                shutil.copyfile(work / "card.ps2", args.keep_card)
+                print(f"the card after the replay: {args.keep_card}")
+            else:
+                print("replay: the run had no card, nothing to keep")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

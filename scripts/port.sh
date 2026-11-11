@@ -82,6 +82,11 @@ export EMSDK="${EMSDK:-$ROOT/tools/emsdk}"
 setup=()
 [ "$web" = 1 ] || setup=(--native-only)
 if { [ "$web" = 1 ] && [ ! -f "$EMSDK/emsdk_env.sh" ]; } || [ ! -x "$tools/eerecomp" ] || [ ! -x "$tools/vurecomp" ]; then "$here/setup.sh" "${setup[@]}"; fi
+# An update can bring a newer translator (the app replaces recomp/ but keeps build/): ninja compiles the tools again when their
+# sources changed, about a second when nothing did. Without this, games built after an update would still use the old translator.
+if [ -f "$tools/build.ninja" ]; then
+  ninja -C "$tools" eerecomp vurecomp > "$tools/ninja-port.log" 2>&1 || { tail -n 30 "$tools/ninja-port.log" >&2; echo "building the translator tools failed" >&2; exit 1; }
+fi
 mkdir -p "$game/disc" "$game/vu1" "$game/vu0" "$game/shots" "$generated"
 
 echo "== [1/6] disc"

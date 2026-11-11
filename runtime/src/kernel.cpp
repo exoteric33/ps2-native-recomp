@@ -7,6 +7,7 @@
 #include "ps2/system.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/crash.hpp"
 
 #include <algorithm>
 #include <array>
@@ -521,6 +522,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     std::uint32_t n = c.r[3].w[0];
     const bool interrupt_variant = (n & 0x80000000u) != 0;
     if (interrupt_variant) n = 0u - n;
+    crash::note_syscall(n, pc);  // a crash report names the game's last system call (one relaxed store)
     if (n < 0x100u) {
         const std::uint32_t custom = ld32(kSyscallTable + n * 4u);
         if (custom && has_code(custom & 0x1FFFFFFFu)) {

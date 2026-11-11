@@ -10,6 +10,7 @@
 #include "iop/sio2.hpp"
 #include "iop/spu2.hpp"
 #include "ipu/ipu.hpp"
+#include "ps2/crash.hpp"
 #include "ps2/disc.hpp"
 #include "ps2/ee_live.hpp"
 #include "kernel.hpp"
@@ -27,6 +28,10 @@
 #endif
 
 #include <algorithm>
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <dlfcn.h>
+#include <pthread.h>
+#endif
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -293,6 +298,7 @@ void report_load() {
 
 void vblank() {
     ++g_frames;
+    crash::test_poll(crash::Thread::Game);
     // Offline EE cache preparation: capture only explicitly requested frames.
     // Disabled for normal runs; the filenames retain the frame and address so
     // a headless preparer can associate each image with the scripted input.
@@ -828,6 +834,7 @@ void core_sample(Who who) {
 }
 
 int run() {
+    crash::enter_thread(crash::Thread::Game);
     thread_tune(Who::Emulation);
     Cpu &c = g_cpu;
     const std::uint64_t started_at = now();  // for the share of waiting loops skipped (hw.cpp)
@@ -922,6 +929,7 @@ std::uint64_t vu1_interpreted_calls() { return vu::interpreted_calls(); }
 void run_vu_thread() {
     gs::queue::role() = gs::queue::Role::Vu;
     gs::queue::Ring &in = gs::queue::vu();
+    crash::enter_thread(crash::Thread::VectorUnit);
     thread_tune(Who::Vu);
     // PS2_VU_SPIN=<microseconds>: look for new work this long before going to sleep (a sleep and a wake-up cost a system call each)
     static const long spin_us = std::atol(os::env("PS2_VU_SPIN").c_str());
@@ -929,6 +937,7 @@ void run_vu_thread() {
         gs::queue::Header h;
         const std::uint8_t *payload = nullptr;
         core_sample(Who::Vu);
+        crash::test_poll(crash::Thread::VectorUnit);
         while (in.peek(h, payload)) {
             switch (h.type) {
             case gs::queue::kVif1: vif::transfer_words(1, reinterpret_cast<const std::uint32_t *>(payload), h.arg0); break;
@@ -974,9 +983,11 @@ Rendered render_pending(bool surface, const std::function<void(const std::uint32
     static thread_local bool tuned = false;
     if (!tuned) {
         tuned = true;
+        crash::enter_thread(crash::Thread::Gpu);
         thread_tune(Who::Render);
     }
     core_sample(Who::Render);
+    crash::test_poll(crash::Thread::Gpu);
     return gs::render_pending([&](const gs::DisplayRegs &regs) {
         quick::on_present(regs);  // the picture for an F9 report is taken here, on the thread that may read the GPU
         if (before_present) before_present();
@@ -1116,5 +1127,209 @@ void set_pad_connected(int pad, bool connected) {
 }
 std::uint16_t pad_rumble(int pad) { return iop::sio2::rumble(pad); }
 void set_audio_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { iop::spu2::set_sink(std::move(sink)); }
+
+
+// ---------------------------------------------------------------------------------------------------------------- crash information
+
+#ifdef _WIN32
+extern "C" {
+void *__stdcall GetModuleHandleW(const wchar_t *);
+void *__stdcall GetProcAddress(void *, const char *);
+void *__stdcall GetCurrentThread();
+int __cdecl _close(int);
+}
+#endif
+namespace crash {
+
+namespace {
+
+// the name for the crash report and the shorter one the system shows (Linux keeps 15 characters)
+struct ThreadInfo {
+    const char *report;
+    const char *system;
+    const char *test;  // the name PS2_CRASH_TEST uses
+};
+constexpr ThreadInfo kThreads[] = {
+    {"main (window)", "ps2 main", "main"},
+    {"emulation (EE)", "ps2 emulation", "game"},
+    {"vector unit (VU1)", "ps2 vu1", "vu"},
+    {"window and drawing (GPU)", "ps2 gpu", "gpu"},
+    {"sound", "ps2 sound", "sound"},
+    {"live compiler (EE code)", "ps2 live-ee", "live-ee"},
+    {"live compiler (VU programs)", "ps2 live-vu", "live-vu"},
+    {"log copy", "ps2 log", "tee"},
+    {"watchdog", "ps2 watchdog", "watchdog"},
+    {"drawing helper (tiles)", "ps2 tiles", "tiles"},
+};
+static_assert(sizeof kThreads / sizeof kThreads[0] == static_cast<std::size_t>(Thread::Count));
+
+thread_local const char *t_name = nullptr;
+void (*g_hook)() = nullptr;
+
+enum class Kind { access, read, stack, divide, illegal, abort, thrown, param, live };
+std::uint64_t g_test_frame = 0;
+Kind g_test_kind = Kind::access;
+std::string g_test_here;  // main, emu or tee: PS2_CRASH_TEST's thread when it is one of the fixed places
+
+constexpr int kMaxLive = 1024;
+LiveLibrary g_live[kMaxLive];
+std::atomic<int> g_live_count{0};
+std::mutex g_live_mutex;  // only between two loaders; the report reads without it
+
+[[gnu::noinline]] int recurse(int depth) {
+    // A frame this big is probed from the top down, so the overflow is found while most of a page is still left (under Wine the
+    // handler has no room at all when the last bytes are used up one small frame after the other).
+    volatile char pad[1000000];  // not a power of two: the last level then ends well above the limit
+    pad[0] = static_cast<char>(depth);
+    return recurse(depth + 1) + pad[0];
+}
+
+[[noreturn]] void fail(Kind kind) {
+    switch (kind) {
+    case Kind::access: *reinterpret_cast<volatile int *>(static_cast<std::uintptr_t>(g_test_frame & 0)) = 1; break;
+    case Kind::read: {
+        volatile int value = *reinterpret_cast<volatile int *>(static_cast<std::uintptr_t>(g_test_frame & 0));
+        (void)value;
+        break;
+    }
+    case Kind::stack: std::exit(recurse(0)); break;
+    case Kind::divide: {
+        volatile int zero = 0, some = 7;  // both unknown: 1 / x alone is turned into a comparison by the compiler, without a division
+        std::exit(some / zero);
+        break;
+    }
+    case Kind::illegal: __builtin_trap();
+    case Kind::abort: std::abort();
+    case Kind::thrown: throw std::runtime_error("PS2_CRASH_TEST");
+    case Kind::live: {
+        // a fault inside live-compiled code: the newest live library's init function (ps2_ee_live_init / ps2_vu_live_init) is called
+        // with null pointers, which it writes through (test_fire waits until a library is loaded)
+        int count = 0;
+        const LiveLibrary *libraries = live_libraries(count);
+        if (count > 0) {
+            using InitFn = const void *(*)(const void *, std::uint32_t *);
+            std::fprintf(stderr, "%p\n", reinterpret_cast<InitFn>(const_cast<void *>(libraries[count - 1].inside))(nullptr, nullptr));
+        }
+        break;
+    }
+    case Kind::param:
+#ifdef _WIN32
+        _close(12345);  // the C runtime calls its invalid-parameter handler for a file number that is not open
+#endif
+        break;
+    }
+    std::abort();  // a kind that did not end the program here (param outside Windows)
+}
+
+}  // namespace
+
+int g_test_thread = -1;
+std::atomic<std::uint64_t> g_last_syscall{0};
+
+void set_thread_hook(void (*hook)()) { g_hook = hook; }
+
+const char *thread_name() { return t_name; }
+
+void enter_thread(Thread thread) {
+    const ThreadInfo &info = kThreads[static_cast<std::size_t>(thread)];
+    t_name = info.report;
+#ifdef _WIN32
+    // SetThreadDescription (Windows 10 1607 on) names the thread for debuggers and profilers; looked up so older systems still start
+    using SetDescription = long(__stdcall *)(void *, const wchar_t *);
+    if (void *kernel = GetModuleHandleW(L"kernel32.dll"))
+        if (const auto set = reinterpret_cast<SetDescription>(GetProcAddress(kernel, "SetThreadDescription"))) {
+            wchar_t wide[32];
+            std::size_t i = 0;
+            for (; info.system[i] && i < 31; ++i) wide[i] = static_cast<unsigned char>(info.system[i]);
+            wide[i] = 0;
+            set(GetCurrentThread(), wide);
+        }
+#elif !defined(__EMSCRIPTEN__) && defined(__linux__)
+    pthread_setname_np(pthread_self(), info.system);
+#elif defined(__APPLE__)
+    pthread_setname_np(info.system);  // macOS names only the calling thread
+#endif
+    if (g_hook) g_hook();
+}
+
+Where where() {
+    const std::uint64_t call = g_last_syscall.load(std::memory_order_relaxed);
+    return Where{g_frames, g_cpu.pc, g_cpu.r[31].w[0], g_cpu.r[29].w[0], kernel::current_thread(), static_cast<std::uint32_t>(call >> 32),
+                 static_cast<std::uint32_t>(call), call != 0};
+}
+
+void note_live_library(Thread kind, const void *inside) {
+    std::lock_guard lock(g_live_mutex);
+    const int n = g_live_count.load(std::memory_order_relaxed);
+    if (n >= kMaxLive) return;
+    std::uint64_t base = 0;
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    Dl_info info{};
+    if (dladdr(inside, &info) && info.dli_fbase) base = reinterpret_cast<std::uint64_t>(info.dli_fbase);
+#endif
+    g_live[n] = LiveLibrary{base, inside, kind};
+    g_live_count.store(n + 1, std::memory_order_release);
+}
+
+const LiveLibrary *live_libraries(int &count) {
+    count = g_live_count.load(std::memory_order_acquire);
+    return g_live;
+}
+
+void test_parse(const char *spec) {
+    if (!spec || !*spec) return;
+    const char *colon = std::strchr(spec, ':');
+    const std::string key = colon ? std::string(spec, colon) : std::string(spec);
+    const char *second = colon ? std::strchr(colon + 1, ':') : nullptr;
+    const std::string what = colon ? (second ? std::string(colon + 1, second) : std::string(colon + 1)) : std::string();
+    g_test_frame = second ? std::strtoull(second + 1, nullptr, 10) : 0;
+    static const std::pair<const char *, Kind> kinds[] = {{"access", Kind::access}, {"write", Kind::access}, {"read", Kind::read},
+                                                          {"stack", Kind::stack},   {"divide", Kind::divide}, {"illegal", Kind::illegal},
+                                                          {"abort", Kind::abort},   {"throw", Kind::thrown},  {"param", Kind::param},
+                                                          {"live", Kind::live}};
+    bool known_kind = what.empty();
+    for (const auto &[name, kind] : kinds)
+        if (what == name) {
+            g_test_kind = kind;
+            known_kind = true;
+        }
+    int which = -1;
+    if (key == "main" || key == "emu" || key == "tee") g_test_here = key;
+    else if (key == "window") which = static_cast<int>(Thread::Gpu);
+    else
+        for (std::size_t i = 0; i < sizeof kThreads / sizeof kThreads[0]; ++i)
+            if (key == kThreads[i].test) which = static_cast<int>(i);
+    if ((which < 0 && g_test_here.empty()) || !known_kind) {
+        g_test_here.clear();
+        std::fprintf(stderr, "[crash-test] PS2_CRASH_TEST=%s not understood: <thread>:<kind>[:<frame>], thread main, emu, game, vu, gpu, sound, live-ee, "
+                             "live-vu, tee; kind access, read, stack, divide, illegal, abort, throw, param, live\n", spec);
+        return;
+    }
+    g_test_thread = which;
+    if (which >= 0)
+        std::fprintf(stderr, "[crash-test] the %s thread will fail on purpose at frame %llu or later (PS2_CRASH_TEST=%s)\n", kThreads[which].report,
+                     static_cast<unsigned long long>(g_test_frame), spec);
+}
+
+void test_fire(Thread thread) {
+    if (g_frames < g_test_frame) return;
+    if (g_test_kind == Kind::live && g_live_count.load(std::memory_order_acquire) == 0) return;  // no live library yet
+    g_test_thread = -1;  // once
+    std::fprintf(stderr, "[crash-test] the %s thread fails on purpose now, frame %llu\n", kThreads[static_cast<std::size_t>(thread)].report,
+                 static_cast<unsigned long long>(g_frames));
+    std::fflush(stderr);
+    fail(g_test_kind);
+}
+
+void test_here(const char *where) {
+    if (g_test_here.empty() || g_test_here != where) return;
+    g_test_here.clear();
+    std::fprintf(stderr, "[crash-test] fails on purpose now at %s\n", where);
+    std::fflush(stderr);
+    fail(g_test_kind);
+}
+
+}
+
 
 }

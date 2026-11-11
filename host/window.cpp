@@ -46,6 +46,7 @@
 
 #include "keymap.hpp"
 #include "quickmenu.hpp"
+#include "ps2/crash.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
 #include "ps2/video.hpp"
@@ -1748,6 +1749,12 @@ void queue_audio(const std::int16_t *samples, std::size_t frames) {
 // The sound device asks for its next block (its own thread): the pipe hands over the game's sound, stretched when the game is slow,
 // and the tone for F5, F8 and F9 is mixed on top.
 void audio_callback(void *, Uint8 *stream, int length) {
+    static thread_local bool named = false;  // the sound device's own thread
+    if (!named) {
+        named = true;
+        ps2::crash::enter_thread(ps2::crash::Thread::Sound);
+    }
+    ps2::crash::test_poll(ps2::crash::Thread::Sound);
     g_pipe->render(reinterpret_cast<std::int16_t *>(stream), static_cast<std::size_t>(length) / 4, audio_seconds(), mix_beep);
 }
 
@@ -1990,6 +1997,7 @@ void report_threads(std::uint64_t frame, int stalled_seconds) {
 }
 
 void watchdog() {
+    ps2::crash::enter_thread(ps2::crash::Thread::Watchdog);
     std::signal(SIGUSR2, on_stack_request);
 #ifdef __GLIBC__
     void *warm[2];

@@ -1189,8 +1189,100 @@ bool fileio_old_layout(std::uint32_t method, std::uint32_t args, std::uint32_t s
     }
 }
 
+// LOADFILE call 1, sceSifLoadElf / sceSifLoadElfPart: the IOP reads an EE program from the disc and copies it into the EE's memory
+// (public issue 98, Xenosaga Episode I: New Game loads its game program this way and calls into it, which stopped at empty memory
+// while this call was not answered). The packet and the answer follow ps2sdk (AFL-2.0, common/include/loadfile-common.h and
+// iop/system/loadfile/src/eeelfloader.c): the entry point at +0, the gp at +4, the path at +8 (252 bytes), the section name at +260.
+// "all" copies the file contents of every loadable segment (a segment below 0x80000 refuses the file, memory past a segment's file
+// contents is left as it is); another name copies that one section's contents to its address. The answer is the entry point and a
+// gp of 0, or an entry point of 0 and the error in the fourth word, which the EE library turns into "load failed".
+bool load_ee_elf(std::uint32_t args, std::uint32_t ret, std::uint32_t ret_size) {
+    const std::string path = ee_text(args + 8, 252);
+    const std::string section = ee_text(args + 8 + 252, 252);
+    constexpr std::int32_t kFileError = -203, kIllegalObject = -201;   // KE_FILEERR, KE_ILLEGAL_OBJECT
+    std::uint32_t answer[4] = {0, 0, 0, 0};
+    const auto finish = [&](std::int32_t error, const char *why) {
+        if (error) {
+            answer[0] = 0;
+            answer[3] = static_cast<std::uint32_t>(error);
+            std::fprintf(stderr, "[loadfile] EE program %s (%s): %s, not loaded\n", path.c_str(), section.c_str(), why);
+        }
+        const std::uint32_t n = std::min<std::uint32_t>(ret_size ? ret_size : 8u, sizeof answer);
+        for (std::uint32_t i = 0; i < n; ++i) g_ram[(ret + i) & (kRamSize - 1)] = reinterpret_cast<const std::uint8_t *>(answer)[i];
+        watch_span(ret, n, "sif:loadfile_elf");
+        return true;
+    };
+
+    std::vector<std::uint8_t> file;
+    std::string lower = path;
+    for (char &ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (lower.rfind("cdrom", 0) == 0 && disc::is_open())
+        if (const auto entry = disc::find(path); entry && !entry->directory && entry->size <= (64u << 20)) {
+            file.resize((entry->size + disc::kSector - 1) / disc::kSector * disc::kSector);
+            if (!disc::read(entry->sector, static_cast<std::uint32_t>(file.size() / disc::kSector), file.data())) file.clear();
+            else file.resize(entry->size);
+        }
+    if (file.empty()) return finish(kFileError, "cannot read the file");
+
+    // Every read of the file's own headers is checked against its length, in 64 bits.
+    bool bad = false;
+    const auto u16 = [&](std::uint64_t o) -> std::uint32_t {
+        if (o + 2 > file.size()) { bad = true; return 0; }
+        return static_cast<std::uint32_t>(file[o] | (file[o + 1] << 8));
+    };
+    const auto u32 = [&](std::uint64_t o) -> std::uint32_t {
+        if (o + 4 > file.size()) { bad = true; return 0; }
+        return static_cast<std::uint32_t>(file[o] | (file[o + 1] << 8) | (file[o + 2] << 16) | (file[o + 3] << 24));
+    };
+    if (file.size() < 0x34 || std::memcmp(file.data(), "\x7F" "ELF", 4) != 0 || u16(0x12) != 8u)
+        return finish(kIllegalObject, "not a MIPS ELF file");
+    struct Copy { std::uint32_t to, from, size; };
+    std::vector<Copy> copies;
+    const auto add = [&](std::uint32_t to, std::uint32_t from, std::uint32_t size) {
+        const std::uint32_t at = to & 0x1FFFFFFFu;   // kseg0/kseg1 addresses are the same memory
+        if (static_cast<std::uint64_t>(from) + size > file.size() || static_cast<std::uint64_t>(at) + size > kRamSize) return false;
+        copies.push_back({at, from, size});
+        return true;
+    };
+    if (section == "all") {
+        for (std::uint32_t i = 0, n = u16(0x2C); i < n && !bad; ++i) {
+            const std::uint64_t ph = static_cast<std::uint64_t>(u32(0x1C)) + static_cast<std::uint64_t>(i) * u16(0x2A);
+            if (u32(ph) != 1u || !u32(ph + 16)) continue;
+            if (u32(ph + 8) < 0x80000u) return finish(kIllegalObject, "a segment lies below 0x80000");
+            if (!add(u32(ph + 8), u32(ph + 4), u32(ph + 16))) return finish(kIllegalObject, "a segment lies outside the file or main memory");
+        }
+    } else {
+        const std::uint64_t table = u32(0x20), entry = u16(0x2E);
+        const std::uint64_t names = u32(table + u16(0x32) * entry + 16);
+        bool found = false;
+        for (std::uint32_t i = 0, n = u16(0x30); i < n && !bad && !found; ++i) {
+            const std::uint64_t sh = table + i * entry;
+            if (!u32(sh + 20)) continue;
+            std::string name;
+            for (std::uint64_t o = names + u32(sh); o < file.size() && file[o] && name.size() < 256; ++o) name += static_cast<char>(file[o]);
+            if (name != section) continue;
+            found = true;
+            if (u32(sh + 12) < 0x80000u) return finish(kIllegalObject, "the section lies below 0x80000");
+            if (!add(u32(sh + 12), u32(sh + 16), u32(sh + 20))) return finish(kIllegalObject, "the section lies outside the file or main memory");
+        }
+        if (!found && !bad) return finish(kIllegalObject, "no section of that name");
+    }
+    if (bad) return finish(kIllegalObject, "damaged headers");
+    std::uint32_t bytes = 0;
+    for (const Copy &c : copies) {
+        std::memcpy(g_ram + c.to, file.data() + c.from, c.size);
+        watch_span(c.to, c.size, "sif:loadfile_elf");
+        bytes += c.size;
+    }
+    answer[0] = u32(0x18);
+    std::fprintf(stderr, "[loadfile] EE program %s (%s): %zu parts, %u bytes, entry 0x%08X\n", path.c_str(), section.c_str(), copies.size(),
+                 bytes, answer[0]);
+    return finish(0, nullptr);
+}
+
 void install_servers() {
-    register_hle_server(0x80000006u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
+    register_hle_server(0x80000006u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t ret_size) {
+        if (method == 0x01) return load_ee_elf(args, ret, ret_size);
         if (method == 0x00) {
             const std::string path = ee_text(args + 8);
             const std::uint32_t arg_len = ee_read<std::uint32_t>(args);

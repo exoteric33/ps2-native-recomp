@@ -311,6 +311,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2fileiolayoutstest PRIVATE synchronization)
     endif()
+    # LOADFILE call 1 (sceSifLoadElf) copies an EE program from the disc into the EE's memory (issue 98, no game needed): ninja ps2loadfileelftest
+    add_executable(ps2loadfileelftest EXCLUDE_FROM_ALL tests/loadfile_elf.cpp)
+    target_include_directories(ps2loadfileelftest PRIVATE runtime/src)
+    target_link_libraries(ps2loadfileelftest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2loadfileelftest PRIVATE synchronization)
+    endif()
     # the stream command sceCdStStat answers the sectors in the stream buffer (issue 44, no game needed): ninja ps2cdvdstreamstattest
     add_executable(ps2cdvdstreamstattest EXCLUDE_FROM_ALL tests/cdvd_stream_stat.cpp)
     target_include_directories(ps2cdvdstreamstattest PRIVATE runtime/src)

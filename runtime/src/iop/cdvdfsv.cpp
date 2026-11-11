@@ -186,12 +186,15 @@ void install_cdvdfsv() {
     sif::register_hle_server(0x80000597u, [](std::uint32_t, std::uint32_t args, std::uint32_t size, std::uint32_t ret, std::uint32_t) {
         const std::uint32_t offset = size == 0x124 ? 0x20u : 0x24u;
         const std::string path = ee_text((args & (ps2::kRamSize - 1)) + offset, 1024);
-        const auto entry = disc::find(path);
+        // The 0x12C packet (ps2sdk libcdvd-rpc.h cdvdfsv_rpc4_sz12c_inpacket_t: file, attributes, path, EE address, layer) is
+        // sceCdLayerSearchFile; the newer EE library's sceCdSearchFile sends it too, with layer 0. The smaller packets have no layer.
+        const int layer = size == 0x12C ? static_cast<int>(ee32(args + 0x128)) : 0;
+        const auto entry = disc::find(path, layer);
         if (entry) {
             set_ee32(args, entry->sector);
             set_ee32(args + 4, entry->size);
         }
-        std::fprintf(stderr, "[cdvdfsv] search %s -> %s\n", path.c_str(), entry ? "found" : "missing");
+        std::fprintf(stderr, "[cdvdfsv] search %s%s -> %s\n", path.c_str(), layer ? " (layer 1)" : "", entry ? "found" : "missing");
         set_ee32(ret, entry ? 1u : 0u);
         return true;
     });

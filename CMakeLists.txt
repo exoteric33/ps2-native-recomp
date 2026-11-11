@@ -297,6 +297,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2cdvdsctest PRIVATE synchronization)
     endif()
+    # a two-layer disc's plain search reads layer 0, cdvdman sceCdRM (#64), the i.LINK link chip with no cable (issues 57 and 91, no game needed): ninja ps2disclayerstest
+    add_executable(ps2disclayerstest EXCLUDE_FROM_ALL tests/disc_layers_ilink.cpp)
+    target_include_directories(ps2disclayerstest PRIVATE runtime/src)
+    target_link_libraries(ps2disclayerstest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2disclayerstest PRIVATE synchronization)
+    endif()
     # ioman AddDrv and DelDrv call the driver's init and deinit and keep a table of its devices (no game needed): ninja ps2iomandrvtest
     add_executable(ps2iomandrvtest EXCLUDE_FROM_ALL tests/ioman_drivers.cpp)
     target_include_directories(ps2iomandrvtest PRIVATE runtime/src)

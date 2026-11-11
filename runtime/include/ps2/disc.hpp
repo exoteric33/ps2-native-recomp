@@ -25,7 +25,8 @@ bool open(const std::string &name, std::uint64_t size, Reader reader, Probe prob
 bool is_open();
 bool read(std::uint32_t sector, std::uint32_t count, void *out);
 bool ready(std::uint32_t sector, std::uint32_t count);
-std::optional<Entry> find(const std::string &path);
+std::optional<Entry> find(const std::string &path);  // layer 0's file system first, as cdvdman's sceCdSearchFile
+std::optional<Entry> find(const std::string &path, int layer);  // sceCdLayerSearchFile: layer 1's entry when it has one
 std::uint32_t layer1_start();
 std::uint64_t sector_count();
 

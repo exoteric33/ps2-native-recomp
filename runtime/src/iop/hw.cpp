@@ -246,10 +246,57 @@ void ohci_write(std::uint32_t a, std::uint32_t v) {
     else g_ohci[reg] = v;
 }
 
+// The i.LINK (IEEE 1394) link chip at 0x1F808400, as it answers with no cable plugged in. Register names and bits from ps2sdk's
+// iLinkman (iop/iLink/iLinkman/src/include/iLink_internal.h, iLink_internal.c, iLink_PHY.c; AFL-2.0). A driver switches the link
+// on by writing LPSEn (bit 1) to ctrl2 (+0x10) and then waits for SOK (bit 3, "the clock is stable"); it resets the transmitter and
+// receiver through ctrl0 (+0x08) bits 24 and 25 and waits for them to clear; it reads a PHY register by writing its number and
+// RdPhy (bit 31) to PHYAccess (+0x14), waits for PhyRRx (bit 30) in intr0 (+0x20) and takes the byte from PHYAccess bits 0 to 7.
+// The interrupt registers intr0/1/2 (+0x20/+0x28/+0x30) clear the bits written as 1. Every other register keeps what was written.
+// Unreal Tournament's PSX2ILI module waited for SOK for ever when it started, so the game stayed on its first picture (public issue 91).
+constexpr std::uint32_t kIlink = 0x1F808400u, kIlinkEnd = 0x1F808600u;
+constexpr std::uint32_t kIlinkCtrl0 = kIlink + 0x08u, kIlinkCtrl2 = kIlink + 0x10u, kIlinkPhy = kIlink + 0x14u, kIlinkIntr0 = kIlink + 0x20u;
+constexpr std::uint32_t kCtrl0Resets = 0x03000000u, kCtrl2LpsEn = 0x2u, kCtrl2Sok = 0x8u, kPhyRead = 0x80000000u, kPhyWrite = 0x40000000u,
+                        kIntr0PhyRRx = 0x40000000u;
+
+std::uint32_t ilink_reg(std::uint32_t a) {
+    const auto it = g_regs.find(a);
+    return it == g_regs.end() ? 0u : it->second;
+}
+
+std::uint32_t ilink_read(std::uint32_t a) {
+    const std::uint32_t v = ilink_reg(a);
+    if (a == kIlinkCtrl0) return v & ~kCtrl0Resets;
+    if (a == kIlinkCtrl2) return (v & kCtrl2LpsEn) ? (v | kCtrl2Sok) : v;
+    if (a == kIlinkPhy) return v & ~(kPhyRead | kPhyWrite);
+    return v;
+}
+
+void ilink_write(std::uint32_t a, std::uint32_t v) {
+    if (a == kIlinkIntr0 || a == kIlink + 0x28u || a == kIlink + 0x30u) {
+        g_regs[a] = ilink_reg(a) & ~v;
+        return;
+    }
+    if (a == kIlinkPhy && (v & kPhyRead)) {
+        g_regs[a] = ((v >> 24) & 0xFu) << 8;  // the register number comes back in bits 8 to 11, its value (0: nothing attached) in 0 to 7
+        g_regs[kIlinkIntr0] = ilink_reg(kIlinkIntr0) | kIntr0PhyRRx;
+        return;
+    }
+    if (a == kIlinkPhy) {
+        g_regs[a] = 0;  // a PHY write finishes at once
+        return;
+    }
+    g_regs[a] = v;
+}
+
 std::uint32_t read(std::uint32_t a, unsigned size) {
     if (a >= 0x1F900000u && a < 0x1F900800u) return spu2::read(a, size);
     if (a >= 0x1F801600u && a < 0x1F801660u) return ohci_read(a);
     if (a >= 0x1F808200u && a < 0x1F808280u) return sio2::read(a);
+    if (a >= kIlink && a < kIlinkEnd) {
+        const std::uint32_t v = ilink_read(a & ~3u) >> ((a & 3u) * 8);
+        report("read", a, v);
+        return v;
+    }
     if (a == kIStat) return g_istat;
     if (a == kIMask) return g_imask;
     if (a == kICtrl) {
@@ -286,6 +333,11 @@ void write(std::uint32_t a, std::uint32_t v, unsigned size) {
     if (a >= 0x1F900000u && a < 0x1F900800u) { spu2::write(a, v, size); return; }
     if (a >= 0x1F801600u && a < 0x1F801660u) { ohci_write(a, v); return; }
     if (a >= 0x1F808200u && a < 0x1F808280u) { sio2::write(a, v); return; }
+    if (a >= kIlink && a < kIlinkEnd) {
+        report("write", a, v);
+        ilink_write(a & ~3u, v);
+        return;
+    }
     if (a == kIStat) { g_istat &= v; return; }
     if (a == kIMask) { g_imask = v; return; }
     if (a == kICtrl) { g_ictrl = v & 1u; return; }

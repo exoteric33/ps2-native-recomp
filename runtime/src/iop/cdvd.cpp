@@ -251,6 +251,15 @@ void install_cdvd() {
         write_clock(arg(c, 0));
         c.r[2] = 1;
     });
+    // #64 sceCdRM(name, status) reads the console's model name, e.g. "SCPH-39001", into 16 bytes (two S commands 0x17 of 8 bytes each),
+    // sets *status to 0 and returns 1 (ps2sdk iop/cdvd/cdvdman exports.tab, cdvdman.c, libcdvd-common.h; AFL-2.0). Unreal Tournament's
+    // i.LINK module PSX2ILI calls it when it starts (public issue 91). The answer is one fixed retail model.
+    def("cdvdman", 64, "sceCdRM", [](Cpu &c) {
+        static const char kModel[16] = "SCPH-39001";
+        for (std::uint32_t i = 0; i < 16; ++i) write8(arg(c, 0) + i, static_cast<std::uint8_t>(kModel[i]));
+        if (arg(c, 1)) write32(arg(c, 1), 0);
+        c.r[2] = 1;
+    });
     def("cdvdman", 28, "sceCdStatus", [](Cpu &c) { c.r[2] = g_cd.busy ? 0x06u : 0x0Au; });
     def("cdvdman", 37, "sceCdCallback", [](Cpu &c) { c.r[2] = g_cd.callback; g_cd.callback = arg(c, 0); });
     def("cdvdman", 38, "sceCdPause", [](Cpu &c) { c.r[2] = 1; });
@@ -307,9 +316,9 @@ void install_cdvd() {
         write32(arg(c, 1), disc::layer1_start());
         c.r[2] = 1;
     });
-    def("cdvdman", 84, "sceCdLayerSearchFile", [](Cpu &c) {
+    def("cdvdman", 84, "sceCdLayerSearchFile", [](Cpu &c) {  // (file, path, layer)
         const std::string name = ram_string(arg(c, 1), 256);
-        const auto entry = disc::find(name);
+        const auto entry = disc::find(name, static_cast<int>(arg(c, 2)));
         if (!entry) { c.r[2] = 0; return; }
         write32(arg(c, 0), entry->sector);
         write32(arg(c, 0) + 4, entry->size);

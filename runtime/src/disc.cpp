@@ -21,6 +21,13 @@ Probe g_probe;
 std::uint64_t g_size = 0;
 std::uint32_t g_layer1 = 0;
 std::map<std::string, Entry> g_index;
+// A two-layer disc has a file system on each layer, often with the same paths in both. The plain search (cdvdman's sceCdSearchFile,
+// fileio's cdrom0:) reads layer 0's only, so g_index keeps layer 0's entry when both have a path; g_index1 holds layer 1's entries for
+// sceCdLayerSearchFile with layer 1 (ps2sdk cdvdman.c, AFL-2.0: sceCdSearchFile is sceCdLayerSearchFile(..., 0), and only layer 1 adds
+// the layer's start). Before 2026-11-10 layer 1's entry replaced layer 0's, and Champions of Norrath (public issue 57) got the layer 1
+// copy of \BG\DATA, read its directory (whose sectors count from layer 1's start) and loaded its data from the wrong layer.
+std::map<std::string, Entry> g_index1;
+bool g_walking_layer1 = false;
 bool g_indexed = false;  // the reads while the file system is being read are not the game's
 
 std::uint32_t u32(const std::uint8_t *p) {
@@ -73,7 +80,12 @@ void walk(std::uint32_t base, std::uint32_t lba, std::uint32_t size, const std::
         const std::string path = prefix + upper(name);
         const bool dir = rec[25] & 2;
         const Entry entry{base + u32(rec + 2), u32(rec + 10), dir};
-        g_index[path] = entry;
+        if (g_walking_layer1) {
+            g_index1[path] = entry;
+            g_index.emplace(path, entry);  // layer 0's entry wins
+        } else {
+            g_index[path] = entry;
+        }
         if (dir) walk(base, u32(rec + 2), u32(rec + 10), path + "/", depth + 1, seen);
     }
 }
@@ -132,6 +144,7 @@ bool open(const std::string &name, std::uint64_t size, Reader reader, Probe prob
     g_size = size;
     g_layer1 = 0;  // a second image without a second layer must not keep the first one's
     g_index.clear();
+    g_index1.clear();
     g_indexed = false;
     index_layer(16, 0);
     std::uint8_t pvd[kSector];
@@ -141,7 +154,9 @@ bool open(const std::string &name, std::uint64_t size, Reader reader, Probe prob
         std::uint8_t probe[kSector];
         if (read(s, 1, probe) && std::memcmp(probe, "\x01" "CD001", 6) == 0) {
             g_layer1 = s - 16;
+            g_walking_layer1 = true;
             index_layer(s, g_layer1);
+            g_walking_layer1 = false;
             break;
         }
     }
@@ -209,7 +224,8 @@ bool ready(std::uint32_t sector, std::uint32_t count) {
     return !g_probe || g_probe(static_cast<std::uint64_t>(sector) * kSector, static_cast<std::size_t>(count) * kSector);
 }
 
-std::optional<Entry> find(const std::string &raw) {
+namespace {
+std::string index_key(const std::string &raw) {
     std::string path = raw;
     const auto colon = path.find(':');
     if (colon != std::string::npos) path = path.substr(colon + 1);
@@ -217,9 +233,22 @@ std::optional<Entry> find(const std::string &raw) {
     const auto semi = path.find(';');
     if (semi != std::string::npos) path = path.substr(0, semi);
     while (!path.empty() && path.front() == '/') path.erase(path.begin());
-    auto it = g_index.find(upper(path));
+    return upper(path);
+}
+}
+
+std::optional<Entry> find(const std::string &raw) {
+    auto it = g_index.find(index_key(raw));
     if (it == g_index.end()) return std::nullopt;
     return it->second;
+}
+
+std::optional<Entry> find(const std::string &raw, int layer) {
+    if (layer != 0) {
+        const auto it = g_index1.find(index_key(raw));
+        if (it != g_index1.end()) return it->second;
+    }
+    return find(raw);  // layer 0, a one-layer disc, or a path only layer 0 has (as before)
 }
 
 namespace {

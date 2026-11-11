@@ -1,0 +1,28 @@
+{
+  "name": "snowblind-engine",
+  "description": "Snowblind Studios Engine (Baldur's Gate: Dark Alliance, Champions of Norrath, Champions: Return to Arms, Justice League Heroes)",
+  "disc_ids": [
+    "SLES-52325",
+    "SLUS-20565",
+    "SLES-53039",
+    "SLUS-20973",
+    "SLES-50672",
+    "SLUS-20066"
+  ],
+  "signature_files": [
+    "BG/PSRS.BIN",
+    "BG/DATA/*.LMP"
+  ],
+  "raw_region_threshold_mb": 8.0,
+  "index_files": [
+    "BG/PSRS.BIN"
+  ],
+  "archive_extensions": [
+    ".LMP",
+    ".GOB",
+    ".PAT",
+    ".TEX",
+    ".VA"
+  ],
+  "custom_regions": []
+}

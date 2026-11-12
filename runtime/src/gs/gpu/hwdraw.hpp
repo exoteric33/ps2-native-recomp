@@ -110,6 +110,9 @@ void live_prepare();                           // submit: the data of the card's
 WGPUComputePassEncoder live_encode(WGPUCommandEncoder enc, std::uint32_t upto, WGPUComputePassEncoder pass);
 void live_submitted();                         // submit: the work is handed over
 void live_stats();
+// PS2_GPU_HW_TIME=1: the window thread's time in wgpu's finish and submit, split by submits with and without card work. live_clock is 0 when the switch is off.
+std::uint64_t live_clock();
+void live_wgpu_time(bool card, std::uint64_t before_finish, std::uint64_t before_submit, std::uint64_t after);
 
 // PS2_GPU_HW_MEMLOG=<n> prints one `[memlog]` line every n frames with what the card path holds (textures, buffers, bind groups, pipelines), what wgpu holds in all, and the
 // process's resident memory and how many queue submits the card is behind. gpu.cpp calls memlog_tick at the end of each submit; with the switch off that is one test of a bool.

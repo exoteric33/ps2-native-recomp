@@ -376,42 +376,108 @@ fn copy_write(@builtin(global_invocation_id) gid: vec3<u32>) {
     write_sample(prm(2u), prm(0u), prm(1u), (prm(3u) + x) & 0x7FFu, (prm(4u) + y) & 0x7FFu, k, scratch[src_at]);
 }
 
+// The colour palette load `k` of record `r` reads from graphics memory.
+fn clut_read(r: u32, k: u32) -> u32 {
+    let cbp = data[r + 2u];
+    let cpsm = data[r + 3u];
+    if (data[r + 4u] != 0u) {
+        return read_pixel(cpsm, cbp, data[r + 7u], data[r + 8u] * 16u + k, data[r + 9u]);
+    }
+    var x = k & 7u;
+    var y = k >> 3u;
+    if (data[r + 6u] != 0u) {
+        let j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
+        x = j & 15u;
+        y = j >> 4u;
+    }
+    return read_pixel(cpsm, cbp, 1u, x, y);
+}
+
+// Which of its own entries a palette load with the slot entries `d` writes into slot entry j: 0 .. d >> 16 - 1, else d >> 16 or more. `d` is
+// record word 10 (gpu.cpp, load_clut): the first slot entry it writes in the low half (CSA * 16 with CSM2, CSA's 16 of the low 256 with CSM1,
+// 0 for 8-bit indices with CSM1) and how many it writes in the high half (16 for 4-bit indices, 256 for 8-bit); the entries wrap at 512.
+fn clut_entry(d: u32, j: u32) -> u32 {
+    return (j - (d & 0xFFFFu)) & 511u;
+}
+
+const CLUT_CHUNK: u32 = 16u;
+const CLUT_NONE: u32 = 0xFFFFFFFFu;
+
+// The palette loads of one command, records prm(0) on, prm(1) of them. Load n fills slot data[r + 1] with the slot before it (data[r]) and
+// then its own 16 or 256 entries; the loads of a command use consecutive slots, each the one before's destination (gpu.cpp, load_clut), and
+// no slot twice. One after another in one workgroup with a barrier between them, a command of a few hundred loads kept one part of the chip
+// busy for most of a millisecond. Now every thread keeps two of the 512 entries in hand and writes them into each load's slot itself, so no
+// load waits for the slot before it to land in memory, and the loads are cut into chunks of CLUT_CHUNK, one chunk per workgroup: a chunk's
+// entries start from what the last earlier load that writes each entry read (looked for four loads at a time), else from the slot before the
+// first load, which is what they held one by one. Graphics memory does not change during the command, so every read gives what it gave then.
 @compute @workgroup_size(256)
-fn load_clut(@builtin(local_invocation_index) k: u32) {
+fn load_clut(@builtin(local_invocation_index) k: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let first = prm(0u);
     let count = prm(1u);
-    for (var n = 0u; n < count; n = n + 1u) {
-        let r = prm(0u) + n * 12u;
-        let src = data[r] * CLUT_ENTRIES;
-        let dst = data[r + 1u] * CLUT_ENTRIES;
-        clut[dst + k] = clut[src + k];
-        clut[dst + k + 256u] = clut[src + k + 256u];
-        storageBarrier();
-        let cbp = data[r + 2u];
-        let cpsm = data[r + 3u];
-        let csm = data[r + 4u];
-        let csa = data[r + 5u];
-        let eight = data[r + 6u] != 0u;
-        var entries = 16u;
-        if (eight) {
-            entries = 256u;
-        }
-        if (k < entries) {
-            if (csm != 0u) {
-                clut[dst + ((csa * 16u + k) & 511u)] = read_pixel(cpsm, cbp, data[r + 7u], data[r + 8u] * 16u + k, data[r + 9u]);
-            } else {
-                var x = k & 7u;
-                var y = k >> 3u;
-                var slot = ((csa & 15u) * 16u + k) & 255u;
-                if (eight) {
-                    let j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
-                    x = j & 15u;
-                    y = j >> 4u;
-                    slot = k;
-                }
-                clut[dst + slot] = read_pixel(cpsm, cbp, 1u, x, y);
+    let before = data[first] * CLUT_ENTRIES;
+    let j0 = k;
+    let j1 = k + 256u;
+    for (var c = wid.x * CLUT_CHUNK; c < count; c = c + groups.x * CLUT_CHUNK) {
+        var m0 = CLUT_NONE;
+        var m1 = CLUT_NONE;
+        var e0 = 0u;
+        var e1 = 0u;
+        var m = c;
+        while (m > 0u && (m0 == CLUT_NONE || m1 == CLUT_NONE)) {
+            var d = vec4<u32>(0u);  // 0: writes no entry
+            d.x = data[first + (m - 1u) * 12u + 10u];
+            if (m > 1u) {
+                d.y = data[first + (m - 2u) * 12u + 10u];
             }
+            if (m > 2u) {
+                d.z = data[first + (m - 3u) * 12u + 10u];
+            }
+            if (m > 3u) {
+                d.w = data[first + (m - 4u) * 12u + 10u];
+            }
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                let di = d[i];
+                let a = clut_entry(di, j0);
+                let b = clut_entry(di, j1);
+                if (m0 == CLUT_NONE && a < (di >> 16u)) {
+                    m0 = m - 1u - i;
+                    e0 = a;
+                }
+                if (m1 == CLUT_NONE && b < (di >> 16u)) {
+                    m1 = m - 1u - i;
+                    e1 = b;
+                }
+            }
+            m = m - min(m, 4u);
         }
-        storageBarrier();
+        var v0 = 0u;
+        var v1 = 0u;
+        if (m0 != CLUT_NONE) {
+            v0 = clut_read(first + m0 * 12u, e0);
+        } else {
+            v0 = clut[before + j0];
+        }
+        if (m1 != CLUT_NONE) {
+            v1 = clut_read(first + m1 * 12u, e1);
+        } else {
+            v1 = clut[before + j1];
+        }
+        let end = min(c + CLUT_CHUNK, count);
+        for (var n = c; n < end; n = n + 1u) {
+            let r = first + n * 12u;
+            let d = data[r + 10u];
+            let a = clut_entry(d, j0);
+            let b = clut_entry(d, j1);
+            if (a < (d >> 16u)) {
+                v0 = clut_read(r, a);
+            }
+            if (b < (d >> 16u)) {
+                v1 = clut_read(r, b);
+            }
+            let dst = data[r + 1u] * CLUT_ENTRIES;
+            clut[dst + j0] = v0;
+            clut[dst + j1] = v1;
+        }
     }
 }
 
@@ -973,6 +1039,11 @@ struct Attr {
     z: u32,
 }
 
+// The frame and depth places of this thread's pixel for the current set-up (raster, worked out again only when the set-up changes): they
+// depend on nothing else, and working them out for every shape cost two table reads, each a trip to memory before the pixel's own.
+var<private> pix_fl: Loc;
+var<private> pix_zl: Loc;
+
 fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) {
         return;
@@ -987,7 +1058,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     let ux = u32(x);
     let uy = u32(y);
     let z = min(at.z, s.zmax);
-    let fl = addr(s.ff, ux, uy);
+    let fl = pix_fl;
     var zl = Loc(0u, 0u, 0u);
 
     var dst = 0u;
@@ -1006,7 +1077,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         if (ztst == 0u) {
             return;
         }
-        zl = addr(s.zf, ux, uy);
+        zl = pix_zl;
         if (ztst != 1u) {
             let old = load_at(zl, k) & s.zmax;
             if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
@@ -1534,6 +1605,8 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
                 s.mip_at = mips + si * MIP_WORDS;
                 s.mip = data[s.mip_at];
             }
+            pix_fl = addr(s.ff, u32(x), u32(y));
+            pix_zl = addr(s.zf, u32(x), u32(y));
             last_setup = si;
         }
         let lo = data[p + 2u];

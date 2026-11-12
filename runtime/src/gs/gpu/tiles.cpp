@@ -73,16 +73,36 @@ struct SpanBuf {
 struct Builder {
     std::vector<std::uint32_t> count, fill, touched;
     SpanBuf spans;
+    std::uint32_t touched_n = 0;  // tiles in `touched`
+    std::size_t counted = 0;      // spans already counted
 
     void prepare() {
         const std::size_t tiles = static_cast<std::size_t>(g_geo.per_row) * static_cast<std::size_t>(g_geo.per_row) + 8;
         if (count.size() == tiles) return;
-        count.assign(tiles, 0);  // g_tile_count, g_tile_fill and touched have 8 words to spare (the unrolled rounds of build write past a span's last tile)
+        count.assign(tiles, 0);  // 8 words to spare, as when the counting rounds of build were unrolled four wide (they wrote past a span's last tile)
         fill.assign(tiles, 0);
         touched.assign(tiles + 8, 0);
     }
     void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi, std::uint16_t prim);
-    Lists build(const std::uint32_t *prims, std::uint32_t shapes, Room room, void *context);
+    // A batch in steps: begin, add its shapes in order (all at once, or a part whenever more are drawn: the spans and counts come out the same,
+    // since they are made shape by shape and span by span in the same order either way), finish for the table and the lists.
+    void begin() {
+        prepare();
+        spans.clear();
+        touched_n = 0;
+        counted = 0;
+    }
+    void add(const std::uint32_t *prims, std::uint32_t from, std::uint32_t to);
+    Lists finish(Room room, void *context);
+    void abandon() {  // a batch given up half way: the counts back to zero for the next one
+        for (std::uint32_t n = 0; n < touched_n; ++n) count[touched[n]] = 0;
+        begin();
+    }
+    Lists build(const std::uint32_t *prims, std::uint32_t shapes, Room room, void *context) {
+        begin();
+        add(prims, 0, shapes);
+        return finish(room, context);
+    }
 };
 
 void Builder::add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi, std::uint16_t prim) {
@@ -144,38 +164,39 @@ void Builder::add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_
     }
 }
 
-Lists Builder::build(const std::uint32_t *prims, std::uint32_t shapes, Room room, void *context) {
-    prepare();
-    // Count how many shapes touch each tile. `touched` lists the tiles in the order they are first touched. The tiles of a span are mostly one to four,
-    // so the first four are done without a branch per tile (the extra ones only read and write back their own count); the old loop left after a
-    // different number of rounds for every span, and that cost more than the tiles.
+void Builder::add(const std::uint32_t *prims, std::uint32_t from, std::uint32_t to) {
+    // Count how many shapes touch each tile. `touched` lists the tiles in the order they are first touched. A plain loop with a branch on the first
+    // touch: on the God of War ship fight (1.6 million shapes, 4.2 million spans, 41 % of them one tile long) it took 13 ms where the form unrolled
+    // four wide with a running touched count (no branch per tile) took 20: that count chained every tile to the one before it. The same for the
+    // lists below (10 ms against 11).
     std::uint32_t *const count = this->count.data();
     std::uint32_t *const touched = this->touched.data();
-    std::uint32_t touched_n = 0;
+    std::uint32_t touched_n = this->touched_n;
     const std::int32_t tiles_per_row = g_geo.per_row;
-    spans.clear();
-    for (std::uint32_t i = 0; i < shapes; ++i) add_spans(prims + i * kPrimWords, prims[i * kPrimWords + 2], prims[i * kPrimWords + 3], static_cast<std::uint16_t>(i));
-    // One loop over all the spans of the batch (not one per shape): its exits are easy to predict.
+    for (std::uint32_t i = from; i < to; ++i) add_spans(prims + i * kPrimWords, prims[i * kPrimWords + 2], prims[i * kPrimWords + 3], static_cast<std::uint16_t>(i));
+    // One loop over all the new spans (not one per shape): its exits are easy to predict.
     const Span *const span_list = spans.spans.get();
     const std::size_t span_count = spans.size();
-    for (std::size_t k = 0; k < span_count; ++k) {
+    for (std::size_t k = counted; k < span_count; ++k) {
         const Span sp = span_list[k];
         const std::uint32_t t = static_cast<std::uint32_t>(sp.ty * tiles_per_row + sp.tx0);
         const std::int32_t len = sp.tx1 - sp.tx0 + 1;
-        for (std::int32_t j = 0; j < 4; ++j) {
-            const std::uint32_t valid = j < len ? 1u : 0u;
+        for (std::int32_t j = 0; j < len; ++j) {
             const std::uint32_t c = count[t + j];
-            touched[touched_n] = t + j;
-            touched_n += valid & (c == 0 ? 1u : 0u);
-            count[t + j] = c + valid;
-        }
-        for (std::int32_t j = 4; j < len; ++j) {
-            const std::uint32_t c = count[t + j];
-            touched[touched_n] = t + j;
-            touched_n += c == 0 ? 1u : 0u;
+            if (c == 0) touched[touched_n++] = t + j;
             count[t + j] = c + 1;
         }
     }
+    counted = span_count;
+    this->touched_n = touched_n;
+}
+
+Lists Builder::finish(Room room, void *context) {
+    std::uint32_t *const count = this->count.data();
+    const std::uint32_t *const touched = this->touched.data();
+    const std::int32_t tiles_per_row = g_geo.per_row;
+    const Span *const span_list = spans.spans.get();
+    const std::size_t span_count = spans.size();
     std::uint32_t total = 0;
     for (std::uint32_t n = 0; n < touched_n; ++n) total += count[touched[n]];
     const std::uint32_t tiles = touched_n;
@@ -199,25 +220,20 @@ Lists Builder::build(const std::uint32_t *prims, std::uint32_t shapes, Room room
     grown[tiles * 2] = 0;
     grown[tiles * 2 + 1] = cursor;
     auto *halves = reinterpret_cast<unsigned char *>(grown + tiles * 2 + 2);
-    unsigned char scratch[2];  // where the unused rounds of the unrolled part below put their index
     for (std::size_t k = 0; k < span_count; ++k) {
         const Span sp = span_list[k];
         const std::uint16_t index = sp.prim;
         const std::uint32_t t = static_cast<std::uint32_t>(sp.ty * tiles_per_row + sp.tx0);
         const std::int32_t len = sp.tx1 - sp.tx0 + 1;
-        for (std::int32_t j = 0; j < 4; ++j) {
-            const std::uint32_t valid = j < len ? 1u : 0u;
-            const std::uint32_t f = fill[t + j];
-            fill[t + j] = f + valid;
-            unsigned char *const to = valid ? halves + 2u * f : scratch;
-            std::memcpy(to, &index, 2);
-        }
-        for (std::int32_t j = 4; j < len; ++j) {
+        for (std::int32_t j = 0; j < len; ++j) {
             const std::uint32_t f = fill[t + j]++;
             std::memcpy(halves + 2u * f, &index, 2);
         }
     }
     for (std::uint32_t n = 0; n < touched_n; ++n) count[touched[n]] = 0;
+    spans.clear();
+    this->touched_n = 0;
+    counted = 0;
     Lists lists;
     lists.tiles = tiles;
     lists.total = total;
@@ -282,6 +298,7 @@ struct Shared {
     alignas(64) std::atomic<std::uint32_t> sleeping{0}, bell{0};
     std::thread *thread = nullptr;  // never joined or destroyed: a running thread's destructor at exit would end the program
     std::thread::id owner;          // the thread that starts and places the jobs (the window thread)
+    int stream_spin_us = 0;  // PS2_TILE_STREAM_SPIN: microseconds the helper looks for an open batch's next shapes before it sleeps (wait_for_shapes). On the God of War ship 0 drew as fast as 50 or 200 (6.05 against 6.0 ms) and spent 2.6 instead of 4.5 ms of the helper's processor a frame
     int spin_us = 0;  // PS2_TILE_SPIN: microseconds the idle helper spins before it sleeps. 0, 50 and 300 drew at the same speed on the Ryzen PC (2026-11-11); 300 cost 1.3 ms of processor a frame
     bool cores = false;
 };
@@ -329,6 +346,65 @@ void name_thread() {
 #endif
 }
 
+constexpr std::uint32_t kClosed = 0, kOpen = 1, kCancelled = 2;  // Job::state
+
+void ring_bell(Shared &s) {
+    if (s.sleeping.load()) {  // sequentially consistent, after the store that announced the work: see helper_main
+        s.bell.fetch_add(1);
+        futex_wake(s.bell);
+    }
+}
+
+// The helper with an open job and all its shapes so far done: waits until more come or the job is closed or cancelled (the next shapes are usually
+// about 100 microseconds away: 1024 shapes drawn). It sleeps at once unless PS2_TILE_STREAM_SPIN says to look for them a while first.
+void wait_for_shapes(Shared *s, const Job *job, std::uint32_t at) {
+    const auto more = [&] { return job->count.load() != at || job->state.load() != kOpen; };
+    const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(s->stream_spin_us);
+    do {
+        for (int i = 0; i < 16; ++i) {
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#endif
+        }
+        if (more()) return;
+    } while (std::chrono::steady_clock::now() < until);
+    const std::uint32_t seen = s->bell.load();
+    s->sleeping.store(1);  // sequentially consistent, like the loads in more() and feed's and close's stores and ring_bell's check
+    if (!more()) futex_wait(s->bell, seen);
+    s->sleeping.store(0);
+}
+
+// The helper builds a job it claimed, its shapes as they come (an open job's, see open/feed/close). False when the job was cancelled.
+bool run_job(Shared *s, Job *job) {
+    Builder &b = s->builder;
+    b.begin();
+    std::uint32_t at = 0;
+    for (;;) {
+        const std::uint32_t state = job->state.load(std::memory_order_acquire);  // before the count: once closed, the count read after it is the last
+        if (state == kCancelled) {
+            b.abandon();
+            return false;
+        }
+        const std::uint32_t n = job->count.load(std::memory_order_acquire);
+        if (n > at) {
+            const std::uint64_t t0 = g_log ? now_ns() : 0;
+            b.add(job->prims.load(std::memory_order_acquire), at, n);  // read after the count: where the records are now, which holds the first n
+            if (g_log) g_busy_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+            at = n;
+            continue;
+        }
+        if (state == kClosed) break;
+        wait_for_shapes(s, job, at);
+    }
+    const std::uint64_t t0 = g_log ? now_ns() : 0;
+    job->result = b.finish(job_room, job);
+    if (g_log) {
+        g_busy_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+        g_jobs.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
 void helper_main(Shared *s) {
     name_thread();
     ps2::crash::enter_thread(ps2::crash::Thread::Tiles);  // a crash report names this thread
@@ -362,12 +438,7 @@ void helper_main(Shared *s) {
         Job *job = s->ring[at & (kRing - 1)];
         std::uint64_t expect = at;  // fails when the window thread took the job (build_waiting); then it may already be in use again with another ticket
         if (job->claim.compare_exchange_strong(expect, kTaken, std::memory_order_acq_rel)) {
-            const std::uint64_t t0 = g_log ? now_ns() : 0;
-            job->result = s->builder.build(job->prims, job->count, job_room, job);
-            if (g_log) {
-                g_busy_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
-                g_jobs.fetch_add(1, std::memory_order_relaxed);
-            }
+            run_job(s, job);
             s->tail.store(at + 1, std::memory_order_release);
             job->done.store(1, std::memory_order_release);
         } else {
@@ -406,6 +477,7 @@ Shared &shared() {
         s->owner = std::this_thread::get_id();
         if (const std::string spin = os::env("PS2_TILE_SPIN"); !spin.empty()) s->spin_us = std::clamp(std::atoi(spin.c_str()), 0, 100000);
         s->cores = !os::env("PS2_CORES").empty();
+        if (const std::string spin = os::env("PS2_TILE_STREAM_SPIN"); !spin.empty()) s->stream_spin_us = std::clamp(std::atoi(spin.c_str()), 0, 100000);
         s->thread = new std::thread(helper_main, s);
         g_shared.store(s, std::memory_order_release);  // owner() reads it from other threads
     }
@@ -455,6 +527,10 @@ void note_lists(const std::uint32_t *words, const Lists &lists) {
 
 bool threaded() { return false; }
 Job *start(const std::uint32_t *, std::uint32_t) { return nullptr; }
+Job *open(const std::uint32_t *, std::uint32_t) { return nullptr; }
+void feed(Job *, const std::uint32_t *, std::uint32_t) {}
+void close(Job *, const std::uint32_t *, std::uint32_t) {}
+void cancel(Job *) {}
 bool owner() { return true; }
 std::size_t backlog() { return 0; }
 Job *next_finished(bool) { return nullptr; }
@@ -474,7 +550,8 @@ bool threaded() {
     return mode != 0 && g_configured && (mode == 2 || queue::active());
 }
 
-Job *start(const std::uint32_t *prims, std::uint32_t count) {
+namespace {
+Job *queue_job(const std::uint32_t *prims, std::uint32_t count, std::uint32_t state) {
     Shared &s = shared();
     Job *job;
     if (s.idle.empty()) {
@@ -485,8 +562,9 @@ Job *start(const std::uint32_t *prims, std::uint32_t count) {
         job = s.idle.back();
         s.idle.pop_back();
     }
-    job->prims = prims;
-    job->count = count;
+    job->prims.store(prims, std::memory_order_relaxed);
+    job->count.store(count, std::memory_order_relaxed);
+    job->state.store(state, std::memory_order_relaxed);
     job->done.store(0, std::memory_order_relaxed);
     const std::uint64_t h = s.head.load(std::memory_order_relaxed);
     job->ticket = h;
@@ -495,11 +573,44 @@ Job *start(const std::uint32_t *prims, std::uint32_t count) {
     if (s.pending.size() > g_peak_backlog.load(std::memory_order_relaxed)) g_peak_backlog.store(s.pending.size(), std::memory_order_relaxed);
     s.ring[h & (kRing - 1)] = job;
     s.head.store(h + 1);  // sequentially consistent, see helper_main
-    if (s.sleeping.load()) {
-        s.bell.fetch_add(1);
-        futex_wake(s.bell);
-    }
+    ring_bell(s);
     return job;
+}
+}  // namespace
+
+Job *start(const std::uint32_t *prims, std::uint32_t count) { return queue_job(prims, count, kClosed); }
+
+Job *open(const std::uint32_t *prims, std::uint32_t count) { return queue_job(prims, count, kOpen); }
+
+void feed(Job *job, const std::uint32_t *prims, std::uint32_t count) {
+    job->prims.store(prims, std::memory_order_release);
+    job->count.store(count);  // sequentially consistent: the helper's sleep check sees it or ring_bell sees the helper asleep
+    ring_bell(*g_shared.load());
+}
+
+void close(Job *job, const std::uint32_t *prims, std::uint32_t count) {
+    job->prims.store(prims, std::memory_order_release);
+    job->count.store(count, std::memory_order_release);
+    job->state.store(kClosed);  // after the count (run_job reads the state first)
+    ring_bell(*g_shared.load());
+}
+
+void cancel(Job *job) {
+    Shared &s = *g_shared.load();
+    job->state.store(kCancelled);
+    std::uint64_t expect = job->ticket;
+    if (job->claim.compare_exchange_strong(expect, kTaken, std::memory_order_acq_rel)) {
+        job->done.store(1, std::memory_order_release);  // the helper had not reached it
+    } else {
+        ring_bell(s);
+        while (!job->done.load(std::memory_order_acquire)) std::this_thread::yield();  // the helper gives it up at its next look (at most kStreamStep shapes)
+    }
+    if (s.pending.empty() || s.pending.back() != job) {  // cannot happen: an open job is the newest
+        std::fprintf(stderr, "[tiles] BAD cancel: the job is not the newest\n");
+        std::abort();
+    }
+    s.pending.pop_back();
+    release(job);
 }
 
 bool owner() {
@@ -515,7 +626,7 @@ void build_waiting() {
         if (job->done.load(std::memory_order_acquire)) break;  // the helper got this far
         std::uint64_t expect = job->ticket;
         if (!job->claim.compare_exchange_strong(expect, kTaken, std::memory_order_acq_rel)) break;  // the helper is on it, and done with or on every older one
-        job->result = g_own.build(job->prims, job->count, job_room, job);
+        job->result = g_own.build(job->prims.load(std::memory_order_relaxed), job->count.load(std::memory_order_relaxed), job_room, job);  // closed: this thread wrote them
         job->done.store(1, std::memory_order_release);
         ++g_stolen;
     }
@@ -553,7 +664,7 @@ Job *next_finished(bool wait) {
 }
 
 void release(Job *job) {
-    job->prims = nullptr;
+    job->prims.store(nullptr, std::memory_order_relaxed);
     if (job->lists.capacity > kKeepWords) job->lists.free_memory();  // a rare big batch does not keep its buffer for good
     const std::uint64_t held = job->lists.capacity;
     const std::uint64_t total = g_held.load(std::memory_order_relaxed) + held - job->held;

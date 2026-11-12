@@ -166,10 +166,25 @@ fn target_raw(t: Tex, x: i32, y: i32) -> u32 {
     if (t.tpsm == 0x02u || t.tpsm == 0x0Au) {
         return ((c.x >> 3u) & 31u) | (((c.y >> 3u) & 31u) << 5u) | (((c.z >> 3u) & 31u) << 10u) | ((c.w >> 7u) << 15u);
     }
+    // indices in the top byte of a 32-bit picture: its alpha channel (8 bits, the low or the high nibble), as raw_axes reads them from memory
+    if (t.tpsm == 0x1Bu) {
+        return c.w;
+    }
+    if (t.tpsm == 0x24u) {
+        return c.w & 15u;
+    }
+    if (t.tpsm == 0x2Cu) {
+        return c.w >> 4u;
+    }
     return c.x | (c.y << 8u) | (c.z << 16u) | (c.w << 24u);
 }
 
-fn target_texel(t: Tex, x: u32, y: u32) -> vec4<f32> {
+// edge_mem (setup word 41 bit 1): a texel past the picture's edge is read from graphics memory (the card path made sure memory is current there), not clamped to the edge
+fn target_texel(t: Tex, x: u32, y: u32, edge_mem: bool) -> vec4<f32> {
+    let d = textureDimensions(src_tex);
+    if (edge_mem && (x >= d.x || y >= d.y)) {
+        return texel_axes(t, axis_x(t, x), axis_y(t, y));
+    }
     return unpack(convert(t, target_raw(t, i32(x), i32(y))));
 }
 
@@ -297,12 +312,13 @@ fn shade(in: VOut) -> Shaded {
             tex = load_tex(b);
         }
         let from_target = DIRECT && (setups[b + 41u] & 1u) != 0u;
+        let edge_mem = (setups[b + 41u] & 2u) != 0u;
         var t: vec4<f32>;
         if ((flags & F_BILINEAR) == 0u || PROBE == 1u) {
             let x = u32(wrap_coord(i32(floor(u)), sw, mu, minu, maxu));
             let y = u32(wrap_coord(i32(floor(vv)), sh, mv, minv, maxv));
             if (from_target) {
-                t = target_texel(tex, x, y);
+                t = target_texel(tex, x, y, edge_mem);
             } else if (DIRECT) {
                 t = texel_axes(tex, axis_x(tex, x), axis_y(tex, y));
             } else {
@@ -324,10 +340,10 @@ fn shade(in: VOut) -> Shaded {
             var t01: vec4<f32>;
             var t11: vec4<f32>;
             if (from_target) {
-                t00 = target_texel(tex, xa, ya);
-                t10 = target_texel(tex, xb, ya);
-                t01 = target_texel(tex, xa, yb);
-                t11 = target_texel(tex, xb, yb);
+                t00 = target_texel(tex, xa, ya, edge_mem);
+                t10 = target_texel(tex, xb, ya, edge_mem);
+                t01 = target_texel(tex, xa, yb, edge_mem);
+                t11 = target_texel(tex, xb, yb, edge_mem);
             } else if (DIRECT) {
                 let axa = axis_x(tex, xa);
                 let axb = axis_x(tex, xb);

@@ -22,8 +22,13 @@ namespace ps2::gs::gpu::tiles {
 
 constexpr std::uint32_t kPrimWords = 28;  // 32-bit words of one shape record (gpu.cpp checks that it has the same number)
 constexpr std::uint32_t kKindMask = 0xFFu;
-constexpr std::size_t kMaxBacklog = 64;  // started jobs not yet placed; at this many the window thread waits for the oldest (the helper's queue holds 1024). 768 held
+constexpr std::size_t kMaxBacklog = 64;  // started jobs not yet placed; at this many the window thread builds the next batch's lists itself (the helper's queue holds 1024). 768 held
                                          // up to 1.2 GB of job buffers on the laptop
+constexpr std::uint32_t kMinJob = 16;  // batches of fewer shapes are built in place by the window thread, never handed to the helper
+// A batch that grows past kStreamStep shapes is handed to the helper while it is still being drawn (open/feed/close below), kStreamStep shapes at a
+// time: the helper makes the spans and counts of those shapes while this thread draws the next ones, so at the flush only the table and the lists are
+// left. The God of War ship fight ends a frame with one batch of about 45,000 shapes that an upload flushes and the submit right after needs.
+constexpr std::uint32_t kStreamStep = 1024;
 constexpr std::size_t kKeepWords = 1u << 20;  // a released job frees a buffer that grew past this (4 MB) instead of keeping it for the next job
 
 // A growing array of 32-bit words. std::vector's insert costs more than the copy it makes (it runs once per shape, about 50,000 times a frame), and
@@ -92,9 +97,11 @@ Lists build_now(const std::uint32_t *prims, std::uint32_t count, Room room, void
 // ---- the helper thread --------------------------------------------------------------------------------------------------------------------
 
 struct Job {
-    // set by start()
-    const std::uint32_t *prims = nullptr;  // the batch's shape records, read by the helper until `done`
-    std::uint32_t count = 0;
+    // set by start() (or open, feed and close)
+    std::atomic<const std::uint32_t *> prims{nullptr};  // the batch's shape records, read by the helper until `done`; an open batch's may move (the
+                                                        // array grew), the new place holds the same records
+    std::atomic<std::uint32_t> count{0};                // shapes handed over so far (all of them once `state` is kClosed)
+    std::atomic<std::uint32_t> state{0};                // kClosed, kOpen (more shapes may come) or kCancelled (the lists are not wanted)
     std::atomic<std::uint32_t> done{0};
     std::uint64_t ticket = 0;                    // its place in the helper's queue
     std::atomic<std::uint64_t> claim{~0ull};     // `ticket` while nobody builds it; kTaken once the helper or the window thread (build_waiting) took it
@@ -120,6 +127,14 @@ std::size_t backlog();
 // The window thread, before it waits for all jobs: builds the newest jobs the helper has not taken yet itself (instead of waiting while the helper works
 // through them one by one), until it meets one the helper has taken.
 void build_waiting();
+// A batch still being drawn (see kStreamStep): open hands over its first `count` records, feed the records drawn since (`prims` is where the batch's
+// records are now: the same records, maybe moved), close the last ones when the batch ends; from then on it is a job like those of start(). A job is
+// open only while it is the newest. cancel drops an open job (its batch's records are dropped or move at a submit): it waits until the helper lets go
+// of it and releases it; the batch's lists are then built in another way.
+Job *open(const std::uint32_t *prims, std::uint32_t count);
+void feed(Job *job, const std::uint32_t *prims, std::uint32_t count);
+void close(Job *job, const std::uint32_t *prims, std::uint32_t count);
+void cancel(Job *job);
 // The oldest job when its lists are built; when `wait`, waits until they are. nullptr when there is none (or, without `wait`, it is not ready).
 Job *next_finished(bool wait);
 // The lists have been copied away: the job and its buffers can be used again.

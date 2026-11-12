@@ -866,9 +866,12 @@ void note_shape(Run &run, const std::uint32_t *r, int kind) {
 
 // Where the processor time of the live path goes (PS2_GPU_HW_TIME=1; nanoseconds, the nested ones are inside the batch)
 bool g_time = false;
-std::uint64_t g_tns[10] = {};
+constexpr int kTimes = 14;
+std::uint64_t g_tns[kTimes] = {};
 std::uint64_t g_cut_why[8] = {};  // runs ended inside a batch: all, scissor, ztest, zwrite, alpha-test split, blend, mask
-const char *const g_tname[10] = {"batch (all)", "independence check", "reader", "writer", "painter batch", "prepare", "encode", "submitted", "display", "batch write-backs and loads"};
+std::uint64_t g_wgpu_submits[2] = {};  // submits without and with card work (PS2_GPU_HW_TIME=1)
+const char *const g_tname[kTimes] = {"batch (all)", "independence check", "reader", "writer", "painter batch", "prepare", "encode", "submitted", "display", "batch write-backs and loads",
+                                     "wgpu finish, card submits", "wgpu submit, card submits", "wgpu finish, other submits", "wgpu submit, other submits"};
 struct Tm {
     int k;
     std::chrono::steady_clock::time_point t0;
@@ -2808,12 +2811,24 @@ Rect unite(Rect a, const Rect &b) {
 // The GPU objects of one size of one target. Work that is already in the list keeps pointing at the Gen it was made for when the target grows.
 struct Gen {
     int w = 0, h = 0;
+    std::uint64_t id = 0;  // never reused, so a cached bind group can name the picture it samples
     WGPUTexture color = nullptr, depth = nullptr;
     WGPUTextureView color_view = nullptr, depth_view = nullptr;
+    WGPUTexture shadow = nullptr;  // a copy of a box of the colour picture, for batches that sample the picture they draw on (made on first use)
+    WGPUTextureView shadow_view = nullptr;
     WGPUBuffer view_buf = nullptr;
     WGPUBindGroup load_group = nullptr, store_group = nullptr, store_z_group = nullptr, render_group = nullptr;
     std::uint64_t render_gen = 0;
+    struct SrcGroup {
+        std::uint64_t src = 0, gen = 0;  // the id of the sampled picture (this one's own id: the shadow copy), and LV.render_gen when it was made
+        WGPUBindGroup group = nullptr;
+    };
+    SrcGroup src_groups[4];  // render bind groups whose texture is another picture or the shadow copy, most recent first
     ~Gen() {
+        for (SrcGroup &s : src_groups)
+            if (s.group) memlog::del_group(s.group);
+        if (shadow_view) wgpuTextureViewRelease(shadow_view);
+        if (shadow) memlog::del_texture(shadow);
         if (load_group) memlog::del_group(load_group);
         if (store_group) memlog::del_group(store_group);
         if (store_z_group) memlog::del_group(store_z_group);
@@ -2841,11 +2856,12 @@ struct Tgt {
 };
 
 struct LOp {
-    enum Kind { Load, Store, StoreZ, LoadZ, Draw, Display } kind = Load;
+    enum Kind { Load, Store, StoreZ, LoadZ, Draw, Display, Copy } kind = Load;
     std::uint32_t after = 0;  // number of compute commands of the submit that run before it
     Gen *g = nullptr;
+    Gen *src = nullptr;       // Draw: the picture the shapes marked in setup word 41 sample (g itself: its shadow copy), or none
     std::uint32_t param = 0, x = 0, y = 0, run_first = 0, run_count = 0;
-    std::uint32_t rect[4] = {};  // LoadZ: x, y, width, height
+    std::uint32_t rect[4] = {};  // LoadZ, Copy: x, y, width, height
 };
 
 struct Stats {
@@ -2853,6 +2869,7 @@ struct Stats {
     std::uint64_t loads = 0, load_px = 0, stores = 0, store_px = 0, store_zs = 0, load_zs = 0, growths = 0, evictions = 0, display_card = 0, display_memory = 0, state_drops = 0;
     std::uint64_t by_reader = 0, by_writer = 0, by_overlap = 0, by_read = 0, by_load = 0, by_grow = 0, by_painter = 0, by_eager = 0, by_other = 0;
     std::uint64_t fallbacks = 0;
+    std::uint64_t fed_other = 0, fed_self = 0, copy_px = 0, fed_refused = 0, top_byte_kept = 0;  // batches that sampled another picture, or a copy of their own, instead of a write-back; refused: a picture was there but a rule said no
     std::map<std::string, std::uint64_t> refused;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> kinds;  // PS2_GPU_HW_LOG=1: what the card draws (target, depth use, texture, blend), batches and shapes
 };
@@ -2890,7 +2907,7 @@ std::uint32_t add_p(std::initializer_list<std::uint32_t> values) {
     return static_cast<std::uint32_t>(LV.params.size() - 1);
 }
 
-std::uint64_t g_before_draw[10] = {};  // PS2_GPU_HW_LOG=1: the op before each draw (kinds 0-5; 6-9: a draw, same/other picture, same/later point)
+std::uint64_t g_before_draw[11] = {};  // PS2_GPU_HW_LOG=1: the op before each draw (kinds 0-5; 6-9: a draw, same/other picture, same/later point; 10: a copy)
 LOp &push_op(LOp::Kind kind, Gen *g) {
     LV.ops.emplace_back();
     LOp &o = LV.ops.back();
@@ -2948,8 +2965,9 @@ void store_depth(Tgt &t, std::uint64_t &why) {
     t.zdpages.reset();
 }
 
-// Everything the card holds newer in these pages of memory goes back, in the order the chip drew it.
-void write_back(const Pg &p, std::uint64_t &why) {
+// Everything the card holds newer in these pages of memory goes back, in the order the chip drew it, except the pictures `skip(target, kind)` (kind 0 colour, 1 depth) leaves on the card.
+template <class Skip>
+void write_back_if(const Pg &p, std::uint64_t &why, Skip skip) {
     struct E {
         std::uint32_t seq;
         int kind;
@@ -2957,11 +2975,16 @@ void write_back(const Pg &p, std::uint64_t &why) {
     };
     std::vector<E> v;
     for (auto &t : LV.targets) {
-        if (!t->drawn.empty() && (t->dpages & p).any()) v.push_back({t->seq, 0, t.get()});
-        if (!t->zdrawn.empty() && (t->zdpages & p).any()) v.push_back({t->zseq, 1, t.get()});
+        if (!t->drawn.empty() && (t->dpages & p).any() && !skip(*t, 0)) v.push_back({t->seq, 0, t.get()});
+        if (!t->zdrawn.empty() && (t->zdpages & p).any() && !skip(*t, 1)) v.push_back({t->zseq, 1, t.get()});
     }
     std::sort(v.begin(), v.end(), [](const E &a, const E &b) { return a.seq != b.seq ? a.seq < b.seq : a.kind < b.kind; });
     for (const E &e : v) e.kind == 0 ? store_color(*e.t, why) : store_depth(*e.t, why);
+}
+
+// `keep`: the colour picture of that target stays on the card.
+void write_back(const Pg &p, std::uint64_t &why, const Tgt *keep = nullptr) {
+    write_back_if(p, why, [keep](const Tgt &t, int kind) { return kind == 0 && &t == keep; });
 }
 
 void store_all(Tgt &t, std::uint64_t &why) {
@@ -2990,7 +3013,8 @@ std::unique_ptr<Gen> make_gen(int w, int h) {
     Context &c = *g_gpu.ctx;
     Gpu &G = g_gpu;
     auto g = std::make_unique<Gen>();
-    g->w = w, g->h = h;
+    static std::uint64_t ids = 0;
+    g->w = w, g->h = h, g->id = ++ids;
     WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
     td.dimension = WGPUTextureDimension_2D;
     td.size = {static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h), 1};
@@ -3024,8 +3048,31 @@ std::unique_ptr<Gen> make_gen(int w, int h) {
     return g;
 }
 
+void make_shadow(Gen &g) {
+    if (g.shadow) return;
+    WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    td.dimension = WGPUTextureDimension_2D;
+    td.size = {static_cast<std::uint32_t>(g.w), static_cast<std::uint32_t>(g.h), 1};
+    td.mipLevelCount = 1;
+    td.sampleCount = 1;
+    td.format = WGPUTextureFormat_RGBA8Unorm;
+    td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    g.shadow = memlog::new_texture(g_gpu.ctx->device, &td);
+    g.shadow_view = wgpuTextureCreateView(g.shadow, nullptr);
+    LV.bytes += static_cast<std::uint64_t>(g.w) * g.h * 4;
+}
+
+// Cached bind groups that sample picture `id` are dropped (the picture is going away; a cached group would keep its texture alive).
+void purge_src(std::uint64_t id) {
+    for (auto &t : LV.targets)
+        if (t->g)
+            for (Gen::SrcGroup &s : t->g->src_groups)
+                if (s.group && s.src == id) memlog::del_group(s.group), s = Gen::SrcGroup();
+}
+
 void retire(Tgt &t) {
     if (!t.g) return;
+    if (t.g->shadow) LV.bytes -= static_cast<std::uint64_t>(t.g->w) * t.g->h * 4;
     LV.bytes -= static_cast<std::uint64_t>(t.g->w) * t.g->h * 8;
     LV.retired.push_back(std::move(t.g));
 }
@@ -3158,25 +3205,43 @@ Rect meet(const Rect &a, const Rect &b) {
 
 std::uint64_t area(const Rect &r) { return r.empty() ? 0 : static_cast<std::uint64_t>(r.x1 - r.x0 + 1) * static_cast<std::uint64_t>(r.y1 - r.y0 + 1); }
 
-// The colour picture of a target is made current in `need`: a part that was never loaded makes the whole valid rectangle grow (and load), a stale part is loaded again (from memory,
-// after whatever the card holds newer in those pages has been written back, this picture's own included).
+// One box of a colour picture loaded from memory, after whatever the card holds newer in those pages has gone back (`keep`: that picture's colour need not, see below).
+void load_box(Tgt &t, const Rect &r, const Tgt *keep) {
+    if (r.empty()) return;
+    Pg pn;
+    pages_of(t.fbp, t.fbw, t.fpsm, r.x0, r.y0, r.x1, r.y1, pn);
+    write_back(pn, LV.st.by_load, keep);
+    sync_op(LOp::Load, t, r);
+    ++LV.st.loads;
+    LV.st.load_px += area(r);
+    t.pages |= pn;
+}
+
+// The colour picture of a target is made current in `need`. A stale part (memory is newer) is loaded again, after whatever the card holds newer in those pages has been
+// written back, this picture's own included. A part that was never loaded makes the valid rectangle grow: only the new strips around the old valid rectangle are loaded
+// (at most four boxes), and this picture's own drawn part needs no write-back for them, because it lies inside the old valid rectangle (a draw makes its box valid first)
+// and a load reads only the pixels of its boxes. (Loading the whole grown rectangle would also write the picture back and, for 16-bit colour, cut what it holds to 5 bits.)
 void make_current(Tgt &t, const Rect &need) {
-    Rect from;
-    bool grow = false;
-    if (!covers(t.valid, need)) from = unite(t.valid, need), grow = true;
-    else if (inter(t.stale, need)) from = meet(t.stale, t.valid);
-    else return;
-    if (!from.empty()) {
-        Pg pn;
-        pages_of(t.fbp, t.fbw, t.fpsm, from.x0, from.y0, from.x1, from.y1, pn);
-        write_back(pn, LV.st.by_load);
-        sync_op(LOp::Load, t, from);
-        ++LV.st.loads;
-        LV.st.load_px += area(from);
-        t.pages |= pn;
-    }
-    if (grow) t.valid = from;
+    const bool grow = !covers(t.valid, need);
+    if (!grow && !inter(t.stale, need)) return;
+    if (!t.stale.empty()) load_box(t, meet(t.stale, t.valid), nullptr);
     t.stale = Rect();
+    if (!grow) return;
+    const Rect u = unite(t.valid, need), v = t.valid;
+    if (v.empty()) {
+        load_box(t, u, &t);
+    } else {
+        Rect top, bottom, left, right;
+        if (u.y0 < v.y0) top.add(u.x0, u.y0, u.x1, v.y0 - 1);
+        if (u.y1 > v.y1) bottom.add(u.x0, v.y1 + 1, u.x1, u.y1);
+        if (u.x0 < v.x0) left.add(u.x0, v.y0, v.x0 - 1, v.y1);
+        if (u.x1 > v.x1) right.add(v.x1 + 1, v.y0, u.x1, v.y1);
+        load_box(t, top, &t);
+        load_box(t, bottom, &t);
+        load_box(t, left, &t);
+        load_box(t, right, &t);
+    }
+    t.valid = u;
 }
 
 void make_current_z(Tgt &t, const Rect &need) {
@@ -3290,6 +3355,161 @@ const LookEntry &entry_of(const std::uint32_t *s) {
 const Look &look_of(const std::uint32_t *s) { return entry_of(s).look; }
 
 // One batch of shapes, all of which the card takes: the work goes into the list. Returns false, having done nothing, when it cannot.
+// ---- textures that are pictures the card holds
+// A batch whose texture is a picture the card drew used to write that picture back to memory first and read memory. Instead the shapes sample the picture
+// itself (another target) or a copy of the box they read, taken just before the draw (the target the batch draws on: a render pass cannot sample its own
+// attachment). Both are exact: where the picture is current (inside `valid`, not `stale`) it holds what the write-back would have put in memory (the shader
+// rebuilds the texel as memory holds it: 16-bit colour cut to 5/5/5/1), and the card reads its textures as they were before the batch either way (gpu.cpp
+// cuts a batch where a shape would read what an earlier shape of it drew). The write-back is only put off: the picture stays newer than memory and goes back
+// when something else reads that memory.
+int g_feedback = 3;  // PS2_GPU_HW_FEEDBACK: bit 0 sample another target, bit 1 sample a copy of the own target (0 = off, write back as before; "other", "self")
+
+// Same rule as the shader's target_raw: 32-bit textures from a 32-bit picture, 24-bit from 32- or 24-bit, 16-bit from the same 16-bit format, and the indices kept in the
+// top byte of 32-bit words (8-bit, 4-bit low and high nibble: the same page layout as 32-bit colour) from a 32-bit picture's alpha. A 32-bit texture over a 24-bit picture
+// would need the top byte, which the picture does not hold.
+bool feed_format_ok(std::uint32_t fpsm, std::uint32_t tpsm) {
+    if (fpsm == 0) return tpsm == 0 || tpsm == 1 || tpsm == 0x1B || tpsm == 0x24 || tpsm == 0x2C;
+    if (fpsm == 1) return tpsm == 1;
+    return (fpsm == 2 || fpsm == 0x0A) && tpsm == fpsm;
+}
+
+// The texels a setup's shapes can read (one more on each side for the bilinear taps), as the shader addresses them; false when it cannot be told (q <= 0, region repeat).
+struct UsedTex {
+    double u0 = 1e30, u1 = -1e30, v0 = 1e30, v1 = -1e30;
+    bool bad = false, any = false;
+};
+
+bool used_rect(const std::uint32_t *s, const UsedTex &u, Rect &out) {
+    if (u.bad || !u.any || u.u0 > u.u1) return false;
+    const auto axis = [](double lo, double hi, std::uint32_t lg, std::uint32_t mode, std::uint32_t region, int &a, int &b) {
+        if (mode == 3) return false;
+        const int size = 1 << lg;
+        a = static_cast<int>(std::floor(lo)) - 1;
+        b = static_cast<int>(std::floor(hi)) + 1;
+        if (mode == 0) {
+            if (a < 0 || b >= size) a = 0, b = size - 1;  // wraps: the whole texture
+        } else {
+            const int mn = mode == 2 ? static_cast<int>(region & 0xFFFFu) : 0, mx = mode == 2 ? static_cast<int>(region >> 16) : size - 1;
+            a = std::clamp(a, mn, mx), b = std::clamp(b, mn, mx);  // clamping is monotone
+        }
+        return true;
+    };
+    int ax, bx, ay, by;
+    if (!axis(u.u0, u.u1, s[15] & 0xFFu, (s[7] >> 24) & 3u, s[18], ax, bx) || !axis(u.v0, u.v1, s[15] >> 8, (s[7] >> 26) & 3u, s[19], ay, by)) return false;
+    out = Rect();
+    out.add(ax, ay, bx, by);
+    return true;
+}
+
+// Which picture (if any) the batch samples instead of a write-back; `fed` marks the setups that sample it, `copy_box` is the box to copy when it is the target T.
+Tgt *pick_source(const LiveBatch &b, Tgt &T, std::vector<std::uint8_t> &fed, Rect &copy_box, Rect &need, Pg &out_pages) {
+    const std::uint32_t nset = b.setup_count;
+    Pg rp;
+    for (std::uint32_t i = 0; i < b.read_count; ++i) rp |= pages_bytes(b.reads[2 * i], b.reads[2 * i + 1]);
+    Tgt *S = nullptr;
+    for (std::uint32_t i = 0; i < nset && !S; ++i) {
+        const std::uint32_t *s = b.setups + static_cast<std::size_t>(i) * kSetupWords;
+        if (!(s[0] & 2u)) continue;
+        for (auto &t : LV.targets)
+            if (t->g && !t->drawn.empty() && (t->dpages & rp).any() && t->fbp == s[12] && t->fbw == s[13] && feed_format_ok(t->fpsm, s[14])) {
+                S = t.get();
+                break;
+            }
+    }
+    if (!S) {
+        if (g_log) {  // PS2_GPU_HW_LOG=1: a picture the textures overlap that none of them is (another address, width or format)
+            for (auto &t : LV.targets) {
+                if (!t->g || t->drawn.empty() || !(t->dpages & rp).any()) continue;
+                for (std::uint32_t i = 0; i < nset; ++i) {
+                    const std::uint32_t *s = b.setups + static_cast<std::size_t>(i) * kSetupWords;
+                    if (!(s[0] & 2u)) continue;
+                    char key[200];
+                    std::snprintf(key, sizeof key, "feedback not possible: texture %u/%u/%02X %ux%u over picture %u/%u/%02X%s", s[12], s[13], s[14], 1u << (s[15] & 0xFFu), 1u << (s[15] >> 8), t->fbp, t->fbw, t->fpsm, t.get() == &T ? " (self)" : "");
+                    ++LV.st.kinds[key].first;
+                }
+            }
+        }
+        return nullptr;
+    }
+    const bool self = S == &T;
+    if (!(g_feedback & (self ? 2 : 1))) return nullptr;
+    static std::vector<UsedTex> used;
+    used.assign(nset, UsedTex());
+    for (std::uint32_t i = 0; i < b.prim_count; ++i) {  // the texture coordinates of every shape (the interpolated s/q lies between the corners' when q > 0)
+        const std::uint32_t *r = b.prims + static_cast<std::size_t>(i) * kPrimWords;
+        const std::uint32_t *s = b.setups + static_cast<std::size_t>(r[0]) * kSetupWords;
+        if (!(s[0] & 2u)) continue;
+        UsedTex &u = used[r[0]];
+        u.any = true;
+        const bool fst = (s[0] & 16u) != 0;
+        const double sw = static_cast<double>(1u << (s[15] & 0xFFu)), sh = static_cast<double>(1u << (s[15] >> 8));
+        const auto acc = [&](float sv, float tv, float qv) {
+            double uu, vv;
+            if (fst) uu = sv / 16.0, vv = tv / 16.0;
+            else if (qv > 0.0f) uu = sv / qv * sw, vv = tv / qv * sh;
+            else { u.bad = true; return; }
+            if (!(uu > -1e9 && uu < 1e9 && vv > -1e9 && vv < 1e9)) { u.bad = true; return; }
+            u.u0 = std::min(u.u0, uu), u.u1 = std::max(u.u1, uu), u.v0 = std::min(u.v0, vv), u.v1 = std::max(u.v1, vv);
+        };
+        if ((r[1] & 3u) == 0) {
+            for (int k = 0; k < 3; ++k) acc(f(r[15 + 3 * k]), f(r[16 + 3 * k]), f(r[17 + 3 * k]));
+        } else {
+            acc(f(r[15]), f(r[16]), f(r[20]));
+            acc(f(r[18]), f(r[19]), f(r[20]));
+        }
+    }
+    const Gen &SG = *S->g;
+    Pg used_pages;
+    bool any = false;
+    const auto refuse = [&](const char *why) -> Tgt * {
+        ++LV.st.fed_refused;
+        if (g_log) ++LV.st.kinds[std::string("feedback refused: ") + why].first;
+        fed.assign(nset, 0);
+        copy_box = need = Rect();
+        out_pages.reset();
+        return nullptr;
+    };
+    for (std::uint32_t i = 0; i < nset; ++i) {
+        const std::uint32_t *s = b.setups + static_cast<std::size_t>(i) * kSetupWords;
+        if (!(s[0] & 2u) || !used[i].any) continue;
+        if (s[12] == S->fbp && s[13] == S->fbw && feed_format_ok(S->fpsm, s[14])) {
+            Rect u;
+            if (!used_rect(s, used[i], u)) return refuse("texel range unknown");
+            // Texels inside the picture's texture are read from it (made current first: a part never loaded, or stale, is loaded from memory). Texels past its edge (the
+            // one-texel margin of a strip at the bottom edge, a texture that reaches into the next buffer) are read from memory by the shader (setup word 41 bit 1); they
+            // are none of this picture's pixels as long as their pages hold none of its drawn part (a texel right of the buffer's width lies in the next row of pages).
+            Rect in;
+            in.add(std::max(u.x0, 0), std::max(u.y0, 0), std::min(u.x1, SG.w - 1), std::min(u.y1, SG.h - 1));
+            if (in.empty() || !covers(in, u)) {
+                Rect parts[4];
+                if (u.y1 >= SG.h) parts[0].add(u.x0, SG.h, u.x1, u.y1);
+                if (u.x1 >= SG.w) parts[1].add(SG.w, u.y0, u.x1, std::min(u.y1, SG.h - 1));
+                if (u.y0 < 0 || u.x0 < 0) return refuse("texels before the picture's origin");
+                for (const Rect &p : parts)
+                    if (!p.empty()) pages_of(s[12], s[13], s[14], p.x0, p.y0, p.x1, p.y1, out_pages);
+                if ((out_pages & S->dpages).any()) return refuse("texels past the picture's edge lie in its drawn pages");
+            }
+            if (!in.empty()) {
+                need = unite(need, in);
+                pages_of(s[12], s[13], s[14], in.x0, in.y0, in.x1, in.y1, used_pages);
+                if (self) copy_box = unite(copy_box, in);
+            }
+            fed[i] = 1;
+            any = true;
+        } else {  // another texture, read from memory: it must not need the picture in memory
+            Pg fp;
+            pages_of(s[12], s[13], s[14], 0, 0, static_cast<int>(1u << (s[15] & 0xFFu)) - 1, static_cast<int>(1u << (s[15] >> 8)) - 1, fp);
+            if ((fp & S->dpages).any()) return refuse("another texture of the batch reads the picture's memory");
+        }
+    }
+    if (!any) return refuse("no shape reads it");
+    for (auto &t : LV.targets) {  // nothing else holds newer data in the pages read (the stale rule already says so; checked because it is cheap)
+        if (!t->zdrawn.empty() && (t->zdpages & used_pages).any()) return refuse("a depth picture holds newer data there");
+        if (t.get() != S && !t->drawn.empty() && (t->dpages & used_pages).any()) return refuse("another picture holds newer data there");
+    }
+    return S;
+}
+
 bool batch(const LiveBatch &b) {
     const std::uint32_t nset = b.setup_count;
     static std::vector<Look> looks, alts;
@@ -3376,9 +3596,40 @@ bool batch(const LiveBatch &b) {
     ensure_gen(T, B.y1 + 1, b.frame);
     evict_for(&T);
     Gen &G = *T.g;
-    // 1. the textures the batch reads come from memory: whatever the card holds newer there goes back first
+    // 1. the textures the batch reads come from memory: whatever the card holds newer there goes back first, except a picture the shapes sample directly (above)
     Tm tm_wb(9);
-    for (std::uint32_t i = 0; i < b.read_count; ++i) write_back(pages_bytes(b.reads[2 * i], b.reads[2 * i + 1]), LV.st.by_read);
+    static std::vector<std::uint8_t> fed;
+    fed.assign(nset, 0);
+    Rect copy_box;
+    Rect need;
+    Pg out_pages;
+    Tgt *const S = g_feedback && !g_eager ? pick_source(b, T, fed, copy_box, need, out_pages) : nullptr;
+    if (!g_feedback || g_eager) {
+        for (std::uint32_t i = 0; i < b.read_count; ++i) write_back(pages_bytes(b.reads[2 * i], b.reads[2 * i + 1]), LV.st.by_read);
+    } else {
+        // Exactly what the card's shader reads from memory goes back first: the base level of each texture that is not sampled from a picture, the 2^tw x 2^th texels it wraps
+        // into (no mipmaps, palettes come from the palette buffer). A texture that holds only the top byte of 32-bit words (8-bit or 4-bit "high" indices) does not need a
+        // 24-bit colour or depth picture written back: that write-back keeps the top byte of every word as memory has it (24-bit drawing never touches it).
+        Pg plain, upper;
+        for (std::uint32_t i = 0; i < nset; ++i) {
+            const std::uint32_t *s = b.setups + static_cast<std::size_t>(i) * kSetupWords;
+            if (!(s[0] & 2u) || fed[i]) continue;
+            const bool top = s[14] == 0x1B || s[14] == 0x24 || s[14] == 0x2C;
+            pages_of(s[12], s[13], s[14], 0, 0, static_cast<int>(1u << (s[15] & 0xFFu)) - 1, static_cast<int>(1u << (s[15] >> 8)) - 1, top ? upper : plain);
+        }
+        write_back_if(plain | upper, LV.st.by_read, [&](const Tgt &U, int kind) {
+            if (kind == 0 && &U == S) return true;  // sampled directly
+            const Pg &dp = kind == 0 ? U.dpages : U.zdpages;
+            if ((dp & plain).any()) return false;
+            if (kind == 0 ? U.fpsm != 1 : U.zpsm != 0x31) return false;
+            ++LV.st.top_byte_kept;
+            return true;
+        });
+    }
+    if (S) {
+        write_back(out_pages, LV.st.by_read, S);  // texels past the picture's edge come from memory
+        if (!need.empty()) make_current(*S, need);  // the texels read inside the picture: loaded where never loaded or stale
+    }
     // 2. the pages the batch writes: other pictures over the same memory are written back, then they are stale
     Pg Pc, Pz;
     pages_of(b.fbp, b.fbw, b.fpsm, B.x0, B.y0, B.x1, B.y1, Pc);
@@ -3417,6 +3668,7 @@ bool batch(const LiveBatch &b) {
         std::memcpy(w, b.setups + static_cast<std::size_t>(i) * kSetupWords, kSetupWords * 4);
         w[24] = 0xFFFFFFFFu;
         w[40] = looks[i].alpha_out ? 1u : 0u;
+        w[41] = fed[i] ? 3u : 0u;  // the shader reads this setup's texels from the picture bound as src_tex, and those past its edge from memory
     }
     const std::uint32_t run_first = static_cast<std::uint32_t>(LV.runs.size());
     Run cur;
@@ -3544,7 +3796,20 @@ bool batch(const LiveBatch &b) {
     close();
     const std::uint32_t run_count = static_cast<std::uint32_t>(LV.runs.size()) - run_first;
     if (run_count) {
+        if (S == &T) {  // the box the shapes read, copied after the loads above and just before the draw
+            const Rect c = clipped(G, copy_box);
+            make_shadow(G);
+            if (!c.empty()) {
+                LOp &cp = push_op(LOp::Copy, &G);
+                cp.rect[0] = static_cast<std::uint32_t>(c.x0), cp.rect[1] = static_cast<std::uint32_t>(c.y0), cp.rect[2] = static_cast<std::uint32_t>(c.x1 - c.x0 + 1), cp.rect[3] = static_cast<std::uint32_t>(c.y1 - c.y0 + 1);
+            }
+            ++LV.st.fed_self;
+            LV.st.copy_px += area(c);
+        } else if (S) {
+            ++LV.st.fed_other;
+        }
         LOp &o = push_op(LOp::Draw, &G);
+        o.src = S ? S->g.get() : nullptr;
         o.run_first = run_first;
         o.run_count = run_count;
         LV.st.runs += run_count;
@@ -4011,6 +4276,39 @@ WGPUBindGroup render_group_of(Gen &g, WGPUBuffer view_buf) {
     return grp;
 }
 
+// The render bind group of picture g whose texture slot holds picture src (src == g: g's shadow copy). Kept per picture, four at most, made again when the
+// shared buffers were made anew (render_gen).
+WGPUBindGroup src_group_of(Gen &g, Gen &src) {
+    Gen::SrcGroup *slots = g.src_groups;
+    for (int i = 0; i < 4; ++i) {
+        if (slots[i].group && slots[i].src == src.id && slots[i].gen == LV.render_gen) {
+            const Gen::SrcGroup hit = slots[i];
+            for (int k = i; k > 0; --k) slots[k] = slots[k - 1];
+            slots[0] = hit;
+            return hit.group;
+        }
+    }
+    Context &c = *g_gpu.ctx;
+    WGPUBindGroupEntry re[7] = {};
+    for (int i = 0; i < 7; ++i) re[i] = WGPU_BIND_GROUP_ENTRY_INIT, re[i].binding = static_cast<std::uint32_t>(i), re[i].size = WGPU_WHOLE_SIZE;
+    re[0].buffer = LV.sbuf;
+    re[1].buffer = LV.dummy_buf;
+    re[2].buffer = g.view_buf;
+    re[3].buffer = c.vram;
+    re[4].buffer = c.tables;
+    re[5].buffer = c.clut;
+    re[6].textureView = &src == &g ? g.shadow_view : src.color_view;
+    WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    d.layout = g_gpu.render_layout;
+    d.entryCount = 7;
+    d.entries = re;
+    WGPUBindGroup grp = memlog::new_group(c.device, &d);
+    if (slots[3].group) memlog::del_group(slots[3].group);
+    for (int k = 3; k > 0; --k) slots[k] = slots[k - 1];
+    slots[0] = {src.id, LV.render_gen, grp};
+    return grp;
+}
+
 std::vector<WGPUBindGroup> g_temp_groups;
 std::vector<WGPUBuffer> g_temp_buffers;
 
@@ -4084,6 +4382,17 @@ WGPUComputePassEncoder live_encode(WGPUCommandEncoder enc, std::uint32_t upto, W
             wgpuRenderPassEncoderRelease(rp);
             break;
         }
+        case LOp::Copy: {  // the box a batch reads of the picture it draws on, into the picture's shadow copy
+            close();
+            WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            from.texture = op.g->color;
+            from.origin = {op.rect[0], op.rect[1], 0};
+            to.texture = op.g->shadow;
+            to.origin = from.origin;
+            const WGPUExtent3D size = {op.rect[2], op.rect[3], 1};
+            wgpuCommandEncoderCopyTextureToTexture(enc, &from, &to, &size);
+            break;
+        }
         case LOp::Draw: {
             close();
             Gen &g = *op.g;
@@ -4101,9 +4410,13 @@ WGPUComputePassEncoder live_encode(WGPUCommandEncoder enc, std::uint32_t upto, W
             rd.depthStencilAttachment = &depth;
             WGPURenderPassEncoder rp = memlog::begin_render(enc, &rd);
             wgpuRenderPassEncoderSetVertexBuffer(rp, 0, LV.vbuf, 0, WGPU_WHOLE_SIZE);
-            wgpuRenderPassEncoderSetBindGroup(rp, 0, render_group_of(g, nullptr), 0, nullptr);
+            wgpuRenderPassEncoderSetBindGroup(rp, 0, op.src ? src_group_of(g, *op.src) : render_group_of(g, nullptr), 0, nullptr);
             // card batches that follow one another on one picture (nothing between them that writes back or loads) are drawn in one render pass
             const LOp *cur_op = &op;
+            // the pass's state: a pipeline, scissor or blend constant is set only when it changes (every command costs wgpu time when the encoder is finished)
+            WGPURenderPipeline cur_pipe = nullptr;
+            std::uint32_t cur_sc[4] = {~0u, ~0u, ~0u, ~0u};
+            double cur_bc = -1.0;
             for (;;) {
             for (std::uint32_t ri = cur_op->run_first; ri < cur_op->run_first + cur_op->run_count; ++ri) {
                 Run &r = LV.runs[ri];
@@ -4112,14 +4425,18 @@ WGPUComputePassEncoder live_encode(WGPUCommandEncoder enc, std::uint32_t upto, W
                     collect(r);
                 }
                 LV.st.runs += r.cuts.size();
-                wgpuRenderPassEncoderSetScissorRect(rp, r.scissor[0], r.scissor[1], r.scissor[2], r.scissor[3]);
-                if (r.look.blend && (r.look.src == kConst || r.look.src == kInvConst || r.look.dst == kConst || r.look.dst == kInvConst)) {
+                if (std::memcmp(cur_sc, r.scissor, sizeof cur_sc) != 0) {
+                    wgpuRenderPassEncoderSetScissorRect(rp, r.scissor[0], r.scissor[1], r.scissor[2], r.scissor[3]);
+                    std::memcpy(cur_sc, r.scissor, sizeof cur_sc);
+                }
+                if (r.look.blend && (r.look.src == kConst || r.look.src == kInvConst || r.look.dst == kConst || r.look.dst == kInvConst) && cur_bc != r.look.constant) {
                     const WGPUColor bc = {r.look.constant, r.look.constant, r.look.constant, r.look.constant};
                     wgpuRenderPassEncoderSetBlendConstant(rp, &bc);
+                    cur_bc = r.look.constant;
                 }
                 const auto draw = [&](bool depth_only, bool alpha_only, std::uint32_t first, std::uint32_t vertices) {
                     if (WGPURenderPipeline p = pipeline_for(r.look, depth_only, alpha_only)) {
-                        wgpuRenderPassEncoderSetPipeline(rp, p);
+                        if (p != cur_pipe) wgpuRenderPassEncoderSetPipeline(rp, p), cur_pipe = p;
                         wgpuRenderPassEncoderDraw(rp, vertices, 1, first, 0);
                         ++LV.st.draws;
                     }
@@ -4148,7 +4465,7 @@ WGPUComputePassEncoder live_encode(WGPUCommandEncoder enc, std::uint32_t upto, W
                     piece(first, at - first);
                 }
             }
-            if (g_merge_passes && LV.cursor < LV.ops.size() && LV.ops[LV.cursor].kind == LOp::Draw && LV.ops[LV.cursor].g == op.g && LV.ops[LV.cursor].after == cur_op->after) {
+            if (g_merge_passes && LV.cursor < LV.ops.size() && LV.ops[LV.cursor].kind == LOp::Draw && LV.ops[LV.cursor].g == op.g && LV.ops[LV.cursor].src == op.src && LV.ops[LV.cursor].after == cur_op->after) {
                 cur_op = &LV.ops[LV.cursor++];
                 continue;
             }
@@ -4199,7 +4516,7 @@ void watch_word() {
     last = v;
     std::string ops;
     for (const live::LOp &o : live::LV.ops) {
-        static const char kinds[] = "LSZlDP";
+        static const char kinds[] = "LSZlDPC";
         char b[32];
         std::snprintf(b, sizeof b, " %c%u%s", kinds[o.kind], o.after, o.g ? "" : "?");
         ops += b;
@@ -4220,7 +4537,7 @@ void live_submitted() {
         for (std::size_t i = 1; i < LV.ops.size(); ++i) {
             const LOp &a = LV.ops[i - 1], &b = LV.ops[i];
             if (b.kind != LOp::Draw) continue;
-            const int k = a.kind != LOp::Draw ? a.kind : 6 + (a.g == b.g ? 0 : 2) + (a.after == b.after ? 0 : 1);
+            const int k = a.kind == LOp::Copy ? 10 : a.kind != LOp::Draw ? a.kind : 6 + (a.g == b.g ? 0 : 2) + (a.after == b.after ? 0 : 1);
             ++g_before_draw[k];
         }
     }
@@ -4236,6 +4553,7 @@ void live_submitted() {
     LV.params.clear();
     LV.runs.clear();
     ++LV.serial;
+    for (const auto &g : LV.retired) purge_src(g->id);
     LV.retired.clear();
     for (WGPUBindGroup g : g_temp_groups) memlog::del_group(g);
     for (WGPUBuffer b : g_temp_buffers) memlog::del_buffer(b);
@@ -4249,12 +4567,15 @@ void live_stats() {
     if (g_log) {
         std::fprintf(stderr, "[hw-live] before a draw:");
         for (std::uint64_t n : g_before_draw) std::fprintf(stderr, " %llu", static_cast<unsigned long long>(n));
-        std::fprintf(stderr, " (load, store, depth store, depth load, -, display, draw same picture, same picture later, other picture, other picture later)\n");
+        std::fprintf(stderr, " (load, store, depth store, depth load, -, display, draw same picture, same picture later, other picture, other picture later, copy)\n");
     }
     const Stats &s = LV.st;
     std::fprintf(stderr, "[hw-live] batches: card %llu (%llu shapes, %llu runs, %llu draws), painter %llu (%llu shapes), fallbacks %llu\n", static_cast<unsigned long long>(s.card_batches),
                  static_cast<unsigned long long>(s.card_shapes), static_cast<unsigned long long>(s.runs), static_cast<unsigned long long>(s.draws), static_cast<unsigned long long>(s.painter_batches),
                  static_cast<unsigned long long>(s.painter_shapes), static_cast<unsigned long long>(s.fallbacks));
+    std::fprintf(stderr, "[hw-live] textures that are pictures on the card (PS2_GPU_HW_FEEDBACK=%d): %llu batches sampled another picture, %llu a copy of their own (%llu px copied), %llu refused (written back); %llu 24-bit pictures left on the card for textures of the top byte\n", g_feedback,
+                 static_cast<unsigned long long>(s.fed_other), static_cast<unsigned long long>(s.fed_self), static_cast<unsigned long long>(s.copy_px), static_cast<unsigned long long>(s.fed_refused),
+                 static_cast<unsigned long long>(s.top_byte_kept));
     std::fprintf(stderr, "[hw-live] pipelines: %llu made in the background, %llu failed, %llu setups waited for one\n[hw-live] loads %llu colour (%llu px) %llu depth; write-backs %llu colour (%llu px) %llu depth; growths %llu evictions %llu state drops %llu\n", static_cast<unsigned long long>(g_async_done), static_cast<unsigned long long>(g_async_failed), static_cast<unsigned long long>(g_waited_routes), static_cast<unsigned long long>(s.loads),
                  static_cast<unsigned long long>(s.load_px), static_cast<unsigned long long>(s.load_zs), static_cast<unsigned long long>(s.stores), static_cast<unsigned long long>(s.store_px),
                  static_cast<unsigned long long>(s.store_zs), static_cast<unsigned long long>(s.growths), static_cast<unsigned long long>(s.evictions), static_cast<unsigned long long>(s.state_drops));
@@ -4262,8 +4583,10 @@ void live_stats() {
                  static_cast<unsigned long long>(s.by_reader), static_cast<unsigned long long>(s.by_writer), static_cast<unsigned long long>(s.by_overlap), static_cast<unsigned long long>(s.by_read),
                  static_cast<unsigned long long>(s.by_load), static_cast<unsigned long long>(s.by_grow), static_cast<unsigned long long>(s.by_painter), static_cast<unsigned long long>(s.by_eager),
                  static_cast<unsigned long long>(s.by_other), static_cast<unsigned long long>(s.display_card), static_cast<unsigned long long>(s.display_memory));
-    if (g_time)
-        for (int i = 0; i < 10; ++i) std::fprintf(stderr, "[hw-live] time %-28s %8.1f ms\n", g_tname[i], static_cast<double>(g_tns[i]) / 1e6);
+    if (g_time) {
+        for (int i = 0; i < kTimes; ++i) std::fprintf(stderr, "[hw-live] time %-28s %8.1f ms\n", g_tname[i], static_cast<double>(g_tns[i]) / 1e6);
+        std::fprintf(stderr, "[hw-live] submits: %llu with card work, %llu without\n", static_cast<unsigned long long>(g_wgpu_submits[1]), static_cast<unsigned long long>(g_wgpu_submits[0]));
+    }
     std::fprintf(stderr, "[hw-live] batches with fewer than %u shapes that went to the painter: %llu would have started a card stretch, %llu would have made the card write a picture back first\n", g_switch_min, static_cast<unsigned long long>(g_small_switch),
                  static_cast<unsigned long long>(g_small_dirty));
     if (g_time) std::fprintf(stderr, "[hw-live] runs ended inside a batch by a change of: any %llu, scissor %llu, ztest %llu, zwrite %llu, alpha-test split %llu, blend %llu, mask/alpha %llu\n", static_cast<unsigned long long>(g_cut_why[0]), static_cast<unsigned long long>(g_cut_why[1]), static_cast<unsigned long long>(g_cut_why[2]), static_cast<unsigned long long>(g_cut_why[3]), static_cast<unsigned long long>(g_cut_why[4]), static_cast<unsigned long long>(g_cut_why[5]), static_cast<unsigned long long>(g_cut_why[6]));
@@ -4281,6 +4604,18 @@ void live_stats() {
                  static_cast<unsigned long long>(pal::n_loads_known), static_cast<unsigned long long>(pal::n_shapes_tried), static_cast<unsigned long long>(pal::n_shapes_pass));
     for (const auto &kv : s.kinds) std::fprintf(stderr, "[hw-live] card draws %llu batches (%llu shapes): %s\n", static_cast<unsigned long long>(kv.second.first), static_cast<unsigned long long>(kv.second.second), kv.first.c_str());
     for (const auto &kv : s.refused) std::fprintf(stderr, "[hw-live] painter keeps: %s (%llu setups)\n", kv.first.c_str(), static_cast<unsigned long long>(kv.second));
+}
+
+std::uint64_t live_clock() {
+    if (!g_time) return 0;
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void live_wgpu_time(bool card, std::uint64_t before_finish, std::uint64_t before_submit, std::uint64_t after) {
+    if (!g_time || !before_finish) return;
+    g_tns[card ? 10 : 12] += before_submit - before_finish;
+    g_tns[card ? 11 : 13] += after - before_submit;
+    ++g_wgpu_submits[card ? 1 : 0];
 }
 
 // one line of what the card path holds (our own count of what we made and dropped), what wgpu says it holds in all (the painter's objects included), the card path's
@@ -4351,6 +4686,7 @@ bool live_init(Context &ctx) {
     g_linear = true;
     g_check = true;
     g_eager = os::env("PS2_GPU_HW_EAGER") == "1";
+    if (const std::string fb = os::env("PS2_GPU_HW_FEEDBACK"); !fb.empty()) g_feedback = fb == "other" ? 1 : fb == "self" ? 2 : fb == "0" ? 0 : 3;
     g_indep = os::env("PS2_GPU_HW_INDEP") != "0";
     g_indep_depth = os::env("PS2_GPU_HW_INDEP") != "3";
     g_indep_exact = false;
@@ -4485,6 +4821,8 @@ void live_prepare() {}
 WGPUComputePassEncoder live_encode(WGPUCommandEncoder, std::uint32_t, WGPUComputePassEncoder pass) { return pass; }
 void live_submitted() {}
 void live_stats() {}
+std::uint64_t live_clock() { return 0; }
+void live_wgpu_time(bool, std::uint64_t, std::uint64_t, std::uint64_t) {}
 void memlog_report(void *, void *, std::uint64_t) {}
 
 }

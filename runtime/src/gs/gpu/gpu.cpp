@@ -18,17 +18,23 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
+#include "trusted.hpp"
 #include "hwcache.hpp"
 #include "hwstat.hpp"
 
@@ -95,6 +101,7 @@ std::uint32_t g_sharp_2d = 1;
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
 bool g_timestamps = false;
+std::uint32_t g_vendor_id = 0;  // PCI vendor id of the chosen adapter (0x8086 Intel), 0 when unknown
 WGPUQuerySet g_queries = nullptr;
 WGPUBuffer g_query_resolve = nullptr, g_query_read = nullptr;
 bool g_query_pending = false, g_query_ready = false;
@@ -190,6 +197,117 @@ Why g_why = kWhyFlush;
 std::uint32_t g_why_runs[kWhys] = {}, g_why_prims[kWhys] = {};
 const bool g_batch_log = std::getenv("PS2_BATCH_LOG") != nullptr;
 const unsigned long long g_batch_log_frame = std::getenv("PS2_BATCH_LOG") ? std::strtoull(std::getenv("PS2_BATCH_LOG"), nullptr, 10) : 0;  // >1: print every "drawn-under" end of that frame
+// PS2_GPU_WGPU_TIME=<frames>: the drawing thread's time inside each kind of wgpu call (wall clock, so the waits show as waits), and the
+// calls, per frame, printed every <frames> vblanks (default 300). Off: one predictable branch per call site.
+namespace wt {
+enum Kind { kEncoder, kBeginPass, kSetPipeline, kSetGroup, kDispatch, kEndPass, kRenderPass, kFinish, kSubmit, kWrite, kPoll, kAcquire, kPresent,
+            kWait, kCopy, kDrain, kKinds };
+const char *const kName[kKinds] = {"create encoder", "begin compute pass", "set pipeline", "set bind group", "dispatch", "end compute pass", "present pass encode",
+                                   "finish", "submit", "write buffer", "poll", "acquire (wait)", "present", "read-back waits", "copy/map other",
+                                   "waiting for the submit thread"};
+std::uint64_t g_post_ns = 0, g_post_jobs = 0;  // the submit thread's totals at the block's start (post::State)
+bool post_totals(std::uint64_t &ns, std::uint64_t &jobs);
+const unsigned g_every = [] {
+    const char *v = std::getenv("PS2_GPU_WGPU_TIME");
+    return v ? std::max(1u, static_cast<unsigned>(std::strtoul(v, nullptr, 10) ? std::strtoul(v, nullptr, 10) : 300)) : 0u;
+}();
+const bool g_on = g_every != 0;
+std::uint64_t g_ns[kKinds] = {}, g_cpu[kKinds] = {}, g_calls[kKinds] = {}, g_bytes = 0, g_frames = 0, g_submits = 0;
+std::chrono::steady_clock::time_point g_since;
+double g_cpu_since = 0;
+// The thread's own processor clock for the calls that may wait (not per dispatch: the clock costs a little): on Windows the thread's
+// cycle counter, which counts at the time-stamp counter's rate (calibrated against the wall clock below), elsewhere CLOCK_THREAD_CPUTIME_ID in ns.
+#if defined(_WIN32) && defined(__x86_64__)
+extern "C" __declspec(dllimport) int __stdcall QueryThreadCycleTime(void *thread, unsigned long long *cycles);
+extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread();
+std::uint64_t cpu_ticks() {
+    unsigned long long c = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &c);
+    return c;
+}
+double ticks_per_ns() {  // the time-stamp counter against the wall clock, measured once over 50 ms
+    static const double rate = [] {
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::uint64_t c0 = __builtin_ia32_rdtsc();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const std::uint64_t c1 = __builtin_ia32_rdtsc();
+        return static_cast<double>(c1 - c0) / static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    }();
+    return rate;
+}
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+std::uint64_t cpu_ticks() {
+    timespec t{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return static_cast<std::uint64_t>(t.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(t.tv_nsec);
+}
+double ticks_per_ns() { return 1.0; }
+#else
+std::uint64_t cpu_ticks() { return 0; }
+double ticks_per_ns() { return 1.0; }
+#endif
+constexpr bool kClocked[kKinds] = {false, false, false, false, false, true, true, true, true, true, true, true, true, true, true, true};
+struct Scope {
+    Kind kind;
+    std::chrono::steady_clock::time_point from;
+    std::uint64_t cpu_from = 0;
+    explicit Scope(Kind k) : kind(k) {
+        if (!g_on) return;
+        from = std::chrono::steady_clock::now();
+        if (kClocked[k]) cpu_from = cpu_ticks();
+    }
+    ~Scope() {
+        if (!g_on) return;
+        if (kClocked[kind]) g_cpu[kind] += cpu_ticks() - cpu_from;
+        g_ns[kind] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
+        ++g_calls[kind];
+    }
+};
+void restart() {
+    for (int k = 0; k < kKinds; ++k) g_ns[k] = g_cpu[k] = g_calls[k] = 0;
+    g_bytes = g_submits = 0;
+    g_since = std::chrono::steady_clock::now();
+    g_cpu_since = ps2::hitch::thread_cpu_ms();
+    post_totals(g_post_ns, g_post_jobs);
+}
+// One line per block: wall ms a vblank, the thread's processor ms a vblank (GetThreadTimes / CLOCK_THREAD_CPUTIME_ID), and per kind of call
+// "wall/processor ms (calls)" a vblank; the processor part only for the calls that may wait. Own work = thread processor ms - the calls' processor ms.
+void frame() {
+    if (!g_on) return;
+    ++g_frames;
+    if (g_frames <= g_every) {  // the first block only starts the clock: start-up and warm-up are left out
+        if (g_frames == g_every) ticks_per_ns(), restart();
+        return;
+    }
+    if (g_frames % g_every) return;
+    const double f = g_every, wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_since).count() / f;
+    const double thread = (ps2::hitch::thread_cpu_ms() - g_cpu_since) / f, rate = ticks_per_ns();
+    double sum = 0, sum_cpu = 0;
+    for (int k = 0; k < kKinds; ++k) {
+        sum += static_cast<double>(g_ns[k]) / 1e6 / f;
+        sum_cpu += kClocked[k] ? static_cast<double>(g_cpu[k]) / rate / 1e6 / f : static_cast<double>(g_ns[k]) / 1e6 / f;
+    }
+    std::fprintf(stderr, "[wgpu-time] %u vblanks: %.2f ms a vblank, thread processor %.2f ms, in wgpu %.3f ms (processor %.3f), own work %.2f ms, %.1f submits, %.0f KiB written;",
+                 g_every, wall, thread, sum, sum_cpu, thread - sum_cpu, static_cast<double>(g_submits) / f, static_cast<double>(g_bytes) / 1024.0 / f);
+    for (int k = 0; k < kKinds; ++k) {
+        if (!g_calls[k]) continue;
+        if (kClocked[k]) std::fprintf(stderr, " %s %.3f/%.3f ms (%.1f),", kName[k], static_cast<double>(g_ns[k]) / 1e6 / f, static_cast<double>(g_cpu[k]) / rate / 1e6 / f, static_cast<double>(g_calls[k]) / f);
+        else std::fprintf(stderr, " %s %.3f ms (%.1f),", kName[k], static_cast<double>(g_ns[k]) / 1e6 / f, static_cast<double>(g_calls[k]) / f);
+    }
+    std::uint64_t post_ns = 0, post_jobs = 0;
+    if (post_totals(post_ns, post_jobs))
+        std::fprintf(stderr, " on the submit thread %.3f ms (%.1f jobs: writes, finish, submit, poll, present)", static_cast<double>(post_ns - g_post_ns) / 1e6 / f,
+                     static_cast<double>(post_jobs - g_post_jobs) / f);
+    std::fprintf(stderr, "\n");
+    restart();
+}
+inline void write(WGPUQueue queue, WGPUBuffer buffer, std::uint64_t offset, const void *data, std::size_t size) {
+    Scope s(kWrite);
+    if (g_on) g_bytes += size;
+    wgpuQueueWriteBuffer(queue, buffer, offset, data, size);
+}
+}  // namespace wt
+
 std::FILE *g_profile_out = nullptr;
 std::uint64_t g_profile_from = 0, g_profile_to = 0;
 WGPUQuerySet g_profile_queries = nullptr;
@@ -288,6 +406,68 @@ struct Shapes {
     }
 } g_shapes;
 std::vector<std::uint32_t> g_shape_params;  // the parameter records of this submit's raster commands: word 1 (the records' offset) gets the arena's size added at submit
+
+// The submit thread. wgpu's part of a submit is the same work every frame: copying the frame's data into its staging memory
+// (wgpuQueueWriteBuffer, 5 to 8 MB a frame in the fights), turning the recorded commands into the backend's command list
+// (wgpuCommandEncoderFinish), the submit, and the present. On Direct3D 12 that is 1.5 to 2.5 ms of the drawing thread a frame. This
+// thread does it instead, while the drawing thread goes on with the next frame: submit() records the commands and hands the encoder over,
+// with the frame's arena, shape records and parameter records (swapped, not copied), and the surface texture to present.
+// Exactness: the queue sees the same operations in the same order. Only one hand-over is in flight, and every other queue or surface
+// operation (a buffer write, a read-back, the next acquire, a resize) waits for it first (drain()), so nothing can slip in between.
+// PS2_GPU_SUBMIT_THREAD=1 turns it on (off by default, see mode()). Always off in the browser build, with the card path, and with the
+// diagnostics that time the present (PS2_PRESENT_LOG, PS2_HITCH_LOG).
+namespace post {
+struct Job {
+    WGPUCommandEncoder enc = nullptr;
+    WGPUTexture texture = nullptr;  // present this surface texture after the submit (with its view)
+    WGPUTextureView view = nullptr;
+    WGPUBuffer data = nullptr, params = nullptr;
+    bool measure = false, writes = false;  // writes: the job writes the arena, shape and parameter records first
+    bool blit = false;                     // and before them present()'s picture parameters
+    std::uint32_t blit_words[8] = {};
+    Arena arena;
+    Words shapes;
+    std::size_t shape_words = 0;
+    std::vector<std::array<std::uint32_t, kParamStride / 4>> records;
+};
+struct State {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool busy = false;
+    Job job;
+    std::atomic<std::uint64_t> ns{0}, jobs{0};  // the thread's time in jobs, for PS2_GPU_WGPU_TIME
+};
+State *g_state = nullptr;  // made at the first hand-over and never freed (a detached thread may still wait on it at exit)
+void drain();
+WGPUTexture g_present_texture = nullptr;  // present() sets it around submit(view): the texture the job presents and releases
+bool g_presented_async = false;           // the last submit() handed its picture over: the job presents it
+std::uint32_t g_blit[8] = {};             // present()'s picture parameters for the present pass, written by the next submit
+bool g_blit_pending = false;
+// 0 off, 1 everything on the submit thread, 2 the writes stay on the drawing thread. Off by default on Windows and macOS: on a laptop with Intel graphics it frees
+// the drawing thread but costs the emulation thread 1 to 2 ms a frame (two fast cores, now four busy threads), and Silent Hill 2, held by that
+// thread, lost 1.5 % with it on (the God of War fights, held by the chip, gained 0.5 to 1 %). On by default on Linux (measured on a 16-thread
+// desktop in a window, limit off: God of War ship +14 %, film +7 %, Silent Hill 2 a tie); PS2_GPU_SUBMIT_THREAD=0 turns it off there.
+int mode() {
+#ifdef __EMSCRIPTEN__
+    return 0;
+#else
+    static const int m = [] {
+        const char *v = std::getenv("PS2_GPU_SUBMIT_THREAD");
+        if (std::getenv("PS2_PRESENT_LOG")) return 0;
+#ifdef __linux__
+        const int def = 1;
+#else
+        const int def = 0;
+#endif
+        const int r = v ? std::atoi(v) : def;
+        if (r != 0 && !v) std::fprintf(stderr, "[gpu] submit thread on by default (PS2_GPU_SUBMIT_THREAD=0 turns it off)\n");
+        return r;
+    }();
+    return m;
+#endif
+}
+bool enabled() { return mode() != 0; }
+}  // namespace post
 
 struct Batch {
     Shapes &prims = g_shapes;
@@ -719,7 +899,8 @@ bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, s
     to[words - 1] = 0;
     to[words - 2] = 0;
     std::memcpy(to, bytes, n);
-    wgpuQueueWriteBuffer(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
+    post::drain();
+    wt::write(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
     g_cache_ring.push_back({key, offset, words, n, g_serial, ++g_cache_uids});
     g_cache_uid = g_cache_uids;
     g_cache_index.emplace(key, &g_cache_ring.back());
@@ -834,7 +1015,7 @@ std::uint64_t mix64(std::uint64_t a, std::uint64_t b) {
 }
 
 struct DecStat {
-    std::uint64_t walks = 0, cells = 0, picture_walks = 0, asked = 0, found = 0, decoded = 0, decoded_words = 0, pictures = 0, picture_words = 0, evicted = 0, refused = 0;
+    std::uint64_t walks = 0, cells = 0, picture_walks = 0, asked = 0, found = 0, decoded = 0, decoded_words = 0, pictures = 0, picture_words = 0, evicted = 0, refused = 0, in_place = 0;
 } g_dec_count;
 
 struct Identities {
@@ -1108,11 +1289,11 @@ void dec_stat_frame() {
     for (const Kept &e : g_kept)
         if (e.live) ++live, words += 1ull << e.order;
     std::fprintf(stderr, "[decode-cache] frame %llu, last 300 frames: %llu asked, %llu found (%.1f %%), %llu decoded (%.1f MB), %llu pictures decoded (%.1f MB), %llu evicted, "
-                         "%llu refused; kept %llu (%.1f MB); %llu walks (%llu of pictures), %llu cells\n",
+                         "%llu refused, %llu read in place; kept %llu (%.1f MB); %llu walks (%llu of pictures), %llu cells\n",
                  static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(c.asked), static_cast<unsigned long long>(c.found),
                  c.asked ? 100.0 * static_cast<double>(c.found) / static_cast<double>(c.asked) : 0.0, static_cast<unsigned long long>(c.decoded),
                  static_cast<double>(c.decoded_words) * 4 / 1e6, static_cast<unsigned long long>(c.pictures), static_cast<double>(c.picture_words) * 4 / 1e6,
-                 static_cast<unsigned long long>(c.evicted), static_cast<unsigned long long>(c.refused), static_cast<unsigned long long>(live),
+                 static_cast<unsigned long long>(c.evicted), static_cast<unsigned long long>(c.refused), static_cast<unsigned long long>(c.in_place), static_cast<unsigned long long>(live),
                  static_cast<double>(words) * 4 / 1e6, static_cast<unsigned long long>(c.walks), static_cast<unsigned long long>(c.picture_walks),
                  static_cast<unsigned long long>(c.cells));
     g_dec_count = DecStat{};
@@ -1123,11 +1304,13 @@ struct Decode {
 };
 std::vector<Decode> g_decodes;   // the decodes this batch dispatches
 std::vector<Decode> g_assigned;  // every decoded texture a setup of this batch reads, dispatched or kept, for setups that share it
+std::vector<double> g_setup_taps;  // per setup of the batch: pixels in the boxes of its shapes (plan_decodes, filled when first asked)
 
 void plan_decodes(std::uint32_t prims) {
     Batch &b = g_batch;
     g_decodes.clear();
     g_assigned.clear();
+    g_setup_taps.clear();
     if (!g_decode) return;
     const bool big = prims > kDecodePrims, cache = g_dec_on && !hw::enabled();
     if (!big && !(cache && g_dec_small)) return;  // a small batch decodes nothing, but may read what is kept
@@ -1155,6 +1338,22 @@ void plan_decodes(std::uint32_t prims) {
         }
         if (shared) continue;
         const std::uint32_t words = 1u << (tw + th);
+        // Decoding costs the chip about one read per texel of the whole texture, reading in place about one per tap of the pixels that use it.
+        // A texture whose shapes cover few pixels is read in place, as a small batch's are (the same texels either way): Silent Hill 2 draws
+        // its 512 x 512 palette pages with a few pixels per set-up and many palettes, and decoded 6 to 8 million texels a frame for that.
+        // The pixels are the shapes' boxes (more than they cover), four taps each when filtered, and decoding wins from an eighth of the texels on.
+        const auto worth = [&] {
+            if (g_setup_taps.empty()) {
+                g_setup_taps.assign(setups, 0.0);
+                for (std::uint32_t q = 0; q < prims; ++q) {
+                    const std::uint32_t *rec = b.prims.data() + q * kPrimWords;
+                    if (rec[0] < setups)
+                        g_setup_taps[rec[0]] += static_cast<double>((rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1) * static_cast<double>((rec[3] >> 16) - (rec[2] >> 16) + 1);
+                }
+            }
+            const double taps = g_setup_taps[i] * ((w[0] & 16384u) ? 4.0 : 1.0) * g_scale * g_scale;
+            return taps * 8.0 >= static_cast<double>(words);
+        };
         if (cache && tw <= 10 && th <= 10) {
             std::uint64_t ident;
             if (texture_id(w, ident) && !(g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1)))) {
@@ -1177,6 +1376,10 @@ void plan_decodes(std::uint32_t prims) {
                     continue;
                 }
                 if (!big) continue;
+                if (!worth()) {
+                    ++g_dec_count.in_place;
+                    continue;
+                }
                 std::uint32_t offset;
                 if (kept_room(tw + th, offset)) {
                     std::uint32_t at;
@@ -1203,6 +1406,10 @@ void plan_decodes(std::uint32_t prims) {
         }
         if (!big) continue;
         // a picture (or no room): decoded for this submit only, after the kept part
+        if (!worth()) {
+            ++g_dec_count.in_place;
+            continue;
+        }
         if (g_decoded_used + words > kDecodedWords) continue;
         if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) continue;
         ++g_dec_count.pictures;
@@ -1292,7 +1499,18 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
     g_command_info.push_back({g_commands.size(), {prims, tiles, entries, snapshot, b.prims[1], first[3] | (first[14] << 8) | (first[6] << 16), first[0], textured}});
 }
 
+// The open batch's lists, started on the tile helper while the batch is still being drawn (tiles.hpp, kStreamStep); nullptr when there is none.
+tiles::Job *g_stream = nullptr;
+
+// The open batch's records are dropped, or move at a submit: its started lists are given up (flush_batch then builds them another way).
+void drop_stream() {
+    if (!g_stream) return;
+    tiles::cancel(g_stream);
+    g_stream = nullptr;
+}
+
 void reset_batch() {
+    drop_stream();
     Batch &b = g_batch;
     exact_reset();
     b.prims.clear();
@@ -1328,9 +1546,13 @@ void place_tiles(tiles::Job *job) {
 
 // Places the finished jobs, oldest first; with `all` it waits for the jobs that are not done yet.
 void finish_tiles(bool all) {
+    if (all) drop_stream();  // a submit while a batch is open: its records move to the front of the array (Shapes::restart)
     if (all) tiles::build_waiting();  // the jobs the helper has not reached: built here rather than waited for
     while (tiles::Job *job = tiles::next_finished(all)) place_tiles(job);
 }
+
+// The tile helper may build the lists (tiles.hpp); see flush_batch.
+bool tiles_to_helper() { return tiles::threaded() && !g_live && !g_bench.capturing && !g_profile_out && !hw::enabled(); }
 
 void flush_batch() {
     Batch &b = g_batch;
@@ -1356,8 +1578,16 @@ void flush_batch() {
     // while this thread goes on with the batch, and finish_tiles fills in what they are for (the numbers in the parameter record and the command) when they are
     // done; else they are built here, as they always were. The card path and the replay capture (PS2_GPU_BENCH) want the numbers at once, so they build here.
     finish_tiles(false);
-    while (tiles::backlog() >= tiles::kMaxBacklog) place_tiles(tiles::next_finished(true));  // only the oldest: the helper keeps the rest
-    tiles::Job *const job = tiles::threaded() && !g_live && !g_bench.capturing && !g_profile_out && !hw::enabled() ? tiles::start(b.prims.data(), prims) : nullptr;
+    // A big batch whose lists the helper started while it was drawn (draw, kStreamStep): it gets the last records now (unless the lists are now wanted at once).
+    if (g_stream && !tiles_to_helper()) drop_stream();
+    tiles::Job *const streamed = g_stream;
+    if (streamed) tiles::close(streamed, b.prims.data(), prims);
+    g_stream = nullptr;
+    // With kMaxBacklog jobs waiting the helper is behind (mostly on one big batch while many small ones follow): this batch's lists are then built here
+    // at once instead of waiting for the oldest job, so neither thread waits for the other. A batch of a few shapes is built here too: handing it
+    // over (and waking the helper) costs more than building it (the God of War ship fight ends about 100 batches a frame after one shape).
+    tiles::Job *const job = streamed ? streamed
+                            : tiles_to_helper() && prims >= tiles::kMinJob && tiles::backlog() < tiles::kMaxBacklog ? tiles::start(b.prims.data(), prims) : nullptr;
     plan_decodes(prims);
     const std::uint32_t prim_offset = static_cast<std::uint32_t>(b.prims.begin);  // the records stay where draw() wrote them (g_shapes, kept by commit() below); place_shapes adds the arena's size at submit
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
@@ -1466,7 +1696,7 @@ void emit_pre() {
             for (std::size_t k = i; k < j; ++k) clut ? hw::live_reader(g_pre[k].range.lo, g_pre[k].range.hi) : hw::live_writer(g_pre[k].range.lo, g_pre[k].range.hi);
         }
         const std::size_t before = g_commands.size();
-        if (clut) g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
+        if (clut) g_commands.push_back({kLoadClut, (count + 15) / 16, 1, push_params({offset, count})});  // one workgroup per 16 palette loads (CLUT_CHUNK in gs.wgsl)
         else dispatch_linear(kUpload, total, push_params({offset, count, total}));
         if (g_bench.capturing && hw::enabled() && g_commands.size() > before) {
             Range both;
@@ -1594,6 +1824,107 @@ void wait_until(const bool &flag) {
     while (!flag) pump();
 }
 
+void query_mapped(WGPUMapAsyncStatus status, WGPUStringView, void *, void *) {
+    if (status == WGPUMapAsyncStatus_Success) g_query_ready = true;
+    else g_query_pending = false;
+}
+
+namespace post {
+// The calls submit() makes after recording, in the same order (upload_data, the parameter records, finish, submit, the timestamps' map,
+// the poll; then present()'s present and releases).
+void run(Job &j) {
+    const auto from = std::chrono::steady_clock::now();
+    if (j.blit) wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, j.blit_words, sizeof j.blit_words);
+    j.blit = false;
+    if (j.writes) {
+        wgpuQueueWriteBuffer(g_queue, j.data, 0, j.arena.data(), j.arena.size() * 4);
+        if (j.shape_words) wgpuQueueWriteBuffer(g_queue, j.data, j.arena.size() * 4, j.shapes.data(), j.shape_words * 4);
+        wgpuQueueWriteBuffer(g_queue, j.params, 0, j.records.data(), j.records.size() * kParamStride);
+    }
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(j.enc, nullptr);
+    wgpuQueueSubmit(g_queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(j.enc);
+    if (j.measure) {
+        WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+        cb.mode = WGPUCallbackMode_AllowProcessEvents;
+        cb.callback = query_mapped;
+        wgpuBufferMapAsync(g_query_read, WGPUMapMode_Read, 0, 16, cb);
+    }
+    wgpuDevicePoll(g_device, false, nullptr);
+    if (j.view) {
+        wgpuSurfacePresent(g_surface);
+        wgpuTextureViewRelease(j.view);
+        wgpuTextureRelease(j.texture);
+    }
+    j.enc = nullptr;
+    j.view = nullptr;
+    j.texture = nullptr;
+    j.arena.clear();
+    j.shapes.used = 0;
+    j.shape_words = 0;
+    j.records.clear();
+    g_state->ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
+    ++g_state->jobs;
+}
+
+#ifdef _WIN32
+extern "C" __declspec(dllimport) void *__stdcall GetModuleHandleW(const wchar_t *name);
+extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread();
+extern "C" __declspec(dllimport) void *__stdcall GetProcAddress(void *module, const char *name);
+#endif
+void loop() {
+#ifdef _WIN32  // the name shows in profilers and speedcheck (SetThreadDescription, Windows 10 1607 on, looked up so older systems still start)
+    using SetDescription = long(__stdcall *)(void *, const wchar_t *);
+    if (void *kernel = GetModuleHandleW(L"kernel32.dll"))
+        if (const auto set = reinterpret_cast<SetDescription>(GetProcAddress(kernel, "SetThreadDescription"))) set(GetCurrentThread(), L"ps2 submit");
+#elif defined(__linux__)
+    pthread_setname_np(pthread_self(), "ps2 submit");
+#endif
+    std::unique_lock<std::mutex> lock(g_state->mutex);
+    for (;;) {
+        g_state->cv.wait(lock, [] { return g_state->busy; });
+        lock.unlock();
+        run(g_state->job);
+        lock.lock();
+        g_state->busy = false;
+        g_state->cv.notify_all();
+    }
+}
+
+void drain() {
+    if (!g_state) return;
+    std::unique_lock<std::mutex> lock(g_state->mutex);
+    if (!g_state->busy) return;
+    wt::Scope s(wt::kDrain);
+    g_state->cv.wait(lock, [] { return !g_state->busy; });
+}
+
+// The job to fill: the last one is done, the thread exists.
+Job &slot() {
+    if (!g_state) {
+        g_state = new State;
+        std::thread(loop).detach();
+        std::atexit([] { drain(); });  // the last picture is submitted before the library is torn down
+    }
+    drain();
+    return g_state->job;
+}
+
+void go() {
+    std::lock_guard<std::mutex> lock(g_state->mutex);
+    g_state->busy = true;
+    g_state->cv.notify_all();
+}
+}  // namespace post
+
+bool wt::post_totals(std::uint64_t &ns, std::uint64_t &jobs) {
+    if (!post::g_state) return false;
+    ns = post::g_state->ns;
+    jobs = post::g_state->jobs;
+    return true;
+}
+
 WGPUBuffer make_buffer(std::uint64_t size, WGPUBufferUsage usage) {
     WGPUBufferDescriptor d = WGPU_BUFFER_DESCRIPTOR_INIT;
     d.size = size;
@@ -1632,8 +1963,8 @@ void place_shapes() {
 
 // One write each: the arena, and the shape records right after it, from where draw() put them.
 void upload_data() {
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
-    if (g_shapes.begin) wgpuQueueWriteBuffer(g_queue, g_data, g_arena.size() * 4, g_shapes.words.data(), g_shapes.begin * 4);
+    wt::write(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    if (g_shapes.begin) wt::write(g_queue, g_data, g_arena.size() * 4, g_shapes.words.data(), g_shapes.begin * 4);
 }
 
 void ensure_capacity() {
@@ -1667,7 +1998,7 @@ void profile_submit() {
     }
     ensure_capacity();
     upload_data();
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    wt::write(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
     for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
@@ -1737,13 +2068,24 @@ void bench_capture() {
 
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
 void submit(WGPUTextureView present_view = nullptr) {
+    const auto write_blit = [] {  // present()'s parameters, when this submit does not hand them to the job
+        if (!post::g_blit_pending) return;
+        post::drain();
+        wt::write(g_queue, g_blit_params, 0, post::g_blit, sizeof post::g_blit);
+        post::g_blit_pending = false;
+    };
     if (g_commands.empty() && !present_view
         && !(g_live && hw::live_pending())
-        ) return;
+        ) {
+        write_blit();
+        return;
+    }
+    post::drain();  // the last hand-over is submitted (and its picture presented) before anything of this one reaches the queue
     finish_tiles(true);  // the helper's lists go into the arena before it is measured, copied or uploaded
     place_shapes();
     if (g_bench.capturing) bench_capture();
     if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
+        write_blit();
         profile_submit();
         return;
     }
@@ -1758,9 +2100,19 @@ void submit(WGPUTextureView present_view = nullptr) {
         g_hitch_now.arena_bytes += (g_arena.size() + g_shapes.begin) * 4;
         ++g_hitch_now.submits;
     }
-    upload_data();
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    // the submit thread takes the writes, finish, submit and present (post above); a present only with its surface texture (present())
+    const bool async = post::enabled() && !g_live && !hwcache::g_on && !ps2::hitch::on() && !g_bench.configured && !hw::g_memlog
+        && (!present_view || post::g_present_texture);
+    post::g_presented_async = false;
+    const bool post_writes = async && post::mode() == 1;
+    const bool post_blit = post::g_blit_pending && post_writes && present_view;
+    if (!post_blit) write_blit();  // first, as present() did before
+    if (!post_writes) {
+        upload_data();
+        wt::write(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    }
     if (g_query_ready) {
+        wt::Scope s(wt::kCopy);
         const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
         if (mapped) {
             std::uint64_t t[2];
@@ -1776,14 +2128,23 @@ void submit(WGPUTextureView present_view = nullptr) {
     const bool measure = g_timestamps && !g_query_pending
         && !card_work
         ;
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    if (wt::g_on) ++wt::g_submits;
+    WGPUCommandEncoder enc;
+    {
+        wt::Scope s(wt::kEncoder);
+        enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    }
     WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
     writes.querySet = g_queries;
     writes.beginningOfPassWriteIndex = 0;
     writes.endOfPassWriteIndex = 1;
     WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
     if (measure) cd.timestampWrites = &writes;
-    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+    WGPUComputePassEncoder pass;
+    {
+        wt::Scope s(wt::kBeginPass);
+        pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+    }
     Pipeline current = kPipelines;
     bool current_mip = false;
     ++g_submits;
@@ -1806,16 +2167,22 @@ void submit(WGPUTextureView present_view = nullptr) {
         ++g_dispatches[c.pipeline];
         if (skip & (1u << c.pipeline)) continue;
         if (c.pipeline != current || c.mip != current_mip) {
+            wt::Scope s(wt::kSetPipeline);
             wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
             current = c.pipeline;
             current_mip = c.mip;
         }
         const std::uint32_t offset = c.param * kParamStride;
-        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        {
+            wt::Scope s(wt::kSetGroup);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        }
+        wt::Scope s(wt::kDispatch);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
     }
     if (card_work) pass = hw::live_encode(enc, ~0u, pass);
     if (pass) {
+        wt::Scope s(wt::kEndPass);
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
@@ -1824,6 +2191,7 @@ void submit(WGPUTextureView present_view = nullptr) {
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
     }
     if (present_view) {
+        wt::Scope s(wt::kRenderPass);
         WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
         color.view = present_view;
         color.loadOp = WGPULoadOp_Clear;
@@ -1852,27 +2220,71 @@ void submit(WGPUTextureView present_view = nullptr) {
         wgpuRenderPassEncoderEnd(rp);
         wgpuRenderPassEncoderRelease(rp);
     }
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
-    wgpuQueueSubmit(g_queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
-    wgpuCommandEncoderRelease(enc);
+    if (async) {
+        post::Job &j = post::slot();
+        j.enc = enc;
+        j.measure = measure;
+        j.data = g_data;
+        j.params = g_params;
+        if (present_view) j.view = present_view, j.texture = post::g_present_texture;
+        j.writes = post_writes;
+        j.blit = post_blit;
+        if (post_blit) std::memcpy(j.blit_words, post::g_blit, sizeof post::g_blit), post::g_blit_pending = false;
+        if (post_writes) {
+        if (wt::g_on) wt::g_bytes += (g_arena.size() + g_shapes.begin) * 4 + g_param_records.size() * kParamStride;
+        // the frame's words go with the job and the drawing thread goes on with the job's emptied ones from last time
+        std::swap(j.arena, g_arena);
+        std::swap(j.records, g_param_records);
+        j.shape_words = g_shapes.begin;
+        if (g_shapes.begin) {
+            const std::size_t open = g_shapes.size();  // the open batch's records stay here, at the front (as Shapes::restart)
+            std::swap(j.shapes, g_shapes.words);
+            g_shapes.words.used = 0;
+            if (open) g_shapes.words.append(j.shapes.data() + j.shape_words, open);
+            g_shapes.begin = 0;
+        }
+        }
+        if (measure) g_query_pending = true;
+        post::go();
+        post::g_presented_async = present_view != nullptr;
+    } else {
+    const std::uint64_t t_finish = g_live ? hw::live_clock() : 0;  // PS2_GPU_HW_TIME=1 times wgpu's finish and submit
+    WGPUCommandBuffer cmd;
+    {
+        wt::Scope s(wt::kFinish);
+        cmd = wgpuCommandEncoderFinish(enc, nullptr);
+    }
+    const std::uint64_t t_submit = g_live ? hw::live_clock() : 0;
+    {
+        wt::Scope s(wt::kSubmit);
+        wgpuQueueSubmit(g_queue, 1, &cmd);
+    }
+    if (g_live) hw::live_wgpu_time(card_work, t_finish, t_submit, hw::live_clock());
+    {
+        wt::Scope s(wt::kSubmit);  // the releases belong to the submit's cost (wgpu frees the recorded commands here)
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+    }
+    if (wt::g_on) --wt::g_calls[wt::kSubmit];
     if (g_live) hw::live_submitted();
     hw::memlog_tick(g_instance, g_queue, frame_count());  // PS2_GPU_HW_MEMLOG=<n>
     if (measure) {
+        wt::Scope s(wt::kCopy);
         g_query_pending = true;
         WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
         cb.mode = WGPUCallbackMode_AllowProcessEvents;
-        cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *, void *) {
-            if (status == WGPUMapAsyncStatus_Success) g_query_ready = true;
-            else g_query_pending = false;
-        };
+        cb.callback = query_mapped;
         wgpuBufferMapAsync(g_query_read, WGPUMapMode_Read, 0, 16, cb);
     }
+    {
+        wt::Scope s(wt::kPoll);
 #ifdef __EMSCRIPTEN__
-    wgpuInstanceProcessEvents(g_instance);
+        wgpuInstanceProcessEvents(g_instance);
 #else
-    wgpuDevicePoll(g_device, false, nullptr);
+        wgpuDevicePoll(g_device, false, nullptr);
 #endif
+    }
+    }
     g_commands.clear();
     g_command_info.clear();
     ++g_serial;
@@ -1896,6 +2308,7 @@ bool log_slow_readback(double ms) {
 }
 
 void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) {
+    post::drain();
     const bool diagnose = readback_log_enabled();
     const auto started = diagnose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
@@ -1913,6 +2326,7 @@ void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t 
     };
     const auto submitted = diagnose ? std::chrono::steady_clock::now() : started;
     cb.userdata1 = &done;
+    wt::Scope s(wt::kWait);
     wgpuBufferMapAsync(g_readback, WGPUMapMode_Read, 0, bytes, cb);
     wait_until(done);
     const auto ready = diagnose ? std::chrono::steady_clock::now() : started;
@@ -1927,6 +2341,7 @@ void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t 
 }
 
 void wait_gpu() {
+    post::drain();
     bool done = false;
     WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
     cb.mode = WGPUCallbackMode_AllowProcessEvents;
@@ -2785,9 +3200,11 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
         return give_up();
     }
     bool selected_dx12 = false;
+    g_vendor_id = 0;
     WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
     if (wgpuAdapterGetInfo(adapter, &info) == WGPUStatus_Success) {
         selected_dx12 = info.backendType == WGPUBackendType_D3D12;
+        g_vendor_id = info.vendorID;
         const char *api = info.backendType == WGPUBackendType_Vulkan ? "Vulkan" : info.backendType == WGPUBackendType_D3D12 ? "Direct3D 12" : info.backendType == WGPUBackendType_Metal ? "Metal" : "other";
         const bool software = info.adapterType == WGPUAdapterType_CPU;
         if (software && !software_ok)
@@ -3005,10 +3422,17 @@ bool init(Mode m) {
     // wgpu normally adds its own run-time checks to the shader: every buffer index clamped where the graphics API does not
     // bound it already, and a counter in every loop that breaks out after very many rounds. gs.wgsl keeps its indices inside
     // its buffers itself (the explicit bounds there) and all its loops end, so PS2_GPU_TRUSTED=1 makes
-    // the built-in draw program without them (wgpu-native's wgpuDeviceCreateShaderModuleTrusted). Off by default until the
-    // laptop has measured it; a shader loaded with PS2_GS_SHADER always keeps the checks.
-    const bool trusted = shader_text.empty() && os::env("PS2_GPU_TRUSTED") == "1";
-    if (trusted) std::fprintf(stderr, "[gpu] draw program without wgpu's run-time checks (PS2_GPU_TRUSTED=1)\n");
+    // the built-in draw program without them (wgpu-native's wgpuDeviceCreateShaderModuleTrusted). On by default only for Intel graphics on Windows (trusted.hpp), where it was measured (a laptop); a shader loaded with PS2_GS_SHADER always keeps the checks.
+#ifdef _WIN32
+    const bool is_windows = true;
+#else
+    const bool is_windows = false;
+#endif
+    const char *trusted_why = "";
+    // (PS2_GS_SHADER_TRUSTED=1 lets a shader loaded from a file go without them too, so a shader experiment is timed as the built-in one runs)
+    const bool trusted = (shader_text.empty() || os::env("PS2_GS_SHADER_TRUSTED") == "1") &&
+                         trusted_shader(g_vendor_id, is_windows, os::env("PS2_GPU_TRUSTED"), &trusted_why);
+    if (trusted) std::fprintf(stderr, "[gpu] draw program without wgpu's run-time checks (%s)\n", trusted_why);
     WGPUShaderModule module = trusted ? wgpuDeviceCreateShaderModuleTrusted(g_device, &md, WGPUShaderRuntimeChecks_None) : wgpuDeviceCreateShaderModule(g_device, &md);
 #endif
     // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE, EXPLICIT_FMA, SHARP and HAS_MIP are listed only when it declares them
@@ -3342,6 +3766,12 @@ void draw(const State &st, const Vertex *v, int count) {
     rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
     const bool fresh_batch = b.prims.empty();
     b.prims.append(rec, kPrimWords);
+    // Every kStreamStep shapes of a big batch go to the tile helper at once (tiles.hpp), so its lists are mostly built when the batch ends.
+    if (const std::size_t words = b.prims.size(); words % (kPrimWords * tiles::kStreamStep) == 0) {
+        const std::uint32_t shapes = static_cast<std::uint32_t>(words / kPrimWords);
+        if (g_stream) tiles::feed(g_stream, b.prims.data(), shapes);
+        else if (tiles_to_helper() && tiles::backlog() < tiles::kMaxBacklog) g_stream = tiles::open(b.prims.data(), shapes);
+    }
     exact_follow(rec, setup);
     if (g_live && b.route == 1) hw::live_shape(cache.look, setup, rec, fresh_batch);  // the card's checks start now
     b.minx = std::min(b.minx, minx);
@@ -3442,6 +3872,11 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     op.clut = true;
     const std::uint32_t rec[10] = {g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u, cbw, cou, cov};
     std::memcpy(op.rec, rec, sizeof rec);
+    {  // word 10: the slot entries the load writes, for load_clut in gs.wgsl (clut_entry): the first, and how many from there (wrapping at 512)
+        const bool eight = rec[6] != 0;
+        const std::uint32_t csa = rec[5], start = csm ? (csa * 16u) & 511u : eight ? 0u : (csa & 15u) * 16u;
+        op.rec[10] = start | (eight ? 256u : 16u) << 16;
+    }
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
@@ -3458,6 +3893,7 @@ void flush() {
     if (g_mode == Mode::off) return;
     flush_all();
     submit();
+    wt::frame();
     if (stat::g_on) stat::frame_end();
     dec_stat_frame();
     if (hwcache::g_on && hwcache::counting()) {
@@ -3491,6 +3927,7 @@ void flush() {
 void wait_idle() {
     flush_all();
     submit();
+    post::drain();
     bool done = false;
     WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
     cb.mode = WGPUCallbackMode_AllowProcessEvents;
@@ -3528,6 +3965,8 @@ bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t by
     if (g_live) hw::live_position(static_cast<std::uint32_t>(g_commands.size())), hw::live_reader(offset, static_cast<std::uint64_t>(offset) + bytes);
     if (g_scale != 1) dispatch_linear(kResolve, bytes / 4, push_params({offset / 4}));
     submit();
+    post::drain();
+    wt::Scope s(wt::kCopy);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     wgpuCommandEncoderCopyBufferToBuffer(enc, g_scale == 1 ? g_vram : g_scratch, offset, g_pending.buffer, 0, bytes);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
@@ -3553,6 +3992,7 @@ bool finish_download(std::uint32_t serial) {
     if (!g_pending.busy || g_pending.serial != serial) return false;
     const bool diagnose = readback_log_enabled();
     const auto started = diagnose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    wt::Scope s(wt::kWait);
     while (g_pending.busy && !g_pending.ready) pump();
     if (diagnose && log_slow_readback(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count())) std::fprintf(stderr, "[readback] async frame %llu serial %u bytes %u: wait %.3f ms\n",
         static_cast<unsigned long long>(frame_count()), serial, g_pending.bytes,
@@ -3635,6 +4075,7 @@ void stats() {
 }
 
 void configure_surface() {
+    post::drain();  // no present of the old swap chain may be in flight
     WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
     config.device = g_device;
     config.format = g_surface_format;
@@ -3666,6 +4107,7 @@ const char *present_mode_name(WGPUPresentMode mode) {
 
 bool attach_surface(const SurfaceTarget &target) {
     if (g_mode != Mode::primary || !g_device) return false;
+    post::drain();
     WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
 #ifdef __EMSCRIPTEN__
     WGPUEmscriptenSurfaceSourceCanvasHTMLSelector canvas = WGPU_EMSCRIPTEN_SURFACE_SOURCE_CANVAS_HTML_SELECTOR_INIT;
@@ -3931,7 +4373,9 @@ bool present(const DisplaySource &src) {
     const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
     const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
     const std::uint32_t blit[8] = {src.width * g_scale, src.height * g_scale, current, previous, blend ? 1u : 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), ps2::video_options()};
-    wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, blit, sizeof blit);
+    post::drain();  // the last picture is presented before this one's acquire
+    std::memcpy(post::g_blit, blit, sizeof blit);  // written by the next submit (its job with the submit thread), before the frame's other writes
+    post::g_blit_pending = true;
     ++g_field;
     g_have_previous = true;
     g_last_width = src.width;
@@ -3944,7 +4388,10 @@ bool present(const DisplaySource &src) {
     const bool faked = fake.hit();
     if (faked && !fake.status) std::this_thread::sleep_for(std::chrono::seconds(12));
     if (faked && fake.status) st.status = static_cast<WGPUSurfaceGetCurrentTextureStatus>(fake.status);
-    else wgpuSurfaceGetCurrentTexture(g_surface, &st);
+    else {
+        wt::Scope s(wt::kAcquire);
+        wgpuSurfaceGetCurrentTexture(g_surface, &st);
+    }
     ps2::hitch::enter_present_stage(nullptr);
     const double acquire_ms = std::chrono::duration<double, std::milli>(PresentLog::Clock::now() - acquire_from).count();
     if (log.on) log.lap(log.acquire);
@@ -3958,21 +4405,29 @@ bool present(const DisplaySource &src) {
     WGPUTextureView target = wgpuTextureCreateView(st.texture, nullptr);
     const auto submit_from = PresentLog::Clock::now();
     ps2::hitch::enter_present_stage("submitting the picture (submit)");
+    post::g_present_texture = st.texture;
     submit(target);
+    post::g_present_texture = nullptr;
     if (log.on) log.lap(log.submit);
+    if (!post::g_presented_async) {  // else the submit thread presents it and releases the texture (post)
 #ifndef __EMSCRIPTEN__
-    ps2::hitch::enter_present_stage("presenting the picture (wgpuSurfacePresent)");
-    wgpuSurfacePresent(g_surface);
+        ps2::hitch::enter_present_stage("presenting the picture (wgpuSurfacePresent)");
+        {
+            wt::Scope s(wt::kPresent);
+            wgpuSurfacePresent(g_surface);
+        }
 #endif
-    ps2::hitch::enter_present_stage(nullptr);
-    if (log.on) log.lap(log.present);
-    if (const double ms = std::chrono::duration<double, std::milli>(PresentLog::Clock::now() - submit_from).count(); ms > kSlowMs) {
-        static unsigned slow = 0;
-        if (slow < 20 || slow % 100 == 0) std::fprintf(stderr, "[present] submitting and presenting a picture took %.0f ms (slow %u)\n", ms, slow + 1);
-        ++slow;
+        ps2::hitch::enter_present_stage(nullptr);
+        if (log.on) log.lap(log.present);
+        if (const double ms = std::chrono::duration<double, std::milli>(PresentLog::Clock::now() - submit_from).count(); ms > kSlowMs) {
+            static unsigned slow = 0;
+            if (slow < 20 || slow % 100 == 0) std::fprintf(stderr, "[present] submitting and presenting a picture took %.0f ms (slow %u)\n", ms, slow + 1);
+            ++slow;
+        }
+        wgpuTextureViewRelease(target);
+        wgpuTextureRelease(st.texture);
     }
-    wgpuTextureViewRelease(target);
-    wgpuTextureRelease(st.texture);
+    ps2::hitch::enter_present_stage(nullptr);
     if (ps2::hitch::on()) {  // PS2_HITCH_LOG=<ms>: a picture whose hand-over took long, with the steps of it (docs/hitches.md)
         const double f = log.flush - flush0, a = log.acquire - acquire0, s = log.submit - submit0, p = log.present - present0;
         ps2::hitch::picture_times() = {f, a, s, p};
@@ -4069,6 +4524,7 @@ bool make_overlay_pipeline() {
 }  // namespace
 
 void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height, std::uint32_t x, std::uint32_t y) {
+    post::drain();
     if (!rgba || !width || !height || !g_surface) {
         g_overlay.on = false;
         return;
@@ -4105,6 +4561,7 @@ void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t h
 
 bool present_again() {
     if (!g_surface || !g_have_previous) return false;
+    post::drain();
     // the same picture as the last present (its fields are still in the scratch buffer: the game draws nothing while it waits), with the
     // window's size and the picture look of now
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
@@ -4144,6 +4601,7 @@ Copy g_copies[3];
 std::uint64_t g_copy_order = 0;
 
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+    post::drain();
 #ifdef __EMSCRIPTEN__
     wgpuInstanceProcessEvents(g_instance);
 #else

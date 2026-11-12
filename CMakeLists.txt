@@ -131,6 +131,9 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2savetest PRIVATE synchronization)
     endif()
+    # which graphics chips get the draw program without wgpu's run-time checks by default (no game, no graphics): ninja ps2trustedtest
+    add_executable(ps2trustedtest EXCLUDE_FROM_ALL tests/trusted_shader.cpp)
+    target_include_directories(ps2trustedtest PRIVATE runtime/src)
     # the lines of the picture each video mode shows (480p must not be cut like a TV picture): ninja ps2displaylinestest
     add_executable(ps2displaylinestest EXCLUDE_FROM_ALL tests/display_lines.cpp)
     target_include_directories(ps2displaylinestest PRIVATE runtime/src)
@@ -252,6 +255,14 @@ if(NOT EMSCRIPTEN)
     # no game needed: ninja ps2drawsetuptest
     add_executable(ps2drawsetuptest EXCLUDE_FROM_ALL tests/draw_setup.cpp)
     target_include_directories(ps2drawsetuptest PRIVATE runtime/include runtime/src)
+    # the tile lists of a drawing batch (runtime/src/gs/gpu/tiles.cpp) against the way they were built before, word for word; also times
+    # batches recorded from a game. No game needed: ninja ps2tilelisttest
+    add_executable(ps2tilelisttest EXCLUDE_FROM_ALL tests/tile_lists.cpp)
+    target_include_directories(ps2tilelisttest PRIVATE runtime/include runtime/src)
+    target_link_libraries(ps2tilelisttest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2tilelisttest PRIVATE synchronization)
+    endif()
     # damaged disc images, IOP modules and boot ELFs refused cleanly, no game needed: ninja ps2discinputtest
     add_executable(ps2discinputtest EXCLUDE_FROM_ALL tests/disc_input.cpp)
     target_include_directories(ps2discinputtest PRIVATE runtime/src)

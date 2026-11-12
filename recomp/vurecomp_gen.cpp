@@ -73,8 +73,9 @@ std::string lane_mask(unsigned d) {
 
 Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, bool late_flags = false) {
     Upper u;
-    // late_flags: the program reads the MAC flags but never the status (see FlagPipeV in vu_ops.hpp): a live flag site keeps its
-    // result in the flag pipe, and the MAC and status are worked out where a reader or a way out of the program needs them.
+    // late_flags: the program reads the MAC flags but never the status, or only its low four bits with FSAND (see FlagPipeV in
+    // vu_ops.hpp): a live flag site keeps its result in the flag pipe, and the MAC and status are worked out where a reader or a
+    // way out of the program needs them.
     const auto set_flags = [&](const std::string &value, unsigned d) {
         return late_flags ? std::format("fl.push<{}u>({}); ", d, value) : std::format("flags(r, {}, {}u); fl.set_mac(r.mac, r.status); ", value, d);
     };
@@ -319,6 +320,8 @@ struct Lower {
     std::string after_upper;
     int writes = -1;
     bool reads_flags = false, reads_status = false;
+    // FSAND with a mask inside the low four bits: reads only the flags of one result, which FlagPipeV keeps (status_low()).
+    bool reads_status_low = false;
     bool branch = false, jump = false;
     std::uint32_t target = 0;
     bool supported = true;
@@ -474,7 +477,17 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
     case 0x13: c = std::format("set_vi(r, 1, ((fl.clip() | {}u) & 0xFFFFFFu) == 0xFFFFFFu ? 1u : 0u); ", w & 0xFFFFFFu); break;
     case 0x14: c = std::format("set_vi(r, {}, (fl.status() & 0xFFFu) == {}u ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
     case 0x15: l.after_upper = std::format("r.status = (r.status & 0x3Fu) | {}u; fl.force_mac(r.mac, r.status); ", imm12 & 0xFC0u); l.reads_flags = l.reads_status = true; break;
-    case 0x16: c = std::format("set_vi(r, {}, fl.status() & {}u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
+    case 0x16:
+        // The low four status bits (zero, sign, underflow, overflow) are those of the result the reader sees, nothing sticky, so a
+        // program whose only status reads are such FSANDs can keep its flags in FlagPipeV (vu_ops.hpp, status_low()).
+        if (!(imm12 & ~0xFu)) {
+            c = std::format("set_vi(r, {}, fl.status_low() & {}u); ", it, imm12);
+            l.reads_flags = l.reads_status_low = true;
+        } else {
+            c = std::format("set_vi(r, {}, fl.status() & {}u); ", it, imm12);
+            l.reads_flags = l.reads_status = true;
+        }
+        break;
     case 0x17: c = std::format("set_vi(r, {}, (fl.status() & 0xFFFu) | {}u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
     case 0x18: c = std::format("set_vi(r, {}, (fl.mac() & 0xFFFFu) == r.vi[{}] ? 1u : 0u); ", it, is); l.reads_flags = true; break;
     case 0x1A: c = std::format("set_vi(r, {}, fl.mac() & r.vi[{}]); ", it, is); l.reads_flags = true; break;
@@ -533,24 +546,132 @@ int vi_written(const std::string &code) {
 // Tests only: the MAC flags of every flag site worked out at once, as before vurecomp 11 (the reference for FlagPipeV).
 bool g_eager_flags = false;
 
-std::string generate(const Program &p, std::string &name) {
+// A VU0 program that calls subroutines through a register (JALR vi15, vi1 with vi1 loaded from data memory: a table of handlers,
+// Silent Hill 2's 0040) is compiled together with the subroutines it can call, into one function, so the pipeline (flags, stalls,
+// the branch delay of the integer registers) runs on across the call and the return exactly as in the interpreter, which runs the
+// whole program in one go. Where a subroutine starts is not in the code: the candidates are the code after the end of a block in the
+// program's own recording (after a JR, a B or an E bit) and the entries of the other recorded VU0 programs (the runner records where a
+// JALR went, vu_micro.cpp), each one kept when its code returns (a JR) and has no E bit, and when it needs no pair the program or a
+// subroutine taken before has with other code (the function keeps one copy of each address). The code of a subroutine is not covered by the program's key, so a call checks the
+// key of the subroutine at its entry in the code memory as it is (vu::vu0_key, cached until the code changes) before it goes there.
+// A return goes back into the program (its code is the program's own, checked by the key at the start). Any other target (a subroutine
+// this build does not know, changed code) puts registers and data memory back as they were at the start and runs the whole program
+// in the interpreter (vu::vu0_restart): exact, only slower. That copy of the state is why every call of such a program saves the
+// registers and the 4 KiB of data memory first.
+struct Calls {
+    std::vector<std::uint8_t> code;                              // the program's recording with the subroutines' code put in
+    std::vector<std::uint32_t> pcs;                              // the pairs of the program and of every subroutine
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> subs;   // entry and key of each subroutine
+    std::vector<std::uint32_t> returns;                          // the return addresses inside the program
+    std::vector<std::uint32_t> targets;                          // both: where a jump through a register can go
+};
+
+// false: the program cannot be compiled this way (it is left to the interpreter, as before).
+bool vu0_calls(const Program &p, const std::vector<std::uint32_t> &own, const std::vector<Program> *peers, Calls &c) {
+    constexpr std::uint32_t m = 4095u;
+    const auto lower_of = [](const std::vector<std::uint8_t> &img, std::uint32_t pc, std::uint32_t &lo, std::uint32_t &hi) {
+        lo = word(img, pc);
+        hi = word(img, pc + 4);
+        return !(hi & 0x80000000u);
+    };
+    // The divide unit's quotient is left out: the interpreter decides whether a read of Q sees a new quotient from the code around it
+    // (q_read_kind), which does not follow a jump through a register.
+    const auto plain = [&](const std::vector<std::uint8_t> &img, std::uint32_t pc) {
+        std::uint32_t lo, hi;
+        const bool has_lower = lower_of(img, pc, lo, hi);
+        if (ps2::vu::q_unit_latency(lo, hi) || ps2::vu::waits_q(lo, hi)) return false;
+        if (!has_lower) return true;
+        const Lower l = lower(lo, pc, m, true);
+        return l.supported && l.code.find("vu::kick(") == std::string::npos && !ps2::vu::branch_in_delay_slot(img.data(), m, pc);
+    };
+    bool calls = false;
+    for (std::uint32_t pc : own) {
+        if (!plain(p.code, pc)) return false;
+        std::uint32_t lo, hi;
+        if (lower_of(p.code, pc, lo, hi) && (lo >> 25) == 0x25u) calls = true;
+    }
+    if (!calls) return false;
+    c.code = p.code;
+    std::vector<std::uint8_t> used(512, 0), mine(512, 0);
+    for (std::uint32_t pc : own) used[pc >> 3] = mine[pc >> 3] = 1;
+    std::vector<std::pair<std::uint32_t, const Program *>> candidates;
+    for (std::uint32_t j = 0; j <= m; j += 8) {
+        std::uint32_t lo, hi;
+        const bool has_lower = lower_of(p.code, j, lo, hi);
+        if ((hi & 0x40000000u) || (has_lower && ((lo >> 25) == 0x24u || (lo >> 25) == 0x20u))) candidates.emplace_back((j + 16u) & m, nullptr);
+    }
+    if (peers)
+        for (const Program &q : *peers)
+            if (q.unit == 0 && q.code.size() == m + 1u) candidates.emplace_back(q.entry & m, &q);
+    for (const auto &[entry, peer] : candidates) {
+        if (mine[entry >> 3] || std::any_of(c.subs.begin(), c.subs.end(), [&](const auto &s) { return s.first == entry; })) continue;
+        const std::vector<std::uint8_t> &img = peer ? peer->code : p.code;
+        const std::vector<std::uint32_t> set = ps2::vu::reachable(img.data(), m, entry);
+        bool ok = true, returns = false, ends = false;
+        for (std::uint32_t pc : set) {
+            std::uint32_t lo, hi;
+            if (lower_of(img, pc, lo, hi) && (lo >> 25) == 0x24u) returns = true;
+            if (hi & 0x40000000u) ends = true;
+            ok = ok && plain(img, pc) && (!used[pc >> 3] || std::memcmp(c.code.data() + pc, img.data() + pc, 8) == 0);
+        }
+        // it must look like a subroutine: it returns and does not end the program (the other recorded programs are mostly programs the
+        // main processor starts, which end)
+        if (!ok || !returns || ends) continue;
+        for (std::uint32_t pc : set) {
+            std::memcpy(c.code.data() + pc, img.data() + pc, 8);
+            used[pc >> 3] = 1;
+        }
+        c.subs.emplace_back(entry, ps2::vu::program_key(img.data(), set, entry));
+    }
+    if (c.subs.empty()) return false;
+    for (std::uint32_t pc = 0; pc <= m; pc += 8)
+        if (used[pc >> 3]) c.pcs.push_back(pc);
+    for (std::uint32_t pc : own) {
+        std::uint32_t lo, hi;
+        if (lower_of(p.code, pc, lo, hi) && ((lo >> 25) == 0x25u || (lo >> 25) == 0x21u) && mine[((pc + 16u) & m) >> 3]) c.returns.push_back((pc + 16u) & m);
+    }
+    std::sort(c.returns.begin(), c.returns.end());
+    c.returns.erase(std::unique(c.returns.begin(), c.returns.end()), c.returns.end());
+    c.targets = c.returns;
+    for (const auto &s : c.subs) c.targets.push_back(s.first);
+    std::sort(c.targets.begin(), c.targets.end());
+    return true;
+}
+
+std::string generate(const Program &p0, std::string &name, const std::vector<Program> *peers = nullptr) {
     name.clear();
-    const std::uint32_t kMask = p.unit == 0 ? 4095u : 16383u;
-    const std::vector<std::uint32_t> pcs = ps2::vu::reachable(p.code.data(), kMask, p.entry);
-    const ps2::vu::StallPlan plan = ps2::vu::stall_plan(p.code.data(), kMask, pcs, p.entry);
+    const std::uint32_t kMask = p0.unit == 0 ? 4095u : 16383u;
+    std::vector<std::uint32_t> pcs = ps2::vu::reachable(p0.code.data(), kMask, p0.entry);
+    Calls calls;
+    Program merged{};
+    bool dyn = false;
+    if (p0.unit == 0) {
+        bool jumps = false;
+        for (std::uint32_t pc : pcs)
+            if (!(word(p0.code, pc + 4) & 0x80000000u) && ps2::vu::is_jump_register(word(p0.code, pc))) jumps = true;
+        if (jumps) {
+            if (!vu0_calls(p0, pcs, peers, calls)) return {};
+            dyn = true;
+            merged = Program{p0.key, p0.entry, calls.code, 0};
+            pcs = calls.pcs;
+        }
+    }
+    const Program &p = dyn ? merged : p0;
+    const ps2::vu::StallPlan plan = ps2::vu::stall_plan(p.code.data(), kMask, pcs, p.entry, dyn ? &calls.targets : nullptr);
     if (!plan.ok) return {};
     std::set<std::uint32_t> in(pcs.begin(), pcs.end());
     std::map<std::uint32_t, Lower> lowers;
-    bool any_status = p.unit == 0, any_flags = false, any_q = false;
+    bool any_status = p.unit == 0, any_flags = false, any_q = false, any_status_low = false;
     for (std::uint32_t pc : pcs) {
         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
         Lower l;
         if (!(hi & 0x80000000u)) l = lower(lo, pc, kMask, p.unit == 0);
         if (ps2::vu::branch_in_delay_slot(p.code.data(), kMask, pc)) l.supported = false;
         any_status = any_status || l.reads_status;
+        any_status_low = any_status_low || l.reads_status_low;
         any_flags = any_flags || l.reads_flags;
         any_q = any_q || l.code.find("fl.end_q(") != std::string::npos;
-        if (p.unit == 0 && (!l.supported || l.jump || l.code.find("vu::kick(") != std::string::npos)) return {};
+        if (p.unit == 0 && (!l.supported || (l.jump && !dyn) || l.code.find("vu::kick(") != std::string::npos)) return {};
         lowers[pc] = l;
     }
     std::map<std::uint32_t, bool> live_in;
@@ -562,6 +683,8 @@ std::string generate(const Program &p, std::string &name) {
             const std::uint32_t phi = word(p.code, prev + 4);
             if (pl.branch) s.push_back(pl.target);
             if (pl.jump || (phi & 0x40000000u)) s.push_back(-1);
+            if (pl.jump && dyn)
+                for (std::uint32_t t : calls.targets) s.push_back(t);
         }
         return s;
     };
@@ -593,6 +716,7 @@ std::string generate(const Program &p, std::string &name) {
         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
         def[pc] = (hi & 0x80000000u) || ps2::vu::branch_delay_exempt(lo) ? -1 : vi_written(lowers[pc].code);
         if (lowers[pc].branch) targets.insert(lowers[pc].target & kMask);
+        if (dyn) targets.insert(calls.targets.begin(), calls.targets.end());
         for (std::int64_t s : successors(pc))
             if (s >= 0 && in.count(static_cast<std::uint32_t>(s))) preds[static_cast<std::uint32_t>(s)].push_back(pc);
     }
@@ -814,6 +938,7 @@ std::string generate(const Program &p, std::string &name) {
     const bool late_flags = p.unit != 0 && any_flags && !any_status && !g_eager_flags;
     std::string o = head + std::string(late_flags ? "    FlagPipeV fl;\n" : "    FlagPipe fl;\n") + std::string("    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n");
     if (p.unit == 0) o += "    std::uint32_t steps = 0;\n";
+    if (dyn) o += "    const Vu0Regs saved = r;\n    std::uint8_t saved_mem[4096];\n    std::memcpy(saved_mem, mem, sizeof saved_mem);\n";
     if (!delay.empty()) o += "    std::uint16_t bk = 0, next_bk = 0;\n    unsigned bi = 0;\n    (void)bk;\n    (void)next_bk;\n    (void)bi;\n";
     // An instruction whose stall depends on the path that led to it reads the pipeline state index `st` the edges set.
     const auto list = [](const std::vector<std::uint8_t> &v) {
@@ -834,7 +959,8 @@ std::string generate(const Program &p, std::string &name) {
         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
         bool out_live = false;
         for (std::int64_t s : successors(pc)) out_live = out_live || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
-        const Upper u = upper(hi, any_status ? true : (any_flags && out_live), p.unit == 0, late_flags);
+        // A program that reads the status keeps every flag site, as the sticky bits it leaves count them all.
+        const Upper u = upper(hi, any_status || any_status_low ? true : (any_flags && out_live), p.unit == 0, late_flags);
         const Lower &l = lowers[pc];
         std::string body;
         if (lazy) {
@@ -901,12 +1027,22 @@ std::string generate(const Program &p, std::string &name) {
                 o += std::format("    if (ending) {{ {}r.tpc = {}; return; }}\n", leave(pc), tpc);
             }
             if (pl.branch) o += std::format("    if (pend) {{ pend = false; {}{}goto {}; }}\n", meet(pc, pl.target & kMask), edge(pl.target & kMask), label(pl.target));
-            if (pl.jump) o += std::format("    if (pendj) {{ pendj = false; {}goto dispatch; }}\n", leave(pc));
+            if (pl.jump && dyn) {
+                // a call or a return (vu0_calls above): the targets this function knows, else the whole program in the interpreter
+                o += "    if (pendj) {\n        pendj = false;\n        switch (jpc) {\n";
+                for (std::uint32_t t : calls.returns) o += std::format("        case {}u: {}goto {};\n", t, edge(t), label(t));
+                for (const auto &[t, key] : calls.subs)
+                    o += std::format("        case {}u: if (vu::vu0_key({}u) == 0x{:016X}ull) {{ {}goto {}; }} break;\n", t, t, key, edge(t), label(t));
+                o += "        default: break;\n        }\n        goto bail;\n    }\n";
+            } else if (pl.jump) {
+                o += std::format("    if (pendj) {{ pendj = false; {}goto dispatch; }}\n", leave(pc));
+            }
         }
         const std::uint32_t next = (pc + 8u) & kMask;
         if (!in.count(next)) o += std::format("    {}vu::interpret(1, {}u);\n    return;\n", leave(pc), next);
         else if (const std::string e = meet(pc, next) + edge(next); !e.empty()) o += "    " + e + "\n";
     }
+    if (dyn) o += std::format("bail:\n    r = saved;\n    std::memcpy(mem, saved_mem, sizeof saved_mem);\n    vu::vu0_restart({}u);\n    return;\n", p.entry & kMask);
     o += "dispatch:\n    vu::interpret(1, jpc);\n    return;\n}\n\n";
     if (late_flags) {
         // every way out: the end of the program, a hop to the interpreter (an unknown jump, an unsupported instruction, code
@@ -950,7 +1086,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp).
-const char *const kGeneratorVersion = "vurecomp 11";
+const char *const kGeneratorVersion = "vurecomp 13";
 
 Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
     std::vector<Program> programs;
@@ -995,8 +1131,12 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
     for (const auto &e : fs::directory_iterator(out_dir))
         if (ps2::os::utf8(e.path().filename()).rfind("vu1_", 0) == 0) fs::remove(e.path());
     std::vector<std::string> names, bodies;
+    // the recorded VU0 programs, as candidates for the subroutines a VU0 program calls (vu0_calls); a copy, as the loop below moves them
+    std::vector<Program> vu0_peers;
+    for (const Program &q : programs)
+        if (q.unit == 0) vu0_peers.push_back(q);
     for (std::size_t i = 0; i < programs.size(); ++i) {
-        std::string name, body = generate(programs[i], name);
+        std::string name, body = generate(programs[i], name, &vu0_peers);
         if (name.empty()) {
             std::fprintf(stderr, "vu%d %016llX at %04X: unsupported control flow or pipeline plan; using interpreter\n", programs[i].unit, static_cast<unsigned long long>(programs[i].key), programs[i].entry);
             continue;

@@ -29,6 +29,11 @@ std::uint32_t itop(int unit);  // VU0 reads VIF0; the no-argument form retains t
 void interpret(int unit, std::uint32_t pc);
 // AOT VU0 checks for a host stop at the same interval as the reference loop.
 bool stopped();
+// A compiled VU0 program that calls subroutines (vurecomp_gen.cpp, vu0_calls): the key of the program that starts at `entry` in the VU0
+// code memory as it is now, and the way out when a call goes somewhere the program does not know (the registers and data memory are
+// already back as they were at the start; the whole program runs in the interpreter).
+std::uint64_t vu0_key(std::uint32_t entry);
+void vu0_restart(std::uint32_t entry);
 
 using ProgramFn = void (*)(Vu0Regs &r, std::uint8_t *mem);
 
@@ -307,7 +312,10 @@ struct StallPlan {
     }
 };
 
-inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const std::vector<std::uint32_t> &pcs, std::uint32_t entry) {
+// `jump_targets` (VU0 programs compiled with their subroutines, vurecomp_gen.cpp): where a jump through a register (JR, JALR) can go
+// from its delay slot. Without it such a jump leaves the program, as for VU1.
+inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const std::vector<std::uint32_t> &pcs, std::uint32_t entry,
+                            const std::vector<std::uint32_t> *jump_targets = nullptr) {
     constexpr std::size_t kMaxStates = 24, kMaxSteps = 200000;
     const std::size_t slots = (mask + 1u) / 8u;
     StallPlan plan;
@@ -326,6 +334,13 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
         in[at] = 1;
     }
     direct[entry >> 3] = 1;
+    std::vector<std::uint32_t> dynamic;
+    if (jump_targets)
+        for (std::uint32_t t : *jump_targets)
+            if (in[(t & mask) >> 3]) {
+                dynamic.push_back(t & mask);
+                direct[(t & mask) >> 3] = 1;
+            }
     for (std::uint32_t pc : pcs) {
         const std::size_t at = pc >> 3;
         if (!(upper[at] & 0x80000000u) && is_branch(lower[at]) && !is_jump_register(lower[at])) direct[(branch_target(lower[at], pc, mask) & mask) >> 3] = 1;
@@ -336,6 +351,9 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
     struct Next {
         std::uint32_t pc[2];
         unsigned n = 0;
+        const std::vector<std::uint32_t> *more = nullptr;
+        unsigned size() const { return n + (more ? static_cast<unsigned>(more->size()) : 0u); }
+        std::uint32_t at(unsigned k) const { return k < n ? pc[k] : (*more)[k - n]; }
     };
     const auto successors = [&](std::uint32_t pc) {
         Next s;
@@ -347,6 +365,7 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
             if (upper[p] & 0x40000000u || (lower_op && is_jump_register(lower[p]))) {
                 slot = true;
                 continues = false;
+                if (!(upper[p] & 0x40000000u) && !dynamic.empty()) s.more = &dynamic;
             } else if (lower_op && is_branch(lower[p])) {
                 slot = true;
                 continues = !is_unconditional(lower[p]);
@@ -383,13 +402,13 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
             const std::size_t at = pc >> 3;
             to[at] = reads[at];
             const Next s = successors(pc);
-            for (unsigned k = 0; k < s.n; ++k) to[at].merge(from[s.pc[k] >> 3]);
+            for (unsigned k = 0; k < s.size(); ++k) to[at].merge(from[s.at(k) >> 3]);
         }
     }
     for (int round = 0; round < 12; ++round)
         for (std::uint32_t pc : pcs) {
             const Next s = successors(pc);
-            for (unsigned k = 0; k < s.n; ++k) q_distance[pc >> 3] = static_cast<std::uint8_t>(std::min<unsigned>(q_distance[pc >> 3], q_distance[s.pc[k] >> 3] + 1u));
+            for (unsigned k = 0; k < s.size(); ++k) q_distance[pc >> 3] = static_cast<std::uint8_t>(std::min<unsigned>(q_distance[pc >> 3], q_distance[s.at(k) >> 3] + 1u));
         }
     const auto canonical = [&](PipeState s, std::uint32_t pc) {
         for (unsigned i = 0; i < kPipeQ; ++i)
@@ -425,7 +444,7 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
         for (; done[at] < states[at].size(); ++done[at]) {
             const PipeState now = states[at][done[at]];
             const PipeState after = pipe_step(now, use[at], pipe_stall(now, use[at]));
-            for (unsigned k = 0; k < s.n; ++k) reach(s.pc[k], after);
+            for (unsigned k = 0; k < s.size(); ++k) reach(s.at(k), after);
         }
     }
     if (!plan.ok) return plan;
@@ -442,12 +461,12 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
             plan.by_state[at] = stalls;
         }
         const Next s = successors(pc);
-        for (unsigned k = 0; k < s.n; ++k) {
-            const std::vector<PipeState> &target = states[s.pc[k] >> 3];
+        for (unsigned k = 0; k < s.size(); ++k) {
+            const std::vector<PipeState> &target = states[s.at(k) >> 3];
             if (target.size() < 2) continue;
-            StallPlan::Edge e{pc, s.pc[k], {}};
+            StallPlan::Edge e{pc, s.at(k), {}};
             for (std::size_t i = 0; i < v.size(); ++i) {
-                const PipeState after = canonical(pipe_step(v[i], use[at], stalls[i]), s.pc[k]);
+                const PipeState after = canonical(pipe_step(v[i], use[at], stalls[i]), s.at(k));
                 std::size_t found = 0;
                 while (found < target.size() && !(target[found] == after)) ++found;
                 if (found == target.size()) return plan.ok = false, plan;
@@ -837,6 +856,8 @@ struct FlagPipe {
     }
     PS2_VU_INLINE std::uint32_t mac() const { return mac_v[mac_slot()]; }
     PS2_VU_INLINE std::uint32_t status() const { return status_v[mac_slot()]; }
+    // The low four bits of the status (zero, sign, underflow, overflow): FSAND with a mask inside them (see FlagPipeV::status_low).
+    PS2_VU_INLINE std::uint32_t status_low() const { return status() & 0xFu; }
     PS2_VU_INLINE std::uint32_t clip() const {
         for (unsigned k = 1; k <= 8; ++k) {
             const unsigned i = (ch - k) & 7u;
@@ -868,6 +889,7 @@ struct FlagPipeV : FlagPipe {
     std::uint32_t mac0 = 0;
     v4i lo_mag = (v4i){0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF}, hi_mag = (v4i){0, 0, 0, 0};
     v4u signs = v4u{0u, 0u, 0u, 0u};
+    std::uint32_t status0 = 0;
 
     void start(const Vu0Regs &r) {
         for (int i = 0; i < 8; ++i) {
@@ -875,6 +897,7 @@ struct FlagPipeV : FlagPipe {
             clip_v[i] = r.clip;
         }
         mac0 = r.mac;
+        status0 = r.status;
     }
     static PS2_VU_INLINE std::uint32_t mac_of(v4u v) {
 #if defined(__SSE2__)
@@ -912,6 +935,23 @@ struct FlagPipeV : FlagPipe {
         return mac_of(fv[(fn - 8) & 7u]);
     }
     std::uint32_t status() const = delete;  // a program that reads the status keeps FlagPipe
+    // FSAND with a mask inside the low four status bits, the one status read a program may have and still keep its flags here
+    // (recomp/vurecomp_gen.cpp; every flag site of such a program pushes, so finish() also leaves the sticky bits of all of them).
+    // flags() sets the low four bits from its own result alone: zero (1) if a MAC zero bit is set, sign (2) for a sign bit,
+    // overflow (8) for an overflow bit, and never underflow (4), as no MAC underflow bit is ever set. So FlagPipe::status() & 0xF
+    // of a slot is that function of the slot's MAC; a slot of before the program holds the status the program started with.
+    // The slot is picked exactly as mac() picks it.
+    static PS2_VU_INLINE std::uint32_t low_of(std::uint32_t mac) {
+        return ((mac & 0x000Fu) ? 0x1u : 0u) | ((mac & 0x00F0u) ? 0x2u : 0u) | ((mac & 0xF000u) ? 0x8u : 0u);
+    }
+    PS2_VU_INLINE std::uint32_t status_low() const {
+        for (unsigned k = 1; k <= 8; ++k) {
+            if (k > fn) return status0 & 0xFu;
+            const unsigned i = (fn - k) & 7u;
+            if (fts[i] + 4u <= t) return low_of(mac_of(fv[i]));
+        }
+        return low_of(mac_of(fv[(fn - 8) & 7u]));
+    }
     PS2_VU_INLINE void finish(Vu0Regs &r) const {
         if (!fn) return;
         const std::uint32_t mac = mac_of(fv[(fn - 1) & 7u]);

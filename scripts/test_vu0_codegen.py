@@ -34,10 +34,102 @@ inline std::vector<std::vector<tc::Pair>> top_cases() {
     };
 }
 '''
+CALLS_H = r'''
+#pragma once
+#include "cases.h"
+// VU0 programs that call subroutines through a register (vurecomp 13, vu0_calls): a loop that picks one of two subroutines by a
+// branch, calls it with JALR, and goes on after the return; the subroutines follow the program's end, each ends in a JR. The pairs
+// around the call write vector results, flags and integer registers that the other side of the call reads (a stall, a flag read and
+// a branch with the integer branch delay right at a subroutine's start, results of a subroutine read right after the return).
+// bad = 1: the second target is a pair inside a subroutine, not its start (the compiled program does not know it: it has to put the
+// state back and run the whole program in the interpreter). bad = 2: as 0, the driver changes a subroutine's code afterwards.
+namespace callprog {
+using namespace tc;
+inline std::vector<Pair> program(unsigned seed, unsigned bad, unsigned &poke) {
+    std::mt19937 g(seed * 2246822519u + 99u);
+    const auto R = [&](unsigned n) { return static_cast<unsigned>(g() % n); };
+    // nothing here writes vi12 (the loop counter), vi14 or vi15 (the links), or uses the divide unit
+    const auto up = [&]() -> Word {
+        const unsigned c = R(10), dest = 1 + R(15), fd = 1 + R(6), fs = R(7), ft = R(7);
+        if (c < 2) return kUnop;
+        if (c < 6) { static const unsigned f[] = {0x28, 0x2C, 0x2A, 0x29, 0x2D}; return fmac(f[R(5)], dest, fd, fs, ft); }
+        if (c < 8) return fmac(R(4), dest, fd, fs, ft);  // ADDbc
+        return clip(fs, ft);
+    };
+    // FCAND writes vi1, the target register: not between the choice of the target and the call (`keep`)
+    const auto low = [&](bool keep = false) -> Word {
+        const unsigned c = R(14), res = 7 + R(5), v = 2 + R(5), w = 2 + R(5), f = R(7), dest = 1 + R(15);
+        switch (c) {
+        case 0: case 1: return kLnop;
+        case 2: return lq(dest, 1 + R(6), 0, R(40));
+        case 3: return sq(dest, f, 0, R(40));
+        case 4: return ialu(R(2) ? 0x30 : 0x31, res, v, w);
+        case 5: return iaddi(v, w, static_cast<int>(R(16)) - 8);
+        case 6: return fmflag(0x1A, res, v);
+        case 7: return fsflag(0x16, res, R(4096));
+        case 8: return fcget(res);
+        case 9: return ilw(15, res, 0, R(40));
+        case 10: return lower_special(0x30, dest, 1 + R(6), f);
+        case 11: return keep ? kLnop : fcflag(0x12, R(1u << 24));
+        case 12: return fsflag(0x15, 0, R(4096));
+        default: return fmflag(0x18, res, v);
+        }
+    };
+    const auto pair = [&](bool keep = false) -> Pair { return {low(keep), up()}; };
+    std::vector<Pair> p;
+    for (unsigned v = 2; v <= 6; ++v) p.push_back({iaddiu(v, 0, R(4)), up()});
+    p.push_back({iaddiu(12, 0, 2 + R(3)), up()});
+    const unsigned top = static_cast<unsigned>(p.size());
+    for (unsigned i = 0, n = 1 + R(3); i < n; ++i) p.push_back(pair());
+    const unsigned set_a = static_cast<unsigned>(p.size());
+    p.push_back({0, up()});  // iaddiu vi1, vi0, A (filled in below)
+    const unsigned pick = static_cast<unsigned>(p.size());
+    p.push_back({branch(0x28, 3, 4, pick * 8u, (pick + 3u) * 8u), up()});
+    p.push_back(pair(true));
+    const unsigned set_b = static_cast<unsigned>(p.size());
+    p.push_back({0, up()});  // iaddiu vi1, vi0, B
+    for (unsigned i = 0, n = R(2); i < n; ++i) p.push_back(pair(true));
+    const unsigned link = R(3) ? 15u : 14u;
+    p.push_back({(0x25u << 25) | (link << 16) | (1u << 11), up()});  // JALR link, vi1
+    // the delay slot: often a write of the register the subroutine's first branch reads
+    p.push_back(R(2) ? Pair{iaddiu(5, 0, R(3)), up()} : pair());
+    for (unsigned i = 0, n = 1 + R(3); i < n; ++i) p.push_back(pair());
+    p.push_back({iaddi(12, 12, -1), up()});
+    p.push_back({branch(0x29, 12, 0, static_cast<unsigned>(p.size()) * 8u, top * 8u), up()});
+    p.push_back(pair());
+    p.push_back({fsflag(0x16, 13, 0xFFF), up()});
+    p.push_back({fcget(11), up()});
+    p.push_back({fmflag(0x1A, 10, 1), up()});
+    p.push_back(pair());
+    p.back()[1] |= kEnd;
+    p.push_back(pair());
+    std::vector<unsigned> starts;
+    for (int s = 0; s < 2; ++s) {
+        starts.push_back(static_cast<unsigned>(p.size()));
+        if (R(2)) {
+            const unsigned at = static_cast<unsigned>(p.size());
+            p.push_back({branch(0x28, 5, 6, at * 8u, (at + 3u) * 8u), up()});
+            p.push_back(pair());
+            p.push_back(pair());
+        }
+        for (unsigned i = 0, n = 2 + R(4); i < n; ++i) p.push_back(pair());
+        p.push_back({(0x24u << 25) | (link << 11), up()});  // JR link
+        p.push_back(pair());
+    }
+    const unsigned a = starts[0], b = bad == 1 ? starts[1] + 1u : starts[1];
+    p[set_a][0] = iaddiu(1, 0, a);
+    p[set_b][0] = iaddiu(1, 0, b);
+    poke = starts[1] + 1u;
+    return p;
+}
+}
+'''
+CALL_PROGRAMS = 240
 GENERATOR = r'''
 #include "recomp/vurecomp_gen.cpp"
 #include "cases.h"
 #include "tops.h"
+#include "calls.h"
 int main(int argc, char **argv) {
     std::vector<ps2::vurecomp::Input> inputs;
     const auto add = [&](const std::vector<tc::Pair> &pairs, unsigned entry = 0, int unit = 0) {
@@ -50,6 +142,17 @@ int main(int argc, char **argv) {
     for (int unit : {0, 1}) for (const auto &pairs : top_cases()) add(pairs, 0, unit);
     for (const auto &c : tc::cases()) add(c.pairs);
     for (unsigned i = 0; i < 150; ++i) add(tc::random_program(i));
+    // Programs that call subroutines through a register: every one must compile (with both subroutines found in its code).
+    for (unsigned i = 0; i < CALL_PROGRAMS; ++i) {
+        unsigned poke = 0;
+        const auto pairs = callprog::program(i, i % 4 == 2 ? 1u : 0u, poke);
+        add(pairs);
+        Program p{inputs.back().key, 0, inputs.back().code, 0};
+        std::string cname;
+        const std::string text = generate(p, cname);
+        if (text.empty()) { std::fprintf(stderr, "call program %u was not compiled\n", i); return 8; }
+        if (text.find("vu::vu0_key(") == std::string::npos || text.find("goto bail;") == std::string::npos) { std::fprintf(stderr, "call program %u has no checked call\n", i); return 8; }
+    }
     // Code wrap and 4 KiB data wrap, plus final flags with no microcode reader.
     add({{tc::sq(15, 1, 0, 256), tc::add(3, 1, 2) | tc::kEnd}, {tc::lq(15, 4, 0, 256), tc::kUnop}}, 4088);
     add({{tc::kLnop, tc::fmac(0x28, 0, 3, 1, 2) | tc::kEnd}, tc::kNop});
@@ -88,7 +191,7 @@ int main(int argc, char **argv) {
         const auto result = ps2::vurecomp::generate_files({ps2::vurecomp::Input{p.key, 0, p.code, 0}}, fs::path(argv[1]) / ("double" + std::to_string(at)), 0);
         if (result.programs) { std::fprintf(stderr, "VU0 double branch at %u was written out\n", at); return 7; }
     }
-    // Dynamic jumps retain the interpreter's pipeline; reject the whole entry.
+    // A jump through a register with no call (JR alone): left to the interpreter, the whole entry.
     Program jump{1, 0, std::vector<std::uint8_t>(4096), 0};
     const tc::Pair pair{(0x24u << 25) | (1u << 11), tc::kUnop | tc::kEnd};
     std::memcpy(jump.code.data(), pair.data(), 8);
@@ -125,6 +228,8 @@ void unknown(std::uint64_t, std::uint32_t, const std::uint8_t *) {}
 DRIVER = r'''
 #include <cstddef>
 #include "tops.h"
+#include "calls.h"
+namespace ps2::vu { extern std::uint64_t g_vu0_restarts, g_vu0_compiled; }
 void register_generated_vu();
 static unsigned padding_calls = 0;
 static void padding_only(Vu0Regs &r, std::uint8_t *) {
@@ -181,8 +286,38 @@ static void check_tops() {
     vu::set_tops(0, 0);
     std::puts("TOP/ITOP unit isolation, cached value updates, branches and addressed memory passed");
 }
+// The call programs (calls.h), compiled against the interpreter: known targets run compiled to the end, an unknown target or a
+// subroutine whose code changed after the build puts the state back and runs the interpreter, and the result is the same every time.
+static int check_calls() {
+    std::uint64_t clean = 0, restarted = 0, changed = 0;
+    for (unsigned i = 0; i < CALL_PROGRAMS; ++i) {
+        const unsigned bad = i % 4 == 2 ? 1u : i % 4 == 3 ? 2u : 0u;
+        unsigned poke = 0;
+        const auto pairs = callprog::program(i, bad == 1 ? 1u : 0u, poke);
+        for (unsigned init = 0; init < 4; ++init) {
+            const std::uint64_t restarts = vu::g_vu0_restarts, compiled = vu::g_vu0_compiled;
+            compare(pairs, i * 4u + init);
+            if (vu::g_vu0_compiled == compiled) { std::fprintf(stderr, "call program %u did not run compiled\n", i); return 9; }
+            if (bad == 1) restarted += vu::g_vu0_restarts - restarts;
+            else if (vu::g_vu0_restarts != restarts) { std::fprintf(stderr, "call program %u went to the interpreter\n", i); return 9; }
+            else ++clean;
+            if (bad == 2) {
+                auto other = pairs;
+                other[poke][1] = other[poke][1] == tc::add(1, 2, 3) ? tc::add(4, 2, 3) : tc::add(1, 2, 3);
+                const std::uint64_t before = vu::g_vu0_restarts;
+                compare(other, i * 4u + init);
+                changed += vu::g_vu0_restarts - before;
+            }
+        }
+    }
+    if (!restarted || !changed) { std::fprintf(stderr, "the way back to the interpreter was not taken (%llu, %llu)\n", (unsigned long long)restarted, (unsigned long long)changed); return 9; }
+    std::printf("VU0 calls: %llu runs compiled to the end, %llu unknown targets and %llu changed subroutines through the interpreter, all exact\n",
+                (unsigned long long)clean, (unsigned long long)restarted, (unsigned long long)changed);
+    return 0;
+}
 int main(int argc, char **argv) {
     register_generated_vu();
+    if (argc > 1 && std::string(argv[1]) == "calls") return check_calls();
     check_tops();
     for (unsigned i = 0; i < 150; ++i) compare(tc::random_program(i), i);
     unsigned i = 0;
@@ -234,9 +369,10 @@ with tempfile.TemporaryDirectory(prefix='vu0-codegen-') as tmp:
     tmp = Path(tmp)
     (tmp / 'cases.h').write_text(fixtures['CASES_H'])
     (tmp / 'tops.h').write_text(TOP_CASES)
+    (tmp / 'calls.h').write_text(CALLS_H)
     (tmp / 'generator.cpp').write_text(GENERATOR)
     (tmp / 'driver.cpp').write_text('#define RANDOM_PROGRAMS 150\n' + STUBS + INTERP + DRIVER)
-    base = [CXX, '-std=c++20', '-O1', '-I.', '-Iruntime/include', '-Iruntime/src', '-I' + str(tmp)]
+    base = [CXX, '-std=c++20', '-O1', '-I.', '-Iruntime/include', '-Iruntime/src', '-I' + str(tmp), '-DCALL_PROGRAMS=%d' % CALL_PROGRAMS]
     run(base + [str(tmp / 'generator.cpp'), '-o', str(tmp / 'generator')])
     run([str(tmp / 'generator'), str(tmp)])
     run(base + [str(tmp / 'driver.cpp'), 'runtime/src/vu_micro.cpp', 'runtime/src/vu_jit_web.cpp']
@@ -251,6 +387,12 @@ with tempfile.TemporaryDirectory(prefix='vu0-codegen-') as tmp:
     assert all(p.stat().st_size == 4096 for p in recordings)
     run([str(tmp / 'check')], env=environment)
     assert sorted(record.glob('*.bin')) == recordings, 'recordings must be deduplicated'
+    # The call programs: compiled against the interpreter. Only the targets of calls are recorded (the programs themselves are compiled).
+    call_record = tmp / 'recorded-calls'
+    called = run([str(tmp / 'check'), 'calls'], env={**environment, 'PS2_VU0_RECORD': str(call_record)})
+    print(called.stdout, end='')
+    assert all(not p.stem.endswith('_0000') for p in call_record.glob('*.bin')), 'a compiled call program was recorded'
+    assert any(call_record.glob('*.bin')), 'the targets of calls are recorded'
     forced = run([str(tmp / 'check'), 'force-interpret'], env={**environment, 'PS2_VU0_INTERPRET': '1', 'PS2_VU0_RECORD': str(tmp / 'forced-recordings')})
     print('Forced interpretation override leaves native functions uncalled')
     checked = run([str(tmp / 'check'), 'negative-control'], env={**environment, 'PS2_VU0_VERIFY': '1', 'PS2_VU0_RECORD': str(tmp / 'verified-recordings')})

@@ -799,10 +799,45 @@ void run_fast(int n, std::uint32_t address);
 std::unordered_map<std::uint64_t, ProgramFn> g_programs;
 std::unordered_map<std::uint64_t, ProgramFn> g_vu0_programs;
 void run_reference(int n, std::uint32_t address);
+// A program seen at an entry before: the instruction pairs it can reach (as runs of addresses) and their code. When the code is
+// uploaded again and those pairs hold the same code, reachable() would find the same pairs and program_key() the same key.
+struct Candidate {
+    std::vector<std::uint32_t> runs;
+    std::vector<std::uint8_t> code;
+    std::uint64_t key = 0;
+    ProgramFn function = nullptr;
+    ProgramFn jit = nullptr;
+};
+
+bool candidate_matches(const Candidate &c, const std::uint8_t *unit_code) {
+    const std::uint8_t *code = c.code.data();
+    for (std::size_t i = 0; i < c.runs.size(); i += 2) {
+        if (std::memcmp(unit_code + c.runs[i], code, c.runs[i + 1]) != 0) return false;
+        code += c.runs[i + 1];
+    }
+    return true;
+}
+
+Candidate make_candidate(std::vector<std::uint32_t> pcs, const std::uint8_t *unit_code) {
+    std::sort(pcs.begin(), pcs.end());
+    Candidate c;
+    for (std::uint32_t pc : pcs) {
+        if (!c.runs.empty() && c.runs[c.runs.size() - 2] + c.runs.back() == pc) c.runs.back() += 8;
+        else {
+            c.runs.push_back(pc);
+            c.runs.push_back(8);
+        }
+        c.code.insert(c.code.end(), unit_code + pc, unit_code + pc + 8);
+    }
+    return c;
+}
+
 struct Vu0Entry {
     std::uint32_t generation = 0;
     std::uint64_t key = 0;
     ProgramFn function = nullptr;
+    std::vector<Candidate> candidates;  // the programs seen at this entry (only their keys are used: the function is looked up again)
+    std::uint32_t next = 0;
 };
 Vu0Entry g_vu0_entries[512];
 std::unordered_set<std::uint64_t> g_vu0_rejected;
@@ -813,20 +848,64 @@ ProgramFn lookup_vu0(std::uint32_t address) {
     Vu0Entry &e = g_vu0_entries[address >> 3];
     if (e.generation == g_generation[0]) return e.function;
     e.generation = g_generation[0];
-    e.key = program_key(g_vu0_code, reachable(g_vu0_code, 4095u, address), address);
+    // A game that uploads its VU0 code again and again (Silent Hill 2, several times a frame) finds the key of a program it ran before
+    // by comparing the code of that program's pairs instead of walking the code and hashing it again (with two allocations).
+    const Candidate *known = nullptr;
+    for (const Candidate &c : e.candidates)
+        if (candidate_matches(c, g_vu0_code)) {
+            known = &c;
+            break;
+        }
+    if (known) {
+        e.key = known->key;
+    } else {
+        std::vector<std::uint32_t> pcs = reachable(g_vu0_code, 4095u, address);
+        e.key = program_key(g_vu0_code, pcs, address);
+        Candidate c = make_candidate(std::move(pcs), g_vu0_code);
+        c.key = e.key;
+        if (e.candidates.size() < 4) e.candidates.push_back(std::move(c));
+        else e.candidates[e.next++ % 4] = std::move(c);
+    }
     const auto it = g_vu0_programs.find(e.key);
     e.function = it == g_vu0_programs.end() || g_vu0_rejected.count(e.key) ? nullptr : it->second;
     static const std::string record = ps2::os::env("PS2_VU0_RECORD");
-    if (!e.function && !record.empty()) {
+    // Each program is looked for on disk once per run: a window run records by default, and a game that uploads its VU0 code often
+    // (Silent Hill 2) asked the file system on every upload, about 14 % of the emulation thread on Windows. A known
+    // program (same key, same entry) was handled when it was first seen.
+    static std::unordered_set<std::string> recorded;
+    if (!known && !e.function && !record.empty()) {
         char name[64];
         std::snprintf(name, sizeof name, "%016llX_%04X.bin", static_cast<unsigned long long>(e.key), address);
-        const auto path = ps2::os::path(record) / name;
-        if (!std::filesystem::exists(path)) {
-            std::filesystem::create_directories(ps2::os::path(record));
-            std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu0_code), 4096);
+        if (recorded.insert(name).second) {
+            const auto path = ps2::os::path(record) / name;
+            if (!std::filesystem::exists(path)) {
+                std::filesystem::create_directories(ps2::os::path(record));
+                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu0_code), 4096);
+            }
         }
     }
     return e.function;
+}
+
+std::uint64_t vu0_key(std::uint32_t entry) {
+    lookup_vu0(entry);
+    return g_vu0_entries[(entry & 4095u) >> 3].key;
+}
+
+std::uint64_t g_vu0_restarts = 0;
+
+void vu0_restart(std::uint32_t entry) {
+    if (++g_vu0_restarts == 1 || g_vu0_restarts % 100000 == 0)
+        std::fprintf(stderr, "[vu0] a compiled program at %04X called code it does not know; ran it in the interpreter (%llu times)\n", entry & 4095u,
+                     static_cast<unsigned long long>(g_vu0_restarts));
+    run_reference(0, entry);
+}
+
+// The interpreter's VU0 calls (JALR): where they go is recorded as a program of its own (PS2_VU0_RECORD), so the next build compiles the
+// subroutine into the program that calls it (vurecomp_gen.cpp, vu0_calls).
+void note_vu0_call(std::uint32_t target) {
+    static const bool recording = !ps2::os::env("PS2_VU0_RECORD").empty();
+    if (recording) lookup_vu0(target);
 }
 
 bool same_vu0_regs(const Vu0Regs &a, const Vu0Regs &b) {
@@ -875,14 +954,6 @@ bool run_compiled_vu0(std::uint32_t address) {
 }
 
 
-struct Candidate {
-    std::vector<std::uint32_t> runs;
-    std::vector<std::uint8_t> code;
-    std::uint64_t key = 0;
-    ProgramFn function = nullptr;
-    ProgramFn jit = nullptr;
-};
-
 struct EntryCache {
     std::uint32_t generation = 0;
     std::uint64_t key = 0;
@@ -892,28 +963,6 @@ struct EntryCache {
     std::uint32_t next = 0;
 };
 
-bool candidate_matches(const Candidate &c) {
-    const std::uint8_t *code = c.code.data();
-    for (std::size_t i = 0; i < c.runs.size(); i += 2) {
-        if (std::memcmp(g_vu1_code + c.runs[i], code, c.runs[i + 1]) != 0) return false;
-        code += c.runs[i + 1];
-    }
-    return true;
-}
-
-Candidate make_candidate(std::vector<std::uint32_t> pcs) {
-    std::sort(pcs.begin(), pcs.end());
-    Candidate c;
-    for (std::uint32_t pc : pcs) {
-        if (!c.runs.empty() && c.runs[c.runs.size() - 2] + c.runs.back() == pc) c.runs.back() += 8;
-        else {
-            c.runs.push_back(pc);
-            c.runs.push_back(8);
-        }
-        c.code.insert(c.code.end(), g_vu1_code + pc, g_vu1_code + pc + 8);
-    }
-    return c;
-}
 std::unordered_map<std::uint64_t, ProgramFn> g_jit_programs;
 std::vector<std::uint32_t> *g_kick_log = nullptr;
 std::int64_t *g_capture = nullptr;
@@ -1258,7 +1307,7 @@ ProgramFn lookup(std::uint32_t address) {
     if (e.generation == g_generation[1]) return e.function;
     e.generation = g_generation[1];
     for (const Candidate &c : e.candidates)
-        if (candidate_matches(c)) {
+        if (candidate_matches(c, g_vu1_code)) {
             e.function = c.function;
             e.jit = c.jit;
             e.key = c.key;
@@ -1274,7 +1323,7 @@ ProgramFn lookup(std::uint32_t address) {
     const int jit_mode = jit::mode();
     if (jit_mode == 2 || (jit_mode >= 1 && !e.function)) e.function = jit_program(key, address);
     else if (jit_mode == 3) e.jit = jit_program(key, address);
-    Candidate c = make_candidate(pcs);
+    Candidate c = make_candidate(pcs, g_vu1_code);
     c.key = key;
     c.function = e.function;
     c.jit = e.jit;
@@ -1291,7 +1340,8 @@ ProgramFn lookup(std::uint32_t address) {
             return e.function;
         }
         const std::filesystem::path path = ps2::os::path(record) / name;
-        if (!std::filesystem::exists(path)) {
+        static std::unordered_set<std::string> recorded;  // once per program and run, as for VU0 (lookup_vu0)
+        if (recorded.insert(name).second && !std::filesystem::exists(path)) {
             std::filesystem::create_directories(ps2::os::path(record));
             std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu1_code), 16384);
         }
@@ -1469,6 +1519,7 @@ void run_reference(int n, std::uint32_t address) {
             std::uint32_t target = npc;
             lower(u, lo, current, target, branch);
             if (branch) npc = target;
+            if (branch && n == 0 && (lo >> 25) == 0x25u) note_vu0_call(target);
         }
         u.branch_vi = nullptr;
         view.commit(was, lo, hi);

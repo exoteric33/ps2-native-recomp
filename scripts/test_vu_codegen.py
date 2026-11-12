@@ -351,6 +351,21 @@ inline std::vector<Pair> mac_only(std::vector<Pair> p) {
     return p;
 }
 
+// The same program reading the status only through FSAND masks inside its low four bits (vurecomp 12, FlagPipeV::status_low):
+// FSEQ and FSOR become FMEQ and FMOR, FSSET a no-op, every FSAND keeps its register with the mask cut to the low bits, and the
+// closing FSAND reads all four.
+inline std::vector<Pair> status_low_only(std::vector<Pair> p) {
+    for (Pair &x : p) {
+        if (x[1] & kLoi) continue;
+        const Word op = x[0] >> 25, it = (x[0] >> 16) & 15u, is = (x[0] >> 11) & 15u;
+        if (op == 0x14) x[0] = fmflag(0x18, it, is);
+        else if (op == 0x16) x[0] = fsflag(0x16, it, x[0] & 0xFu);
+        else if (op == 0x17) x[0] = fmflag(0x1B, it, is);
+        else if (op == 0x15) x[0] = kLnop;
+    }
+    return p;
+}
+
 inline void random_init(ps2::Vu0Regs &r, std::uint8_t *mem, unsigned seed) {
     std::mt19937 g(seed * 40503u + 7u);
     std::memset(&r, 0, sizeof r);
@@ -561,22 +576,26 @@ int main(int argc, char **argv) {
     // (FlagPipeV) and, as the reference, at every flag site (g_eager_flags, the code before vurecomp 11). Both must leave the same
     // registers, flags and memory (main below).
     std::string late_table = "static void (*const kLateFns[])(Vu0Regs &, std::uint8_t *) = {\n", eager_table = "static void (*const kEagerFns[])(Vu0Regs &, std::uint8_t *) = {\n";
-    unsigned late = 0;
-    for (unsigned i = 0; i < RANDOM_PROGRAMS; ++i) {
-        const std::vector<tc::Pair> pairs = tc::mac_only(tc::random_program(i));
+    // The second half of the tables: the same programs reading the status through low-bit FSANDs only (status_low_only).
+    unsigned late = 0, late_low = 0;
+    for (unsigned j = 0; j < 2 * RANDOM_PROGRAMS; ++j) {
+        const unsigned i = j % RANDOM_PROGRAMS;
+        const std::vector<tc::Pair> pairs = j < RANDOM_PROGRAMS ? tc::mac_only(tc::random_program(i)) : tc::status_low_only(tc::random_program(i));
         std::string name;
-        const std::string text = generate(programs(pairs, 300000 + i), name);
-        if (name.empty()) { std::fprintf(stderr, "MAC-only random program %u: no plan\n", i); return 1; }
-        late += text.find("FlagPipeV fl;") != std::string::npos;
+        const std::string text = generate(programs(pairs, 300000 + j), name);
+        if (name.empty()) { std::fprintf(stderr, "MAC-only random program %u: no plan\n", j); return 1; }
+        (j < RANDOM_PROGRAMS ? late : late_low) += text.find("FlagPipeV fl;") != std::string::npos;
         native << text;
         late_table += "    " + name + ",\n";
         g_eager_flags = true;
-        native << generate(programs(pairs, 400000 + i), name);
+        native << generate(programs(pairs, 400000 + j), name);
         g_eager_flags = false;
         eager_table += "    " + name + ",\n";
     }
     if (late < RANDOM_PROGRAMS / 2) { std::fprintf(stderr, "only %u MAC-only random programs work out their flags late\n", late); return 1; }
     std::fprintf(stderr, "%u of %u MAC-only random programs work out their flags late\n", late, static_cast<unsigned>(RANDOM_PROGRAMS));
+    if (late_low < RANDOM_PROGRAMS / 2) { std::fprintf(stderr, "only %u low-status random programs work out their flags late\n", late_low); return 1; }
+    std::fprintf(stderr, "%u of %u random programs reading the low status bits work out their flags late\n", late_low, static_cast<unsigned>(RANDOM_PROGRAMS));
     native << late_table << "};\n" << eager_table << "};\n";
     native << R"(
 static int run_late_flags() {

@@ -1,4 +1,4 @@
-// Sampling profiler for the emulation thread on Windows: the same PS2_PROFILE=<file> and PS2_PROFILE_FROM=<frame>
+﻿// Sampling profiler for the emulation thread on Windows: the same PS2_PROFILE=<file> and PS2_PROFILE_FROM=<frame>
 // switches as host/profile.cpp on Linux, but the file is a readable list of the busiest functions (DbgHelp reads the
 // symbol table the linker left in ps2run.exe), so no other tool is needed.
 //
@@ -33,7 +33,7 @@
 namespace {
 
 struct Sample {
-    std::uintptr_t pc, caller;
+    std::uintptr_t pc, caller, caller2, caller3;
 };
 
 constexpr std::size_t kMaxSamples = 1'000'000;  // 16 MB; about 15 minutes of sampling, later samples are dropped
@@ -44,6 +44,7 @@ std::vector<Sample> g_samples;
 std::atomic<std::size_t> g_count{0};
 std::uint64_t g_from = 0;
 bool g_armed = false;
+DWORD64 g_image_begin = 0, g_image_end = 0;  // ps2run.exe in memory
 
 void sampler() {
     timeBeginPeriod(1);
@@ -53,12 +54,41 @@ void sampler() {
         // nothing that can take a lock (malloc, stdio) may run between Suspend and Resume: the target may hold it
         if (SuspendThread(g_target) != static_cast<DWORD>(-1)) {
             CONTEXT c{};
-            c.ContextFlags = CONTEXT_CONTROL;
+            c.ContextFlags = CONTEXT_FULL;
             if (GetThreadContext(g_target, &c)) {
                 s.pc = static_cast<std::uintptr_t>(c.Rip);
-                SIZE_T read = 0;
-                std::uintptr_t top = 0;
-                if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(c.Rsp), &top, sizeof top, &read) && read == sizeof top) s.caller = top;
+                // Outside ps2run.exe (a system library: a wait, a copy, a clock): walk the stack with the libraries' unwind tables up to
+                // the first return address inside ps2run.exe, so the sample can be charged to the function of ours that called it.
+                // Only reads memory; the stack cannot change while the thread is stopped.
+                // The two callers above that (caller2, caller3) say who called a library helper of ours (std::filesystem, operator new).
+                if (s.pc < g_image_begin || s.pc >= g_image_end) {
+                    CONTEXT u = c;
+                    const auto up = [&u]() {
+                        DWORD64 base = 0;
+                        PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(u.Rip, &base, nullptr);
+                        if (entry) {
+                            void *handler_data = nullptr;
+                            DWORD64 frame = 0;
+                            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, u.Rip, entry, &u, &handler_data, &frame, nullptr);
+                        } else {  // a leaf function: the return address is on top of the stack
+                            DWORD64 top = 0;
+                            SIZE_T read = 0;
+                            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(u.Rsp), &top, sizeof top, &read) || read != sizeof top) return false;
+                            u.Rip = top;
+                            u.Rsp += 8;
+                        }
+                        return u.Rip != 0;
+                    };
+                    for (int depth = 0; depth < 16 && up(); ++depth)
+                        if (u.Rip >= g_image_begin && u.Rip < g_image_end) {
+                            s.caller = static_cast<std::uintptr_t>(u.Rip);
+                            if (up() && u.Rip >= g_image_begin && u.Rip < g_image_end) {
+                                s.caller2 = static_cast<std::uintptr_t>(u.Rip);
+                                if (up() && u.Rip >= g_image_begin && u.Rip < g_image_end) s.caller3 = static_cast<std::uintptr_t>(u.Rip);
+                            }
+                            break;
+                        }
+                }
                 got = true;
             }
             ResumeThread(g_target);
@@ -82,6 +112,10 @@ void arm() {
         std::fprintf(stderr, "[profile] cannot open the emulation thread (error %lu)\n", GetLastError());
         return;
     }
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(GetModuleHandleA(nullptr));
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(reinterpret_cast<const char *>(dos) + dos->e_lfanew);
+    g_image_begin = reinterpret_cast<DWORD64>(dos);
+    g_image_end = g_image_begin + nt->OptionalHeader.SizeOfImage;
     g_samples.assign(kMaxSamples, Sample{});
     g_running.store(true);
     g_thread = std::thread(sampler);
@@ -143,7 +177,31 @@ std::vector<Symbol> load_symbols() {
     return symbols;
 }
 
-// "ps2::vu::run_fast(int, unsigned int)" for an address of ps2run.exe, "SomeLibrary.dll!?" for one of a DLL
+// The exported function of a loaded DLL at or below an address (its nearest export: a guess for unexported code), "?" when none
+std::string export_below(HMODULE module, std::uintptr_t address) {
+    const auto *base = reinterpret_cast<const unsigned char *>(module);
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size) return "?";
+    const auto *exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(base + dir.VirtualAddress);
+    const auto *functions = reinterpret_cast<const DWORD *>(base + exports->AddressOfFunctions);
+    const auto *names = reinterpret_cast<const DWORD *>(base + exports->AddressOfNames);
+    const auto *ordinals = reinterpret_cast<const WORD *>(base + exports->AddressOfNameOrdinals);
+    const auto rva = static_cast<DWORD>(address - reinterpret_cast<std::uintptr_t>(base));
+    DWORD best = 0;
+    const char *best_name = nullptr;
+    for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
+        const DWORD f = functions[ordinals[i]];
+        if (f <= rva && f >= best && !(f >= dir.VirtualAddress && f < dir.VirtualAddress + dir.Size)) {  // not a forwarder string
+            best = f;
+            best_name = reinterpret_cast<const char *>(base + names[i]);
+        }
+    }
+    return best_name ? best_name : "?";
+}
+
+// "ps2::vu::run_fast(int, unsigned int)" for an address of ps2run.exe, "SomeLibrary.dll!Export" for one of a DLL
 std::string describe(std::uintptr_t address, std::uintptr_t image_begin, std::uintptr_t image_end, const std::vector<Symbol> &symbols,
                      std::unordered_map<std::uintptr_t, std::string> &cache) {
     const auto found = cache.find(address);
@@ -165,7 +223,7 @@ std::string describe(std::uintptr_t address, std::uintptr_t image_begin, std::ui
         if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module) &&
             GetModuleFileNameA(module, path, MAX_PATH)) {
             const std::string full = path;
-            text = full.substr(full.find_last_of(R"(\/)") + 1) + "!?";
+            text = full.substr(full.find_last_of(R"(\/)") + 1) + "!" + export_below(module, address);
         } else {
             text = "?";
         }
@@ -203,16 +261,26 @@ void write_profile(const char *path) {
     const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(dos), end = begin + nt->OptionalHeader.SizeOfImage;
     const std::vector<Symbol> symbols = load_symbols();
     std::unordered_map<std::uintptr_t, std::string> names;
-    std::map<std::string, std::uint64_t> self, outside, callers;
+    std::map<std::string, std::uint64_t> self, outside, callers, pairs, inclusive, chains;
     std::uint64_t in_program = 0;
     for (std::size_t i = 0; i < total; ++i) {
         const Sample &s = g_samples[i];
         if (s.pc >= begin && s.pc < end) {
-            ++self[describe(s.pc, begin, end, symbols, names)];
+            const std::string name = describe(s.pc, begin, end, symbols, names);
+            ++self[name];
+            ++inclusive[name];
             ++in_program;
         } else {
-            ++outside[describe(s.pc, begin, end, symbols, names)];
-            if (s.caller >= begin && s.caller < end) ++callers[describe(s.caller, begin, end, symbols, names)];
+            const std::string name = describe(s.pc, begin, end, symbols, names);
+            ++outside[name];
+            const std::string caller = s.caller >= begin && s.caller < end ? describe(s.caller, begin, end, symbols, names) : std::string("?");
+            ++callers[caller];
+            ++inclusive[caller];
+            ++pairs[name + "  <-  " + caller];
+            std::string chain = name + "  <-  " + caller;
+            for (const std::uintptr_t a : {s.caller2, s.caller3})
+                if (a) chain += "  <-  " + describe(a, begin, end, symbols, names);
+            ++chains[chain];
         }
     }
     const auto sorted = [](const std::map<std::string, std::uint64_t> &m) {
@@ -231,9 +299,21 @@ void write_profile(const char *path) {
     shown = 0;
     for (const auto &[name, hits] : sorted(outside))
         if (shown++ < 20) std::fprintf(f, "%5.1f%% %7llu  %s\n", percent(hits), static_cast<unsigned long long>(hits), name.c_str());
-    std::fprintf(f, "\n# the function of ps2run.exe on top of the stack at those moments (usually the caller)\n");
+    std::fprintf(f, "\n# the function of ps2run.exe that called into the system libraries at those moments (found by unwinding the stack)\n");
     shown = 0;
     for (const auto &[name, hits] : sorted(callers))
         if (shown++ < 20) std::fprintf(f, "%5.1f%% %7llu  %s\n", percent(hits), static_cast<unsigned long long>(hits), name.c_str());
+    std::fprintf(f, "\n# system library function  <-  its caller in ps2run.exe\n");
+    shown = 0;
+    for (const auto &[name, hits] : sorted(pairs))
+        if (shown++ < 30) std::fprintf(f, "%5.1f%% %7llu  %s\n", percent(hits), static_cast<unsigned long long>(hits), name.c_str());
+    std::fprintf(f, "\n# the same with two more callers in ps2run.exe\n");
+    shown = 0;
+    for (const auto &[name, hits] : sorted(chains))
+        if (shown++ < 30) std::fprintf(f, "%5.1f%% %7llu  %s\n", percent(hits), static_cast<unsigned long long>(hits), name.c_str());
+    std::fprintf(f, "\n# functions of ps2run.exe with the system library time they caused added in\n");
+    shown = 0;
+    for (const auto &[name, hits] : sorted(inclusive))
+        if (shown++ < 60) std::fprintf(f, "%5.1f%% %7llu  %s\n", percent(hits), static_cast<unsigned long long>(hits), name.c_str());
     std::fclose(f);
 }

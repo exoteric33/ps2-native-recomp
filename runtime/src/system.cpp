@@ -18,6 +18,7 @@
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/os.hpp"
+#include "ps2/pace.hpp"
 #include "ps2/state.hpp"
 #include "ps2/state_request.hpp"
 #include "ps2/system.hpp"
@@ -499,7 +500,7 @@ std::uint32_t video_options() { return g_video_options.load(std::memory_order_re
 namespace {
 
 constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr std::uint32_t kStateVersion = 9;
+constexpr std::uint32_t kStateVersion = 10;
 
 std::function<void()> event_action(int id, std::uint64_t at) {
     if (id == hw::kEventVblank) return vblank;
@@ -528,8 +529,9 @@ void machine_state(state::Stream &s) {
     // of the IOP (sceCdSt*, where it is and whether it runs), so a state saved while a film or a music stream plays goes on streaming;
     // 7 adds the SIF RPC endpoints kept per server (guest servers, their order) and the IOP-to-EE request packet ring (SIF RPC rework, PR #27);
     // 8 adds the IOP's low-level hardware timers (AllocHardTimer, SetTimerCompare, SetTimerMode) that raise an interrupt;
-    // 9 adds the count of GS FINISH events that wait until the game has cleared CSR.FINISH.
-    if (version != kStateVersion && !(s.loading() && (version >= 4 && version <= 8))) throw std::runtime_error("state file from another version");
+    // 9 adds the count of GS FINISH events that wait until the game has cleared CSR.FINISH;
+    // 10 adds the picture pace's last picture and a hold that is due (kernel.cpp, ps2/pace.hpp).
+    if (version != kStateVersion && !(s.loading() && (version >= 4 && version <= 9))) throw std::runtime_error("state file from another version");
     s.set_version(version);
     s.tag("ee");
     s.pod(g_cpu);
@@ -706,6 +708,25 @@ void request_iop_sync() {
     if (g_cpu.budget > 64) set_budget(g_cpu, 64);
 }
 
+// The picture pace (ps2/pace.hpp): PS2_PACE (a window run sets it from the game's keys.ini, PS2_PACE_FROM names the
+// file) wins over the built-in list of serials. A replay takes it from the recording instead (quick_keys.inc).
+static void setup_pace() {
+    const std::string serial = pace::serial_of(g_options.program_path);
+    if (const std::string setting = os::env("PS2_PACE"); !setting.empty()) {
+        if (const int every = pace::parse(setting)) {
+            const std::string from = os::env("PS2_PACE_FROM");
+            kernel::pace_setup(every, (from.empty() ? "PS2_PACE=" + setting : from + ": pace = " + setting).c_str());
+            return;
+        }
+        std::fprintf(stderr, "[pace] PS2_PACE=%s is not 30, 20, 15, 60 or off: ignored\n", setting.c_str());
+    }
+    if (const pace::Listed *l = pace::listed(serial)) {
+        kernel::pace_setup(l->every, ("built-in list for " + serial + ", " + l->why).c_str());
+        return;
+    }
+    kernel::pace_setup(1, "");
+}
+
 void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     init_watch();
     hw::reset();
@@ -732,6 +753,7 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     }
     store<std::uint32_t>(g_ram + argv + 4 * guest_args.size(), 0);
     kernel::start_main_thread(entry, 0, static_cast<std::uint32_t>(guest_args.size()), argv);
+    setup_pace();
     apply_patches(true);
     schedule(hw::kEventVblank, frame_cycles(), vblank);
 }
@@ -894,6 +916,7 @@ int run() {
         }
     }
     gs::stats();
+    kernel::pace_report();
     ipu::stats();
     if (const std::string path = os::env("PS2_DUMP_AUDIO"); !path.empty()) iop::spu2::dump_audio(path.c_str());
     if (std::getenv("PS2_TRACE_SPU2")) iop::spu2::dump_voices();

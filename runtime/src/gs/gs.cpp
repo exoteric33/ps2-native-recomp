@@ -4,6 +4,7 @@
 #include "queue.hpp"
 #include "raster.hpp"
 #include "../hw.hpp"
+#include "../kernel.hpp"
 #ifdef PS2_GPU
 #include "gpu/gpu.hpp"
 #endif
@@ -1152,7 +1153,10 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
     case 0x0050: g_synch2 = value; break;
     case 0x0060: g_syncv = value; break;
     case 0x0070:
-        if (trace_display() && value != g_dispfb[0]) std::fprintf(stderr, "[gs] dispfb1 0x%llX\n", static_cast<unsigned long long>(value));
+        if (value != g_dispfb[0]) {
+            if (trace_display()) std::fprintf(stderr, "[gs] dispfb1 0x%llX f%llu\n", static_cast<unsigned long long>(value), static_cast<unsigned long long>(frame_count()));
+            kernel::pace_picture();  // a new picture shown (the end-of-run count; the hold of a game with a picture pace)
+        }
         g_dispfb[0] = value;
         break;
     case 0x0080:
@@ -1160,7 +1164,10 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
         g_display[0] = value;
         break;
     case 0x0090:
-        if (trace_display() && value != g_dispfb[1]) std::fprintf(stderr, "[gs] dispfb2 0x%llX\n", static_cast<unsigned long long>(value));
+        if (value != g_dispfb[1]) {
+            if (trace_display()) std::fprintf(stderr, "[gs] dispfb2 0x%llX f%llu\n", static_cast<unsigned long long>(value), static_cast<unsigned long long>(frame_count()));
+            kernel::pace_picture();  // a new picture shown (the end-of-run count; the hold of a game with a picture pace)
+        }
         g_dispfb[1] = value;
         break;
     case 0x00A0:

@@ -1846,6 +1846,11 @@ bool open_window(bool fullscreen) {
         ps2::os::set_env("PS2_SCALE", std::to_string(g_keys.scale));
         std::fprintf(stderr, "[video] resolution %dx from %s (scale = %d)\n", g_keys.scale, g_keys_path.c_str(), g_keys.scale);
     }
+    // The picture pace (ps2/pace.hpp): the 'pace' line of keys.ini, unless PS2_PACE is set. The runtime reads it at boot, after this.
+    if (!g_keys.pace.empty() && ps2::os::env("PS2_PACE").empty()) {
+        ps2::os::set_env("PS2_PACE", g_keys.pace);
+        ps2::os::set_env("PS2_PACE_FROM", g_keys_path);
+    }
     g_scale_now = std::clamp(std::atoi(ps2::os::env("PS2_SCALE").c_str()), 1, 4);
     g_scale_next = g_scale_locked ? g_scale_now : (g_keys.scale >= 1 ? g_keys.scale : g_scale_now);
     // the 2D art filter the same way: PS2_SHARP_2D, else the 'sharp_2d' line of keys.ini, else sharp (gpu.cpp reads it at its start)

@@ -134,6 +134,9 @@ if(NOT EMSCRIPTEN)
     # which graphics chips get the draw program without wgpu's run-time checks by default (no game, no graphics): ninja ps2trustedtest
     add_executable(ps2trustedtest EXCLUDE_FROM_ALL tests/trusted_shader.cpp)
     target_include_directories(ps2trustedtest PRIVATE runtime/src)
+    # the picture pace's hold (runtime/include/ps2/pace.hpp) with made-up games, no game and no runtime needed: ninja ps2pacetest
+    add_executable(ps2pacetest EXCLUDE_FROM_ALL tests/pace.cpp)
+    target_include_directories(ps2pacetest PRIVATE runtime/include)
     # the lines of the picture each video mode shows (480p must not be cut like a TV picture): ninja ps2displaylinestest
     add_executable(ps2displaylinestest EXCLUDE_FROM_ALL tests/display_lines.cpp)
     target_include_directories(ps2displaylinestest PRIVATE runtime/src)

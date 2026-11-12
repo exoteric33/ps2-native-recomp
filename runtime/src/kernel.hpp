@@ -27,4 +27,11 @@ void on_hblank();
 void wake_idle();
 void dump();
 
+// The picture pace (ps2/pace.hpp). pace_setup sets the refreshes per picture (1 = off) and says where it came from
+// in the log; pace_picture is called when the game changes the buffer the TV shows (DISPFB1/2); pace_report prints the end-of-run line.
+void pace_setup(int every, const char *source);
+int pace_every();
+void pace_picture();
+void pace_report();
+
 }

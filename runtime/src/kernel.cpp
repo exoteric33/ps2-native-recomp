@@ -7,6 +7,7 @@
 #include "ps2/system.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/pace.hpp"
 #include "ps2/crash.hpp"
 
 #include <algorithm>
@@ -24,7 +25,9 @@ namespace ps2::kernel {
 namespace {
 
 enum Status { kRun = 1, kReady = 2, kWait = 4, kSuspend = 8, kWaitSuspend = 12, kDormant = 16 };
-enum WaitType { kWaitNone, kWaitSleep, kWaitSema };
+// kWaitPace: held by the picture pace (ps2/pace.hpp) until the vertical blank in wait_id. On a PS2 the thread would still be
+// working, so the game sees it as ready, never as waiting.
+enum WaitType { kWaitNone, kWaitSleep, kWaitSema, kWaitPace };
 
 constexpr std::uint32_t kKernelStackTop = 0x00080000u;
 constexpr std::uint32_t kSyscallTable = 0x00001800u;
@@ -104,6 +107,14 @@ bool g_reschedule = false;
 std::vector<int> g_pending_alarms;
 std::uint32_t g_vsync_flag = 0, g_vsync_data = 0;
 std::uint32_t g_osd_config = 0;
+// The picture pace (ps2/pace.hpp). A hold that is due is noted here and served at the next safe point (service()), where the
+// thread's place in its code is exact: the thread that changed the shown buffer, or, for a change made in an interrupt handler,
+// the thread that runs after the handler (-1 until then). g_pace_until is 0 when no hold is due.
+pace::Hold g_pace;
+pace::Count g_pace_count;
+std::uint64_t g_pace_until = 0;
+int g_pace_thread = 0;
+int g_pace_held = 0;  // threads in kWaitPace (a hint for on_vblank_start, counted again there)
 
 template <typename Map>
 int lowest_free(const Map &map, int limit, int first = 1) {
@@ -359,7 +370,8 @@ void exit_current(Cpu &c, bool remove) {
 void write_thread_status(int id, std::uint32_t p) {
     Thread *t = thread(id);
     if (!t || !p) return;
-    st32(p + 0, static_cast<std::uint32_t>(t->status));
+    const bool held = t->wait == kWaitPace;  // working on a PS2: ready (or suspended), not waiting
+    st32(p + 0, static_cast<std::uint32_t>(held ? (t->status == kWaitSuspend ? kSuspend : kReady) : t->status));
     st32(p + 4, t->entry);
     st32(p + 8, t->stack);
     st32(p + 12, t->stack_size);
@@ -369,7 +381,7 @@ void write_thread_status(int id, std::uint32_t p) {
     st32(p + 28, t->attr);
     st32(p + 32, t->option);
     st32(p + 36, t->wait == kWaitSema ? 2u : t->wait == kWaitSleep ? 1u : 0u);
-    st32(p + 40, static_cast<std::uint32_t>(t->wait_id));
+    st32(p + 40, held ? 0u : static_cast<std::uint32_t>(t->wait_id));
     st32(p + 44, static_cast<std::uint32_t>(t->wakeups));
 }
 
@@ -426,6 +438,10 @@ void reset() {
     g_next_handler = 1;
     g_in_handler = g_reschedule = false;
     g_pending_alarms.clear();
+    g_pace.have_last = false;
+    g_pace_until = 0;
+    g_pace_thread = 0;
+    g_pace_held = 0;
     // The console's setup word (the layout of ps2sdk's ConfigParam): screen type in bits 1-2 (2 is 16:9), "the system language is not
     // Japanese" in bit 4, version in bits 13-15 (2 is a console that knows the Japanese flag), language in bits 16-20. A game that
     // picks its text from it shows Japanese when it is 0 (Silent Hill 2 does, on its US disc). PS2_LANGUAGE=<n> picks another one (1 English,
@@ -470,6 +486,44 @@ bool in_handler() { return g_in_handler; }
 bool interruptible() { return interrupts_enabled() && !g_in_handler; }
 int current_thread() { return g_current; }
 
+// A hold of the picture pace is due: hold the thread it is for, at this safe point, until the refresh in g_pace_until.
+static void pace_serve(Cpu &c) {
+    if (frame_count() >= g_pace_until) {  // that refresh has come already: nothing to hold
+        g_pace_until = 0;
+        return;
+    }
+    if (g_pace_thread < 0) {  // the picture was shown by an interrupt handler: the thread that runs after it is held
+        if (g_reschedule || c.pc == kIdle) reschedule(c);
+        if (!g_current) return;  // none runs yet: the first one that does
+        g_pace_thread = g_current;
+    }
+    Thread *t = current();
+    if (!t || t->id != g_pace_thread || t->status != kRun || c.pc == kIdle) return;  // held when it runs again, or let go at that refresh
+    const std::uint64_t until = g_pace_until;
+    g_pace_until = 0;
+    ++g_pace_held;
+    ++g_pace_count.holds;
+    block_current(c, kWaitPace, static_cast<int>(until));
+}
+
+// At a vertical blank: threads held until this refresh go on. Their registers are untouched (they were stopped between two
+// instructions, not in a system call).
+static void pace_release() {
+    const std::uint64_t frame = frame_count();
+    int left = 0;
+    for (auto &[id, t] : g_threads) {
+        if (t.wait != kWaitPace) continue;
+        if (static_cast<std::uint64_t>(static_cast<std::uint32_t>(t.wait_id)) > frame) {
+            ++left;
+            continue;
+        }
+        t.wait = kWaitNone;
+        if (t.status == kWaitSuspend) t.status = kSuspend;
+        else make_ready(t);
+    }
+    g_pace_held = left;
+}
+
 void service(Cpu &c) {
     if (g_in_handler) return;
     run_alarms(c);
@@ -489,11 +543,14 @@ void service(Cpu &c) {
         const Thread *t = current();
         if (t && (t->status == kRun || t->status == kSuspend)) exit_current(c, false);
     }
+    if (g_pace_until) [[unlikely]] pace_serve(c);
     if (g_reschedule || c.pc == kIdle) reschedule(c);
     c.pc &= ~kUnwind;
 }
 
 void on_vblank_start() {
+    ++g_pace_count.refreshes;
+    if (g_pace_held) [[unlikely]] pace_release();
     if (!g_vsync_flag) return;
     st32(g_vsync_flag, 1);
     if (g_vsync_data) st64(g_vsync_data, hw::gs_csr());
@@ -501,6 +558,45 @@ void on_vblank_start() {
 }
 
 void wake_idle() { g_reschedule = true; }
+
+void pace_setup(int every, const char *source) {
+    g_pace.every = every > 1 ? every : 1;
+    if (g_pace.every > 1) std::fprintf(stderr, "[pace] holding the game to one picture every %d refreshes (%s)\n", g_pace.every, source);
+    else if (source && *source) std::fprintf(stderr, "[pace] off (%s)\n", source);
+}
+
+int pace_every() { return g_pace.every; }
+
+void pace_picture() {
+    const std::uint64_t frame = frame_count();
+    g_pace_count.picture(frame);
+    if (g_pace.every <= 1) return;
+    const std::uint64_t until = g_pace.picture(frame);
+    if (!until) return;
+    g_pace_until = until;
+    g_pace_thread = g_in_handler ? -1 : g_current;
+    g_reschedule = true;  // served at the next safe point (service), at most one time slice later
+}
+
+void pace_report() {
+    const pace::Count &n = g_pace_count;
+    if (!n.refreshes) return;
+    char pace[64];
+    if (g_pace.every > 1) std::snprintf(pace, sizeof pace, "pace: one picture every %d refreshes", g_pace.every);
+    else std::snprintf(pace, sizeof pace, "pace: off");
+    if (!n.pictures) {
+        std::fprintf(stderr, "[pace] the shown buffer (DISPFB) never changed in %llu refreshes: the game copies its pictures into one buffer "
+                             "(or showed none), so this count cannot tell how often it shows a new one (%s)\n",
+                     static_cast<unsigned long long>(n.refreshes), pace);
+        return;
+    }
+    std::fprintf(stderr, "[pace] %llu new pictures in %llu refreshes (one every %.2f); gaps of 1 refresh %llu, 2 %llu, 3 %llu, 4 or more %llu; "
+                         "held %llu times (%s)\n",
+                 static_cast<unsigned long long>(n.pictures), static_cast<unsigned long long>(n.refreshes),
+                 static_cast<double>(n.refreshes) / static_cast<double>(n.pictures), static_cast<unsigned long long>(n.gaps[0]),
+                 static_cast<unsigned long long>(n.gaps[1]), static_cast<unsigned long long>(n.gaps[2]), static_cast<unsigned long long>(n.gaps[3]),
+                 static_cast<unsigned long long>(n.holds), pace);
+}
 
 void dump() {
     for (const auto &[id, t] : g_threads) {
@@ -625,7 +721,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     }
     case 0x2D: case 0x2E: {
         Thread *t = thread(static_cast<int>(arg(c, 0)));
-        if (t && (t->status == kWait || t->status == kWaitSuspend)) {
+        if (t && (t->status == kWait || t->status == kWaitSuspend) && t->wait != kWaitPace) {
             for (auto &[id, s] : g_semas) s.waiters.erase(std::remove(s.waiters.begin(), s.waiters.end(), t->id), s.waiters.end());
             release(*t, -418);
             if (n == 0x2D) reschedule(c);
@@ -640,7 +736,8 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         // The kernel returns the status of the thread slot, which is 0 once its thread is gone; a game that waits for a worker
         // thread to disappear polls for that (follows upstream 507fe38). Ids outside the 256 slots still give -1.
         const Thread *t = thread(id);
-        ret(c, t ? t->status : id >= 0 && id < 256 ? 0 : -1);
+        const int status = t && t->wait == kWaitPace ? (t->status == kWaitSuspend ? kSuspend : kReady) : t ? t->status : 0;
+        ret(c, t ? status : id >= 0 && id < 256 ? 0 : -1);
         break;
     }
     case 0x32: {
@@ -995,6 +1092,20 @@ void state(ps2::state::Stream &s) {
     s.pod(g_osd_config);
     s.pod(g_boot_argc);
     s.pod(g_boot_argv);
+    if (s.version() >= 10) {  // the picture pace's last picture and a hold that is due (an older state has neither)
+        s.pod(g_pace.have_last);
+        s.pod(g_pace.last);
+        s.pod(g_pace_until);
+        s.pod(g_pace_thread);
+    } else if (s.loading()) {
+        g_pace.have_last = false;
+        g_pace_until = 0;
+        g_pace_thread = 0;
+    }
+    if (s.loading()) {
+        g_pace_held = 0;
+        for (const auto &[id, t] : g_threads) g_pace_held += t.wait == kWaitPace;
+    }
 }
 
 }

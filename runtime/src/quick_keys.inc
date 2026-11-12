@@ -336,6 +336,7 @@ void record_start(const fs::path &file, const fs::path &state, CardAt card_at) {
     else g_rec.buffer += "start state " + os::utf8(state.filename()) + " frame " + std::to_string(g_frames) + "\n";
     g_rec.buffer += "recorded " + stamp() + "\n";
     if (g_options.rtc_epoch) g_rec.buffer += "rtc " + std::to_string(g_options.rtc_epoch) + "\n";
+    g_rec.buffer += "pace " + std::to_string(kernel::pace_every()) + "\n";  // refreshes per picture (ps2/pace.hpp); a replay holds the game the same way
     const char *card_line = "card none\n";
     if (!g_options.memcard_path.empty()) {
         if (card_at == CardAt::state) {
@@ -1003,6 +1004,7 @@ bool replay_begin() {
     quick::Replay &r = quick::g_rep;
     char line[256];
     bool magic = false;
+    unsigned pace_every = 1;  // a recording without a 'pace' line was made before the picture pace existed: off
     while (std::fgets(line, sizeof line, f)) {
         unsigned long long frame = 0, begin = 0;
         unsigned buttons, a0, a1, a2, a3, l2, r2, conn;
@@ -1028,6 +1030,8 @@ bool replay_begin() {
             r.end = std::max<std::uint64_t>(r.end, frame);
         } else if (std::sscanf(line, "start state %199s frame %llu", name, &begin) == 2 || std::sscanf(line, "start power-on frame %llu", &begin) == 1) {
             r.began = begin;
+        } else if (std::sscanf(line, "pace %u", &a0) == 1 && a0 >= 1 && a0 <= 8) {
+            pace_every = a0;
         } else if (std::sscanf(line, "rtc %llu", &begin) == 1) {
             if (!g_options.rtc_epoch) g_options.rtc_epoch = begin;  // the clock the game read when this was recorded (--rtc wins)
         } else if (std::sscanf(line, "check-every %u slices %u", &a0, &a1) == 2 && a0 == quick::kCheckEvery && a1 >= 1 && a1 <= 4096 && kRamSize % a1 == 0) {
@@ -1041,6 +1045,7 @@ bool replay_begin() {
         return false;
     }
     r.active = true;
+    if (static_cast<int>(pace_every) != kernel::pace_every()) kernel::pace_setup(static_cast<int>(pace_every), "as the recording was made");
     std::fprintf(stderr, "[replay] %s: frames %llu to %llu, %zu checkpoints\n", g_options.replay_path.c_str(), static_cast<unsigned long long>(r.began),
                  static_cast<unsigned long long>(r.end), r.checks.size());
     return true;

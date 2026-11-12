@@ -1,5 +1,7 @@
 #include "keymap.hpp"
 
+#include "ps2/pace.hpp"
+
 #include <SDL.h>
 
 #include <algorithm>
@@ -290,6 +292,11 @@ void parse(const std::string &text, Config &config, std::vector<std::string> &pr
             else config.sharp_2d = found;
             continue;
         }
+        if (name == "pace") {
+            if (ps2::pace::parse(value)) config.pace = value;
+            else bad("pace is 30, 20, 15, 60 or off, ignored");
+            continue;
+        }
         if (name == "mousespeed") {
             char *tail = nullptr;
             const double v = std::strtod(value.c_str(), &tail);
@@ -386,7 +393,11 @@ std::string default_file_text() {
         "\n# Text, icons and menus drawn at the console's own size, when the inner resolution is above 1: soft (plain bilinear, as\n"
         "# before), sharp (the default: each texel keeps its colour, its edges stay smooth) or sharpest. Used when the game starts;\n"
         "# the quick menu (F1) writes it here. PS2_SHARP_2D (0, 1, 2), when it is set, wins over this line.\n"
-        "# sharp_2d = sharp\n";
+        "# sharp_2d = sharp\n"
+        "\n# The picture pace, for a game that runs too fast because it moves on once per picture: 30 holds it to one new picture every\n"
+        "# second TV refresh, as a real PS2 shows it (20: every third). 60 or off turns it off, also for a game the program paces by\n"
+        "# itself. Used when the game starts. PS2_PACE, when it is set, wins over this line.\n"
+        "# pace = 30\n";
     return t;
 }
 

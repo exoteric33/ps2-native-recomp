@@ -241,6 +241,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2vuregtest PRIVATE synchronization)
     endif()
+    # the GS message ring between two threads (wrap, full ring, held batches, sleeps and wake-ups), no game needed: ninja ps2queuestresstest
+    add_executable(ps2queuestresstest EXCLUDE_FROM_ALL tests/gs_queue_stress.cpp)
+    target_include_directories(ps2queuestresstest PRIVATE runtime/src)
+    target_link_libraries(ps2queuestresstest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2queuestresstest PRIVATE synchronization)
+    endif()
     # the late float clean-up of the compiled VU1 programs against the old one, on every bit pattern and with the processor's
     # "denormals are zero" bit set (ps2/vu_ops.hpp), no game needed: ninja ps2vucleanuptest
     add_executable(ps2vucleanuptest EXCLUDE_FROM_ALL tests/test_vu_cleanup.cpp)

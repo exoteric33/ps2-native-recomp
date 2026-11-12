@@ -933,11 +933,17 @@ void run_vu_thread() {
     thread_tune(Who::Vu);
     // PS2_VU_SPIN=<microseconds>: look for new work this long before going to sleep (a sleep and a wake-up cost a system call each)
     static const long spin_us = std::atol(os::env("PS2_VU_SPIN").c_str());
+    // What this thread hands to the drawing thread goes in batches: the packets of the vector programs and of
+    // PATH2/3 are published together when the batch reaches Ring::kBatchBytes or this thread runs out of work, every other message
+    // (present, download, state, reset, ...) at once with what came before it. The order of the messages stays as it was.
+    gs::queue::Ring &out = gs::queue::render();
+    static const int batch = [] { const std::string v = os::env("PS2_HANDOVER_BATCH"); return v.empty() ? 2 : std::atoi(v.c_str()); }();
     for (;;) {
         gs::queue::Header h;
         const std::uint8_t *payload = nullptr;
         core_sample(Who::Vu);
         crash::test_poll(crash::Thread::VectorUnit);
+        if (batch) out.hold();
         while (in.peek(h, payload)) {
             switch (h.type) {
             case gs::queue::kVif1: vif::transfer_words(1, reinterpret_cast<const std::uint32_t *>(payload), h.arg0); break;
@@ -959,7 +965,12 @@ void run_vu_thread() {
             default: gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes); break;
             }
             in.pop(h);
+            if (batch == 1 || (h.type != gs::queue::kVif1 && h.type != gs::queue::kVif1Write && h.type != gs::queue::kGif && h.type != gs::queue::kPath3Idle)) {
+                out.flush();
+                if (batch) out.hold();
+            }
         }
+        out.flush();
         const auto start = std::chrono::steady_clock::now();
         bool found = false;
         if (spin_us > 0) {

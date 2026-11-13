@@ -301,6 +301,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2talestest PRIVATE synchronization)
     endif()
+    # an EE sceSifSetDma whose transfer list or packet is in the scratchpad (issues 96 and 101, no game needed): ninja ps2sifsprtest
+    add_executable(ps2sifsprtest EXCLUDE_FROM_ALL tests/sif_spr_dma.cpp)
+    target_include_directories(ps2sifsprtest PRIVATE runtime/src)
+    target_link_libraries(ps2sifsprtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2sifsprtest PRIVATE synchronization)
+    endif()
     # an IOP reset with no image (SifIopReset("", 0), Need for Speed) and the waits after it, no game needed: ninja ps2iopresettest
     add_executable(ps2iopresettest EXCLUDE_FROM_ALL tests/iop_reboot_empty.cpp)
     target_include_directories(ps2iopresettest PRIVATE runtime/src)

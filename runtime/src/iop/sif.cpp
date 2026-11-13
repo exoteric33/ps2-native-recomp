@@ -284,10 +284,19 @@ std::uint32_t g_next_handle = 0;
 std::uint32_t g_iop_dma_id = 1, g_ee_dma_id = 1;
 std::uint64_t g_ee_dma_done = 0;
 
+// Where the EE address `a` lives on the host: the scratchpad (0x70000000..0x70003FFF) or main RAM, whatever segment the address
+// names. A game may keep the transfer list of a sceSifSetDma, or the packet it sends, in the scratchpad (NASCAR 06, Need for Speed:
+// Most Wanted, issues 96 and 101); masking such an address into main RAM read zeros, took the call for the IOP reset transfer
+// (destination 0) and dropped the command.
+std::uint8_t *ee_ptr(std::uint32_t a) {
+    if ((a >> 14) == (kScratchpadBase >> 14)) return g_spr + (a & (kScratchpadSize - 1));
+    return g_ram + (a & (kRamSize - 1));
+}
+
 template <typename T>
 T ee_read(std::uint32_t a) {
     T v;
-    std::memcpy(&v, g_ram + (a & (kRamSize - 1)), sizeof v);
+    std::memcpy(&v, ee_ptr(a), sizeof v);
     return v;
 }
 
@@ -472,7 +481,7 @@ void other_data(const std::uint8_t *packet) {
 }
 
 void command(std::uint32_t src, std::uint32_t size) {
-    const std::uint8_t *packet = g_ram + (src & (kRamSize - 1));
+    const std::uint8_t *packet = ee_ptr(src);
     const auto *h = reinterpret_cast<const Header *>(packet);
     if (g_options.trace_iop_modules) {
         std::uint32_t words[14];
@@ -645,7 +654,7 @@ std::uint32_t smflag() {
 // that work today (docs/iop-reboot-empty.md).
 void reboot(std::uint32_t src) {
     constexpr std::uint32_t kCmdReset = 0x80000003u;
-    const std::uint8_t *packet = g_ram + (src & (kRamSize - 1));
+    const std::uint8_t *packet = ee_ptr(src);
     std::uint32_t cid, args_size, mode;
     std::memcpy(&cid, packet + 8, 4);
     std::memcpy(&args_size, packet + 16, 4);
@@ -1512,13 +1521,15 @@ std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {
     std::uint64_t bytes = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint32_t base = transfers + i * 16;
-        const std::uint32_t src = ee_read<std::uint32_t>(base) & (kRamSize - 1);
+        const std::uint32_t src_address = ee_read<std::uint32_t>(base);
+        const std::uint32_t src = src_address & (kRamSize - 1);
+        const bool src_in_spr = (src_address >> 14) == (kScratchpadBase >> 14);
         const std::uint32_t dst = ee_read<std::uint32_t>(base + 4);
         const std::uint32_t size = ee_read<std::uint32_t>(base + 8) & 0x7FFFFFFFu;
         bytes += size;
         if (dst == kRpcRecvAddr) g_data_addr = src;
-        else if (dst == 0) reboot(src);
-        else if (dst == kCmdBuffer) command(src, size);
+        else if (dst == 0) reboot(src_address);
+        else if (dst == kCmdBuffer) command(src_address, size);
         else {
             iop::watch_copy("EE DMA (sceSifSetDma)", dst, src, size, 0);
             std::uint32_t moved = fit_copy("EE sceSifSetDma", src, dst, size);
@@ -1528,7 +1539,9 @@ std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {
                 const std::uint64_t room = std::min<std::uint64_t>(kRamSize - src, iop::kRamSize - (iop::phys(dst) & (iop::kRamSize - 1)));
                 moved = static_cast<std::uint32_t>(std::min<std::uint64_t>((std::uint64_t{size} + 15u) & ~std::uint64_t{15}, room));
             }
-            std::memcpy(iop::ram_ptr(dst), g_ram + src, moved);
+            // A source in the scratchpad ends with its 16 KiB, not with main RAM
+            if (src_in_spr) moved = std::min<std::uint32_t>(moved, kScratchpadSize - (src_address & (kScratchpadSize - 1)));
+            std::memcpy(iop::ram_ptr(dst), ee_ptr(src_address), moved);
             release_iop_rpc_packet(dst);
         }
     }

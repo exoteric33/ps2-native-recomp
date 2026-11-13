@@ -172,6 +172,8 @@ void set_pad_axis(int axis, std::uint8_t value, int pad = 0);
 void set_pad_pressure(int button, std::uint8_t value, int pad = 0);
 void set_pad_connected(int pad, bool connected);
 std::uint16_t pad_rumble(int pad = 0);
+// The pad state set above goes on to the controller ports at a frame boundary; a test with no frames calls this to take it over now.
+void latch_pads_now();
 void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);
 // Writes the memory card file if the game changed the card since the last write; call it wherever the game can end. hurry: do not wait
 // long for the card (Ctrl+C, a crash).

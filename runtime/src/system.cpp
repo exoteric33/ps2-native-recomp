@@ -1159,6 +1159,8 @@ void set_pad_connected(int pad, bool connected) {
     if (g_pad_in[pad].connected != connected) g_pad_dirty |= 1u << pad;
     g_pad_in[pad].connected = connected;
 }
+// For tests without a running emulation (host/pad_test.cpp): take over the host's pad state now, as the next frame boundary would.
+void latch_pads_now() { latch_pads(); }
 std::uint16_t pad_rumble(int pad) { return iop::sio2::rumble(pad); }
 void set_audio_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { iop::spu2::set_sink(std::move(sink)); }
 

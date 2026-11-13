@@ -541,11 +541,16 @@ void release(Job *) {}
 
 bool threaded() {
     // PS2_TILE_THREAD: 0 off, 1 on (when there is a render ring), 2 on even without a render ring (a single-thread run builds its lists on the helper: how the lists are
-    // compared with the old code's in a run that ends cleanly); not set: off.
+    // compared with the old code's in a run that ends cleanly); not set: on on Linux (measured faster on big batches, no loss elsewhere), off elsewhere.
     static const int mode = [] {
         const std::string text = os::env("PS2_TILE_THREAD");
         if (!text.empty()) return std::atoi(text.c_str());
-        return 0;  // off by default until the speed is measured on the charger: the helper costs memory (hundreds of MB) and has not been shown to be faster
+#ifdef __linux__
+        std::fprintf(stderr, "[tiles] helper thread on by default on Linux; PS2_TILE_THREAD=0 turns it off\n");
+        return 1;
+#else
+        return 0;  // off by default: the helper costs memory (hundreds of MB) and is not measured on this platform
+#endif
     }();
     return mode != 0 && g_configured && (mode == 2 || queue::active());
 }

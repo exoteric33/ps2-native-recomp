@@ -148,6 +148,7 @@ const Single kSingles[] = {
     ARITH(opmula, b, c),          ARITH(opmsub, a, b, c),
     PLAIN(max, max4, dest, a, b, c),     PLAIN(maxbc, maxbc4, dest, a, b, bc), PLAIN(mini, mini4, dest, a, b, c), PLAIN(minibc, minibc4, dest, a, b, bc),
     PLAIN(abs, abs4, dest, a, b),        PLAIN(move, move4, dest, a, b),       PLAIN(mr32, mr32_4, dest, a, b),
+    PLAIN(ftoi, ftoi4, dest, a, b, 0),   PLAIN(ftoi, ftoi4, dest, a, b, 4),    PLAIN(ftoi, ftoi4, dest, a, b, 12), PLAIN(ftoi, ftoi4, dest, a, b, 15),
 };
 #undef ARITH
 #undef PLAIN
@@ -267,8 +268,10 @@ bool exec(Vu0Regs &v, const Insn &i, Mode mode) {
     case Vdiv: vu::div(v, v.vf[fs].w[fsf], v.vf[ft].w[ftf]); return true;
     case Vsqrt: vu::sqrt(v, v.vf[ft].w[ftf]); return true;
     case Vrsqrt: vu::rsqrt(v, v.vf[fs].w[fsf], v.vf[ft].w[ftf]); return true;
-    case Vftoi0: vu::ftoi(v, dest, ft, fs, 0); return true;
-    case Vftoi4: vu::ftoi(v, dest, ft, fs, 4); return true;
+    case Vftoi0: PLAIN(ftoi, ftoi4, dest, ft, fs, 0);
+    case Vftoi4: PLAIN(ftoi, ftoi4, dest, ft, fs, 4);
+    case Vftoi12: PLAIN(ftoi, ftoi4, dest, ft, fs, 12);
+    case Vftoi15: PLAIN(ftoi, ftoi4, dest, ft, fs, 15);
     case Vitof0: vu::itof(v, dest, ft, fs, 0); return true;
     case Vitof12: vu::itof(v, dest, ft, fs, 12); return true;
     case Vnop: case Addiu: case Sll: return true;
@@ -424,6 +427,29 @@ int known() {
     return failures;
 }
 
+// VFTOI on every exponent, both signs and a spread of significands (the ends of each exponent included), every scale,
+// every lane: the four-lane form against fp::to_fixed one lane at a time.
+int ftoi_all() {
+    int failures = 0;
+    const int kFractions[] = {0, 4, 12, 15};
+    for (std::uint32_t e = 0; e < 256; ++e)
+        for (std::uint32_t k = 0; k < 512; ++k) {
+            const std::uint32_t m = k == 0 ? 0u : k == 1 ? 0x7FFFFFu : k == 2 ? 1u : k == 3 ? 0x400000u : r32() & 0x7FFFFFu;
+            Vu0Regs v;
+            fill(v, 4);
+            for (int i = 0; i < 4; ++i) v.vf[1].w[i] = ((k + i) & 1u ? 0x80000000u : 0u) | (e << 23) | (i ? r32() & 0x7FFFFFu : m);
+            for (const int f : kFractions) {
+                Vu0Regs got;
+                copy(got, v);
+                vu::ftoi4(got, 15u, 2u, 1u, f);
+                for (int i = 0; i < 4; ++i)
+                    if (got.vf[2].w[i] != fp::to_fixed(v.vf[1].w[i], f) && failures++ < 3)
+                        std::printf("FAIL ftoi%d %08X: want %08X got %08X\n", f, v.vf[1].w[i], fp::to_fixed(v.vf[1].w[i], f), got.vf[2].w[i]);
+            }
+        }
+    return failures;
+}
+
 }
 
 int main(int argc, char **argv) {
@@ -433,6 +459,7 @@ int main(int argc, char **argv) {
     failures += singles(cases);
     std::printf("single instructions: %zu kinds, %llu cases each\n", sizeof kSingles / sizeof *kSingles, static_cast<unsigned long long>(cases));
     failures += lines(cases);
+    failures += ftoi_all();
     std::printf(failures ? "FAILED: %d\n" : "ok\n", failures);
     return failures ? 1 : 0;
 }

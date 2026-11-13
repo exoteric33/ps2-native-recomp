@@ -537,9 +537,38 @@ private:
         line("}");
     }
 
+    // A delay loop: the branch at i goes back to t over nothing but one `addiu rX, rX, -1` and nops, its delay slot is a nop,
+    // and it loops while rX is not zero. Returns X, or 0 when the branch is anything else. Such a loop only counts down and
+    // uses up cycles; games wait in them (God of War: 2000 turns between two looks at a counter that an interrupt raises).
+    std::uint32_t countdown_register(const Insn &i, const Insn &ds) {
+        if (countdown_off_ || i.op != Bne || ds.word != 0u) return 0;
+        const std::uint32_t x = i.rt() == 0 ? i.rs() : i.rs() == 0 ? i.rt() : 0u;
+        const std::uint32_t t = i.branch_target(), a = i.pc;
+        if (x == 0 || t >= a || !in_unit(t) || !have_label(t)) return 0;
+        if (options_.probes.count(a) || options_.toggles.count(a) || options_.probes.count(a + 4) || options_.toggles.count(a + 4)) return 0;
+        int counts = 0;
+        for (std::uint32_t p = t; p < a; p += 4) {
+            if (!p_.is_code(p) || (p != t && labels_.count(p)) || options_.probes.count(p) || options_.toggles.count(p)) return 0;
+            const Insn s = at(p);
+            if (s.word == 0u) continue;
+            if ((s.op != Addiu && s.op != Addi) || s.rs() != x || s.rt() != x || s.simm() != -1) return 0;
+            ++counts;
+        }
+        return counts == 1 ? x : 0u;
+    }
+
     void control(const Insn &i, const Insn &ds) {
         const std::uint32_t a = i.pc, ret = a + 8;
-        line(std::format("c.budget -= {};", pending_ + 2));
+        const std::uint32_t cost = pending_ + 2;
+        line(std::format("c.budget -= {};", cost));
+        // Turns of a delay loop (countdown_register) that end before the budget runs out are done at once: the loop takes
+        // rX down by one and the budget by `cost` every turn and asks preempt() only once the budget is below zero, so
+        // running s turns here, as long as rX does not reach zero and the budget stays at zero or above, leaves rX and the
+        // budget as the turns would, and the loop goes on from there as before (the last turn, or the one that preempts).
+        if (const std::uint32_t x = countdown_register(i, ds))
+            line(std::format("{{ const std::uint32_t n = c.r[{0}].w[0]; if (n > 1u && c.budget >= {1}) {{ const std::uint32_t q = static_cast<std::uint32_t>(c.budget) / {1}u, "
+                             "s = n - 1u < q ? n - 1u : q; set32(c.r[{0}], n - s); c.budget -= static_cast<std::int32_t>(s * {1}u); }} }}",
+                             x, cost));
         pending_ = 0;
         if (complex_slot(ds)) {
             slot_flow(a, Next{Next::Jump, a + 4, 0, {}}, 0);
@@ -993,7 +1022,7 @@ private:
         }
         case Vftoi0: case Vftoi4: case Vftoi12: case Vftoi15: {
             const int frac = i.op == Vftoi0 ? 0 : i.op == Vftoi4 ? 4 : i.op == Vftoi12 ? 12 : 15;
-            line(std::format("vu::ftoi(c.vu0, {}u, {}u, {}u, {});", i.dest(), i.ft(), i.fs(), frac));
+            line(std::format("vu::{}(c.vu0, {}u, {}u, {}u, {});", vu0_old_ ? "ftoi" : "ftoi4", i.dest(), i.ft(), i.fs(), frac));
             break;
         }
         case Vabs: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("abs", false), i.dest(), i.ft(), i.fs())); break;
@@ -1044,6 +1073,7 @@ private:
     std::set<std::uint32_t> labels_;
     bool flags_dead_{};  // the instruction simple() is writing sets vector-unit flags that nothing can see (vu0_flags_unseen)
     const bool vu0_old_ = [] { const char *e = std::getenv("PS2_VU0_HELPERS"); return e && std::string_view(e) == "old"; }();
+    const bool countdown_off_ = [] { const char *e = std::getenv("PS2_EE_COUNTDOWN"); return e && std::string_view(e) == "0"; }();
     std::size_t unserved_{};  // branch targets without a label that left through the dispatcher (see unserved())
     std::string *capture_{};
     bool collecting_{};

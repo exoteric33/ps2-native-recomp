@@ -275,9 +275,16 @@ PS2_VU4 u32x4 add_flushed(u32x4 a, u32x4 b, u32x4 &bad) {
     // fp::add shifts the smaller significand right by the difference of the exponents and keeps one bit below the last
     // place of the larger: of `small` the bits from 2^(difference - 1) up stay, and nothing from a difference of 25.
     const u32x4 diff = ((big >> 23) - (small >> 23)) & 0xFFu;
+#if defined(__AVX2__)
+    // With AVX2 every lane shifts by its own count, and a count of 32 or more gives 0: ~0 << diff is -(2^diff), the same
+    // mask as below without its way through a float.
+    const s32x4 cut = (s32x4)__builtin_ia32_psllv4si((s32x4)splat(~0u), (s32x4)diff);
+    small &= (u32x4)(cut >> 1) & (u32x4)((s32x4)diff < 25);
+#else
     const s32x4 d = (s32x4)__builtin_elementwise_min((s16x8)diff, (s16x8)splat(25u));
     const u32x4 pow2 = (u32x4)__builtin_convertvector((f32x4)(((u32x4)d + 127u) << 23), s32x4);
     small &= (u32x4)((s32x4)(0u - pow2) >> 1) & (u32x4)(d < 25);
+#endif
     // What is left adds without losing anything but the PC's own rounding. `rest` is that sum's error, exact because
     // `big` is the larger operand: when it is not zero and points the other way than the sum, the sum was rounded away
     // from zero and the float one step below is the cut-off one.
@@ -423,6 +430,21 @@ PS2_VU4 void move4(Vu0Regs &v, unsigned dest, unsigned ft, unsigned fs) { v4::ke
 PS2_VU4 void mr32_4(Vu0Regs &v, unsigned dest, unsigned ft, unsigned fs) {
     const u32x4 s = v.vf[fs].uw4;
     v4::keep(v, dest, ft, __builtin_shufflevector(s, s, 1, 2, 3, 0));
+}
+// ftoi(), fp::to_fixed on four lanes (no flags). A lane whose exponent plus `fraction` is 158 or more becomes the largest
+// number of its sign; a zero, a denormal, or a value that is below one after the scaling becomes 0. Every other lane is
+// the value times 2^fraction (exact: a power of two times a normal float, below 2^31) cut towards zero by the PC's own
+// conversion, which is what to_fixed's shift of the significand does. The lanes of the first two kinds are zeroed before
+// the conversion, so it never sees a number it cannot convert.
+PS2_VU4 void ftoi4(Vu0Regs &v, unsigned dest, unsigned ft, unsigned fs, int fraction) {
+    const u32x4 x = v.vf[fs].uw4;
+    const s32x4 e = (s32x4)((x >> 23) & 0xFFu) + fraction;
+    const u32x4 big = (u32x4)(e >= 158);
+    const u32x4 none = (u32x4)(e <= 126) | (u32x4)((x & 0x7F800000u) == 0u);
+    const f32x4 scaled = (f32x4)(x & ~(big | none)) * (f32x4)v4::splat((127u + static_cast<std::uint32_t>(fraction)) << 23);
+    const u32x4 whole = (u32x4)__builtin_convertvector(scaled, s32x4);
+    const u32x4 most = (x >> 31) + 0x7FFFFFFFu;
+    v4::keep(v, dest, ft, (whole & ~big) | (most & big));
 }
 
 }

@@ -54,6 +54,18 @@ void walk(Path &p, const std::uint8_t *data, std::uint32_t qwc, Sink &sink) {
             std::uint32_t reg = p.reg, loop = p.loop;
             const std::uint32_t nreg = p.nreg, nloop = p.nloop;
             const std::uint64_t regs = p.regs;
+            if (sink.runs(regs, nreg)) {
+                // the rest of this tag's data, or of this message, in one call (gs::write_packed_run)
+                const std::uint64_t left = static_cast<std::uint64_t>(nloop - loop) * nreg - reg;
+                const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::uint64_t>(left, qwc - i));
+                sink.packed_run(data + static_cast<std::size_t>(i) * 16, n, regs, nreg, reg);
+                const std::uint64_t done = static_cast<std::uint64_t>(loop) * nreg + reg + n;
+                p.loop = static_cast<std::uint32_t>(done / nreg);
+                p.reg = static_cast<std::uint32_t>(done % nreg);
+                if (p.loop >= nloop) p.active = false;
+                i += n - 1;
+                break;
+            }
             for (;;) {
                 sink.packed(static_cast<std::uint32_t>(regs >> (reg * 4)) & 0xFu, q);
                 if (++reg >= nreg) {
@@ -144,6 +156,18 @@ struct GsSink {
         if ((reg == 0xEu && !exists(static_cast<std::uint32_t>(q.d[1]) & 0xFFu)) || reg == 0xBu) [[unlikely]]
             note(g_missing[path], path, reg == 0xEu ? static_cast<std::uint32_t>(q.d[1]) & 0xFFu : reg, reg == 0xEu ? 'a' : 'p', 0);
         gs::write_packed(reg, q);
+    }
+    // True when none of the tag's descriptors is A+D (0xE, whose address is checked qword by qword) or the reserved 0xB: its data can then
+    // go to the GS in runs (packed_run) with no check per qword.
+    static bool runs(std::uint64_t regs, std::uint32_t nreg) {
+        for (std::uint32_t r = 0; r < nreg; ++r) {
+            const std::uint32_t d = static_cast<std::uint32_t>(regs >> (r * 4)) & 0xFu;
+            if (d == 0xEu || d == 0xBu) return false;
+        }
+        return true;
+    }
+    void packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg) {
+        gs::write_packed_run(data, count, regs, nreg, reg);
     }
     void reglist(std::uint32_t reg, std::uint64_t value) {
         if (reg == 0xBu || reg == 0xEu) [[unlikely]] note(g_missing[path], path, reg, 'r', 0);

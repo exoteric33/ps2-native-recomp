@@ -166,7 +166,8 @@ inline void corner_attrs3(std::uint32_t *rec, const Vertex *v, bool fst, bool ii
 #endif
 }
 
-inline bool triangle(std::uint32_t *rec, int box[4], const Vertex *v, int ofx, int ofy, float samples, std::uint32_t scissor_x, std::uint32_t scissor_y,
+// Always inlined into draw(): the call passed ten arguments, some on the stack, for every triangle.
+[[gnu::always_inline]] inline bool triangle(std::uint32_t *rec, int box[4], const Vertex *v, int ofx, int ofy, float samples, std::uint32_t scissor_x, std::uint32_t scissor_y,
                      bool fst, bool iip) {
     PS2_SETUP_NO_FMA
     using vec::F4;

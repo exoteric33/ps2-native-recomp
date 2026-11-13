@@ -757,7 +757,8 @@ void transfer(const State &s, std::uint64_t dir) {
 
 }
 
-static void kick(bool draw) {
+// Inlined into the PACKED run (write_packed_run): as a call of its own it cost the ship about 0.15 ms of the drawing thread a frame.
+[[gnu::always_inline]] static inline void kick(bool draw) {
     State &s = g_state;
     const std::uint32_t prim = static_cast<std::uint32_t>(s.prim) & 7u;
     const int needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
@@ -965,11 +966,7 @@ static void write_packed_generic(std::uint32_t reg, const Reg128 &q);
 // stores them; write() would unpack the vertex words into one 64-bit value just for vertex() to take them apart again. It counts the register
 // in g_writes (statistics) and does not change g_setup_generation for these registers, as write() does. The rest, and everything while
 // PS2_TRACE_GSSEQ prints the writes, goes the old way.
-void write_packed(std::uint32_t reg, const Reg128 &q) {
-    if (g_gsseq) [[unlikely]] {
-        write_packed_generic(reg, q);
-        return;
-    }
+[[gnu::always_inline]] static inline void packed_one(std::uint32_t reg, const Reg128 &q) {
     State &s = g_state;
     switch (reg) {
     case 0x1: {
@@ -997,6 +994,28 @@ void write_packed(std::uint32_t reg, const Reg128 &q) {
         break;
     }
     default: write_packed_generic(reg, q); break;
+    }
+}
+
+void write_packed(std::uint32_t reg, const Reg128 &q) {
+    if (g_gsseq) [[unlikely]] {
+        write_packed_generic(reg, q);
+        return;
+    }
+    packed_one(reg, q);
+}
+
+// `count` qwords of PACKED data in a row, the first for descriptor `reg` of `regs` (`nreg` of them): the same writes in the same order as
+// write_packed for each one, but one call for the run instead of one per qword. On the God of War ship (about 53,000 small triangles a
+// frame, nine qwords each) the calls, the trace check and the reloads around them took about 0.3 ms of the drawing thread a frame.
+void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg) {
+    for (std::uint32_t k = 0; k < count; ++k) {
+        Reg128 q;
+        std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
+        const std::uint32_t r = static_cast<std::uint32_t>(regs >> (reg * 4)) & 0xFu;
+        if (g_gsseq) [[unlikely]] write_packed_generic(r, q);
+        else packed_one(r, q);
+        if (++reg >= nreg) reg = 0;
     }
 }
 

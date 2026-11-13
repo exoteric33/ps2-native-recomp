@@ -1645,15 +1645,21 @@ void flush_batch() {
     reset_batch();
 }
 
-void batch_ranges() {
+[[gnu::noinline]] void batch_ranges_now() {
     Batch &b = g_batch;
-    if (b.rx0 == b.minx && b.ry0 == b.miny && b.rx1 == b.maxx && b.ry1 == b.maxy) return;
     b.rx0 = b.minx;
     b.ry0 = b.miny;
     b.rx1 = b.maxx;
     b.ry1 = b.maxy;
     b.fb_range = region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
     b.z_range = region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
+}
+
+// The ranges are made again only when the batch's box grew; the check is inlined, as draw() asks for every textured shape.
+[[gnu::always_inline]] inline void batch_ranges() {
+    const Batch &b = g_batch;
+    if (b.rx0 == b.minx && b.ry0 == b.miny && b.rx1 == b.maxx && b.ry1 == b.maxy) return;
+    batch_ranges_now();
 }
 
 bool batch_conflict(const Range &r, bool clut) {
@@ -3772,7 +3778,7 @@ void draw(const State &st, const Vertex *v, int count) {
         if (g_stream) tiles::feed(g_stream, b.prims.data(), shapes);
         else if (tiles_to_helper() && tiles::backlog() < tiles::kMaxBacklog) g_stream = tiles::open(b.prims.data(), shapes);
     }
-    exact_follow(rec, setup);
+    if (g_exact.pending_valid || g_exact.state == 1) exact_follow(rec, setup);  // it does nothing else (most shapes: a call saved)
     if (g_live && b.route == 1) hw::live_shape(cache.look, setup, rec, fresh_batch);  // the card's checks start now
     b.minx = std::min(b.minx, minx);
     b.miny = std::min(b.miny, miny);

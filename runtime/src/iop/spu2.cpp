@@ -9,10 +9,14 @@
 #include "ps2/state.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <new>
+#include <string>
 #include <vector>
 
 namespace ps2::iop {
@@ -100,6 +104,74 @@ std::uint64_t g_next_tick = 0;
 bool g_reverb_off = false;  // PS2_SPU2_REVERB=0 leaves the reverb out (to compare with the sound from before it existed)
 bool g_tick_pending = false;
 std::uint64_t g_first_tick = 0, g_last_tick = 0;
+
+// ---- what the problem report (F9) says about the sound (summary() at the end of this file) ----
+// A few relaxed atomics that only the emulation thread writes (the key on/off registers, the DMA and the sound tick all run there) and
+// that the report may read from another thread. They are not part of a save state and do not change what the chip does. Events are
+// counted per second of IOP time in a small ring, so "the last 5 seconds" needs no list of events and no clock of its own.
+constexpr std::uint64_t kClockHz = 36864000;  // the IOP's clock, which kernel::now() counts
+constexpr unsigned kBuckets = 8, kWindowSeconds = 5;
+using Counter = std::atomic<std::uint32_t>;
+using Counter64 = std::atomic<std::uint64_t>;
+
+void bump(Counter &c, std::uint32_t n = 1) { c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed); }
+void bump(Counter64 &c, std::uint64_t n = 1) { c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed); }
+void raise(Counter &c, std::uint32_t v) {
+    if (v > c.load(std::memory_order_relaxed)) c.store(v, std::memory_order_relaxed);
+}
+
+struct Bucket {
+    Counter64 second;  // the IOP second this bucket counts, plus 1 (0 = never used)
+    Counter kon[2], koff[2], blank_kon[2], upload_bytes[2], adma_bytes[2], peak_pre[2], peak_out;
+};
+Bucket g_buckets[kBuckets];
+
+struct Totals {
+    Counter64 kon[2], koff[2], blank_kon[2], upload_bytes[2], uploads[2], adma_bytes[2], adma_stops[2];
+    Counter64 last_upload[2], last_adma[2], last_stop[2], last_kon[2], last_batch, batches;  // IOP time + 1 (0 = never)
+    Counter peak_out, peak_pre[2];
+};
+Totals g_totals;
+
+// A voice that is playing, as the summary shows it (refreshed about six times a second).
+struct VoiceNote {
+    Counter w[3];  // 0: valid, voice, phase, start address; 1: pitch and flags; 2: envelope level
+};
+struct Live {
+    Counter attr[2], admas[2], input_frames[2], queued[2], playing[2], keyed_no_mixer[2];
+    Counter mvol[2][2], bvol[2][2], evol[2][2];
+    VoiceNote notes[2][3];
+};
+Live g_live;
+constexpr unsigned kNoteFlagVoll = 1, kNoteFlagVolr = 2, kNoteFlagData = 4, kNoteFlagMixed = 8;
+
+// A machine reset starts the counts over (the IOP clock they are stamped with starts over too).
+void clear_summary() {
+    for (Bucket &b : g_buckets) {
+        b.second.store(0, std::memory_order_relaxed);
+    }
+    new (&g_totals) Totals();
+    new (&g_live) Live();
+}
+
+Bucket &bucket() {
+    const std::uint64_t second = kernel::now() / kClockHz + 1;
+    Bucket &b = g_buckets[second % kBuckets];
+    if (b.second.load(std::memory_order_relaxed) != second) {
+        for (int c = 0; c < 2; ++c) {
+            b.kon[c].store(0, std::memory_order_relaxed);
+            b.koff[c].store(0, std::memory_order_relaxed);
+            b.blank_kon[c].store(0, std::memory_order_relaxed);
+            b.upload_bytes[c].store(0, std::memory_order_relaxed);
+            b.adma_bytes[c].store(0, std::memory_order_relaxed);
+            b.peak_pre[c].store(0, std::memory_order_relaxed);
+        }
+        b.peak_out.store(0, std::memory_order_relaxed);
+        b.second.store(second, std::memory_order_relaxed);
+    }
+    return b;
+}
+void stamp(Counter64 &t) { t.store(kernel::now() + 1, std::memory_order_relaxed); }
 
 // A 48000 Hz 16-bit stereo WAV file written while the sound is made, so a long run needs no memory for it. The header is
 // brought up to date about once a second, so a run that is killed still leaves a file that plays up to that point.
@@ -342,6 +414,9 @@ void feed_input(int core) {
             g_ram[kInputBase[core] + 0x200 + slot] = static_cast<std::uint16_t>(r);
         }
         k.input_count += frames;
+        bump(bucket().adma_bytes[core], chunk);
+        bump(g_totals.adma_bytes[core], chunk);
+        stamp(g_totals.last_adma[core]);
         t.madr += chunk;
         t.bytes -= chunk;
         if (!t.bytes) {
@@ -451,6 +526,56 @@ void write_rings(int core, const std::int16_t (*rings)[kBatch]) {
     }
 }
 
+// The sound summary's view of the cores, refreshed every 256 batches (about 0.17 s of sound): what is playing and where it goes.
+void publish_live() {
+    constexpr auto kRelaxed = std::memory_order_relaxed;
+    for (int c = 0; c < 2; ++c) {
+        const Core &k = g_cores[c];
+        const Routing route = routing(k);
+        g_live.attr[c].store(k.attr, kRelaxed);
+        g_live.admas[c].store(k.admas, kRelaxed);
+        g_live.input_frames[c].store(k.input_count, kRelaxed);
+        g_live.queued[c].store(static_cast<std::uint32_t>(k.transfers.size()), kRelaxed);
+        for (int i = 0; i < 2; ++i) {
+            g_live.mvol[c][i].store(k.mvol[i], kRelaxed);
+            g_live.bvol[c][i].store(k.bvol[i], kRelaxed);
+            g_live.evol[c][i].store(k.evol[i], kRelaxed);
+        }
+        std::uint32_t playing = 0, shown = 0, no_mixer = 0;
+        for (unsigned i = 0; i < 24; ++i) {
+            const Voice &v = k.voices[i];
+            if (v.phase == kOff && !v.key_on) continue;
+            ++playing;
+            const bool mixed = ((route.dry[0] | route.dry[1] | route.wet[0] | route.wet[1]) >> i) & 1u;
+            if (!mixed) ++no_mixer;
+            if (shown >= 3) continue;
+            bool data = false;
+            for (unsigned w = 0; w < 8; ++w) data |= g_ram[(v.ssa + w) & kRamMask] != 0;
+            const std::uint32_t flags = ((v.voll & 0x7FFFu) ? kNoteFlagVoll : 0) | ((v.volr & 0x7FFFu) ? kNoteFlagVolr : 0) | (data ? kNoteFlagData : 0) | (mixed ? kNoteFlagMixed : 0);
+            VoiceNote &n = g_live.notes[c][shown++];
+            n.w[0].store(0x80000000u | i << 24 | static_cast<std::uint32_t>(v.phase) << 20 | (v.ssa & 0xFFFFFu), kRelaxed);
+            n.w[1].store(v.pitch | flags << 16, kRelaxed);
+            n.w[2].store(static_cast<std::uint32_t>(v.env.level), kRelaxed);
+        }
+        for (; shown < 3; ++shown) g_live.notes[c][shown].w[0].store(0, kRelaxed);
+        g_live.playing[c].store(playing, kRelaxed);
+        g_live.keyed_no_mixer[c].store(no_mixer, kRelaxed);
+    }
+}
+
+void note_batch(const std::int32_t (&peak_pre)[2], std::int32_t peak_out) {
+    Bucket &b = bucket();
+    for (int c = 0; c < 2; ++c) {
+        raise(b.peak_pre[c], static_cast<std::uint32_t>(peak_pre[c]));
+        raise(g_totals.peak_pre[c], static_cast<std::uint32_t>(peak_pre[c]));
+    }
+    raise(b.peak_out, static_cast<std::uint32_t>(peak_out));
+    raise(g_totals.peak_out, static_cast<std::uint32_t>(peak_out));
+    stamp(g_totals.last_batch);
+    if ((g_totals.batches.load(std::memory_order_relaxed) & 255u) == 0) publish_live();
+    bump(g_totals.batches);
+}
+
 void tick() {
     const cost::Timer time_it(cost::kSpuTick);
     std::int16_t out[kBatch * 2];
@@ -487,9 +612,11 @@ void tick() {
             }
         }
     }
+    std::int32_t peak_pre[2] = {}, peak_out = 0;  // for the problem report: the loudest sample before and after the master volume
     for (unsigned n = 0; n < kBatch; ++n) {
         std::int32_t mix[2] = {};
         for (int c = 0; c < 2; ++c) {
+            peak_pre[c] = std::max({peak_pre[c], std::abs(sum[c][n][0]), std::abs(sum[c][n][1])});
             const std::int32_t l = sum[c][n][0] * master(g_cores[c].mvol[0]) >> 15, r = sum[c][n][1] * master(g_cores[c].mvol[1]) >> 15;
             if (!c) {
                 rings[1][0][n] = clamp16(l);
@@ -500,7 +627,9 @@ void tick() {
         }
         out[n * 2] = clamp16(mix[0]);
         out[n * 2 + 1] = clamp16(mix[1]);
+        peak_out = std::max({peak_out, std::abs(static_cast<std::int32_t>(out[n * 2])), std::abs(static_cast<std::int32_t>(out[n * 2 + 1]))});
     }
+    note_batch(peak_pre, peak_out);
     write_rings(0, rings[0]);
     write_rings(1, rings[1]);
     if (count && ++ticks % 15000 == 0)
@@ -621,6 +750,23 @@ void key(Core &k, std::uint32_t mask, bool on) {
             if (!kon_late()) key_on(v);
         } else if (v.key_on) v.key_on = false;
         else if (v.phase != kOff) v.phase = kRelease;
+        // for the problem report
+        Bucket &b = bucket();
+        const int c = static_cast<int>(&k - g_cores);
+        if (on) {
+            bool data = false;  // does the sound data at the voice's start address hold anything (a block of zeros is silence)?
+            for (unsigned w = 0; w < 8; ++w) data |= g_ram[(v.ssa + w) & kRamMask] != 0;
+            bump(b.kon[c]);
+            bump(g_totals.kon[c]);
+            if (!data) {
+                bump(b.blank_kon[c]);
+                bump(g_totals.blank_kon[c]);
+            }
+            stamp(g_totals.last_kon[c]);
+        } else {
+            bump(b.koff[c]);
+            bump(g_totals.koff[c]);
+        }
     }
 }
 
@@ -687,6 +833,8 @@ void write_core(int core, std::uint32_t off, std::uint32_t value) {
         check_irq(k.tsa, 1);
         g_ram[k.tsa] = static_cast<std::uint16_t>(value);
         k.tsa = (k.tsa + 1) & kRamMask;
+        bump(g_totals.upload_bytes[core], 2);
+        stamp(g_totals.last_upload[core]);
         break;
     case 0x1B0:
         k.admas = static_cast<std::uint16_t>(value);
@@ -750,6 +898,7 @@ void reset() {
     g_reverb_off = os::env("PS2_SPU2_REVERB") == "0";
     g_tick_pending = false;
     g_first_tick = g_last_tick = 0;
+    clear_summary();
     const std::string chip = os::env("PS2_DUMP_AUDIO"), out = os::env("PS2_AUDIO_DUMP");
     if (!chip.empty() && g_chip_wav.open(chip)) std::fprintf(stderr, "[spu2] writing the sound chip's output to %s\n", chip.c_str());
     // the sink is set before the machine resets (host/window.cpp opens the sound device first)
@@ -811,6 +960,12 @@ void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, int cha
         else std::memcpy(iop, spu, 2);
     }
     k.tsa = (k.tsa + halfwords) & kRamMask;
+    if (to_spu) {
+        bump(bucket().upload_bytes[core], words * 4);
+        bump(g_totals.upload_bytes[core], words * 4);
+        bump(g_totals.uploads[core]);
+        stamp(g_totals.last_upload[core]);
+    }
     if (channel >= 0) kernel::schedule(kernel::now() + 64 + words / 4, kernel::Job{kernel::kJobDmaDone, static_cast<std::uint32_t>(channel)});
 }
 
@@ -824,6 +979,8 @@ void dma_stop(int core) {
         std::fprintf(stderr, "[adma] core %d dma stopped at %.4f s, %zu transfers dropped, %u frames waiting\n", core,
                      g_first_tick ? static_cast<double>(kernel::now() - g_first_tick) / 36864000.0 : 0.0, k.transfers.size(), k.input_count);
     k.transfers.clear();
+    bump(g_totals.adma_stops[core]);
+    stamp(g_totals.last_stop[core]);
 }
 
 void set_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { g_sink = std::move(sink); }
@@ -891,6 +1048,142 @@ void state(ps2::state::Stream &s) {
     s.pod(g_spdif_media);
     s.pod(g_next_tick);
     s.pod(g_tick_pending);
+}
+
+}
+
+namespace ps2::iop::spu2 {
+
+namespace {
+
+struct Window {
+    std::uint64_t kon[2] = {}, koff[2] = {}, blank_kon[2] = {}, upload[2] = {}, adma[2] = {};
+    std::uint32_t peak_pre[2] = {}, peak_out = 0;
+};
+
+// the sums of the buckets of the last kWindowSeconds seconds of IOP time (4 to 5 seconds, since the newest one is still filling)
+Window window(std::uint64_t now) {
+    Window w;
+    const std::uint64_t current = now / kClockHz + 1;
+    for (const Bucket &b : g_buckets) {
+        const std::uint64_t second = b.second.load(std::memory_order_relaxed);
+        if (!second || second > current || current - second >= kWindowSeconds) continue;
+        for (int c = 0; c < 2; ++c) {
+            w.kon[c] += b.kon[c].load(std::memory_order_relaxed);
+            w.koff[c] += b.koff[c].load(std::memory_order_relaxed);
+            w.blank_kon[c] += b.blank_kon[c].load(std::memory_order_relaxed);
+            w.upload[c] += b.upload_bytes[c].load(std::memory_order_relaxed);
+            w.adma[c] += b.adma_bytes[c].load(std::memory_order_relaxed);
+            w.peak_pre[c] = std::max(w.peak_pre[c], b.peak_pre[c].load(std::memory_order_relaxed));
+        }
+        w.peak_out = std::max(w.peak_out, b.peak_out.load(std::memory_order_relaxed));
+    }
+    return w;
+}
+
+std::string text(const char *format, ...) __attribute__((format(printf, 1, 2)));
+std::string text(const char *format, ...) {
+    char buffer[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buffer, sizeof buffer, format, args);
+    va_end(args);
+    return buffer;
+}
+
+// "never" or "3.2 s ago" for a time stamp (IOP time plus 1, 0 = never)
+std::string ago(std::uint64_t stamp, std::uint64_t now) {
+    if (!stamp) return "never";
+    const double seconds = stamp - 1 > now ? 0.0 : static_cast<double>(now - (stamp - 1)) / static_cast<double>(kClockHz);
+    return text("%.1f s ago", seconds);
+}
+
+// a master or bus volume register is zero when it is not sweeping and its 15 value bits are 0
+bool volume_set(std::uint32_t reg) { return (reg & 0x8000u) || (reg & 0x7FFFu); }
+
+}  // namespace
+
+// The sound part of the problem report: plain lines (indented four spaces) that tell from one report whether the game's sound driver
+// starts voices, whether sound data reached the sound memory, whether the stream (auto-DMA) goes on and whether anything comes out.
+std::string summary() {
+    constexpr auto kRelaxed = std::memory_order_relaxed;
+    const std::uint64_t now = kernel::now();
+    const Window w = window(now);
+    const Totals &t = g_totals;
+    const auto sum2 = [](const Counter64 (&a)[2]) { return a[0].load(kRelaxed) + a[1].load(kRelaxed); };
+    const auto sum2w = [](const std::uint64_t (&a)[2]) { return a[0] + a[1]; };
+    const std::uint64_t batches = t.batches.load(kRelaxed);
+    std::string out;
+    if (!batches) return "    the game has not used the sound chip yet (no sound batch has been made since the runner started)\n";
+
+    out += text("    sound chip:      running, %llu batches made since start, the last one %s\n", static_cast<unsigned long long>(batches), ago(t.last_batch.load(kRelaxed), now).c_str());
+    out += "    (\"last 5 s\" below = the last 4 to 5 seconds of the game's own time)\n";
+    for (int c = 0; c < 2; ++c)
+        out += text("    voices started:  core %d: last 5 s %llu on / %llu off; since start %llu on / %llu off (last start %s)\n", c, static_cast<unsigned long long>(w.kon[c]),
+                    static_cast<unsigned long long>(w.koff[c]), static_cast<unsigned long long>(t.kon[c].load(kRelaxed)), static_cast<unsigned long long>(t.koff[c].load(kRelaxed)),
+                    ago(t.last_kon[c].load(kRelaxed), now).c_str());
+    out += text("    start data:      %llu of the %llu voices started since start had only zeros at their start address (last 5 s: %llu of %llu)\n",
+                static_cast<unsigned long long>(sum2(t.blank_kon)), static_cast<unsigned long long>(sum2(t.kon)), static_cast<unsigned long long>(sum2w(w.blank_kon)),
+                static_cast<unsigned long long>(sum2w(w.kon)));
+    for (int c = 0; c < 2; ++c) {
+        out += text("    playing now:     core %d: %u voices (%u not sent to the mixer)\n", c, g_live.playing[c].load(kRelaxed), g_live.keyed_no_mixer[c].load(kRelaxed));
+        for (const VoiceNote &n : g_live.notes[c]) {
+            const std::uint32_t w0 = n.w[0].load(kRelaxed), w1 = n.w[1].load(kRelaxed);
+            if (!(w0 & 0x80000000u)) continue;
+            static const char *const kPhase[] = {"off", "attack", "decay", "sustain", "release"};
+            const std::uint32_t flags = w1 >> 16, phase = (w0 >> 20) & 7u;
+            out += text("                     voice %u: start 0x%05X, pitch 0x%04X (0x1000 = normal), volume left %s right %s, %s, %s, %s, envelope %u of 32767\n", (w0 >> 24) & 31u, w0 & 0xFFFFFu,
+                        w1 & 0xFFFFu, (flags & kNoteFlagVoll) ? "set" : "ZERO", (flags & kNoteFlagVolr) ? "set" : "ZERO", (flags & kNoteFlagData) ? "data at start" : "NO DATA at start (zeros)",
+                        (flags & kNoteFlagMixed) ? "sent to the mixer" : "NOT sent to the mixer", phase < 5 ? kPhase[phase] : "?", n.w[2].load(kRelaxed));
+        }
+    }
+    for (int c = 0; c < 2; ++c)
+        out += text("    sound data in:   core %d: last 5 s %llu bytes into sound memory; since start %llu bytes in %llu transfers (last %s)\n", c, static_cast<unsigned long long>(w.upload[c]),
+                    static_cast<unsigned long long>(t.upload_bytes[c].load(kRelaxed)), static_cast<unsigned long long>(t.uploads[c].load(kRelaxed)), ago(t.last_upload[c].load(kRelaxed), now).c_str());
+    bool stream_stopped = false, stream_flowing = false;
+    for (int c = 0; c < 2; ++c) {
+        const bool on = (g_live.admas[c].load(kRelaxed) & (1u << c)) != 0;
+        out += text("    stream (ADMA):   core %d: %s, last 5 s %llu bytes moved, since start %llu bytes (last %s), %u blocks waiting, stopped by the game %llu times\n", c, on ? "ON" : "off",
+                    static_cast<unsigned long long>(w.adma[c]), static_cast<unsigned long long>(t.adma_bytes[c].load(kRelaxed)), ago(t.last_adma[c].load(kRelaxed), now).c_str(),
+                    g_live.queued[c].load(kRelaxed), static_cast<unsigned long long>(t.adma_stops[c].load(kRelaxed)));
+        if (on && !w.adma[c] && t.adma_bytes[c].load(kRelaxed)) stream_stopped = true;
+        if (w.adma[c]) stream_flowing = true;
+    }
+    for (int c = 0; c < 2; ++c) {
+        const std::uint32_t l = g_live.mvol[c][0].load(kRelaxed), r = g_live.mvol[c][1].load(kRelaxed), bl = g_live.bvol[c][0].load(kRelaxed), br = g_live.bvol[c][1].load(kRelaxed);
+        const bool set = volume_set(l) || volume_set(r);
+        out += text("    volumes:         core %d: master %s (0x%04X 0x%04X), stream input %s (0x%04X 0x%04X), core %s\n", c, set ? "not zero" : "ZERO", l, r, (volume_set(bl) || volume_set(br)) ? "not zero" : "ZERO", bl, br,
+                    (g_live.attr[c].load(kRelaxed) & 0x8000u) ? "enabled" : "NOT enabled");
+    }
+    out += text("    loudness:        last 5 s: loudest output sample %u of 32767 (core 0 before its master volume %u, core 1 %u); since start %u\n", w.peak_out, w.peak_pre[0], w.peak_pre[1], t.peak_out.load(kRelaxed));
+
+    // the one-line reading, only where the numbers make it safe to say
+    const bool playing_now = g_live.playing[0].load(kRelaxed) + g_live.playing[1].load(kRelaxed) > 0;
+    const bool active = sum2w(w.kon) > 0 || playing_now || stream_flowing;
+    const bool ever_started = sum2(t.kon) > 0 || sum2(t.adma_bytes) > 0;
+    std::string meaning;
+    if (!ever_started) {
+        meaning = sum2(t.upload_bytes) ? "sound data was loaded, but no voice was ever started and no stream ever ran: the game's sound driver has not played anything yet."
+                                       : "no sound data was ever loaded and no voice or stream was ever started: the game's sound driver is probably not running.";
+    } else if (active && w.peak_out == 0) {
+        int muted_core = -1, quiet_stream = -1;  // a core that makes sound before its master volume but has it at zero; a stream whose input volume is zero
+        for (int c = 0; c < 2; ++c) {
+            if (w.peak_pre[c] && !volume_set(g_live.mvol[c][0].load(kRelaxed)) && !volume_set(g_live.mvol[c][1].load(kRelaxed))) muted_core = c;
+            if (w.adma[c] && !volume_set(g_live.bvol[c][0].load(kRelaxed)) && !volume_set(g_live.bvol[c][1].load(kRelaxed))) quiet_stream = c;
+        }
+        if (muted_core >= 0) meaning = text("core %d makes sound but its master volume is zero, so nothing comes out.", muted_core);
+        else if (quiet_stream >= 0) meaning = text("the stream of core %d is moving but its input volume is zero, so nothing comes out.", quiet_stream);
+        else if (sum2w(w.kon) && sum2w(w.blank_kon) == sum2w(w.kon)) meaning = "voices are started but silent: the sound data at all their start addresses is zeros, so the sound bank probably did not land correctly in sound memory.";
+        else if (!w.peak_pre[0] && !w.peak_pre[1]) meaning = "voices or the stream are active but silent before the master volume (voice volumes, envelopes or the mixer routing are zero).";
+        else meaning = "sound is made before the master volume but nothing comes out of the chip.";
+    } else if (!active) {
+        meaning = stream_stopped ? "nothing plays right now and the stream is switched on but no data moved in the last 5 s: the streaming transfer has stopped (or the game paused it)."
+                                 : "nothing plays right now (no voice started and no stream data in the last 5 s); sounds that should be heard now are not being started.";
+    } else {
+        meaning = "sound is coming out of the chip; if it is not heard, look after the chip (the sound device or the window's volume).";
+    }
+    out += "    reading:         " + meaning + "\n";
+    return out;
 }
 
 }

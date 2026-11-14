@@ -835,6 +835,7 @@ std::string report_info(bool emergency, const fs::path &dir, bool has_state, boo
     t += "    log.txt            the last lines of the runner's log\n";
     if (has_state) t += "\nsave state size: " + megabytes(state_bytes) + "\n";
     if (emergency) t += "\nThe emulation did not answer F9 within " + std::to_string(kGiveUpMs / 1000) + " seconds, so this report was written by the window.\nThe game is probably hanging inside the runner.\n";
+    t += "\nsound (what the sound chip did):\n" + iop::spu2::summary();
     const std::string first = g_options.first_log ? g_options.first_log(80) : std::string();
     const std::string startup = pick_lines(first, {"[gpu]", "[window]", "[audio] sound device", "[pad]"});
     t += "\nfrom the start of the log:\n" + (startup.empty() ? std::string("    (not captured)\n") : startup);

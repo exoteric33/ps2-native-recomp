@@ -301,6 +301,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2talestest PRIVATE synchronization)
     endif()
+    # the sound lines of the F9 problem report, no game needed: ninja ps2spu2summarytest
+    add_executable(ps2spu2summarytest EXCLUDE_FROM_ALL tests/spu2_summary.cpp)
+    target_include_directories(ps2spu2summarytest PRIVATE runtime/src)
+    target_link_libraries(ps2spu2summarytest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2spu2summarytest PRIVATE synchronization)
+    endif()
     # an EE sceSifSetDma whose transfer list or packet is in the scratchpad (issues 96 and 101, no game needed): ninja ps2sifsprtest
     add_executable(ps2sifsprtest EXCLUDE_FROM_ALL tests/sif_spr_dma.cpp)
     target_include_directories(ps2sifsprtest PRIVATE runtime/src)

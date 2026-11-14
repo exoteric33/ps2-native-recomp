@@ -230,6 +230,10 @@ void dma_done(unsigned ch) {
     g_istat |= 8u;
 }
 
+void dma_progress(unsigned ch, std::uint32_t madr) {
+    if (ch < 14 && (g_dma[ch].chcr & 0x01000000u)) g_dma[ch].madr = madr;
+}
+
 std::uint32_t ohci_read(std::uint32_t a) {
     const std::uint32_t reg = (a - 0x1F801600u) >> 2;
     switch (reg) {

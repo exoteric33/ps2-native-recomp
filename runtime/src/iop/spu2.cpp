@@ -334,7 +334,35 @@ Routing routing(const Core &k) {
     return r;
 }
 
-void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (*dry)[2], std::int32_t (*wet)[2], std::int16_t *raw) {
+// The noise generator, one per core, as the public PlayStation hardware documentation (nocash's psx-spx, "SPU Noise Generator")
+// describes the first PlayStation's: a 16-bit shift register that takes in one new bit (the inverted parity of bits 15, 12, 11 and 10)
+// each time a timer runs out; the timer counts down by 4..7 each sample and is reloaded with 0x20000 >> shift. The rate comes from the
+// core's attribute register, bits 8-9 (the step) and 10-13 (the shift). A voice whose bit is set in NON (0x184/0x186) plays the
+// register's value instead of its sound data (the data still runs on, for its loop and end flags), through its envelope and volumes.
+// GTA Vice City's sound driver times the chip at start-up by watching a quiet noise voice change the core's output ring (issue 100).
+// Its state lives in two unused words of the core's register array (0x3D0, 0x3D2/0x3D4), so a saved state needs nothing new.
+constexpr std::uint32_t kNoiseLevel = 0x3D0, kNoiseTimer = 0x3D2;
+void run_noise(Core &k, std::int16_t *out) {
+    const unsigned clock = (k.attr >> 8) & 0x3Fu, step = 4 + (clock & 3u), reload = 0x20000u >> (clock >> 2);
+    std::uint16_t level = k.regs[kNoiseLevel >> 1];
+    std::int32_t timer = static_cast<std::int32_t>(static_cast<std::uint32_t>(k.regs[kNoiseTimer >> 1]) | static_cast<std::uint32_t>(k.regs[(kNoiseTimer + 2) >> 1]) << 16);
+    if (timer > static_cast<std::int32_t>(reload)) timer = static_cast<std::int32_t>(reload);  // the rate was just made faster
+    for (unsigned n = 0; n < kBatch; ++n) {
+        timer -= static_cast<std::int32_t>(step);
+        if (timer < 0) {
+            const unsigned parity = ((level >> 15) ^ (level >> 12) ^ (level >> 11) ^ (level >> 10) ^ 1u) & 1u;
+            level = static_cast<std::uint16_t>(level << 1 | parity);
+            timer += static_cast<std::int32_t>(reload);
+            if (timer < 0) timer += static_cast<std::int32_t>(reload);
+        }
+        out[n] = static_cast<std::int16_t>(level);
+    }
+    k.regs[kNoiseLevel >> 1] = level;
+    k.regs[kNoiseTimer >> 1] = static_cast<std::uint16_t>(timer);
+    k.regs[(kNoiseTimer + 2) >> 1] = static_cast<std::uint16_t>(static_cast<std::uint32_t>(timer) >> 16);
+}
+
+void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (*dry)[2], std::int32_t (*wet)[2], std::int16_t *raw, const std::int16_t *noise) {
     if (v.key_on) key_on(v);
     const std::uint32_t bit = 1u << voice;
     const std::uint32_t step = std::min<std::uint32_t>(v.pitch, 0x3FFFu);
@@ -344,7 +372,7 @@ void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (
     for (unsigned n = 0; n < kBatch; ++n) {
         if (v.phase == kOff) break;
         const std::uint32_t index = position >> 12, frac = position & 0xFFFu;
-        const std::int32_t sample = (v.buffer[index] * static_cast<std::int32_t>(0x1000 - frac) + v.buffer[index + 1] * static_cast<std::int32_t>(frac)) >> 12;
+        const std::int32_t sample = noise ? noise[n] : (v.buffer[index] * static_cast<std::int32_t>(0x1000 - frac) + v.buffer[index + 1] * static_cast<std::int32_t>(frac)) >> 12;
         position += step;
         while ((position >> 12) >= 28) {
             position -= 28u << 12;
@@ -419,6 +447,11 @@ void feed_input(int core) {
         stamp(g_totals.last_adma[core]);
         t.madr += chunk;
         t.bytes -= chunk;
+        // The channel's address register moves on with each piece the chip takes in, as on the console, where the chip asks for the
+        // next piece each time 256 samples of its input buffer have played. Drivers read it to see how far a looping stream has got
+        // (libsd's BlockTransStatus); GTA Vice City's sound driver times the chip with it at start-up (issue 100). Only the
+        // newest transfer shows there: an older one still queued ahead of it is not what the register holds.
+        if (t.channel >= 0 && k.transfers.size() == 1) hw::dma_progress(static_cast<unsigned>(t.channel), t.madr);
         if (!t.bytes) {
             const int channel = t.channel;
             k.transfers.pop_front();
@@ -586,6 +619,9 @@ void tick() {
     static std::uint64_t ticks = 0, active = 0, phases[5] = {};
     for (int c = 0; c < 2; ++c) {
         const Routing route = routing(g_cores[c]);
+        std::int16_t noise[kBatch];
+        run_noise(g_cores[c], noise);
+        const std::uint32_t non = g_cores[c].regs[0x184 >> 1] | static_cast<std::uint32_t>(g_cores[c].regs[0x186 >> 1] & 0xFFu) << 16;
         for (int i = 0; i < 24; ++i) {
             Voice &v = g_cores[c].voices[i];
             if (!v.key_on && v.phase == kOff) continue;
@@ -593,7 +629,8 @@ void tick() {
                 ++active;
                 ++phases[v.phase];
             }
-            render_voice(v, static_cast<unsigned>(i), route, sum[c], wet[c], i == 1 ? rings[c][2] : i == 3 ? rings[c][3] : nullptr);
+            render_voice(v, static_cast<unsigned>(i), route, sum[c], wet[c], i == 1 ? rings[c][2] : i == 3 ? rings[c][3] : nullptr,
+                         (non >> i) & 1u ? noise : nullptr);
         }
         for (unsigned n = 0; n < kBatch; ++n) {
             rings[c][4][n] = clamp16(sum[c][n][0]);
@@ -940,6 +977,25 @@ void write(std::uint32_t a, std::uint32_t v, unsigned size) {
     } else write_global(off, v);
 }
 
+namespace {
+
+// A stream starts into an empty input buffer (the first block, or the first after the game turned ADMA off, which empties it). On the
+// console the input buffer is a ring of 512 samples that the chip reads at the same position as it writes its output rings, and it asks
+// for the next piece each time it has played half of it, so a piece only ever goes into the half that is not playing. The first piece
+// therefore plays from the next half boundary on, and every later one comes in exactly as a half ends, in step with the output rings.
+// Here the buffer is a queue: start it at the ring position the next batch plays, with silence up to that boundary. A driver that times
+// the chip with the stream (GTA Vice City's sound driver at start-up, issue 100) sees the pieces come at the moments it expects.
+static_assert(kInputFrames == kRingWords, "the input buffer runs in step with the output rings");
+void align_input(Core &k) {
+    const auto pos = static_cast<unsigned>(g_next_tick / (kBatch * kCyclesPerSample) % (kRingWords / kBatch) * kBatch);
+    const unsigned silence = kInputFrames / 2 - pos % (kInputFrames / 2);
+    k.input_read = pos;
+    for (unsigned i = 0; i < silence; ++i) k.input[(pos + i) % kInputFrames][0] = k.input[(pos + i) % kInputFrames][1] = 0;
+    k.input_count = silence;
+}
+
+}
+
 void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, int channel) {
     keep_ticking();
     Core &k = g_cores[core];
@@ -947,6 +1003,7 @@ void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, int cha
         static const bool trace_adma = std::getenv("PS2_TRACE_ADMA") != nullptr;  // porting work: when each ADMA block starts, and the blocks
         if (trace_adma) std::fprintf(stderr, "[adma] core %d dma of %u bytes from 0x%06X at %.4f s, %u frames already waiting, %zu transfers queued\n", core, words * 4, madr,
                                                         g_first_tick ? static_cast<double>(kernel::now() - g_first_tick) / 36864000.0 : 0.0, k.input_count, k.transfers.size());
+        if (!k.input_count && k.transfers.empty()) align_input(k);
         k.transfers.push_back(Transfer{madr, words * 4, channel});
         feed_input(core);
         return;

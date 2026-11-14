@@ -548,6 +548,26 @@ void service(Cpu &c) {
     c.pc &= ~kUnwind;
 }
 
+// Interrupts that are pending when the program turns interrupts back on (EI, or MTC0 to Status) are taken right there on the
+// console, before the next instruction. The usual place to take them here is the next preemption point (a backward branch once
+// the slice is used up), which can be many instructions later. A driver that unmasks a channel inside DI ... EI and then reads
+// the state its handler keeps sees it from before the handler ran: GTA Vice City's DMA queue kick calls EnableDmac(1) while a
+// transfer that ended under the mask still has its status bit set, reads "not busy", and only later, in a polling loop, the
+// handler runs, starts and drains the whole queue; the kick then starts the empty slot after it, which nothing ever finishes,
+// and the game waits forever (black screen after the opening films). So the handlers run here, nested like those a system
+// call runs: the caller's registers are saved and restored around them. A thread switch they ask for waits for the next
+// preemption point, as before.
+void take_pending(Cpu &c) {
+    if (g_in_handler || !interrupts_enabled()) return;
+    for (unsigned guard = 0; guard < 16; ++guard) {
+        const std::uint32_t pending = hw::intc_pending();
+        const std::uint32_t dmac = hw::dmac_pending();
+        if (!pending && !dmac) break;
+        if (dmac) run_dmac(c, static_cast<unsigned>(std::countr_zero(dmac)));
+        else run_intc(c, static_cast<unsigned>(std::countr_zero(pending)));
+    }
+}
+
 void on_vblank_start() {
     ++g_pace_count.refreshes;
     if (g_pace_held) [[unlikely]] pace_release();
@@ -1029,6 +1049,13 @@ namespace ps2 {
 void syscall(Cpu &c, std::uint32_t pc) {
     ++hw::g_slow_seq;  // a system call is something a waiting loop is not skipped over (hw.cpp, spin_watch)
     kernel::handle_syscall(c, pc);
+    // On the console a system call returns with ERET, and an interrupt that is pending and enabled at that moment is taken at
+    // once, before the next instruction of the caller. That matters when the call itself unmasked it: EnableDmac(1) with the
+    // channel's status bit already set (a transfer that ended while the channel was masked) runs the DMAC handler right on
+    // return. Without this the handler ran only at the next preemption point, some instructions later, after the caller had
+    // already looked at the state the handler changes (GTA Vice City's DMA queue: the kick saw "not busy", the handler then
+    // started and drained the queue, and the kick started an empty slot that nothing ever finished: black screen after the films).
+    if (kernel::interruptible() && (hw::intc_pending() || hw::dmac_pending())) c.pc |= kUnwind;
 }
 
 std::uint32_t mfc0(Cpu &c, std::uint32_t reg, std::uint32_t) {
@@ -1041,7 +1068,9 @@ std::uint32_t mfc0(Cpu &c, std::uint32_t reg, std::uint32_t) {
 }
 
 void mtc0(Cpu &c, std::uint32_t reg, std::uint32_t value) {
+    const bool was = kernel::interrupts_enabled();
     c.cop0[reg] = value;
+    if (reg == 12 && !was) kernel::take_pending(c);
 }
 
 std::uint32_t eret(Cpu &c) {
@@ -1055,7 +1084,9 @@ std::uint32_t eret(Cpu &c) {
 }
 
 void set_interrupts(Cpu &c, bool enabled) {
+    const bool was = kernel::interrupts_enabled();
     c.cop0[12] = enabled ? (c.cop0[12] | 0x10000u) : (c.cop0[12] & ~0x10000u);
+    if (enabled && !was) kernel::take_pending(c);
 }
 
 }

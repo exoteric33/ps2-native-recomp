@@ -10,6 +10,7 @@ FMAC result, FCGET three instructions after CLIP, and the same without the wait)
 runtime/src/vu_micro.cpp, the compiled programs of recomp/vurecomp_gen.cpp and the Wasm translator, and compares the
 interpreters with the compiled programs on random microprograms.
 """
+import contextlib
 import concurrent.futures
 import os
 import pathlib
@@ -366,6 +367,20 @@ inline std::vector<Pair> status_low_only(std::vector<Pair> p) {
     return p;
 }
 
+// The same program reading no flags at all: every FSEQ, FSSET, FSAND, FSOR, FMEQ, FMAND and FMOR
+// becomes a NOP. The MAC and status it leaves are those of its last results, as the interpreter leaves them; the interpreter works
+// the flags out only while something in the code memory reads them (scan_flags in vu_micro.cpp), as in a game, where other
+// programs in the memory do, so an FMAND that nothing reaches follows the program.
+inline std::vector<Pair> no_flags(std::vector<Pair> p) {
+    for (Pair &x : p) {
+        if (x[1] & kLoi) continue;
+        const Word op = x[0] >> 25;
+        if (op >= 0x14 && op <= 0x1B && op != 0x19) x[0] = kLnop;
+    }
+    p.push_back({fmflag(0x1A, 11, 1), kUnop});
+    return p;
+}
+
 inline void random_init(ps2::Vu0Regs &r, std::uint8_t *mem, unsigned seed) {
     std::mt19937 g(seed * 40503u + 7u);
     std::memset(&r, 0, sizeof r);
@@ -597,6 +612,21 @@ int main(int argc, char **argv) {
     if (late_low < RANDOM_PROGRAMS / 2) { std::fprintf(stderr, "only %u low-status random programs work out their flags late\n", late_low); return 1; }
     std::fprintf(stderr, "%u of %u random programs reading the low status bits work out their flags late\n", late_low, static_cast<unsigned>(RANDOM_PROGRAMS));
     native << late_table << "};\n" << eager_table << "};\n";
+    // The random programs once more, reading no flags (no_flags): compiled with only their last results kept for the MAC and the
+    // low status bits, and every result for the sticky bits (FlagPipeV::push_last and stick); compared with the interpreter.
+    std::string end_table = "static void (*const kEndFns[])(Vu0Regs &, std::uint8_t *) = {\n";
+    unsigned ends = 0;
+    for (unsigned i = 0; i < RANDOM_PROGRAMS; ++i) {
+        std::string name;
+        const std::string text = generate(programs(tc::no_flags(tc::random_program(i)), 500000 + i), name);
+        if (name.empty()) { std::fprintf(stderr, "flagless random program %u: no plan\n", i); return 1; }
+        ends += text.find("fl.push_last<") != std::string::npos;
+        native << text;
+        end_table += "    " + name + ",\n";
+    }
+    if (ends < RANDOM_PROGRAMS / 2) { std::fprintf(stderr, "only %u flagless random programs keep their last flags\n", ends); return 1; }
+    std::fprintf(stderr, "%u of %u random programs reading no flags keep the flags of their last results\n", ends, static_cast<unsigned>(RANDOM_PROGRAMS));
+    native << end_table << "};\n";
     native << R"(
 static int run_late_flags() {
     int failures = 0, runs = 0;
@@ -613,7 +643,16 @@ static int run_late_flags() {
             kEagerFns[p](b, mb);
             ++runs;
             if (std::memcmp(&a, &b, sizeof a) != 0 || std::memcmp(ma, mb, sizeof ma) != 0) {
-                if (++failures <= 5) std::printf("FAIL MAC-only random run %u: late flags mac %04X status %03X vi13 %04X, at every site mac %04X status %03X vi13 %04X\n", i, a.mac, a.status, a.vi[13], b.mac, b.status, b.vi[13]);
+                if (++failures <= 5) {
+                    std::printf("FAIL MAC-only random run %u (program %u): late flags mac %04X status %03X vi13 %04X, at every site mac %04X status %03X vi13 %04X\n", i, p, a.mac, a.status, a.vi[13], b.mac, b.status, b.vi[13]);
+                    const std::string da = tc::describe(a, ma), db = tc::describe(b, mb);
+                    for (std::size_t x = 0, y = 0; x < da.size() && y < db.size();) {
+                        const std::size_t ex = da.find('\n', x), ey = db.find('\n', y);
+                        if (da.compare(x, ex - x, db, y, ey - y) != 0) std::printf("  late  %s\n  every %s\n", da.substr(x, ex - x).c_str(), db.substr(y, ey - y).c_str());
+                        x = ex + 1;
+                        y = ey + 1;
+                    }
+                }
             }
         }
     std::printf("%d of %d MAC-only random runs leave the same state with the flags worked out late and at every site\n", runs - failures, runs);
@@ -662,6 +701,18 @@ static void bench() {
 )";
     native << "int main(int argc, char **argv) {\n"
               "    if (argc > 1 && std::string(argv[1]) == \"bench\") { bench(); return 0; }\n"
+              "    if (argc > 1 && std::string(argv[1]) == \"endflags\") {\n"
+              "        for (unsigned p = 0; p < " << RANDOM_PROGRAMS << "; ++p)\n"
+              "        for (unsigned k = 0; k < tc::run_inits(p); ++k) {\n"
+              "            const unsigned i = p + k * tc::kRunStep;\n"
+              "            if (argc > 2 && static_cast<unsigned>(std::atoi(argv[2])) != i) continue;\n"
+              "            Vu0Regs r; std::uint8_t mem[16384] = {};\n"
+              "            tc::random_init(r, mem, i); kEndFns[p](r, mem);\n"
+              "            if (argc > 2) std::fputs(tc::describe(r, mem).c_str(), stdout);\n"
+              "            else std::printf(\"%u %s\\n\", i, tc::digests(tc::describe(r, mem)).c_str());\n"
+              "        }\n"
+              "        return 0;\n"
+              "    }\n"
               "    if (argc > 2) {\n"
               "        const unsigned i = std::atoi(argv[2]);\n"
               "        Vu0Regs r; std::uint8_t mem[16384] = {};\n"
@@ -771,6 +822,19 @@ int main(int argc, char **argv) {
     int failures = 0;
     if (argc > 1 && std::string(argv[1]) == "bench") {
         bench();
+        return 0;
+    }
+    if (argc > 1 && std::string(argv[1]) == "endflags") {
+        for (unsigned p = 0; p < RANDOM_PROGRAMS; ++p)
+            for (unsigned k = 0; k < tc::run_inits(p); ++k) {
+                const unsigned i = p + k * tc::kRunStep;
+                if (argc > 2 && static_cast<unsigned>(std::atoi(argv[2])) != i) continue;
+                Vu0Regs r;
+                std::uint8_t mem[4096];
+                run(1, tc::no_flags(tc::random_program(p)), [](Vu0Regs &r, std::uint8_t *m, unsigned seed) { tc::random_init(r, m, seed); }, i, r, mem);
+                if (argc > 2) std::fputs(tc::describe(r, mem).c_str(), stdout);
+                else std::printf("%u %s\n", i, tc::digests(tc::describe(r, mem)).c_str());
+            }
         return 0;
     }
     if (argc > 2) {
@@ -893,8 +957,10 @@ def lines(text):
     return {tuple(line.split(None, 2)[:2]): line.split(None, 2)[2] for line in text.splitlines() if line.strip()}
 
 
-with tempfile.TemporaryDirectory(prefix='vu-codegen-') as tmp:
+# VU_KEEP=<folder>: build in that folder and keep it (the generated programs, to look at a failure)
+with (contextlib.nullcontext(os.environ['VU_KEEP']) if os.environ.get('VU_KEEP') else tempfile.TemporaryDirectory(prefix='vu-codegen-')) as tmp:
     tmp = pathlib.Path(tmp)
+    tmp.mkdir(parents=True, exist_ok=True)
     (tmp / 'generator.cpp').write_text('#define RANDOM_PROGRAMS %d\n' % RANDOM_PROGRAMS + GENERATOR)
     (tmp / 'cases.h').write_text(CASES_H)
     (tmp / 'interp.cpp').write_text('#define RANDOM_PROGRAMS %d\n#include <atomic>\n#include <vector>\n#include "ps2/vu_live.hpp"\nnamespace ps2 { std::uint64_t frame_count() { return 0; } bool halted() { return false; } namespace vif { std::uint32_t itop(int) { return 0; } void describe_vu1() {} } namespace vu::live { std::atomic<bool> g_ready{false}; bool active() { return false; } void note_call(std::uint64_t) {} std::vector<Program> take() { return {}; } void unknown(std::uint64_t, std::uint32_t, const std::uint8_t *) {} } }\n' % RANDOM_PROGRAMS + INTERP)
@@ -990,5 +1056,21 @@ with tempfile.TemporaryDirectory(prefix='vu-codegen-') as tmp:
         sys.exit(f'{len(bad)} random program runs differ')
     compared = len([i for i in want if i % 100000 < CLASSIC or i % 2])
     print(f'{compared} runs of the random microprograms (of {len(want)}; the others have MAX and MINI forms the interpreter orders differently) leave the same state compiled and in the interpreters ({skipped} not compared with unit 0: its truncating arithmetic gives other numbers)')
+    # The random programs reading no flags (no_flags): the compiled ones must leave the MAC and status the interpreter of unit 1
+    # leaves, with everything else (the wide programs with every form of MAX and MINI left out, as above).
+    end_c = {l.split()[0]: l.split()[1:] for l in subprocess.run([str(tmp / 'native'), 'endflags'], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines() if l.strip()}
+    end_i = {l.split()[0]: l.split()[1:] for l in subprocess.run([str(tmp / 'interp'), 'endflags'], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines() if l.strip()}
+    keep = [i for i in end_c if int(i) % 100000 < CLASSIC or int(i) % 2]
+    bad = [i for i in keep if end_c[i] != end_i.get(i)]
+    for i in bad[:5]:
+        a = subprocess.run([str(tmp / 'native'), 'endflags', i], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
+        b = subprocess.run([str(tmp / 'interp'), 'endflags', i], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
+        print(f'flagless random program {i}: compiled and interpreter differ')
+        for x, y in zip(a, b):
+            if x != y:
+                print(f'  compiled    {x}\n  interpreter {y}')
+    if bad:
+        sys.exit(f'{len(bad)} runs of the random programs reading no flags differ')
+    print(f'{len(keep)} runs of the random programs reading no flags leave the same flags and state compiled and in the interpreter')
     (tmp / 'wasm.cjs').write_text(WASM_TEST)
     run('node', str(tmp / 'wasm.cjs'), str(tmp))

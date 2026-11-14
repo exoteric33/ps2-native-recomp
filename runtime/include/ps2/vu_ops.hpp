@@ -879,15 +879,22 @@ struct FlagPipe {
 //  - mac() picks the slot exactly as FlagPipe::mac_slot() does (the slots of before the program start as r.mac, at cycle 0).
 //  - flags() leaves status = (status before & 0xFF0) | low | low << 6, where low is the zero (1), sign (2) and overflow (8)
 //    bits of that result; so after n results it is (status at the start & 0xFF0) | (OR of every low) << 6 | the last low.
-//    The OR of every low is kept as three running lanes: the smallest magnitude (zero: one below 2^-126, the exponent
-//    field is 0), the OR of the sign bits, the largest magnitude (overflow: 0x7FFFFFFF).
+//    The OR of every low is kept as two running lanes: the smallest magnitude (zero: one below 2^-126, the exponent
+//    field is 0) and the OR of the sign bits. The overflow bit needs no lane: no value a compiled VU1 program gives a flag
+//    site has the largest magnitude 0x7FFFFFFF in a lane it writes (every result goes through fout, vfix or vclamp_result,
+//    which clamp to 0x7F7FFFFF, or is a sum or product of such a value with 0 or 1), so its overflow and sticky overflow
+//    bits are never set.
+//  - The sticky bits only ever go from 0 to 1 in such a program (no FSSET). The generator makes every program body a
+//    template on kSticky and runs it with kSticky false when the status already has the sticky zero and sign bits (0xC0)
+//    at the start, which is all but the first few calls of a game: every add_sticky would then be a no-op,
+//    so push, push_last and stick leave it out.
 // A push is about five vector instructions and two stores, against about fifty for flags() + set_mac().
 struct FlagPipeV : FlagPipe {
     v4u fv[8];
     std::uint32_t fts[8];
     unsigned fn = 0;
     std::uint32_t mac0 = 0;
-    v4i lo_mag = (v4i){0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF}, hi_mag = (v4i){0, 0, 0, 0};
+    v4i lo_mag = (v4i){0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF};
     v4u signs = v4u{0u, 0u, 0u, 0u};
     std::uint32_t status0 = 0;
 
@@ -915,16 +922,38 @@ struct FlagPipeV : FlagPipe {
 #endif
     }
     template <unsigned D>
-    PS2_VU_INLINE void push(v4u v) {
+    static PS2_VU_INLINE v4u written(v4u v) {
         if constexpr (D != 15u)
             v = vsel(vsplat(0x3F800000u), v, v4u{D & 8u ? ~0u : 0u, D & 4u ? ~0u : 0u, D & 2u ? ~0u : 0u, D & 1u ? ~0u : 0u});
+        return v;
+    }
+    PS2_VU_INLINE void add_sticky(v4u v) {
+        const v4i m = (v4i)(v & 0x7FFFFFFFu);
+        lo_mag = __builtin_elementwise_min(lo_mag, m);
+        signs |= v;
+    }
+    template <unsigned D, bool S = true>
+    PS2_VU_INLINE void push(v4u v) {
+        v = written<D>(v);
         const unsigned i = fn++ & 7u;
         fv[i] = v;
         fts[i] = t;
-        const v4i m = (v4i)(v & 0x7FFFFFFFu);
-        lo_mag = __builtin_elementwise_min(lo_mag, m);
-        hi_mag = __builtin_elementwise_max(hi_mag, m);
-        signs |= v;
+        if constexpr (S) add_sticky(v);
+    }
+    // A flag site whose MAC no reader and no way out can see (recomp/vurecomp_gen.cpp, the liveness of the flag sites): the
+    // interpreter's flags() still ORs its zero, sign and overflow bits into the sticky part of the status the program leaves.
+    template <unsigned D, bool S = true>
+    PS2_VU_INLINE void stick(v4u v) {
+        if constexpr (S) add_sticky(written<D>(v));
+    }
+    // A program that reads no flags: only the last result before a way out counts for the MAC and the low status bits it leaves
+    // (finish() reads fv[(fn - 1) & 7]), so a live site of such a program keeps one slot instead of the ring.
+    template <unsigned D, bool S = true>
+    PS2_VU_INLINE void push_last(v4u v) {
+        v = written<D>(v);
+        fv[0] = v;
+        fn = 1;
+        if constexpr (S) add_sticky(v);
     }
     PS2_VU_INLINE std::uint32_t mac() const {
         for (unsigned k = 1; k <= 8; ++k) {
@@ -952,17 +981,21 @@ struct FlagPipeV : FlagPipe {
         }
         return low_of(mac_of(fv[(fn - 8) & 7u]));
     }
+    // The sticky bits are those of every flag site the program ran (push, push_last, stick), as the interpreter ORs them in at each
+    // one; the MAC and the low status bits are those of the last pushed result. Before any push (fn == 0) they stay as they were:
+    // the dead sites that ran before a hop to the interpreter are overwritten there by a later site before anything reads them.
     PS2_VU_INLINE void finish(Vu0Regs &r) const {
-        if (!fn) return;
-        const std::uint32_t mac = mac_of(fv[(fn - 1) & 7u]);
-        r.mac = mac;
-        std::uint32_t status = r.status & 0xFF0u;
-        if (mac & 0x000Fu) status |= 0x1u;
-        if (mac & 0x00F0u) status |= 0x2u;
-        if (mac & 0xF000u) status |= 0x8u;
+        std::uint32_t status = r.status;
+        if (fn) {
+            const std::uint32_t mac = mac_of(fv[(fn - 1) & 7u]);
+            r.mac = mac;
+            status &= 0xFF0u;
+            if (mac & 0x000Fu) status |= 0x1u;
+            if (mac & 0x00F0u) status |= 0x2u;
+            if (mac & 0xF000u) status |= 0x8u;
+        }
         if (__builtin_reduce_or((v4u)(lo_mag < 0x00800000))) status |= 0x40u;
         if (__builtin_reduce_or(signs) & 0x80000000u) status |= 0x80u;
-        if (__builtin_reduce_or((v4u)(hi_mag == 0x7FFFFFFF))) status |= 0x200u;
         r.status = status;
     }
 };

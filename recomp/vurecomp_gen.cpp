@@ -71,14 +71,27 @@ std::string lane_mask(unsigned d) {
     return mask + "}";
 }
 
-Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, bool late_flags = false) {
+// How a compiled VU1 program keeps its flags (generate()): kFlagsEager works out the MAC and status at a flag site (flags()), the
+// others keep results in FlagPipeV (vu_ops.hpp). kFlagsLate: the program reads the MAC flags, or the low four status bits; a live
+// site pushes its result. kFlagsEnd: the program reads no flags at all, so only what it leaves for the next program counts; a live
+// site (one whose flags can reach a way out) keeps its result as the last one. With both, a dead site (one whose MAC nobody can
+// see) still adds its result to the sticky status bits, which the program leaves too (stick()). Both are a template on kSticky
+// (generate()): with it false the sticky bits are left out, as they are already set.
+enum FlagMode { kFlagsEager, kFlagsLate, kFlagsEnd };
+
+Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode = kFlagsEager) {
     Upper u;
-    // late_flags: the program reads the MAC flags but never the status, or only its low four bits with FSAND (see FlagPipeV in
-    // vu_ops.hpp): a live flag site keeps its result in the flag pipe, and the MAC and status are worked out where a reader or a
-    // way out of the program needs them.
+    const bool late_flags = mode != kFlagsEager;
     const auto set_flags = [&](const std::string &value, unsigned d) {
-        return late_flags ? std::format("fl.push<{}u>({}); ", d, value) : std::format("flags(r, {}, {}u); fl.set_mac(r.mac, r.status); ", value, d);
+        // a dead site: only the sticky bits (the eager form, the reference of the tests, keeps the MAC and the low status bits)
+        if (!flags_live)
+            return late_flags ? std::format("fl.stick<{}u, kSticky>({}); ", d, value)
+                              : std::format("{{ const std::uint32_t sm = r.mac, ss = r.status; flags(r, {}, {}u); r.mac = sm; r.status = (r.status & ~0xFu) | (ss & 0xFu); }} ", value, d);
+        if (mode == kFlagsEnd) return std::format("fl.push_last<{}u, kSticky>({}); ", d, value);
+        return late_flags ? std::format("fl.push<{}u, kSticky>({}); ", d, value) : std::format("flags(r, {}, {}u); fl.set_mac(r.mac, r.status); ", value, d);
     };
+    // the flags of a site are written when it is live, and of a VU1 program also when it is dead (its sticky bits)
+    const bool flags_out = flags_live || !exact;
     const unsigned dest = (hi >> 21) & 15u, ft = (hi >> 16) & 31u, fs = (hi >> 11) & 31u, fd = (hi >> 6) & 31u, bc = hi & 3u;
     const unsigned funct = hi & 63u;
     enum Kind { Nop, Add, Sub, Madd, Msub, Max, Min, Mul, Abs, Ftoi, Itof, Clip, Opmula, Opmsub } kind = Nop;
@@ -163,7 +176,7 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, bool late_fla
     }
     unsigned d = dest;
     if (kind == Opmula || kind == Opmsub) d = 0xE;
-    if ((d == 0 && !(exact && flags)) || (target == 0 && !(flags && flags_live))) return u;
+    if ((d == 0 && !(exact && flags)) || (target == 0 && !(flags && flags_out))) return u;
     const auto b = [&](int i) -> std::string {
         switch (src) {
         case Vec: return vf(ft, i);
@@ -252,7 +265,7 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, bool late_fla
         if (d == 0xF) u.post += std::format("vstore({}, uv); ", dst);
         else u.post += std::format("vstore({0}, vsel(vload({0}), uv, {1})); ", dst, lane_mask(d));
         u.sets_flags = flags;
-        if (flags && flags_live) u.post += set_flags("uv", d);
+        if (flags && flags_out) u.post += set_flags("uv", d);
         return u;
     }
     for (int i = 0; i < 4; ++i) {
@@ -294,7 +307,7 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, bool late_fla
     for (int i = 0; i < 4; ++i)
         if (lane(d, i)) u.post += std::format("{}.w[{}] = u{}; ", dst, i, kLane[i]);
     u.sets_flags = flags;
-    if (flags && flags_live) u.post += set_flags(late_flags ? std::format("vload({})", dst) : dst, d);
+    if (flags && flags_out) u.post += set_flags(late_flags ? std::format("vload({})", dst) : dst, d);
     return u;
 }
 
@@ -935,7 +948,17 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
                                          : std::format("static inline __attribute__((always_inline)) void {}_b(Vu0Regs &r, std::uint8_t *mem, std::uint32_t &hop) {{\n", name);
     // The MAC flags worked out where they are read (vu-sticky): for VU1 programs that read the MAC flags but not the status. The
     // flag sites stay the same (live_in above), so the reader, the next program and the interpreter see the same bits.
-    const bool late_flags = p.unit != 0 && any_flags && !any_status && !g_eager_flags;
+    // A VU1 program that reads no flags at all still leaves the MAC and status of its last results, as the interpreter
+    // does: its live flag sites (the last ones before a way out) keep their result as the last one, every other one only adds to
+    // the sticky bits (FlagPipeV::push_last, stick).
+    const bool end_flags = p.unit != 0 && !any_flags && !any_status && !any_status_low && !g_eager_flags;
+    const bool late_flags = (p.unit != 0 && any_flags && !any_status && !g_eager_flags) || end_flags;
+    const FlagMode flag_mode = end_flags ? kFlagsEnd : late_flags ? kFlagsLate : kFlagsEager;
+    // With FlagPipeV the body is a template on kSticky, and the function the table calls runs it with kSticky false when the status
+    // it starts with already has the sticky zero and sign bits (0xC0): the sticky bits of a FlagPipeV program only go from 0 to 1
+    // (it has no FSSET), and its sticky overflow bit is never set (vu_ops.hpp), so the sticky work would change nothing. That is
+    // one branch per call instead of the sticky work at every flag site (in Silent Hill 2 and both God of War
+    // games every call starts so).
     std::string o = head + std::string(late_flags ? "    FlagPipeV fl;\n" : "    FlagPipe fl;\n") + std::string("    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n");
     if (p.unit == 0) o += "    std::uint32_t steps = 0;\n";
     if (dyn) o += "    const Vu0Regs saved = r;\n    std::uint8_t saved_mem[4096];\n    std::memcpy(saved_mem, mem, sizeof saved_mem);\n";
@@ -959,8 +982,9 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
         bool out_live = false;
         for (std::int64_t s : successors(pc)) out_live = out_live || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
-        // A program that reads the status keeps every flag site, as the sticky bits it leaves count them all.
-        const Upper u = upper(hi, any_status || any_status_low ? true : (any_flags && out_live), p.unit == 0, late_flags);
+        // A program that reads the status keeps every flag site live; elsewhere a dead site only adds to the sticky bits (upper()).
+        const bool site_live = any_status || any_status_low || out_live;
+        const Upper u = upper(hi, site_live, p.unit == 0, flag_mode);
         const Lower &l = lowers[pc];
         std::string body;
         if (lazy) {
@@ -1044,6 +1068,9 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
     }
     if (dyn) o += std::format("bail:\n    r = saved;\n    std::memcpy(mem, saved_mem, sizeof saved_mem);\n    vu::vu0_restart({}u);\n    return;\n", p.entry & kMask);
     o += "dispatch:\n    vu::interpret(1, jpc);\n    return;\n}\n\n";
+    // A FlagPipeV program with a flag site: its body becomes a template on kSticky (see above), the copy with kSticky true is called
+    // through a cold function of its own (_c), so the copy that runs stays as small as the body was without the sticky work.
+    const bool sticky_split = late_flags && o.find(", kSticky>(") != std::string::npos;
     if (late_flags) {
         // every way out: the end of the program, a hop to the interpreter (an unknown jump, an unsupported instruction, code
         // outside the program) leaves the MAC and status in the registers
@@ -1066,17 +1093,31 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         for (const auto &[from, to] : std::initializer_list<std::pair<const char *, const char *>>{
                  {"vaddd(", "vaddn("}, {"vsubd(", "vsubn("}, {"vmuld(", "vmuln("}, {"vmaddd(", "vmaddn("}, {"vmsubd(", "vmsubn("}, {"vshadow(", "vshadow_eager("}, {"vqd(", "vqd_eager("}})
             replace_all(o, from, to);
-        return local_vi(o);
+        o = local_vi(o);
+        if (sticky_split) {
+            o.replace(0, head.size(), std::format("template <bool kSticky>\nstatic void {}_s(Vu0Regs &r, std::uint8_t *mem) {{\n", name));
+            o += std::format("static __attribute__((noinline, cold)) void {0}_c(Vu0Regs &r, std::uint8_t *mem) {{ {0}_s<true>(r, mem); }}\n\n", name);
+            o += std::format("void {0}(Vu0Regs &r, std::uint8_t *mem) {{\n    if ((r.status & 0xC0u) == 0xC0u) {0}_s<false>(r, mem);\n    else {0}_c(r, mem);\n}}\n\n", name);
+        }
+        return o;
     }
     o = local_vi(o);
+    if (sticky_split) o.insert(0, "template <bool kSticky>\n");
     replace_all(o, "vu::interpret(1, ", "vhop(hop, ");
     if (any_arith) {
         replace_all(o, "vu::kick(1, ", "vkick(daz.csr, 1, ");
         replace_all(o, "efu(r, ", "vefu(daz.csr, r, ");
     }
     o.erase(o.size() - 1);  // one empty line after the two functions, not between them
+    const std::string args = any_arith ? "r, mem, daz, hop" : "r, mem, hop";
+    if (sticky_split)
+        o += std::format("static __attribute__((noinline, cold)) void {0}_c(Vu0Regs &r, std::uint8_t *mem, {1}std::uint32_t &hop) {{ {0}_b<true>({2}); }}\n", name,
+                         any_arith ? "VuDaz &daz, " : "", args);
+    const std::string pad = any_arith ? "        " : "    ";
+    const std::string run = !sticky_split ? std::format("{}_b({});", name, args)
+                                          : std::format("if ((r.status & 0xC0u) == 0xC0u) {0}_b<false>({1});\n{2}else {0}_c({1});", name, args, pad);
     o += std::format("void {0}(Vu0Regs &r, std::uint8_t *mem) {{\n    std::uint32_t hop = kNoHop;\n    {1}\n    if (hop != kNoHop) vu::interpret(1, hop);\n}}\n\n", name,
-                     any_arith ? std::format("{{ VuDaz daz; {}_b(r, mem, daz, hop); }}", name) : std::format("{}_b(r, mem, hop);", name));
+                     !any_arith ? run : sticky_split ? std::format("{{\n        VuDaz daz;\n        {}\n    }}", run) : std::format("{{ VuDaz daz; {} }}", run));
     return o;
 }
 
@@ -1086,7 +1127,7 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp).
-const char *const kGeneratorVersion = "vurecomp 13";
+const char *const kGeneratorVersion = "vurecomp 15";
 
 Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
     std::vector<Program> programs;

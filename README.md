@@ -1,8 +1,8 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 53 games work as far as they
-have been tested, 34 of them out of the box, with zero game-specific code. God of War II has been played from start to
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 54 games work as far as they
+have been tested, 35 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
 **How it works, from the disc to the picture: [read the explanation](#how-it-works).**
@@ -11,9 +11,9 @@ Built on [ps2-web-recomp](https://github.com/snuri00/ps2-web-recomp) by Samir Nu
 
 https://github.com/user-attachments/assets/32487cfd-b222-4e72-9c46-1fe71fafbd08
 
-**34 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
+**35 games ran out of the box, with zero game-specific code:** God of War, Gran Turismo 4, Tekken 4, The King of Fighters XI, God Hand, Ecco the
 Dolphin: Defender of the Future, The Super Dimension Fortress Macross, Armored Trooper VOTOMS, Ben 10: Alien Force, Samurai
-Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe, Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima, Robot Alchemic Drive, Altered Beast, Mister Moskeeto, Twisted Metal: Head-On, Quake III Revolution, Sonic Heroes, Return to Castle Wolfenstein: Operation Resurrection, SpongeBob SquarePants: Battle for Bikini Bottom, Tony Hawk's Pro Skater 3, Peter Jackson's King Kong and No One Lives Forever. *Out of the box* means nobody changed anything for these games: the
+Western, Thunder Force VI, Raiden III, Heavenly Guardian, Shin Megami Tensei: Nocturne, Persona 4, Tales of the Abyss, Digimon World Data Squad, Football Kingdom, College Basketball 2K5, Castlevania: Lament of Innocence, Auto Modellista, Viewtiful Joe, Hudson Selection Vol. 4: Takahashi Meijin no Boukenjima, Robot Alchemic Drive, Altered Beast, Mister Moskeeto, Twisted Metal: Head-On, Quake III Revolution, Sonic Heroes, Return to Castle Wolfenstein: Operation Resurrection, SpongeBob SquarePants: Battle for Bikini Bottom, Tony Hawk's Pro Skater 3, Peter Jackson's King Kong, No One Lives Forever and Red Faction. *Out of the box* means nobody changed anything for these games: the
 tool recompiled the disc as it is, and the game played (as far as it has been played, see [*What runs*](#what-runs)). Gran Turismo 4 needs one small build step that
 unpacks its program; the runtime has no code for it.
 
@@ -147,6 +147,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Peter Jackson's King Kong (USA) | plays well: all levels and the dinosaur fights, about three hours, mostly at 60 fps with a game controller; the opening boat scene runs slow with stretched sound, and small horizontal lines show up ([#93](https://github.com/exoteric33/ps2-native-recomp/issues/93)) | m3tabolic |
 | No One Lives Forever (USA) | plays well, not played through yet: to scene 7 at 60 fps with occasional dips, with a game controller; no problems found ([#94](https://github.com/exoteric33/ps2-native-recomp/issues/94)) | m3tabolic |
 | Champions of Norrath (USA) | runs, not played through yet: into the game and playing; heavy slowdown in places with many torches and fire effects ([#57](https://github.com/exoteric33/ps2-native-recomp/issues/57)) | davidsdullea |
+| Red Faction (USA) | plays well, not played through yet: about 3 hours (a third of the game) at full speed (about 30 fps) with a game controller; no problems found ([#107](https://github.com/exoteric33/ps2-native-recomp/issues/107)) | m3tabolic |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

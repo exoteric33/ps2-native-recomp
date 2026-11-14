@@ -399,6 +399,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2cdvdstreamstattest PRIVATE synchronization)
     endif()
+    # two RPC calls on one EE client before the first ended: each end wakes its own caller (issue 106, no game needed): ninja ps2sifcalloverlaptest
+    add_executable(ps2sifcalloverlaptest EXCLUDE_FROM_ALL tests/sif_call_overlap.cpp)
+    target_include_directories(ps2sifcalloverlaptest PRIVATE runtime/src)
+    target_link_libraries(ps2sifcalloverlaptest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2sifcalloverlaptest PRIVATE synchronization)
+    endif()
     # ioman AddDrv and DelDrv call the driver's init and deinit and keep a table of its devices (no game needed): ninja ps2iomandrvtest
     add_executable(ps2iomandrvtest EXCLUDE_FROM_ALL tests/ioman_drivers.cpp)
     target_include_directories(ps2iomandrvtest PRIVATE runtime/src)

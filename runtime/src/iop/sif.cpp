@@ -300,6 +300,69 @@ T ee_read(std::uint32_t a) {
     return v;
 }
 
+// Two calls on one EE client before the first one ended (issue 106, Seek and Destroy). The EE library keeps the state of a
+// call in the client struct, not in the packet: sceSifCallRpc writes the packet address (+0), the packet id (+4), the semaphore it
+// waits on (+8, -1 for a call that does not wait), the end function (+28) and its argument (+32) into the client, and the end
+// command's handler reads them back from the client (ps2sdk ee/kernel/src/sifrpc.c, AFL-2.0: sceSifCallRpc and _request_end; Sony's
+// sceSifClientData has the same layout). Nothing stops a second thread from calling on a client that is still busy. If it does so
+// before the first call's end command arrives, that end runs the second call's end function and signals the second call's
+// semaphore, and the first caller waits forever. On a console the IOP's answer comes back first in the cases games rely on; here
+// the IOP runs in slices behind the EE and its answers reach the EE only at the end of an EE slice, so a second caller can get in
+// between. The guard: what a waiting call wrote into its client is kept by packet address when the call goes out, and when the EE's
+// end handler takes the end command of that call (its isceSifSetDChain, which comes after it copied the packet and before it runs the
+// command: ps2sdk sifcmd.c _SifCmdIntHandler) while the client names another packet, the call's own fields are written back first.
+// A call whose end finds its own packet in the client is left alone, so a game that never overlaps calls on a client sees no change.
+// The fields of the later call need no restoring: its own end command finds the client changed too (the earlier end cleared +0) and
+// gets its fields back the same way. Not in the save state: after a load the calls in flight have no guard, as before this.
+struct CallFields {
+    std::uint32_t client, packet_id, sema, end_function, end_param;
+};
+std::map<std::uint32_t, CallFields> g_call_fields;  // by the call packet's address as the EE sent it
+std::uint32_t g_end_packet = 0, g_end_client = 0;   // the call end command the EE received last (0: none, or another command)
+std::uint32_t g_overlap_count = 0;
+
+void ee_write32(std::uint32_t a, std::uint32_t v) { std::memcpy(ee_ptr(a), &v, sizeof v); }
+
+// The EE sends a call (command 0x8000000A): `packet` is the call packet as it arrived.
+void keep_call_fields(const std::uint8_t *packet) {
+    std::uint32_t packet_address, client;
+    std::memcpy(&packet_address, packet + 20, 4);
+    std::memcpy(&client, packet + 28, 4);
+    if (!packet_address || !client) return;
+    // Only a client that names this very packet (the library's own client struct) and a call that waits on a semaphore: a call
+    // without one (NOWAIT, -1) loses no wake-up when it overlaps.
+    if (ee_read<std::uint32_t>(client) != packet_address || ee_read<std::int32_t>(client + 8) < 0) {
+        g_call_fields.erase(packet_address);
+        return;
+    }
+    g_call_fields[packet_address] = CallFields{client, ee_read<std::uint32_t>(client + 4), ee_read<std::uint32_t>(client + 8),
+                                               ee_read<std::uint32_t>(client + 28), ee_read<std::uint32_t>(client + 32)};
+}
+
+// The EE's end handler has taken the end command of a call and is about to run it.
+void restore_call_fields() {
+    const std::uint32_t packet_address = g_end_packet, client = g_end_client;
+    g_end_packet = g_end_client = 0;
+    if (!packet_address) return;
+    const auto it = g_call_fields.find(packet_address);
+    if (it == g_call_fields.end()) return;
+    const CallFields f = it->second;
+    g_call_fields.erase(it);
+    if (f.client != client) return;
+    const std::uint32_t now_packet = ee_read<std::uint32_t>(client);
+    if (now_packet == packet_address) return;
+    if (g_overlap_count++ < 16)
+        std::fprintf(stderr,
+                     "[sif] the end of call packet 0x%08X finds client 0x%08X on packet 0x%08X (a second call on the client before this one "
+                     "ended): its own semaphore %d and end function 0x%08X are put back for its end handler\n",
+                     packet_address, client, now_packet, static_cast<std::int32_t>(f.sema), f.end_function);
+    ee_write32(client, packet_address);
+    ee_write32(client + 4, f.packet_id);
+    ee_write32(client + 8, f.sema);
+    ee_write32(client + 28, f.end_function);
+    ee_write32(client + 32, f.end_param);
+}
+
 void send(const void *packet, std::uint32_t size) {
     const auto *bytes = static_cast<const std::uint8_t *>(packet);
     g_outgoing.emplace_back(bytes, bytes + size);
@@ -575,7 +638,10 @@ void command(std::uint32_t src, std::uint32_t size) {
         break;
     }
     case 0x80000009u: bind(packet); break;
-    case 0x8000000Au: call(packet); break;
+    case 0x8000000Au:
+        keep_call_fields(packet);
+        call(packet);
+        break;
     case 0x8000000Cu: other_data(packet); break;
     default: {
         auto it = g_cmd_handlers.find(h->cid);
@@ -1473,6 +1539,9 @@ void reset() {
     g_boot_end = 0;
     g_ee_recv = g_data_addr = 0;
     g_processed = true;
+    g_call_fields.clear();
+    g_end_packet = g_end_client = 0;
+    g_overlap_count = 0;
     g_outgoing.clear();
     g_servers.clear();
     g_guest_servers.clear();
@@ -1552,6 +1621,7 @@ std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {
 int dma_stat(std::uint32_t id) { return id + 1 == g_ee_dma_id && now() < g_ee_dma_done ? 0 : -1; }
 
 void packet_processed() {
+    restore_call_fields();
     g_processed = true;
     pump();
 }
@@ -1576,6 +1646,7 @@ void pump() {
         // a packet; the game's own channel 5 handler starts it again with isceSifSetDChain (Sony's sifcmd handler does not when no packet
         // came: it skips that call when the packet size is 0, seen in God of War II's EE code and in ps2sdk's _SifCmdIntHandler).
         g_outgoing.pop_front();
+        g_end_packet = g_end_client = 0;
         if (g_options.trace_iop_modules) std::fprintf(stderr, "[sif] to EE: SIF0 interrupt of an IOP sceSifSetDma\n");
         g_processed = false;
         hw::dmac_raise(5);
@@ -1599,6 +1670,16 @@ void pump() {
     }
     const std::vector<std::uint8_t> packet = std::move(g_outgoing.front());
     g_outgoing.pop_front();
+    // The end command of a call (cid 0x80000008 with the call's command 0x8000000A at +32), remembered for restore_call_fields().
+    g_end_packet = g_end_client = 0;
+    if (packet.size() >= sizeof(Rend)) {
+        Rend r;
+        std::memcpy(&r, packet.data(), sizeof r);
+        if (r.header.cid == kCmdRend && r.command == 0x8000000Au) {
+            g_end_packet = r.packet_addr;
+            g_end_client = r.client_data;
+        }
+    }
     const std::uint32_t at = g_ee_recv & (kRamSize - 1);
     const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(packet.size(), kRamSize - at));
     if (n < packet.size()) iop::bad_span("SIF packet to EE", at, packet.size(), "cut at the end of EE memory");

@@ -234,21 +234,25 @@ std::string describe(std::uintptr_t address, std::uintptr_t image_begin, std::ui
 
 }
 
+// PS2_PROFILE_TO=<frame> stops sampling at that frame (the file is still written when the run ends), so one stretch of a scene can be
+// profiled alone (the God of War II film: its in-engine part, the full-motion video and what follows have different limits).
 void start_profile(std::uint64_t from_frame) {
     g_from = from_frame;
-    if (!g_from) {
-        arm();
-        return;
-    }
+    const char *to = std::getenv("PS2_PROFILE_TO");
+    const std::uint64_t until = to ? std::strtoull(to, nullptr, 10) : 0;
+    if (!g_from) arm();
+    if (!g_from && !until) return;
     auto previous = ps2::g_options.on_vblank;
-    ps2::g_options.on_vblank = [previous]() {
-        if (ps2::frame_count() == g_from) arm();
+    ps2::g_options.on_vblank = [previous, until]() {
+        if (g_from && ps2::frame_count() == g_from) arm();
+        if (until && ps2::frame_count() == until) g_running.store(false, std::memory_order_relaxed);
         if (previous) previous();
     };
 }
 
 void write_profile(const char *path) {
-    if (g_running.exchange(false) && g_thread.joinable()) g_thread.join();
+    g_running.store(false);
+    if (g_thread.joinable()) g_thread.join();
     if (g_target) {
         CloseHandle(g_target);
         g_target = nullptr;

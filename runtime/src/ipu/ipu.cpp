@@ -335,6 +335,26 @@ inline std::uint64_t window(std::size_t bit) {
 // what has arrived) is handed to the plain calls, from the same start, so it fetches, waits for data or fails as it always did.
 inline std::size_t bits_left() { return g_in.size() * 8 > g_bit ? g_in.size() * 8 - g_bit : 0; }
 
+// `n` bytes as `for (i < n) out[i] = get(8)` gives them, with the same fetches and the same failure point: the bytes already in the
+// input are taken in one go (get(8) would fetch for none of them), and only a byte that needs a fetch goes through get(), which fetches,
+// waits for data or fails exactly as the plain loop does at that byte. CSC reads its 384-byte macroblocks this way (the God of War II
+// film converts millions of them; one get() per byte was about a tenth of the emulation thread).
+void get_bytes(std::uint8_t *out, std::size_t n) {
+    std::size_t i = 0;
+    while (i < n) {
+        const std::size_t ready = std::min(n - i, bits_left() / 8);
+        if (!ready) {
+        } else if (!(g_bit & 7u)) {
+            std::memcpy(out + i, g_in.data() + g_bit / 8, ready);
+        } else {
+            for (std::size_t k = 0; k < ready; ++k) out[i + k] = static_cast<std::uint8_t>(bits_at(g_bit + 8 * k, 8));
+        }
+        g_bit += ready * 8;
+        i += ready;
+        if (i < n) out[i++] = static_cast<std::uint8_t>(get(8));
+    }
+}
+
 void decode_block(std::int16_t *out, int channel, bool intra, std::uint32_t qsc) {
     int coef[64] = {};
     int index = 0;
@@ -733,7 +753,7 @@ bool run_command() {
         while (g_count) {
             std::uint8_t raw[384];
             const bool ok = atomic([&] {
-                for (std::uint8_t &v : raw) v = static_cast<std::uint8_t>(get(8));
+                get_bytes(raw, sizeof raw);
                 convert(raw, (cmd >> 27) & 1u);
             });
             if (!ok) {

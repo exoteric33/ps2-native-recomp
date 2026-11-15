@@ -168,6 +168,15 @@ std::map<std::uint32_t, std::uint64_t> g_ee_commands;
 std::map<std::uint32_t, std::uint64_t> g_unhandled_commands;
 std::map<std::uint32_t, std::uint64_t> g_ee_binds;
 std::map<std::uint32_t, std::uint64_t> g_ee_calls;  // RPC calls by server id (the server of an endpoint the EE called)
+// The calls the EE has sent and the IOP has not answered yet, by call packet address, for the F9 report's thread list:
+// which server, which function, which EE semaphore the caller waits on (-1: none), and when it was sent. Only read for the report; not in
+// save states (a state loaded in the middle of a call starts with none), cleared with the rest of the SIF state.
+struct OpenCall {
+    std::uint32_t server, function;
+    std::int32_t sema;
+    std::uint64_t frame;
+};
+std::map<std::uint32_t, OpenCall> g_open_calls;
 std::uint32_t g_sreg[32] = {};
 std::map<std::uint32_t, int> g_iop_clients;
 std::uint32_t g_iop_rpc_id = 1;
@@ -383,6 +392,7 @@ Rend make_rend(const Header &h, std::uint32_t record, std::uint32_t packet, std:
 }
 
 void reply_call(const Call &call) {
+    g_open_calls.erase(call.packet_addr);
     Rend r = make_rend(call.header, call.record_id, call.packet_addr, call.rpc_id, call.client_data, 0x8000000Au);
     send(&r, sizeof r);
 }
@@ -467,6 +477,15 @@ void bind(const std::uint8_t *packet) {
     }
     std::fprintf(stderr, "[sif] bind to 0x%08X waits for the server\n", server);
     g_binds[server] = PendingBind{r, now() + kEeClock * 4};
+}
+
+// Remember a call for the report's list; reply_call forgets it.
+void note_open_call(const std::uint8_t *packet) {
+    Call c;
+    std::memcpy(&c, packet, sizeof c);
+    std::int32_t sema = -1;
+    if (c.client_data && ee_read<std::uint32_t>(c.client_data) == c.packet_addr) sema = ee_read<std::int32_t>(c.client_data + 8);
+    if (g_open_calls.size() < 256) g_open_calls[c.packet_addr] = OpenCall{server_id_of_endpoint(c.server_data), c.rpc_number, sema, ps2::frames_run()};
 }
 
 void call(const std::uint8_t *packet) {
@@ -640,6 +659,7 @@ void command(std::uint32_t src, std::uint32_t size) {
     case 0x80000009u: bind(packet); break;
     case 0x8000000Au:
         keep_call_fields(packet);
+        note_open_call(packet);
         call(packet);
         break;
     case 0x8000000Cu: other_data(packet); break;
@@ -1549,6 +1569,7 @@ void reset() {
     g_binds.clear();
     g_iop_binds.clear();
     g_held_calls.clear();
+    g_open_calls.clear();
     g_hle_replies.clear();
     g_requests.clear();
     g_taken.clear();
@@ -1736,6 +1757,50 @@ void dump() {
         line += item;
     }
     if (!line.empty()) std::fprintf(stderr, "[sif] RPC servers of IOP modules:%s\n", line.c_str());
+}
+
+// The thread list of the F9 report asks these three; they only read.
+static std::string call_text(const OpenCall &o) {
+    char b[160];
+    const std::uint64_t now = ps2::frames_run();
+    std::snprintf(b, sizeof b, "an RPC call to server 0x%08X function %u, sent %llu frames ago, has no reply yet", o.server, o.function,
+                  static_cast<unsigned long long>(now >= o.frame ? now - o.frame : 0));
+    return b;
+}
+
+std::string rpc_call_of_ee_semaphore(int sema) {
+    for (const auto &[packet, o] : g_open_calls)
+        if (o.sema == sema) return call_text(o);
+    return {};
+}
+
+std::string open_calls_text() {
+    std::string out;
+    for (const auto &[packet, o] : g_open_calls) out += "    the EE's " + call_text(o) + "\n";
+    return out;
+}
+
+std::string iop_thread_rpc_wait(int thread, int queue) {
+    char b[200];
+    if (queue) {
+        std::string servers;
+        for (const auto &[sd, s] : g_guest_servers)
+            if (s.queue == static_cast<std::uint32_t>(queue)) {
+                std::snprintf(b, sizeof b, "%s0x%08X", servers.empty() ? "" : ", ", s.sid);
+                servers += b;
+            }
+        return "the RPC server loop waits for a call" + (servers.empty() ? std::string() : " (server " + servers + ")");
+    }
+    for (const auto &[client, t] : g_iop_clients) {
+        if (t != thread) continue;
+        const auto bind = g_iop_binds.find(client);
+        if (bind != g_iop_binds.end()) {
+            std::snprintf(b, sizeof b, "an RPC bind to EE server 0x%08X has no answer yet", bind->second.server);
+            return b;
+        }
+        return "an RPC call to an EE server has no answer yet";
+    }
+    return "an RPC wait";
 }
 
 std::uint64_t unhandled_commands(std::uint32_t cid) {

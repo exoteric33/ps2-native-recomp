@@ -338,7 +338,11 @@ std::int32_t load_module(const std::string &path, const std::string &args, std::
     for (char &ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     if (lower.rfind("cdrom", 0) == 0) data = kernel::read_disc_file(path);
     if (data.empty() && lower.rfind("rom0:", 0) != 0) {
-        std::fprintf(stderr, "[iop] cannot read module %s\n", path.c_str());
+        // one word more for the log: a file that is not on the disc (a wrong name, or an image that lacks it) is not the same problem as
+        // one that is there but has no bytes (a damaged image), and a name that is not a disc path (cdrom...) is read from nowhere
+        const auto entry = lower.rfind("cdrom", 0) == 0 ? disc::find(path) : std::nullopt;
+        const char *why = lower.rfind("cdrom", 0) != 0 ? "not a disc path" : !entry || entry->directory ? "file not found" : entry->size == 0 ? "file is empty" : "file could not be read";
+        std::fprintf(stderr, "[iop] cannot read module %s: %s\n", path.c_str(), why);
     }
     return load_module_buffer(data, path, args, std::move(done));
 }

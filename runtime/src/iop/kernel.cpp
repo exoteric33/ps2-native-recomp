@@ -708,8 +708,52 @@ void dump() {
     using namespace kernel;
     for (const auto &[id, m] : g_modules) std::fprintf(stderr, "[iop] module %d %s at 0x%08X\n", id, m.name.c_str(), m.base);
     for (const auto &[id, t] : g_threads)
-        std::fprintf(stderr, "[iop] thread %d status %d prio %d wait %d/%d pc 0x%08X\n", id, t.status, t.priority, t.wait, t.wait_id,
-                     id == g_current ? g_cpu.pc : t.context.pc);
+        std::fprintf(stderr, "[iop] thread %d status %d prio %d wait %d/%d pc 0x%08X (%s)\n", id, t.status, t.priority, t.wait, t.wait_id,
+                     id == g_current ? g_cpu.pc : t.context.pc, wait_words(t).c_str());
+}
+
+// The name of the module whose code holds an address, for the thread list ("" when none does).
+static std::string module_of(std::uint32_t address) {
+    for (const auto &[id, m] : kernel::g_modules)
+        if (address >= m.base && address - m.base < m.size) return m.name;
+    return {};
+}
+
+std::string thread_summary() {
+    using namespace kernel;
+    int live = 0, waiting = 0, servers = 0;
+    for (const auto &[id, t] : g_threads) {
+        if (t.status == kDormant) continue;
+        ++live;
+        if (t.status == kWait || t.status == kWaitSuspend) {
+            ++waiting;
+            servers += t.wait == kWaitRpc && t.wait_id != 0;
+        }
+    }
+    if (!live) return "no IOP thread has started yet";
+    if (waiting == live) return "every IOP thread waits (" + std::to_string(live) + ", " + std::to_string(servers) + " of them idle RPC server loops)";
+    return std::to_string(live - waiting) + " of " + std::to_string(live) + " IOP threads run or are ready, " + std::to_string(waiting) + " wait";
+}
+
+std::string thread_report() {
+    using namespace kernel;
+    std::string out;
+    char b[200];
+    int dormant = 0;
+    for (const auto &[id, t] : g_threads) {
+        if (t.status == kDormant) {
+            ++dormant;
+            continue;
+        }
+        const std::string module = module_of(t.entry);
+        std::snprintf(b, sizeof b, "    IOP thread %d%s%s%s, priority %d: ", id, module.empty() ? "" : " (", module.c_str(), module.empty() ? "" : ")", t.priority);
+        out += b;
+        out += wait_words(t);
+        std::snprintf(b, sizeof b, "; at 0x%08X\n", id == g_current ? g_cpu.pc : t.context.pc);
+        out += b;
+    }
+    if (dormant) out += "    (IOP threads that exist but are not started: " + std::to_string(dormant) + ")\n";
+    return out;
 }
 
 void raise_interrupt(unsigned line) { hw::raise_interrupt(line); }

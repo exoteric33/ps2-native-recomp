@@ -76,6 +76,9 @@ void raise_interrupt(unsigned line);
 void vblank(bool start);
 bool idle();
 void dump();
+// The F9 report's thread list, the same words as the end-of-run list. Only on the emulation thread.
+std::string thread_summary();  // one plain line
+std::string thread_report();   // one line per started thread
 
 std::int32_t load_module(const std::string &path, const std::string &args, std::function<void(int, int)> done = {});
 std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std::string &path, const std::string &args,

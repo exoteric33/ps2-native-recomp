@@ -836,6 +836,18 @@ std::string report_info(bool emergency, const fs::path &dir, bool has_state, boo
     if (has_state) t += "\nsave state size: " + megabytes(state_bytes) + "\n";
     if (emergency) t += "\nThe emulation did not answer F9 within " + std::to_string(kGiveUpMs / 1000) + " seconds, so this report was written by the window.\nThe game is probably hanging inside the runner.\n";
     t += "\nsound (what the sound chip did):\n" + iop::spu2::summary();
+    // The thread lists are read on this thread, between two instructions. An emergency report is written by the window while the
+    // emulation is stuck, where the maps could be half changed, so it gets none.
+    t += "\nthreads (what each game thread waits for):\n";
+    if (emergency) {
+        t += "    (not listed: the emulation did not answer, so the lists could not be read safely)\n";
+    } else {
+        t += "    reading: " + kernel::thread_summary() + "\n";
+        t += "    reading: " + iop::thread_summary() + "\n";
+        t += kernel::thread_report() + iop::thread_report();
+        const std::string calls = sif::open_calls_text();
+        t += calls.empty() ? std::string("    no RPC call the EE sent is waiting for a reply\n") : calls;
+    }
     const std::string first = g_options.first_log ? g_options.first_log(80) : std::string();
     const std::string startup = pick_lines(first, {"[gpu]", "[window]", "[audio] sound device", "[pad]"});
     t += "\nfrom the start of the log:\n" + (startup.empty() ? std::string("    (not captured)\n") : startup);

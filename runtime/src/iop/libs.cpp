@@ -1,6 +1,7 @@
 #include "kernel.hpp"
 
 #include "hw.hpp"
+#include "sif.hpp"
 
 #include "ps2/state.hpp"
 #include "ps2/system.hpp"
@@ -1663,6 +1664,43 @@ void libs_state(ps2::state::Stream &s) {
     }
 }
 
+
+// What an IOP thread is doing, in words (the end-of-run list and the F9 report's thread list share this): for a wait,
+// the object (semaphore with its count, event flag with its bits, ...) or the RPC call.
+std::string wait_words(const Thread &t) {
+    char b[200];
+    if (t.status == kDormant) return "not started";
+    if (t.status == kRun) return "running";
+    if (t.status == kReady) return "ready (waits for the processor)";
+    if (t.status == kSuspend) return "suspended";
+    std::string out;
+    switch (t.wait) {
+    case kWaitSleep: out = "asleep (SleepThread: waits for a wake-up)"; break;
+    case kWaitDelay: out = "waits out a delay (DelayThread)"; break;
+    case kWaitSema: {
+        const auto it = g_semas.find(t.wait_id);
+        if (it == g_semas.end()) std::snprintf(b, sizeof b, "waits on semaphore %d (gone)", t.wait_id);
+        else std::snprintf(b, sizeof b, "waits on semaphore %d (count %d, %zu waiting)", t.wait_id, it->second.count, it->second.waiters.size());
+        out = b;
+        break;
+    }
+    case kWaitEvent: {
+        const auto it = g_events.find(t.wait_id);
+        std::snprintf(b, sizeof b, "waits on event flag %d (bits now 0x%X, it wants 0x%X, %s)", t.wait_id, it == g_events.end() ? 0u : it->second.bits,
+                      t.event_bits, (t.event_mode & 1u) ? "any of them" : "all of them");
+        out = b;
+        break;
+    }
+    case kWaitMbx: std::snprintf(b, sizeof b, "waits on message box %d for a message", t.wait_id); out = b; break;
+    case kWaitFpl: case kWaitVpl: std::snprintf(b, sizeof b, "waits on memory pool %d for a free block", t.wait_id); out = b; break;
+    case kWaitVblank: out = t.wait_id ? "waits for the end of the vertical blank" : "waits for the start of the next vertical blank"; break;
+    case kWaitRpc: out = sif::iop_thread_rpc_wait(t.id, t.wait_id); break;
+    case kWaitHle: out = "waits for a disc read or a module start"; break;
+    default: std::snprintf(b, sizeof b, "waits (kind %d, id %d)", static_cast<int>(t.wait), t.wait_id); out = b; break;
+    }
+    if (t.status == kWaitSuspend) out += ", and is suspended";
+    return out;
+}
 }
 
 namespace ps2::iop {

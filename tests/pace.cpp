@@ -84,6 +84,44 @@ int main() {
     }
     check(gaps_are(play(3, 0.4, 40), 3), "pace 20: a quick game shows a picture every third refresh");
 
+    // Films (#44): while the video decoder is given work the game is not held; a few refreshes after it stops, it is again.
+    // The made-up game works 0.4 refresh a picture; the decoder is busy in refreshes 20 to 59 (the kernel notes it once a refresh,
+    // at the vertical blank, before the game's picture of that refresh).
+    {
+        ps2::pace::Hold hold;
+        hold.every = 2;
+        std::vector<std::uint64_t> shown, held_at;
+        double t = 0.25;
+        for (int i = 0; i < 120; ++i) {
+            const auto at = static_cast<std::uint64_t>(std::floor(t + 0.4)) + 1;
+            for (std::uint64_t f = shown.empty() ? 0 : shown.back() + 1; f <= at; ++f)
+                if (f >= 20 && f < 60) hold.decoder(f);
+            shown.push_back(at);
+            const std::uint64_t until = hold.picture(at);
+            if (until) held_at.push_back(at), t = static_cast<double>(until);
+            else t = static_cast<double>(at);
+        }
+        bool before = true, during = true, after = true;
+        std::uint64_t first_after = 0;
+        for (std::size_t i = 1; i < shown.size(); ++i) {
+            const std::uint64_t gap = shown[i] - shown[i - 1];
+            if (shown[i] < 20 && i > 3) before = before && gap == 2;
+            if (shown[i] >= 22 && shown[i] < 60) during = during && gap == 1;
+            if (shown[i] >= 60 + ps2::pace::kFilmRefreshes + 3 && !first_after) first_after = i;
+        }
+        for (std::size_t i = first_after; i < shown.size(); ++i) after = after && shown[i] - shown[i - 1] == 2;
+        bool none_held_in_film = true;
+        std::uint64_t first_held_after = 0;
+        for (std::uint64_t h : held_at) {
+            if (h >= 20 && h < 60) none_held_in_film = false;
+            if (h >= 60 && !first_held_after) first_held_after = h;
+        }
+        check(before, "film: before the decoder starts, a quick game is held to every second refresh");
+        check(during && none_held_in_film, "film: while the decoder is busy, a picture every refresh and never held");
+        check(first_held_after && first_held_after <= 60 + ps2::pace::kFilmRefreshes + 2, "film: held again a few refreshes after the decoder stops");
+        check(after, "film: after it, every second refresh again");
+    }
+
     // The end-of-run count.
     {
         ps2::pace::Count n;

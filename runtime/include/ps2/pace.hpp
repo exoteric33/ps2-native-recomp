@@ -67,18 +67,28 @@ inline int parse(std::string text) {
     return 0;
 }
 
+// Films (#44): a film is played through the video decoder (the IPU) and its speed is the number of pictures the game decodes
+// and shows per refresh, so a hold would play it at half speed. A race never uses the decoder. So the game is not held while the
+// decoder has been given work in the last kFilmRefreshes refreshes (more than the gap between two pictures of a 25 or 30 a second
+// film, short enough that the pace is back a moment after the film ends).
+inline constexpr std::uint64_t kFilmRefreshes = 4;
+
 // The rule of the hold, fed with the refresh count (vertical blanks since power-on) at every new picture.
 struct Hold {
     int every = 1;              // refreshes per picture the game is held to; 1 = off
     bool have_last = false;
     std::uint64_t last = 0;     // the refresh the last picture counts for: when it was shown, or when a hold ended
+    std::uint64_t film_until = 0;  // no hold before this refresh: the decoder was busy at or after film_until - kFilmRefreshes
+
+    // The video decoder was given work in refresh `frame` (noted once a refresh, from the kernel's vertical blank).
+    void decoder(std::uint64_t frame) { film_until = frame + kFilmRefreshes; }
 
     // A new picture at refresh `frame`. Returns the refresh until which the game is held (it runs again at that vertical
     // blank), or 0 when it is not held. A second change in the same refresh (DISPFB1 and DISPFB2, or a write while a hold still
     // runs) belongs to the same picture.
     std::uint64_t picture(std::uint64_t frame) {
         if (have_last && frame <= last) return 0;
-        if (every > 1 && have_last && frame < last + static_cast<std::uint64_t>(every)) {
+        if (every > 1 && have_last && frame >= film_until && frame < last + static_cast<std::uint64_t>(every)) {
             last += static_cast<std::uint64_t>(every);
             return last;
         }

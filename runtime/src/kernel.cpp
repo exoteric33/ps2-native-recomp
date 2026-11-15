@@ -8,6 +8,7 @@
 
 #include "ps2/state.hpp"
 #include "ps2/pace.hpp"
+#include "ipu/ipu.hpp"
 #include "ps2/crash.hpp"
 
 #include <algorithm>
@@ -114,6 +115,7 @@ pace::Hold g_pace;
 pace::Count g_pace_count;
 std::uint64_t g_pace_until = 0;
 int g_pace_thread = 0;
+std::uint64_t g_pace_decoded = 0;  // the decoder's commands at the last refresh
 int g_pace_held = 0;  // threads in kWaitPace (a hint for on_vblank_start, counted again there)
 
 template <typename Map>
@@ -439,6 +441,7 @@ void reset() {
     g_in_handler = g_reschedule = false;
     g_pending_alarms.clear();
     g_pace.have_last = false;
+    g_pace.film_until = 0;
     g_pace_until = 0;
     g_pace_thread = 0;
     g_pace_held = 0;
@@ -570,6 +573,16 @@ void take_pending(Cpu &c) {
 
 void on_vblank_start() {
     ++g_pace_count.refreshes;
+    static const bool trace_film = std::getenv("PS2_TRACE_DISPLAY") != nullptr;
+    if (g_pace.every > 1 || trace_film) [[unlikely]] {  // a film is playing while the video decoder is given work: no hold (pace.hpp, kFilmRefreshes)
+        const std::uint64_t decoded = ipu::decode_commands();
+        if (decoded != g_pace_decoded) {
+            if (g_pace.every > 1) g_pace.decoder(frame_count());
+            if (trace_film) std::fprintf(stderr, "[ipu] f%llu %llu decode commands\n", static_cast<unsigned long long>(frame_count()),
+                                         static_cast<unsigned long long>(decoded - g_pace_decoded));
+        }
+        g_pace_decoded = decoded;
+    }
     if (g_pace_held) [[unlikely]] pace_release();
     if (!g_vsync_flag) return;
     st32(g_vsync_flag, 1);

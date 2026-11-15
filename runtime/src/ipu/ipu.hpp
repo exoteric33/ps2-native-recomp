@@ -19,4 +19,8 @@ void read_fifo(std::uint8_t *qword);
 void dma_started(int channel);
 void stats();
 
+// Commands that decode or convert a picture (IDEC, BDEC, VDEC, FDEC, CSC) given since the start: the picture pace reads it once a
+// refresh to see that a film is playing. Not part of a save state.
+std::uint64_t decode_commands();
+
 }

@@ -886,6 +886,10 @@ void read_fifo(std::uint8_t *qword) {
 
 void dma_started(int) { step(); }
 
+std::uint64_t decode_commands() {
+    return g_commands[kIdec] + g_commands[kBdec] + g_commands[kVdec] + g_commands[kFdec] + g_commands[kCsc];
+}
+
 void stats() {
     std::fprintf(stderr, "[ipu] commands:");
     for (int i = 0; i < 16; ++i)

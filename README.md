@@ -1,7 +1,7 @@
 # ps2-native-recomp
 
 Turns a PS2 game disc you own into a native Windows or Linux program by static recompilation: the code of the PS2's
-main processor is translated to C++ and compiled, and the rest of the console is emulated. 54 games work as far as they
+main processor is translated to C++ and compiled, and the rest of the console is emulated. 55 games work as far as they
 have been tested, 35 of them out of the box, with zero game-specific code. God of War II has been played from start to
 end. **This project is at an early stage** and still changes a lot.
 
@@ -148,6 +148,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | No One Lives Forever (USA) | plays well, not played through yet: to scene 7 at 60 fps with occasional dips, with a game controller; no problems found ([#94](https://github.com/exoteric33/ps2-native-recomp/issues/94)) | m3tabolic |
 | Champions of Norrath (USA) | runs, not played through yet: into the game and playing; heavy slowdown in places with many torches and fire effects ([#57](https://github.com/exoteric33/ps2-native-recomp/issues/57)) | davidsdullea |
 | Red Faction (USA) | plays well, not played through yet: about 3 hours (a third of the game) at full speed (about 30 fps) with a game controller; no problems found ([#107](https://github.com/exoteric33/ps2-native-recomp/issues/107)) | m3tabolic |
+| Half-Life (USA) | runs, not played through yet: menus and maps at full speed; the missing sound in the maps is fixed since the update of 2026-11-14 ([#105](https://github.com/exoteric33/ps2-native-recomp/issues/105)) | ChuckBurry200 |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

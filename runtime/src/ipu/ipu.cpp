@@ -861,6 +861,13 @@ std::uint32_t read32(std::uint32_t a) {
     }
 }
 
+// A 64-bit load of a register pair (the game reads the command result this way, about 6,700 times a frame in God of War II's film):
+// the two 32-bit reads, which change nothing, in one call
+std::uint64_t read64(std::uint32_t a) {
+    const std::uint32_t low = read32(a);
+    return low | (static_cast<std::uint64_t>(read32(a + 4)) << 32);
+}
+
 void write32(std::uint32_t a, std::uint32_t v) {
     switch (a) {
     case 0x10002000u: {

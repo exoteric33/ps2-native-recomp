@@ -200,6 +200,28 @@ constexpr std::uint32_t kIpuBase = 0x10002000u;  // the IPU registers, 0x1000200
 //  - IPU registers, 32 and 64 bits: hw.cpp hands them to ipu::read32 / ipu::write32 after checks that no IPU address passes.
 inline std::uint8_t *ram_mirror(std::uint32_t p) { return p < 0x10000000u ? g_ram + (p & (kRamSize - 1)) : nullptr; }
 
+// The IPU registers, the same calls on both ways in: the first test in slow_ld32 / slow_ld64 / slow_st32 / slow_st64 below (the
+// address exactly as the game's code passes it, 0x10002000..0x1000203F: physical() leaves it as it is, it is no RAM mirror and not
+// INTC_STAT, so the long tests before the IPU's turn could only fall through) and load_fast / store_fast (the same registers seen
+// through a mirror such as 0xB0002000). God of War II's film makes about 20,000 of these accesses a frame.
+inline std::uint32_t ipu_load32(std::uint32_t p) {
+    ++hw::g_slow_seq;
+    return ipu::read32(p & ~3u) >> ((p & 3u) * 8u);
+}
+inline std::uint64_t ipu_load64(std::uint32_t p) {
+    ++hw::g_slow_seq;
+    return ipu::read64(p);  // read32(p), read32(p + 4); reading a register changes nothing, so their order does not matter
+}
+inline void ipu_store32(std::uint32_t p, std::uint32_t v) {
+    ++hw::g_slow_seq;
+    ipu::write32(p, v);
+}
+inline void ipu_store64(std::uint32_t p, std::uint64_t v) {
+    ++hw::g_slow_seq;
+    ipu::write32(p, static_cast<std::uint32_t>(v));
+    ipu::write32(p + 4, static_cast<std::uint32_t>(v >> 32));
+}
+
 template <typename T>
 inline T load_fast(std::uint32_t a) {
     const std::uint32_t p = physical(a);
@@ -209,9 +231,8 @@ inline T load_fast(std::uint32_t a) {
     }
     if constexpr (sizeof(T) >= 4) {
         if (p - kIpuBase < (sizeof(T) == 8 ? 0x38u : 0x40u)) {
-            ++hw::g_slow_seq;
-            if constexpr (sizeof(T) == 8) return ipu::read32(p) | (static_cast<std::uint64_t>(ipu::read32(p + 4)) << 32);
-            else return static_cast<T>(ipu::read32(p & ~3u) >> ((p & 3u) * 8u));
+            if constexpr (sizeof(T) == 8) return ipu_load64(p);
+            else return static_cast<T>(ipu_load32(p));
         }
     }
     return read_slow<T>(a);
@@ -231,13 +252,8 @@ inline void store_fast(std::uint32_t a, T v) {
     }
     if constexpr (sizeof(T) >= 4) {
         if (p - kIpuBase < (sizeof(T) == 8 ? 0x38u : 0x40u)) {
-            ++hw::g_slow_seq;
-            if constexpr (sizeof(T) == 8) {
-                ipu::write32(p, static_cast<std::uint32_t>(v));
-                ipu::write32(p + 4, static_cast<std::uint32_t>(v >> 32));
-            } else {
-                ipu::write32(p, v);
-            }
+            if constexpr (sizeof(T) == 8) ipu_store64(p, v);
+            else ipu_store32(p, static_cast<std::uint32_t>(v));
             return;
         }
     }
@@ -249,11 +265,15 @@ inline void store_fast(std::uint32_t a, T v) {
 std::uint8_t slow_ld8(std::uint32_t a) { return load_fast<std::uint8_t>(a); }
 std::uint16_t slow_ld16(std::uint32_t a) { return load_fast<std::uint16_t>(a); }
 std::uint32_t slow_ld32(std::uint32_t a) {
+    if (a - kIpuBase < 0x40u) return ipu_load32(a);
     // INTC_STAT is read in a tight loop by every game that waits for the next picture (sceGsSyncV): a short way for it, same value
     if (a == 0x1000F000u || a == 0xB000F000u) return hw::read_intc_stat();
     return load_fast<std::uint32_t>(a);
 }
-std::uint64_t slow_ld64(std::uint32_t a) { return load_fast<std::uint64_t>(a); }
+std::uint64_t slow_ld64(std::uint32_t a) {
+    if (a - kIpuBase < 0x38u) return ipu_load64(a);
+    return load_fast<std::uint64_t>(a);
+}
 
 void slow_ld128(std::uint32_t a, Reg128 &out) {
     if (const std::uint8_t *host = ram_mirror(physical(a))) {
@@ -269,8 +289,14 @@ void slow_ld128(std::uint32_t a, Reg128 &out) {
 
 void slow_st8(std::uint32_t a, std::uint8_t v) { store_fast(a, v); }
 void slow_st16(std::uint32_t a, std::uint16_t v) { store_fast(a, v); }
-void slow_st32(std::uint32_t a, std::uint32_t v) { store_fast(a, v); }
-void slow_st64(std::uint32_t a, std::uint64_t v) { store_fast(a, v); }
+void slow_st32(std::uint32_t a, std::uint32_t v) {
+    if (a - kIpuBase < 0x40u) return ipu_store32(a, v);
+    store_fast(a, v);
+}
+void slow_st64(std::uint32_t a, std::uint64_t v) {
+    if (a - kIpuBase < 0x38u) return ipu_store64(a, v);
+    store_fast(a, v);
+}
 
 void slow_st128(std::uint32_t a, const Reg128 &v) {
     if (std::uint8_t *host = ram_mirror(physical(a))) {

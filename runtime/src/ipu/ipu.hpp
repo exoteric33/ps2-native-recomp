@@ -12,6 +12,7 @@ void state(ps2::state::Stream &s);
 
 void reset();
 std::uint32_t read32(std::uint32_t a);
+std::uint64_t read64(std::uint32_t a);  // read32(a) and read32(a + 4) in one call
 void write32(std::uint32_t a, std::uint32_t v);
 void write_fifo(const std::uint8_t *qword);
 void read_fifo(std::uint8_t *qword);

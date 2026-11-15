@@ -59,10 +59,11 @@ int main(int argc, char **argv) {
                 continue;
             }
             ps2::vurecomp::Input in{key, entry, std::vector<std::uint8_t>(bytes), unit};
-            // the recording order (Input::order): +1 keeps a time of 0 from meaning "unknown"
+            // the recording order (Input::order). The file clock's count is signed and its epoch differs between libraries (libstdc++'s is in
+            // 2174, so every real time is negative there): moving the sign bit keeps the order for any count; 0 stays "unknown".
             std::error_code time_error;
             const auto written = fs::last_write_time(e.path(), time_error);
-            if (!time_error) in.order = static_cast<std::uint64_t>(std::max<std::int64_t>(written.time_since_epoch().count(), 0)) + 1;
+            if (!time_error) in.order = std::max<std::uint64_t>(static_cast<std::uint64_t>(written.time_since_epoch().count()) ^ (1ull << 63), 1);
             std::ifstream f(e.path(), std::ios::binary);
             if (!f.read(reinterpret_cast<char *>(in.code.data()), bytes) || f.peek() != std::ifstream::traits_type::eof()) {
                 std::fprintf(stderr, "VU%d recording must contain %u bytes: %s\n", unit, bytes, ps2::os::utf8(e.path()).c_str());

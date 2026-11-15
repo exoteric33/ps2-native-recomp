@@ -22,6 +22,7 @@ from pathlib import Path
 import argparse
 import os
 import re
+import platform
 import shutil
 import struct
 import subprocess
@@ -185,10 +186,11 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # 5. the C++ is accepted
     compiler = shutil.which('clang++')
+    x86_flags = ['-mavx2'] if platform.machine().lower() in ('x86_64', 'amd64') else []  # an ARM Mac has no AVX2
     if compiler:
         bad = []
         for p in sorted(out.glob('vu1_*.cpp')):
-            r = subprocess.run([compiler, '-std=gnu++20', '-mavx2', '-ffp-contract=off', '-fsyntax-only', '-Wno-unused-label', '-Wno-unused-variable',
+            r = subprocess.run([compiler, '-std=gnu++20', *x86_flags, '-ffp-contract=off', '-fsyntax-only', '-Wno-unused-label', '-Wno-unused-variable',
                                 '-isystem', str(root / 'runtime/include'), str(p)], capture_output=True, text=True)
             if r.returncode != 0:
                 bad.append(p.name + ': ' + r.stderr.strip().splitlines()[0] if r.stderr.strip() else p.name)

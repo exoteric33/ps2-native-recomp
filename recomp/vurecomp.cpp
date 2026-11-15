@@ -2,6 +2,8 @@
 
 #include "ps2/os.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -57,6 +59,10 @@ int main(int argc, char **argv) {
                 continue;
             }
             ps2::vurecomp::Input in{key, entry, std::vector<std::uint8_t>(bytes), unit};
+            // the recording order (Input::order): +1 keeps a time of 0 from meaning "unknown"
+            std::error_code time_error;
+            const auto written = fs::last_write_time(e.path(), time_error);
+            if (!time_error) in.order = static_cast<std::uint64_t>(std::max<std::int64_t>(written.time_since_epoch().count(), 0)) + 1;
             std::ifstream f(e.path(), std::ios::binary);
             if (!f.read(reinterpret_cast<char *>(in.code.data()), bytes) || f.peek() != std::ifstream::traits_type::eof()) {
                 std::fprintf(stderr, "VU%d recording must contain %u bytes: %s\n", unit, bytes, ps2::os::utf8(e.path()).c_str());

@@ -28,6 +28,10 @@ struct Program {
     std::uint32_t entry;
     std::vector<std::uint8_t> code;
     int unit = 1;
+    std::uint64_t order = 0;   // when the input was recorded (Input::order); a jump target has the order of the program that brought it
+    std::size_t root = 0;      // the recorded program this one comes from: its place in the recording order (a recorded program: its own)
+    bool target = false;       // a jump target that no input named
+    std::size_t group = 0;     // the file it is written to
 };
 
 std::uint32_t word(const std::vector<std::uint8_t> &code, std::uint32_t at) {
@@ -1133,7 +1137,7 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
     std::vector<Program> programs;
     std::set<std::pair<int, std::uint64_t>> recorded_keys;
     for (Input &in : inputs) {
-        Program p{in.key, in.entry, std::move(in.code), in.unit};
+        Program p{in.key, in.entry, std::move(in.code), in.unit, in.order};
         const std::uint32_t kMask = p.unit == 0 ? 4095u : 16383u;
         if ((p.unit != 0 && p.unit != 1) || p.entry > kMask || (p.entry & 7u) || p.code.size() != kMask + 1u || (live_stamp && p.unit == 0)) {
             std::fprintf(stderr, "vu%d %016llX at %04X: invalid input or unsupported VU0 live-library request, skipped\n", p.unit, static_cast<unsigned long long>(p.key), p.entry);
@@ -1150,6 +1154,17 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
     std::set<std::pair<int, std::uint64_t>> keys;
     for (const Program &p : programs) keys.emplace(p.unit, p.key);
     const std::size_t recorded = programs.size();
+    // A tool run gives every input the time it was recorded: the files are then made so that a later recording changes the last files only
+    // (below). Without a time (live compiling, the tests) the programs are sorted by key as before.
+    const bool recorded_order = std::any_of(programs.begin(), programs.end(), [](const Program &p) { return p.order != 0; });
+    if (recorded_order) {
+        std::vector<std::size_t> by_time(recorded);
+        for (std::size_t i = 0; i < recorded; ++i) by_time[i] = i;
+        std::sort(by_time.begin(), by_time.end(), [&](std::size_t a, std::size_t b) {
+            return programs[a].order != programs[b].order ? programs[a].order < programs[b].order : programs[a].key < programs[b].key;
+        });
+        for (std::size_t rank = 0; rank < recorded; ++rank) programs[by_time[rank]].root = rank;
+    }
     for (std::size_t i = 0; i < (with_targets ? recorded : 0); ++i) {
         if (programs[i].unit == 0) continue;  // VU0 entries are called by the EE and recorded individually.
         const std::uint32_t kMask = 16383u;
@@ -1164,13 +1179,20 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
         for (std::uint32_t target : targets) {
             const std::uint64_t key = ps2::vu::program_key(programs[i].code.data(), ps2::vu::reachable(programs[i].code.data(), kMask, target), target);
             if (ps2::vu::branch_in_delay_slot(programs[i].code.data(), kMask, target)) continue;
-            if (keys.emplace(programs[i].unit, key).second) programs.push_back(Program{key, target, programs[i].code, programs[i].unit});
+            if (keys.emplace(programs[i].unit, key).second) programs.push_back(Program{key, target, programs[i].code, programs[i].unit, programs[i].order, programs[i].root, true});
         }
     }
-    std::sort(programs.begin(), programs.end(), [](const Program &a, const Program &b) { return a.key < b.key; });
+    if (recorded_order) {
+        // In the order of recording, a program followed by its jump targets.
+        std::sort(programs.begin(), programs.end(), [](const Program &a, const Program &b) {
+            if (a.root != b.root) return a.root < b.root;
+            return a.target != b.target ? b.target : a.key < b.key;
+        });
+        for (Program &p : programs) p.group = p.root / per_file;
+    } else {
+        std::sort(programs.begin(), programs.end(), [](const Program &a, const Program &b) { return a.key < b.key; });
+    }
     fs::create_directories(out_dir);
-    for (const auto &e : fs::directory_iterator(out_dir))
-        if (ps2::os::utf8(e.path().filename()).rfind("vu1_", 0) == 0) fs::remove(e.path());
     std::vector<std::string> names, bodies;
     // the recorded VU0 programs, as candidates for the subroutines a VU0 program calls (vu0_calls); a copy, as the loop below moves them
     std::vector<Program> vu0_peers;
@@ -1190,11 +1212,25 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
     result.skipped = programs.size() - names.size();
     result.jump_targets = programs.size() - recorded;
     programs.resize(names.size());
-    for (std::size_t first = 0; first < programs.size(); first += per_file) {
+    if (!recorded_order)
+        for (std::size_t i = 0; i < programs.size(); ++i) programs[i].group = i / per_file;
+    // A file is written only when its text is not what the folder holds: build tools (ninja) go by time stamps, so a file written again
+    // with the same text would be compiled again. The files that a run no longer makes are removed.
+    std::set<std::string> written;
+    const auto put = [&](const std::string &file, const std::string &text) {
+        written.insert(file);
+        const fs::path path = out_dir / file;
+        std::string before;
+        if (std::ifstream in(path, std::ios::binary); in) before.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        if (before != text || !fs::exists(path)) std::ofstream(path, std::ios::binary) << text;
+    };
+    std::map<std::size_t, std::string> files;
+    for (std::size_t i = 0; i < programs.size(); ++i) files[programs[i].group] += bodies[i];
+    for (const auto &[group, bodies_text] : files) {
         std::string text = "#include \"ps2/vu_ops.hpp\"\n#include <cstdio>\n\nnamespace gen {\n\nusing namespace ps2;\nusing namespace ps2::vuops;\n\n";
-        for (std::size_t i = first; i < std::min(programs.size(), first + per_file); ++i) text += bodies[i];
+        text += bodies_text;
         text += "}\n";
-        std::ofstream(out_dir / std::format("vu1_{:03}.cpp", first / per_file), std::ios::binary) << text;
+        put(std::format("vu1_{:03}.cpp", group), text);
     }
     std::string table = "#include \"ps2/vu_ops.hpp\"\n\nnamespace gen {\n";
     for (const auto &n : names) table += std::format("void {}(ps2::Vu0Regs &r, std::uint8_t *mem);\n", n);
@@ -1233,7 +1269,11 @@ PS2_LIVE_EXPORT const ps2::vu::Program *ps2_vu_live_init(const ps2::vu::LiveHost
 }}
 )", live_stamp, programs.size());
     }
-    std::ofstream(out_dir / "vu1_table.cpp", std::ios::binary) << table;
+    put("vu1_table.cpp", table);
+    for (const auto &e : fs::directory_iterator(out_dir)) {
+        const std::string name = ps2::os::utf8(e.path().filename());
+        if (name.rfind("vu1_", 0) == 0 && !written.count(name)) fs::remove(e.path());
+    }
     result.programs = programs.size();
     for (const Program &p : programs) result.keys.push_back(p.key);
     return result;

@@ -1075,8 +1075,8 @@ $U.bar.Size = New-Size 684 22
 $U.bar.Minimum = 0
 $U.bar.Maximum = 1000
 $U.buildCard.Controls.Add($U.bar)
-$U.elapsed = Add-Label $U.buildCard 'elapsed' '' 18 158 360 22 (New-Font 10.5) $C.Muted
-$U.percent = Add-Label $U.buildCard 'percent' '' 502 156 200 24 (New-Font 11 $true) $C.Ink 'TopRight'
+$U.elapsed = Add-Label $U.buildCard 'elapsed' '' 18 158 480 22 (New-Font 10.5) $C.Muted
+$U.percent = Add-Label $U.buildCard 'percent' '' 542 156 160 24 (New-Font 11 $true) $C.Ink 'TopRight'
 $U.buildExtras = Add-Label $U.buildCard 'buildExtras' '' 18 180 684 20 (New-Font 10) $C.Muted
 $U.tip = Add-Label $w 'tip' 'This can take a while. You can leave this window open and use your PC for other things. Please do not shut the PC down.' 42 306 716 50 (New-Font 11) $C.Muted
 $U.log = New-Object Windows.Forms.TextBox
@@ -2041,7 +2041,7 @@ function Start-Stage([int]$index) {
     $stage = $b.Plan[$index]
     $b.Stage = $stage
     $b.StageClock = [Diagnostics.Stopwatch]::StartNew()
-    $b.Step = 0; $b.Round = 0; $b.F = 0.0; $b.ExitSeen = $null; $b.Error = ''; $b.Phase = 0; $b.Ninja = $null; $b.NinjaAt = [DateTime]::MinValue
+    $b.Step = 0; $b.Round = 0; $b.Testing = 0; $b.TestMax = 8; $b.TestSeen = $false; $b.TestClock = [Diagnostics.Stopwatch]::StartNew(); $b.LastLine = [DateTime]::Now; $b.F = 0.0; $b.ExitSeen = $null; $b.Error = ''; $b.Phase = 0; $b.Ninja = $null; $b.NinjaAt = [DateTime]::MinValue
     $bash = Join-Path $ToolsDir 'mingit\usr\bin\bash.exe'
     switch ($stage.Id) {
         'tools' {
@@ -2078,6 +2078,7 @@ function Start-Stage([int]$index) {
 function Read-BuildLine($b, [string]$raw) {
     $line = $raw.TrimEnd()
     if ($line -eq '') { return }
+    $b.LastLine = [DateTime]::Now   # the "last sign of life" under the bar
     switch ($b.Stage.Id) {
         'tools' {
             $t = $b.Tools
@@ -2111,13 +2112,52 @@ function Read-BuildLine($b, [string]$raw) {
                 $text = Get-StepText $b $b.Step
                 Set-Status $text[0] $text[1]
             }
-            elseif ($line -match '^round (\d+):') { $b.Round = [int]$Matches[1] }
+            elseif ($line -match '^round (\d+):') { $b.Round = [int]$Matches[1]; $b.Testing = 0 }
+            elseif ($line -match '^\[port\] testing round (\d+) of at most (\d+)') {
+                $b.Testing = [int]$Matches[1]; $b.TestMax = [Math]::Max(1, [int]$Matches[2]); $b.TestSeen = $true; $b.TestClock = [Diagnostics.Stopwatch]::StartNew()
+            }
             elseif ($line -match '^Play it natively:.* --widescreen( |$)') { $b.Wide = $true }   # a ticked section is made for a 16:9 screen
         }
     }
     Add-LogLine $b $line
     $b.Tail.Add($line)
     if ($b.Tail.Count -gt 40) { $b.Tail.RemoveAt(0) }
+}
+
+# Testing rounds on the bar (fraction of step 4): round 1 to 4 end at 1/2, 3/4, 7/8 and 15/16 as always; rounds 5 and on share the last
+# stretch up to 99 %, so a long game does not look frozen. Never the end: step 5 and 6 still follow.
+function Get-RoundCeiling([int]$round, [int]$max) {
+    if ($round -le 0) { return 0.0 }
+    if ($round -le 4) { return 1 - [Math]::Pow(0.5, $round) }
+    0.9375 + 0.0525 * [Math]::Min(1.0, ($round - 4) / [Math]::Max(1.0, $max - 4))
+}
+
+# Step 4 while a round runs: from the end of the last round toward the end of this one, slower and slower (about 90 s). Without the
+# "testing round" line (an older port.sh) it is the time-based creep of before.
+function Get-ExploreFraction($b, [double]$timeG) {
+    $floor = Get-RoundCeiling $b.Round $b.TestMax
+    if (-not $b.TestSeen) { return [Math]::Max($timeG, $floor) }
+    if ($b.Testing -le 0) { return $floor }
+    $top = Get-RoundCeiling $b.Testing $b.TestMax
+    $floor + ($top - $floor) * (1 - [Math]::Exp(-$b.TestClock.Elapsed.TotalSeconds / 90))
+}
+
+# Seconds since the build last showed a sign of life: a line on its output, and while a testing round runs (port.sh is silent then)
+# also the game's own log and the folder of its pictures.
+function Get-LastSign($b) {
+    $t = $b.LastLine
+    if ($b.Step -eq 4 -and $b.Testing -gt 0) {
+        $dir = Join-Path $GamesDir $b.Name
+        foreach ($path in @((Join-Path $dir 'explore.log'), (Join-Path $dir 'shots'))) {
+            try { $i = Get-Item -LiteralPath $path -ErrorAction Stop; if ($i.LastWriteTime -gt $t) { $t = $i.LastWriteTime } } catch { }
+        }
+    }
+    [Math]::Max(0.0, ([DateTime]::Now - $t).TotalSeconds)
+}
+
+function Format-Ago([double]$seconds) {
+    if ($seconds -lt 60) { return '{0} s ago' -f [int]$seconds }
+    '{0} min {1} s ago' -f [int][Math]::Floor($seconds / 60), [int]($seconds % 60)
 }
 
 # The bar: where we are on the whole plan, never going back.
@@ -2140,7 +2180,7 @@ function Update-Progress($b) {
                 $r = if ($b.Faster) { $FasterRange[$b.Step] } else { $StepRange[$b.Step] }
                 $stepSeconds = $b.StepClock.Elapsed.TotalSeconds
                 $g = 1 - [Math]::Exp(-$stepSeconds / $r[2])
-                if ($b.Step -eq 4) { $g = [Math]::Max($g, 1 - [Math]::Pow(0.5, $b.Round)) }
+                if ($b.Step -eq 4) { $g = Get-ExploreFraction $b $g }
                 if ($b.Step -eq 4 -or $b.Step -eq 6) {
                     if (([DateTime]::Now - $b.NinjaAt).TotalSeconds -ge 1) {
                         $b.NinjaAt = [DateTime]::Now
@@ -2149,12 +2189,15 @@ function Update-Progress($b) {
                         $runtime = @(Get-ChildItem -LiteralPath (Join-Path $Root 'build') -Directory -Filter 'runtime-native-*' -ErrorAction SilentlyContinue |
                             ForEach-Object { Get-NinjaProgress (Join-Path $_.FullName 'ninja.log') } | Where-Object { $_ })
                         if ($runtime.Count -gt 0) { $b.Ninja = $runtime[0]; $kind = 'runtime' } elseif ($game) { $b.Ninja = $game } else { $b.Ninja = $null }
-                        if ($b.Ninja) { $b.Ninja.Kind = $kind }
+                        if ($b.Ninja) { $b.Ninja.Kind = $kind; $b.LastLine = [DateTime]::Now }   # the compiler's log moved: a sign of life, too
                     }
                     if ($b.Ninja -and $b.Ninja.N -gt 0 -and $b.Ninja.M -gt 0) {
                         if ($b.Step -eq 4) { $g = [Math]::Max($g, 0.45 * $b.Ninja.N / $b.Ninja.M) }
                         if ($b.Ninja.Kind -eq 'runtime') { Set-Status 'Building the PS2 runtime' ('Compiling file {0} of {1}. This is done once and reused by every game.' -f $b.Ninja.N, $b.Ninja.M) }
                         else { Set-Status 'Compiling the translated game' ('Compiling file {0} of {1}.' -f $b.Ninja.N, $b.Ninja.M) }
+                    } elseif ($b.Step -eq 4 -and $b.Testing -gt 0) {
+                        # which round runs, and whether the build is alive: a slow round is not a hang
+                        Set-Status ('Testing the game: round {0} of at most {1}' -f $b.Testing, $b.TestMax) 'The game is started without a window to find code the first pass missed. Each round can take a minute or more, big games much longer.'
                     } elseif ($b.Step -eq 4 -and $b.Round -gt 0) {
                         Set-Status $StepText[4][0] ("Round $($b.Round) is done. Each round can take a minute or more.")
                     } elseif ($U.status.Text -like 'Compiling*' -or $U.status.Text -like 'Building the PS2*') {
@@ -2162,7 +2205,7 @@ function Update-Progress($b) {
                         Set-Status $text[0] $text[1]
                     }
                 }
-                $inner = $r[0] + ($r[1] - $r[0]) * [Math]::Min($g, 0.97)
+                $inner = $r[0] + ($r[1] - $r[0]) * [Math]::Min($g, $(if ($b.Step -eq 4 -and $b.TestSeen) { 0.99 } else { 0.97 }))
                 $f = $inner / 100
             }
         }
@@ -2172,6 +2215,7 @@ function Update-Progress($b) {
     $U.bar.Value = [int][Math]::Min(1000, $b.Bar * 10)
     $U.percent.Text = '{0} %' -f [int]$b.Bar
     $U.elapsed.Text = 'Time so far: ' + (Format-Time $b.Clock.Elapsed.TotalSeconds)
+    if ($stage.Id -eq 'port' -and $b.Step -ge 1) { $U.elapsed.Text += '     Last sign of life: ' + (Format-Ago (Get-LastSign $b)) }
 }
 
 function Update-Build {

@@ -213,6 +213,7 @@ echo "== [4/6] exploring"
 if [ "$explore" = 1 ]; then
   for ((round = 1; round <= rounds; round++)); do
     build_native
+    echo "[port] testing round $round of at most $rounds"
     rm -f "$game/misses.txt" "$game/explore.ps2" "$game/explore_ram.bin"
     code=0
     PS2_DUMP="$game/explore_ram.bin" PS2_GPU_LOW_POWER=1 PS2_VU0_RECORD="$game/vu0" PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" --memcard "$game/explore.ps2" \

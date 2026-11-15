@@ -36,6 +36,7 @@ void init_watch() {
             g_watch_base = base & (kRamSize - 1);
             g_watch_end = g_watch_base + len;
             g_watch_on = true;
+            g_store_ram_end = 0;  // every guest store takes st*_other, which checks the watch
             std::fprintf(stderr, "[watch] writes to 0x%08X..0x%08X will print\n", g_watch_base, g_watch_end);
         }
     }
@@ -55,6 +56,76 @@ void watch_hit(std::uint32_t a, std::uint32_t v, const char *via) {
         for (int i = 16; i < 24; ++i) std::fprintf(stderr, " %08X", g_cpu.r[i].w[0]);
         std::fprintf(stderr, " sp %08X\n", g_cpu.r[29].w[0]);
     }
+}
+
+// The stores that are not a plain write to main memory (memory.hpp). While the watch is on, every store takes st*_watched: the
+// watch check, then main memory or scratchpad, then the slow path, as every store did before g_store_ram_end. With the watch
+// off an address here is at or above the end of main memory, so what is left of that is the scratchpad test and the slow path.
+namespace {
+
+inline bool scratchpad(std::uint32_t a) { return (a >> 14) == (kScratchpadBase >> 14); }
+inline std::uint8_t *spr_at(std::uint32_t a) { return g_spr + (a & (kScratchpadSize - 1)); }
+
+[[gnu::noinline]] void st8_watched(std::uint32_t a, std::uint8_t v) {
+    watched<std::uint8_t>(a, v);
+    if (auto *p = fast<std::uint8_t>(a)) { *p = v; return; }
+    slow_st8(a, v);
+}
+
+[[gnu::noinline]] void st16_watched(std::uint32_t a, std::uint16_t v) {
+    watched<std::uint16_t>(a, v);
+    if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+    slow_st16(a, v);
+}
+
+[[gnu::noinline]] void st32_watched(std::uint32_t a, std::uint32_t v) {
+    watched<std::uint32_t>(a, v);
+    if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+    slow_st32(a, v);
+}
+
+[[gnu::noinline]] void st64_watched(std::uint32_t a, std::uint64_t v) {
+    watched<std::uint32_t>(a, static_cast<std::uint32_t>(v));
+    if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+    slow_st64(a, v);
+}
+
+[[gnu::noinline]] void st128_watched(std::uint32_t a, const Reg128 &v) {
+    watched<std::uint32_t>(a, v.w[0]);
+    if (auto *p = fast<std::uint8_t>(a)) { std::memcpy(p, &v, 16); return; }
+    slow_st128(a, v);
+}
+
+}  // namespace
+
+void st8_other(std::uint32_t a, std::uint8_t v) {
+    if (g_watch_on) [[unlikely]] return st8_watched(a, v);
+    if (scratchpad(a)) { *spr_at(a) = v; return; }
+    slow_st8(a, v);
+}
+
+void st16_other(std::uint32_t a, std::uint16_t v) {
+    if (g_watch_on) [[unlikely]] return st16_watched(a, v);
+    if (scratchpad(a)) { store(spr_at(a), v); return; }
+    slow_st16(a, v);
+}
+
+void st32_other(std::uint32_t a, std::uint32_t v) {
+    if (g_watch_on) [[unlikely]] return st32_watched(a, v);
+    if (scratchpad(a)) { store(spr_at(a), v); return; }
+    slow_st32(a, v);
+}
+
+void st64_other(std::uint32_t a, std::uint64_t v) {
+    if (g_watch_on) [[unlikely]] return st64_watched(a, v);
+    if (scratchpad(a)) { store(spr_at(a), v); return; }
+    slow_st64(a, v);
+}
+
+void st128_other(std::uint32_t a, const Reg128 &v) {
+    if (g_watch_on) [[unlikely]] return st128_watched(a, v);
+    if (scratchpad(a)) { std::memcpy(spr_at(a), &v, 16); return; }
+    slow_st128(a, v);
 }
 
 void watch_span(std::uint32_t a, std::uint32_t n, const char *via) {
@@ -287,18 +358,19 @@ void slow_ld128(std::uint32_t a, Reg128 &out) {
     else std::memset(&out, 0, 16);
 }
 
-void slow_st8(std::uint32_t a, std::uint8_t v) { store_fast(a, v); }
-void slow_st16(std::uint32_t a, std::uint16_t v) { store_fast(a, v); }
-void slow_st32(std::uint32_t a, std::uint32_t v) {
+// Out of line (as when only memory.hpp called them), so that st*_other above stays a leaf with no stack frame.
+[[gnu::noinline]] void slow_st8(std::uint32_t a, std::uint8_t v) { store_fast(a, v); }
+[[gnu::noinline]] void slow_st16(std::uint32_t a, std::uint16_t v) { store_fast(a, v); }
+[[gnu::noinline]] void slow_st32(std::uint32_t a, std::uint32_t v) {
     if (a - kIpuBase < 0x40u) return ipu_store32(a, v);
     store_fast(a, v);
 }
-void slow_st64(std::uint32_t a, std::uint64_t v) {
+[[gnu::noinline]] void slow_st64(std::uint32_t a, std::uint64_t v) {
     if (a - kIpuBase < 0x38u) return ipu_store64(a, v);
     store_fast(a, v);
 }
 
-void slow_st128(std::uint32_t a, const Reg128 &v) {
+[[gnu::noinline]] void slow_st128(std::uint32_t a, const Reg128 &v) {
     if (std::uint8_t *host = ram_mirror(physical(a))) {
         ++hw::g_slow_seq;
         std::memcpy(host, &v, 16);

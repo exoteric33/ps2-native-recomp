@@ -16,8 +16,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(PS2_GENERATED "" CACHE PATH "Folder with the C++ generated for a game")
 set(PS2_RUNTIME_LIB "" CACHE FILEPATH "libps2runtime.a built earlier from this source tree (scripts/runtime.sh); a game links it instead of compiling the runtime again")
 
+# ps2run.exe with no DLL next to it (SDL2 and winpthread linked in): the single-file pack (scripts/extract_disc.py bundle). The normal Windows build
+# keeps SDL2.dll beside the program.
+option(PS2_WIN_STATIC "Link ps2run.exe fully static, for the single-file pack" OFF)
+
 if(WIN32)
     add_link_options(-static-libgcc -static-libstdc++)
+    if(PS2_WIN_STATIC)
+        add_link_options(-static)
+    endif()
 endif()
 
 if(EMSCRIPTEN)
@@ -61,6 +68,8 @@ else()
         runtime/src/hw.cpp
         runtime/src/cop.cpp
         runtime/src/disc.cpp
+        runtime/src/disc_folder.cpp
+        runtime/src/disc_bundle.cpp
         runtime/src/dmac.cpp
         runtime/src/vif.cpp
         runtime/src/vu_micro.cpp
@@ -503,9 +512,15 @@ if(PS2_GENERATED)
     if(SDL2_FOUND AND NOT EMSCRIPTEN)
         target_sources(ps2run PRIVATE host/window.cpp host/keymap.cpp host/quickmenu.cpp host/stretch.cpp)
         target_compile_definitions(ps2run PRIVATE PS2_WINDOW)
-        target_link_libraries(ps2run PRIVATE SDL2::SDL2)
+        if(WIN32 AND PS2_WIN_STATIC AND TARGET SDL2::SDL2-static)
+            target_link_libraries(ps2run PRIVATE SDL2::SDL2-static)
+        else()
+            target_link_libraries(ps2run PRIVATE SDL2::SDL2)
+            if(WIN32)
+                add_custom_command(TARGET ps2run POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:ps2run>)
+            endif()
+        endif()
         if(WIN32)
-            add_custom_command(TARGET ps2run POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:ps2run>)
             # Microsoft's shader compiler for Direct3D 12 (scripts/fetch_dxc.sh): used when the two DLLs sit next to ps2run.exe,
             # FXC otherwise. Not shipped with the source: each PC downloads it.
             foreach(dxc_dll dxcompiler.dll dxil.dll)

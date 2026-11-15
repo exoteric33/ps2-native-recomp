@@ -50,12 +50,14 @@ def load_phdrs(elf):
 def windows(elf):
     out = []
     for v in load_phdrs(elf):
-        if v[0] != 1 or v[4] or not (v[6] & 1):  # no PT_LOAD, has contents, not executable
+        if v[0] != 1 or v[4] or not v[5] or not (v[6] & 1) or v[2] >= 0x02000000:  # no PT_LOAD, has contents, empty, not executable, or outside RAM
             continue
         base = v[2] & ~(UNIT - 1)
-        while base in [b for b, _ in out]:
+        limit = min(0x02000000, (v[2] + v[5] + UNIT - 1) & ~(UNIT - 1))
+        while base < limit and base in [b for b, _ in out]:
             base += UNIT
-        out.append((base, UNIT))
+        if base < limit:
+            out.append((base, UNIT))
     return out
 
 

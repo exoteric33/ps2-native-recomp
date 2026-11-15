@@ -285,7 +285,7 @@ if(NOT EMSCRIPTEN)
     endif()
     # damaged disc images, IOP modules and boot ELFs refused cleanly, no game needed: ninja ps2discinputtest
     add_executable(ps2discinputtest EXCLUDE_FROM_ALL tests/disc_input.cpp)
-    target_include_directories(ps2discinputtest PRIVATE runtime/src)
+    target_include_directories(ps2discinputtest PRIVATE runtime/src recomp)
     target_link_libraries(ps2discinputtest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2discinputtest PRIVATE synchronization)

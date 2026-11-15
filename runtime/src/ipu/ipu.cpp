@@ -1,5 +1,6 @@
 #include "ipu.hpp"
 
+#include "idct.hpp"
 #include "tables.hpp"
 #include "../dmac.hpp"
 #include "../hw.hpp"
@@ -89,16 +90,6 @@ struct Tables {
     Lookup motion = build(kMotionCode), dmv = build(kDmVector), dc_luma = build(kDcSizeLuma), dc_chroma = build(kDcSizeChroma);
     Lookup cbp = build(kCodedBlockPattern);
     DctLookup dct0 = build(kDctTable0), dct1 = build(kDctTable1);
-    double cosines[8][8];
-    double cosines_t[8][8];  // the same values, indexed [u][x]: the inverse transform adds one coefficient to all eight outputs at a time
-
-    Tables() {
-        for (int x = 0; x < 8; ++x)
-            for (int u = 0; u < 8; ++u) {
-                cosines[x][u] = (u ? 0.5 : 0.5 / std::sqrt(2.0)) * std::cos((2 * x + 1) * u * 3.14159265358979323846 / 16.0);
-                cosines_t[u][x] = cosines[x][u];
-            }
-    }
 };
 
 const Tables &tables() {
@@ -280,40 +271,7 @@ bool read_coefficient(const DctLookup &l, int &run, int &level) {
     return true;
 }
 
-void idct(const int *in, std::int16_t *out) {
-    // Same sums in the same order as the plain 8 x 8 x 8 version, but the terms whose coefficient is zero are left out: such a term adds
-    // +0.0 or -0.0, and a sum that starts at +0.0 is never -0.0 (round to nearest), so the sum and the picture stay bit for bit the
-    // same. A video block has few non-zero coefficients, so most of the 1024 multiplications are gone (docs/speed-cpu.md).
-    // The eight outputs of a row are summed side by side (one coefficient added to all eight, in the order of the coefficients), which
-    // is the same sum for every output as one at a time, only the compiler can now do four or two of them in one instruction.
-    const Tables &t = tables();
-    alignas(32) double rows[8][8];
-    int live[8], live_rows = 0;
-    for (int v = 0; v < 8; ++v) {
-        const int *row = in + v * 8;
-        int at[8], count = 0;
-        for (int u = 0; u < 8; ++u)
-            if (row[u]) at[count++] = u;
-        if (!count) continue;  // an all-zero row adds nothing in the second pass either
-        live[live_rows++] = v;
-        double acc[8] = {};
-        for (int k = 0; k < count; ++k) {
-            const double w = row[at[k]];
-            const double *ct = t.cosines_t[at[k]];
-            for (int x = 0; x < 8; ++x) acc[x] += ct[x] * w;
-        }
-        for (int x = 0; x < 8; ++x) rows[v][x] = acc[x];
-    }
-    for (int y = 0; y < 8; ++y) {
-        double acc[8] = {};
-        for (int k = 0; k < live_rows; ++k) {
-            const double cy = t.cosines[y][live[k]];
-            const double *r = rows[live[k]];
-            for (int x = 0; x < 8; ++x) acc[x] += cy * r[x];
-        }
-        for (int x = 0; x < 8; ++x) out[y * 8 + x] = static_cast<std::int16_t>(std::clamp(static_cast<int>(std::floor(acc[x] + 0.5)), -256, 255));
-    }
-}
+// The inverse transform is in idct.cpp.
 
 // The next 57 bits, most significant bit first, bits past the end of the input read as zero (the same bits as bits_at gives).
 inline std::uint64_t window(std::size_t bit) {
@@ -356,17 +314,36 @@ void get_bytes(std::uint8_t *out, std::size_t n) {
 }
 
 void decode_block(std::int16_t *out, int channel, bool intra, std::uint32_t qsc) {
-    int coef[64] = {};
+    // Each coefficient is dequantised as soon as it is read, with the formula a pass over all of them did afterwards (that pass skipped a
+    // zero, as `put` does): the positions only rise, so every one is written once, and the sum for the mismatch control is the same
+    // integer sum. The control register and the matrices cannot change while a block is decoded (only a register write or a command does).
+    const std::uint8_t *scan = alternate_scan() ? kAlternate : kZigzag;
+    const std::uint8_t *weights = intra ? g_intra_iq : g_nonintra_iq;
+    const bool mp1 = mpeg1();
+    const int scale = mp1 || !nonlinear_q() ? static_cast<int>(qsc) * 2 : kNonLinearScale[qsc & 31u];
+    alignas(32) int f[64] = {};
+    int sum = 0;
+    const auto put = [&](int k, int v) {
+        if (!v) return;
+        const int r = scan[k];
+        const int sign = v > 0 ? 1 : -1;
+        int x = intra ? (v * weights[r] * scale * 2) / 32 : ((2 * v + sign) * weights[r] * scale) / 32;
+        if (mp1 && x && !(x & 1)) x -= sign;
+        x = std::clamp(x, -2048, 2047);
+        f[r] = x;
+        sum += x;
+    };
     int index = 0;
     const DctLookup &table = intra && intra_vlc_one() ? tables().dct1 : tables().dct0;
     const bool table_one = &table == &tables().dct1;
-    const bool mp1 = mpeg1();
     if (intra) {
         g_dc[channel] = static_cast<std::int16_t>(g_dc[channel] + read_dc_diff(channel));
-        coef[0] = g_dc[channel];
+        const int x = std::clamp(g_dc[channel] * (8 >> dc_precision()), -2048, 2047);  // the intra DC term (scan position 0 is 0 in both scans)
+        f[0] = x;
+        sum += x;
         index = 1;
     } else if (bits_left() >= 16 ? (window(g_bit) >> 63) != 0 : peek(1) != 0) {
-        coef[0] = get(2) & 1u ? -1 : 1;
+        put(0, get(2) & 1u ? -1 : 1);
         index = 1;
     }
     for (;;) {
@@ -411,7 +388,7 @@ void decode_block(std::int16_t *out, int channel, bool intra, std::uint32_t qsc)
                 g_bit += used;
                 index += run;
                 if (index >= 64) throw BadCode{};
-                coef[index++] = level;
+                put(index++, level);
                 continue;
             }
         }
@@ -425,29 +402,7 @@ void decode_block(std::int16_t *out, int channel, bool intra, std::uint32_t qsc)
         read_coefficient(table, run, level);
         index += run;
         if (index >= 64) throw BadCode{};
-        coef[index++] = level;
-    }
-    const std::uint8_t *scan = alternate_scan() ? kAlternate : kZigzag;
-    const std::uint8_t *weights = intra ? g_intra_iq : g_nonintra_iq;
-    const int scale = mpeg1() || !nonlinear_q() ? static_cast<int>(qsc) * 2 : kNonLinearScale[qsc & 31u];
-    int f[64] = {};
-    int sum = 0;
-    // The coefficients are stored at rising positions, so everything from `index` on is zero (and a zero is skipped below anyway)
-    for (int k = 0; k < index; ++k) {
-        const int v = coef[k];
-        const int r = scan[k];
-        int x;
-        if (intra && k == 0) {
-            x = v * (8 >> dc_precision());
-        } else {
-            if (!v) continue;
-            const int sign = v > 0 ? 1 : -1;
-            x = intra ? (v * weights[r] * scale * 2) / 32 : ((2 * v + sign) * weights[r] * scale) / 32;
-            if (mpeg1() && x && !(x & 1)) x -= sign;
-        }
-        x = std::clamp(x, -2048, 2047);
-        f[r] = x;
-        sum += x;
+        put(index++, level);
     }
     if (!mpeg1() && !(sum & 1)) f[63] += f[63] & 1 ? -1 : 1;
     idct(f, out);

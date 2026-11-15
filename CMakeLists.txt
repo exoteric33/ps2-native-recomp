@@ -78,6 +78,7 @@ else()
         runtime/src/live_build.cpp
         runtime/src/vu_live.cpp
         runtime/src/ee_live.cpp
+        runtime/src/ipu/idct.cpp
         runtime/src/ipu/ipu.cpp
         runtime/src/gs/gs.cpp
         runtime/src/gs/gif.cpp
@@ -351,6 +352,13 @@ if(NOT EMSCRIPTEN)
     target_link_libraries(ps2eipendingtest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2eipendingtest PRIVATE synchronization)
+    endif()
+    # the IPU's inverse transform (BDEC) gives the same pixels bit for bit as the one it replaced, on millions of random blocks (no game needed): ninja ps2idctexacttest
+    add_executable(ps2idctexacttest EXCLUDE_FROM_ALL tests/idct_exact.cpp)
+    target_include_directories(ps2idctexacttest PRIVATE runtime/src)
+    target_link_libraries(ps2idctexacttest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2idctexacttest PRIVATE synchronization)
     endif()
     # a sound stream sent by auto-DMA moves the IOP DMA channel's address on as the chip takes it in (issue 100, GTA Vice City, no game needed): ninja ps2admaprogresstest
     add_executable(ps2admaprogresstest EXCLUDE_FROM_ALL tests/adma_progress.cpp)

@@ -1048,9 +1048,16 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         const std::string pro = plan.tracked[pc >> 3] ? std::format("fl.t += 1u + ks_{:04X}[st]; ", pc)
                                 : stall              ? std::format("fl.t += {}u; ", 1 + stall)
                                                      : std::string("++fl.t; ");
+        // an instruction that reads Q brings the quotient up to date first, on both ways into a split slot
+        std::string qread;
+        if (any_q && ps2::vu::reads_q(hi)) {
+            const ps2::vu::QRead kind = ps2::vu::q_read_kind(p.code.data(), kMask, pc);
+            if (kind == ps2::vu::kQNew) qread = "fl.flush_q(r); ";
+            else if (kind == ps2::vu::kQDynamic) qread = "fl.sync_q(r); ";
+        }
         const std::uint32_t next_pc = (pc + 8u) & kMask;
         if (split_slot.count(pc)) {
-            o += std::format("{}: {{ {}{}{}", label(pc), stop, pro, body);
+            o += std::format("{}: {{ {}{}{}{}", label(pc), stop, pro, qread, body);
             const int lw = (hi & 0x80000000u) || !l.supported ? -1 : l.writes;
             if (lw >= 0 && shadowed.count(lw)) o += std::format("{} = vshadow({}); ", shadow(lw), raw(lw));
             if (u.target >= 0 && u.target != lw && shadowed.count(u.target)) {
@@ -1063,12 +1070,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             if (!in.count(next_pc)) o += std::format("}}{}vu::interpret(1, {});\n    return;\n", meet(pc, next_pc), addr(resume));
             else o += std::format("}}{}{}goto {};\n", meet(pc, next_pc), edge(next_pc), label(next_pc));
         }
-        o += std::format("{}: {{ {}{}", split_slot.count(pc) ? std::format("LF_{:04X}", pc) : label(pc), stop, pro);
-        if (any_q && ps2::vu::reads_q(hi)) {
-            const ps2::vu::QRead kind = ps2::vu::q_read_kind(p.code.data(), kMask, pc);
-            if (kind == ps2::vu::kQNew) o += "fl.flush_q(r); ";
-            else if (kind == ps2::vu::kQDynamic) o += "fl.sync_q(r); ";
-        }
+        o += std::format("{}: {{ {}{}{}", split_slot.count(pc) ? std::format("LF_{:04X}", pc) : label(pc), stop, pro, qread);
         o += body;
         const int lower_write = (hi & 0x80000000u) || !l.supported ? -1 : l.writes;
         if (lower_write >= 0 && shadowed.count(lower_write)) o += std::format("{} = vshadow({}); ", shadow(lower_write), raw(lower_write));

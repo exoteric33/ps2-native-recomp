@@ -2,6 +2,7 @@
 #include "ps2/generated.hpp"
 #include "ps2/os.hpp"
 #include "ps2/system.hpp"
+#include "dispatch_cache.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -194,6 +195,8 @@ void register_modules(const ModuleInfo *modules, std::uint32_t count) {
 }
 
 void add_modules(const ModuleInfo *modules, std::uint32_t count) { add_modules_ranked(modules, count, 0); }
+
+void invalidate_window_instances() { g_instances.clear(); }
 
 void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank, const SoftChecks *soft) {
     for (std::uint32_t k = 0; k < count; ++k) {

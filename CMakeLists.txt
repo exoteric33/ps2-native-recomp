@@ -40,7 +40,8 @@ if(NOT EMSCRIPTEN)
         recomp/analysis.cpp
         recomp/codegen.cpp
         recomp/eerecomp_gen.cpp
-        recomp/snr2.cpp)
+        recomp/snr2.cpp
+        recomp/memory_profile.cpp)
     target_include_directories(eerecomp PRIVATE runtime/include)
     target_compile_options(eerecomp PRIVATE -Wall -Wextra)
 

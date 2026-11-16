@@ -2,6 +2,7 @@
 #include "codegen.hpp"
 #include "eerecomp_gen.hpp"
 #include "elf.hpp"
+#include "memory_profile.hpp"
 #include "snr2.hpp"
 #include "xff2.hpp"
 
@@ -122,7 +123,7 @@ std::map<std::uint32_t, Toggle> read_toggles(const std::string &path) {
 }
 
 int usage() {
-    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--overlays dir] [--probes file] [--toggles file] [--out dir] [--stats]\n");
+    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--modules dir] [--overlays dir] [--probes file] [--toggles file] [--out dir] [--stats] [--profile-only] [--profile-json file]\n");
     std::fprintf(stderr, "       eerecomp --live-image <captured.bin> --base <hex> --stamp <hex> --out <dir> [--entry <hex>]... [--expect-name <base_crc>] [--dense-checks]\n");
     return 2;
 }
@@ -200,12 +201,14 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    std::string elf_path = argv[1], entries_path, out, probes_path, toggles_path, modules_dir, overlays_dir;
-    bool stats = false;
+    std::string elf_path = argv[1], entries_path, out, probes_path, toggles_path, modules_dir, overlays_dir, profile_json_path;
+    bool stats = false, profile_only = false;
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--entries" && i + 1 < argc) entries_path = argv[++i];
         else if (arg == "--stats") stats = true;
+        else if (arg == "--profile-only") profile_only = true;
+        else if (arg == "--profile-json" && i + 1 < argc) profile_json_path = argv[++i];
         else if (arg == "--out" && i + 1 < argc) out = argv[++i];
         else if (arg == "--probes" && i + 1 < argc) probes_path = argv[++i];
         else if (arg == "--toggles" && i + 1 < argc) toggles_path = argv[++i];
@@ -332,13 +335,34 @@ int main(int argc, char **argv) {
                         overlays.size(), overlay_code, overlay_code * 4 / 1024, called_entries);
         }
 
-        if (!out.empty()) {
+        std::vector<OverlayAnalysisView> overlay_views;
+        for (std::size_t i = 1; i < translations.size(); ++i) {
+            overlay_views.push_back({translations[i].name, translations[i].image, translations[i].program});
+        }
+        const MemoryProfile mem_profile = analyze_memory_profile(image, program, overlay_views);
+        print_memory_profile_summary(mem_profile);
+        if (!profile_json_path.empty()) {
+            write_memory_profile_json(mem_profile, profile_json_path);
+        }
+
+        if (!out.empty() && !profile_only) {
             CodegenOptions options;
             options.output = out;
             if (!probes_path.empty())
                 for (std::uint32_t a : read_entries(probes_path).main) options.probes.insert(a);
             if (!toggles_path.empty()) options.toggles = read_toggles(toggles_path);
+            for (const auto &cand : mem_profile.allocators) {
+                if (cand.module_name != "main") continue;
+                if (cand.kind == AllocatorCandidate::Kind::kBlockHeapInit ||
+                    cand.kind == AllocatorCandidate::Kind::kLinkedHeapInit ||
+                    cand.kind == AllocatorCandidate::Kind::kIndexedZoneInit) {
+                    options.auto_arena_hooks_a1_a2.insert(cand.func_addr);
+                } else if (cand.kind == AllocatorCandidate::Kind::kBumpArenaInit) {
+                    options.auto_arena_hooks_a0_a1.insert(cand.func_addr);
+                }
+            }
             generate(translations, options);
+            write_memory_profile_json(mem_profile, out + "/memory_profile.json");
         }
     } catch (const std::exception &error) {
         std::fprintf(stderr, "eerecomp: %s\n", error.what());

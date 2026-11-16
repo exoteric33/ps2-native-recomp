@@ -3,12 +3,23 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <span>
 #include <utility>
 #include <vector>
 
 namespace recomp {
+
+struct ProgramHeader {
+    std::uint32_t offset{};
+    std::uint32_t vaddr{};
+    std::uint32_t paddr{};
+    std::uint32_t filesz{};
+    std::uint32_t memsz{};
+    std::uint32_t flags{};
+    std::uint32_t align{};
+};
 
 struct Segment {
     std::uint32_t address{};
@@ -25,6 +36,7 @@ public:
 
     std::uint32_t entry() const { return entry_; }
     const std::vector<Segment> &segments() const { return segments_; }
+    const std::vector<ProgramHeader> &headers() const { return headers_; }
     const std::map<std::uint32_t, std::string> &symbols() const { return symbols_; }
     std::pair<std::uint32_t, std::uint32_t> text() const { return text_; }
 
@@ -35,6 +47,7 @@ public:
 private:
     std::uint32_t entry_{};
     std::vector<Segment> segments_;
+    std::vector<ProgramHeader> headers_;
     std::map<std::uint32_t, std::string> symbols_;
     std::pair<std::uint32_t, std::uint32_t> text_{};
 };

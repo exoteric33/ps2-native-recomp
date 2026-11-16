@@ -43,9 +43,11 @@ Image Image::load(std::span<const std::uint8_t> data) {
         const std::size_t ph = phoff + i * phentsize;
         if (read<std::uint32_t>(data, ph) != 1) continue;
         const auto offset = read<std::uint32_t>(data, ph + 4), vaddr = read<std::uint32_t>(data, ph + 8);
+        const auto paddr = read<std::uint32_t>(data, ph + 12);
         const auto filesz = read<std::uint32_t>(data, ph + 16), memsz = read<std::uint32_t>(data, ph + 20);
-        const auto flags = read<std::uint32_t>(data, ph + 24);
+        const auto flags = read<std::uint32_t>(data, ph + 24), align = read<std::uint32_t>(data, ph + 28);
         if (offset + filesz > data.size()) throw std::runtime_error("segment outside the file");
+        image.headers_.push_back(ProgramHeader{offset, vaddr, paddr, filesz, memsz, flags, align});
         // An executable segment with no file contents is a code window: the
         // game rewrites it at runtime, so it holds no code to translate here
         // and any call into it walks to the images the game puts there.

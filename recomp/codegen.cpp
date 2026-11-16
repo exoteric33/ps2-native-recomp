@@ -246,6 +246,10 @@ private:
                 flush();
                 out_ << label(a) << ":\n";
             }
+            if (!relocatable_ && options_.auto_arena_hooks_a1_a2.count(a))
+                line("unshackle::auto_expand_arena_a1_a2(c);");
+            if (!relocatable_ && options_.auto_arena_hooks_a0_a1.count(a))
+                line("unshackle::auto_expand_arena_a0_a1(c);");
             if (options_.probes.count(a)) line(std::format("probe(c, {});", pc(a)));
             const Insn i = at(a);
             const Flow fl = flow(i.op);
@@ -1090,7 +1094,12 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
     // A live library (options.live_stamp, runtime/src/ee_live.cpp) is compiled against the live variant of the runtime headers: the
     // runner's functions are reached through a table (ps2/ee_live_abi.hpp), defined once in table.cpp.
     const bool live = options.live_stamp != 0;
-    header << "#pragma once\n\n" << (live ? "#define PS2_LIVE_EE 1\n" : "") << "#include \"ps2/generated.hpp\"\n\nnamespace gen {\n";
+    header << "#pragma once\n\n" << (live ? "#define PS2_LIVE_EE 1\n" : "") << "#include \"ps2/generated.hpp\"\n";
+    if (!live) {
+        header << "#if __has_include(\"ps2/unshackle.hpp\")\n#include \"ps2/unshackle.hpp\"\n#else\n"
+                  "namespace ps2::unshackle { inline void auto_expand_arena_a1_a2(Cpu &) {} inline void auto_expand_arena_a0_a1(Cpu &) {} }\n#endif\n";
+    }
+    header << "\nnamespace gen {\n";
     if (live) table << "#define PS2_LIVE_EE 1\n#define PS2_LIVE_EE_DEFINE 1\n#include \"ps2/ee_live_abi.hpp\"\n";
     table << "#include \"units.hpp\"\n\nnamespace gen {\n\n";
     std::size_t written = 0, main_units = 0, module_count = 0;

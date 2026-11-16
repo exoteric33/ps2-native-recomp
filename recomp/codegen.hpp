@@ -31,6 +31,8 @@ struct CodegenOptions {
     // ps2_ee_live_stamp() and ps2_ee_live_init() instead of register_generated_code().
     std::uint64_t live_stamp = 0;
     bool quiet = false;  // no line on stdout
+    std::set<std::uint32_t> auto_arena_hooks_a1_a2;
+    std::set<std::uint32_t> auto_arena_hooks_a0_a1;
 };
 
 struct Translation {

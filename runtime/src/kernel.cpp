@@ -5,6 +5,7 @@
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
+#include "ps2/unshackle.hpp"
 
 #include "ps2/state.hpp"
 #include "ps2/pace.hpp"
@@ -665,7 +666,7 @@ void dump() {
                      id == g_current ? g_cpu.pc : t.context.pc, id == g_current ? g_cpu.r[31].w[0] : t.context.r[31].w[0], state_words(t).c_str());
         const std::uint32_t sp = id == g_current ? g_cpu.r[29].w[0] : t.context.r[29].w[0];
         std::fprintf(stderr, "[thread]   stack:");
-        for (std::uint32_t i = 0; i < 512 && sp + i * 4 < kRamSize; ++i) {
+        for (std::uint32_t i = 0; i < 512 && sp + i * 4 < ee_ram_size(); ++i) {
             const std::uint32_t v = load<std::uint32_t>(g_ram + sp + i * 4);
             if (v >= 0x00100000u && v < 0x00617A14u && has_code(v) && (v & 3u) == 0) std::fprintf(stderr, " %08X", v);
         }
@@ -900,7 +901,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     case 0x3C: {
         Thread *t = current();
         const std::uint32_t stack = arg(c, 1), size = arg(c, 2);
-        const std::uint32_t top = stack == 0xFFFFFFFFu ? kRamSize - 0x1000u : stack + size;
+        const std::uint32_t top = unshackle::resolve_setup_thread_top(pc, stack, size);
         t->stack = top - size;
         t->stack_size = size;
         t->gp = arg(c, 0);
@@ -930,11 +931,11 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     }
     case 0x3D: {
         Thread *t = current();
-        t->heap = arg(c, 1) == 0xFFFFFFFFu ? t->stack : arg(c, 0) + arg(c, 1);
+        t->heap = unshackle::resolve_setup_heap_end(pc, arg(c, 0), arg(c, 1), t->stack);
         ret(c, t->heap);
         break;
     }
-    case 0x3E: ret(c, current()->heap); break;
+    case 0x3E: ret(c, unshackle::hook_end_of_heap(pc, current()->heap)); break;
     case 0x40: {
         const std::uint32_t p = arg(c, 0);
         Semaphore s;
@@ -1030,7 +1031,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         break;
     }
     case 0x7E: ret(c, 0); break;
-    case 0x7F: ret(c, kRamSize); break;
+    case 0x7F: ret(c, unshackle::resolve_memory_size()); break;
     default:
         std::fprintf(stderr, "[sys] unhandled syscall 0x%02X from 0x%08X\n", n, pc);
         ret(c, 0);

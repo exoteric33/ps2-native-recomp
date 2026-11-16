@@ -61,6 +61,7 @@ else()
     set(PS2_API PUBLIC)
     add_library(ps2runtime STATIC
         runtime/src/memory.cpp
+        runtime/src/unshackle.cpp
         runtime/src/os.cpp
         runtime/src/dispatch.cpp
         runtime/src/system.cpp
@@ -140,6 +141,13 @@ if(NOT EMSCRIPTEN)
     target_link_libraries(ps2savetest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2savetest PRIVATE synchronization)
+    endif()
+    # EE High-RAM expansion and 5-archetype kernel/arena hooks (no game, no graphics): ninja ps2unshackletest
+    add_executable(ps2unshackletest EXCLUDE_FROM_ALL tests/unshackle_test.cpp)
+    target_include_directories(ps2unshackletest PRIVATE runtime/src)
+    target_link_libraries(ps2unshackletest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2unshackletest PRIVATE synchronization)
     endif()
     # which graphics chips get the draw program without wgpu's run-time checks by default (no game, no graphics): ninja ps2trustedtest
     add_executable(ps2trustedtest EXCLUDE_FROM_ALL tests/trusted_shader.cpp)

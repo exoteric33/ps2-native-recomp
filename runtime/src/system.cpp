@@ -22,6 +22,7 @@
 #include "ps2/state.hpp"
 #include "ps2/state_request.hpp"
 #include "ps2/system.hpp"
+#include "ps2/unshackle.hpp"
 #include "ps2/video.hpp"
 
 #ifdef __EMSCRIPTEN__
@@ -646,11 +647,12 @@ bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry) {
     // The zero fill of every segment comes first and the file contents after it, so a later segment's zero fill (Tekken 5's
     // overlay area is a 24 MiB segment with no file contents that lies over its own loader code) never wipes the contents of an
     // earlier one. Memory is zero at power-on, so this is what a loader that only copies the file contents gives.
+    std::uint32_t highest_low_vaddr = 0u, highest_low_end = 0u;
     for (const bool copy : {false, true}) {
         for (std::uint32_t i = 0; i < u16(44); ++i) {
             const std::uint64_t ph = phoff + std::uint64_t{i} * u16(42);
             // The ELF comes from the disc: a program header past the end of the file, or a segment whose sums wrap round 4 GiB,
-            // would read past the file or write past the 32 MiB of memory. ELF spec: p_offset + p_filesz lies inside the file and
+            // would read past the file or write past memory. ELF spec: p_offset + p_filesz lies inside the file and
             // the segment (p_vaddr up to p_memsz, and the p_filesz bytes copied) inside memory.
             if (ph > data.size() || data.size() - ph < 24) {
                 std::fprintf(stderr, "[elf] damaged ELF: program header %u lies past the end of the file\n", i);
@@ -674,13 +676,17 @@ bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry) {
             // A segment with no file contents that starts wholly outside main memory has nothing to load and nothing to clear
             // (Pro Evolution Soccer's boot ELFs end with an empty 0x800 byte entry at 0x03000000 or 0x04000000): it is left out,
             // before any write. One that has contents, or one that starts inside memory and runs past its end, stays refused.
-            if (filesz == 0 && vaddr >= kRamSize) {
+            if (filesz == 0 && vaddr >= ee_ram_size()) {
                 if (!copy) std::fprintf(stderr, "[elf] segment %u (empty, %u bytes at 0x%08X) lies outside main memory: ignored\n", i, memsz, vaddr);
                 continue;
             }
-            if (std::uint64_t{vaddr} + std::max(memsz, filesz) > kRamSize || std::uint64_t{offset} + filesz > data.size()) {
+            if (std::uint64_t{vaddr} + std::max(memsz, filesz) > ee_ram_size() || std::uint64_t{offset} + filesz > data.size()) {
                 std::fprintf(stderr, "[elf] damaged ELF: segment %u does not fit in the file or in memory\n", i);
                 return false;
+            }
+            if (vaddr < kRamSize) {
+                highest_low_end = std::max<std::uint32_t>(highest_low_end, vaddr + std::max(memsz, filesz));
+                if (memsz > 0) highest_low_vaddr = std::max<std::uint32_t>(highest_low_vaddr, vaddr);
             }
             if (copy) {
                 std::memcpy(g_ram + vaddr, data.data() + offset, filesz);
@@ -690,6 +696,7 @@ bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry) {
             }
         }
     }
+    unshackle::note_elf_loaded(entry, highest_low_vaddr, highest_low_end);
     return true;
 }
 

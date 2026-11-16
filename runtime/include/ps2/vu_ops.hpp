@@ -26,6 +26,10 @@ void kick(int unit, std::uint32_t address);
 std::uint32_t top();
 std::uint32_t itop();
 std::uint32_t itop(int unit);  // VU0 reads VIF0; the no-argument form retains the VU1 live-library ABI.
+// Where the VU1 program that is running was started in the code memory. A compiled VU1 program stands for every copy of its code at any
+// address (program_key_moved), so it works out how far the copy that runs is from the one it was made from and adds that to the
+// addresses it hands back (the program counter, the return address of a call, the place the interpreter goes on at).
+std::uint32_t entry();
 void interpret(int unit, std::uint32_t pc);
 // AOT VU0 checks for a host stop at the same interval as the reference loop.
 bool stopped();
@@ -46,12 +50,13 @@ struct Program {
 void register_programs(const Program *programs, std::uint32_t count);
 
 // The functions of the runner that generated code calls. A library made while the game runs (runtime/src/vu_live.cpp) is not
-// linked to the runner: it gets these four in a table when it is loaded.
+// linked to the runner: it gets these five in a table when it is loaded.
 struct LiveHost {
     void (*interpret)(int unit, std::uint32_t pc);
     void (*kick)(int unit, std::uint32_t address);
     std::uint32_t (*top)();
     std::uint32_t (*itop)();
+    std::uint32_t (*entry)();
 };
 
 inline std::uint32_t lower_major(std::uint32_t lo) { return lo >> 25; }
@@ -560,6 +565,35 @@ inline QRead q_read_kind(const std::uint8_t *code, std::uint32_t mask, std::uint
         if (any_new && any_old) return kQDynamic;
     }
     return any_old ? kQOld : kQNew;
+}
+
+// The key of a VU1 program as the runner and the generator use it: the same as program_key, except that it does not matter where in the code
+// memory the program sits. Every pair counts with its distance from the entry (modulo the size of the memory), not its address, and the entry
+// itself is left out; the words are the same. The game puts the same piece of code at many places (Killzone builds its programs from small
+// pieces laid one after another, so one piece stands at hundreds of addresses), and the old key made every place its own program, hundreds
+// of compiles for one piece of code. Code that holds an address in its words (a constant that is a jump target) differs in those words and so
+// keeps a key of its own per place. The start value differs from program_key's so that no key of the old kind is ever taken for a new one.
+inline std::uint64_t program_key_moved(const std::uint8_t *code, const std::vector<std::uint32_t> &pcs, std::uint32_t entry, std::uint32_t mask) {
+    std::uint64_t h = 0xCBF29CE484222325ull ^ 0x4D4F564544ull;
+    const auto mix = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            h ^= (v >> (i * 8)) & 0xFFu;
+            h *= 0x100000001B3ull;
+        }
+    };
+    // The pairs in the order of their distance from the entry. `pcs` is in address order, and that order is the distance order except that
+    // the pairs before the entry come last: a rotation, which also covers code that crosses the end of the memory and goes on at 0.
+    const std::size_t first = static_cast<std::size_t>(std::lower_bound(pcs.begin(), pcs.end(), entry & mask) - pcs.begin());
+    for (std::size_t k = 0; k < pcs.size(); ++k) {
+        const std::uint32_t pc = pcs[(first + k) % pcs.size()];
+        std::uint32_t lo, hi;
+        std::memcpy(&lo, code + pc, 4);
+        std::memcpy(&hi, code + pc + 4, 4);
+        mix((pc - entry) & mask);
+        mix(lo);
+        mix(hi);
+    }
+    return h;
 }
 
 inline std::uint64_t program_key(const std::uint8_t *code, const std::vector<std::uint32_t> &pcs, std::uint32_t entry) {

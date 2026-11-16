@@ -346,8 +346,11 @@ struct Lower {
     std::vector<std::pair<int, unsigned>> raw_reads;
 };
 
-Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, bool unit0 = false) {
+// moved: a VU1 program that stands for the copy of its code at any address (ps2::vu::program_key_moved). The addresses it leaves behind are
+// then the ones of the copy that runs: `sh` (the generated function's, see generate) is how far that copy is from the one this was made from.
+Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, bool unit0 = false, bool moved = false) {
     const std::uint32_t kMask = code_mask;
+    const auto link = [&]() { return moved ? std::format("((({}u + sh) & {}u) + 16u) / 8u", pc, kMask) : std::format("{}u", (pc + 16u) / 8u); };
     Lower l;
     const unsigned dest = (w >> 21) & 15u, it = (w >> 16) & 15u, is = (w >> 11) & 15u, id = (w >> 6) & 15u;
     const unsigned ft = (w >> 16) & 31u, fs = (w >> 11) & 31u;
@@ -511,9 +514,9 @@ Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t code_mask = kMask, 
     case 0x1B: c = std::format("set_vi(r, {}, (fl.mac() & 0xFFFFu) | r.vi[{}]); ", it, is); l.reads_flags = true; break;
     case 0x1C: c = std::format("set_vi(r, {}, fl.clip() & 0xFFFu); ", it); break;
     case 0x20: c = "pend = true; "; l.branch = true; l.target = target; break;
-    case 0x21: c = std::format("set_vi(r, {}, {}u); pend = true; ", it, (pc + 16u) / 8u); l.branch = true; l.target = target; break;
+    case 0x21: c = std::format("set_vi(r, {}, {}); pend = true; ", it, link()); l.branch = true; l.target = target; break;
     case 0x24: c = std::format("jpc = (static_cast<std::uint32_t>(r.vi[{}]) * 8u) & {}u; pendj = true; ", is, kMask); l.jump = true; break;
-    case 0x25: c = std::format("jpc = (static_cast<std::uint32_t>(r.vi[{}]) * 8u) & {}u; set_vi(r, {}, {}u); pendj = true; ", is, kMask, it, (pc + 16u) / 8u); l.jump = true; break;
+    case 0x25: c = std::format("jpc = (static_cast<std::uint32_t>(r.vi[{}]) * 8u) & {}u; set_vi(r, {}, {}); pendj = true; ", is, kMask, it, link()); l.jump = true; break;
     case 0x28: c = std::format("pend = r.vi[{}] == r.vi[{}]; ", is, it); l.branch = true; l.target = target; break;
     case 0x29: c = std::format("pend = r.vi[{}] != r.vi[{}]; ", is, it); l.branch = true; l.target = target; break;
     case 0x2C: c = std::format("pend = static_cast<std::int16_t>(r.vi[{}]) < 0; ", is); l.branch = true; l.target = target; break;
@@ -682,7 +685,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
     for (std::uint32_t pc : pcs) {
         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
         Lower l;
-        if (!(hi & 0x80000000u)) l = lower(lo, pc, kMask, p.unit == 0);
+        if (!(hi & 0x80000000u)) l = lower(lo, pc, kMask, p.unit == 0, p.unit == 1);
         if (ps2::vu::branch_in_delay_slot(p.code.data(), kMask, pc)) l.supported = false;
         any_status = any_status || l.reads_status;
         any_status_low = any_status_low || l.reads_status_low;
@@ -944,6 +947,14 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         return flush(lanes, from);
     };
     name = std::format("vu{}_{:016X}", p.unit, p.key);
+    // A VU1 program stands for every copy of its code at any address (ps2::vu::program_key_moved): the key that picked it does not hold the
+    // address. It is generated from one copy, at `p.entry`; the copy that runs starts at vu::entry(), and `sh` is the distance. Every address
+    // the program hands on is written as the address in this copy plus `sh`: the program counter it leaves (TPC), the place the interpreter
+    // goes on at when the program cannot (an instruction it does not compile, the end of the code it holds), the hop to it, and the return
+    // address a call writes (lower()). Addresses that come out of the registers (a JR) are the running copy's already. The labels inside
+    // the function stay as they are: the code is the same, only where it stands differs. VU0 programs keep their addresses.
+    const bool moved = p.unit == 1;
+    const auto addr = [&](std::uint32_t a) { return moved ? std::format("(({}u + sh) & {}u)", a, kMask) : std::format("{}u", a); };
     // Unit 1: the program is a body that every float instruction lives in, and a small function around it that sets the "denormals
     // are zero" bit of the processor for the body (when the program has float arithmetic at all) and does a hop to the interpreter
     // after it.
@@ -963,7 +974,8 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
     // (it has no FSSET), and its sticky overflow bit is never set (vu_ops.hpp), so the sticky work would change nothing. That is
     // one branch per call instead of the sticky work at every flag site (in Silent Hill 2 and both God of War
     // games every call starts so).
-    std::string o = head + std::string(late_flags ? "    FlagPipeV fl;\n" : "    FlagPipe fl;\n") + std::string("    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n");
+    std::string o = head + std::string(late_flags ? "    FlagPipeV fl;\n" : "    FlagPipe fl;\n") + std::string("    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n") +
+                    (moved ? std::format("    const std::uint32_t sh = (vu::entry() - {}u) & {}u;\n    (void)sh;\n", p.entry & kMask, kMask) : std::string());
     if (p.unit == 0) o += "    std::uint32_t steps = 0;\n";
     if (dyn) o += "    const Vu0Regs saved = r;\n    std::uint8_t saved_mem[4096];\n    std::memcpy(saved_mem, mem, sizeof saved_mem);\n";
     if (!delay.empty()) o += "    std::uint16_t bk = 0, next_bk = 0;\n    unsigned bi = 0;\n    (void)bk;\n    (void)next_bk;\n    (void)bi;\n";
@@ -1012,7 +1024,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             }
         }
         if (hi & 0x80000000u) body += std::format("r.i = {}u; ", lo);
-        else if (!l.supported) body += std::format("vu::interpret(1, {}u); return; ", pc);
+        else if (!l.supported) body += "vu::interpret(1, " + addr(pc) + "); return; ";
         else {
             if (lazy && any_arith && !daz_in[pc]) replace_all(lcode, "vu::kick(1, ", "vkick_last(daz, 1, ");
             body += lcode;
@@ -1048,7 +1060,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             }
             if (hi & 0x40000000u) o += "ending = true; ";
             const std::uint32_t resume = (lowers[pc].branch || lowers[pc].jump) ? pc : next_pc;
-            if (!in.count(next_pc)) o += std::format("}}{}vu::interpret(1, {}u);\n    return;\n", meet(pc, next_pc), resume);
+            if (!in.count(next_pc)) o += std::format("}}{}vu::interpret(1, {});\n    return;\n", meet(pc, next_pc), addr(resume));
             else o += std::format("}}{}{}goto {};\n", meet(pc, next_pc), edge(next_pc), label(next_pc));
         }
         o += std::format("{}: {{ {}{}", split_slot.count(pc) ? std::format("LF_{:04X}", pc) : label(pc), stop, pro);
@@ -1072,8 +1084,8 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             const Lower &pl = lowers[prev];
             const std::uint32_t phi = word(p.code, prev + 4);
             if (phi & 0x40000000u) {
-                const std::string after = std::format("{}u", (pc + 8u) & kMask);
-                const std::string tpc = pl.branch ? std::format("pend ? {}u : {}", pl.target & kMask, after) : pl.jump ? "pendj ? jpc : " + after : after;
+                const std::string after = addr((pc + 8u) & kMask);
+                const std::string tpc = pl.branch ? std::format("pend ? {} : {}", addr(pl.target & kMask), after) : pl.jump ? "pendj ? jpc : " + after : after;
                 o += std::format("    if (ending) {{ {}r.tpc = {}; return; }}\n", leave(pc), tpc);
             }
             if (pl.branch) o += std::format("    if (pend) {{ pend = false; {}{}goto {}; }}\n", meet(pc, pl.target & kMask), edge(pl.target & kMask), label(pl.target));
@@ -1089,7 +1101,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             }
         }
         const std::uint32_t next = (pc + 8u) & kMask;
-        if (!in.count(next)) o += std::format("    {}vu::interpret(1, {}u);\n    return;\n", leave(pc), next);
+        if (!in.count(next)) o += std::format("    {}vu::interpret(1, {});\n    return;\n", leave(pc), addr(next));
         else if (split_slot.count(next)) o += std::format("    {}{}goto LF_{:04X};\n", meet(pc, next), edge(next), next);
         else if (const std::string e = meet(pc, next) + edge(next); !e.empty()) o += "    " + e + "\n";
     }
@@ -1153,12 +1165,29 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
 namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
-// are then left alone and built again (vu_live.cpp).
-const char *const kGeneratorVersion = "vurecomp 15";
+// are then left alone and built again (vu_live.cpp). 16: VU1 programs keyed by program_key_moved, with the shift `sh` in them.
+const char *const kGeneratorVersion = "vurecomp 16";
+
+// The key a program is built and found under, worked out from its code: VU0 keeps program_key (the address counts), VU1 has program_key_moved
+// (the same code at any address is one program). A recording of the old kind (VU1, its name holds a key that counted the address) is a
+// label only: it gets its new key here and every copy of one piece of code that it brought is one program from now on.
+std::uint64_t key_of(int unit, const std::vector<std::uint8_t> &code, std::uint32_t entry) {
+    const std::uint32_t kMask = unit == 0 ? 4095u : 16383u;
+    const auto pcs = ps2::vu::reachable(code.data(), kMask, entry);
+    return unit == 0 ? ps2::vu::program_key(code.data(), pcs, entry) : ps2::vu::program_key_moved(code.data(), pcs, entry, kMask);
+}
+
+// Of two recordings of one program, the one that is built from: the earlier recorded (a later recording of the same code at another address
+// then changes nothing in the generated files), the lower address when the time is the same or unknown.
+template <class T>
+bool better_copy(const T &a, const T &b) {
+    const std::uint64_t oa = a.order ? a.order : ~0ull, ob = b.order ? b.order : ~0ull;
+    return oa != ob ? oa < ob : a.entry < b.entry;
+}
 
 Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
     std::vector<Program> programs;
-    std::set<std::pair<int, std::uint64_t>> recorded_keys;
+    std::map<std::pair<int, std::uint64_t>, std::size_t> recorded_keys;  // the program of each key, as an index into programs
     for (Input &in : inputs) {
         Program p{in.key, in.entry, std::move(in.code), in.unit, in.order};
         const std::uint32_t kMask = p.unit == 0 ? 4095u : 16383u;
@@ -1166,13 +1195,16 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
             std::fprintf(stderr, "vu%d %016llX at %04X: invalid input or unsupported VU0 live-library request, skipped\n", p.unit, static_cast<unsigned long long>(p.key), p.entry);
             continue;
         }
-        const auto pcs = ps2::vu::reachable(p.code.data(), kMask, p.entry);
-        if (ps2::vu::program_key(p.code.data(), pcs, p.entry) != p.key) {
+        const std::uint64_t key = key_of(p.unit, p.code, p.entry);
+        if (p.unit == 0 && key != p.key) {
             std::fprintf(stderr, "%016llX_%04X: key mismatch, skipped\n", static_cast<unsigned long long>(p.key), p.entry);
             continue;
         }
+        p.key = key;
         if (ps2::vu::branch_in_delay_slot(p.code.data(), kMask, p.entry)) continue;
-        if (recorded_keys.emplace(p.unit, p.key).second) programs.push_back(std::move(p));
+        const auto [at, fresh] = recorded_keys.emplace(std::make_pair(p.unit, p.key), programs.size());
+        if (fresh) programs.push_back(std::move(p));
+        else if (better_copy(p, programs[at->second])) programs[at->second] = std::move(p);
     }
     std::set<std::pair<int, std::uint64_t>> keys;
     for (const Program &p : programs) keys.emplace(p.unit, p.key);
@@ -1200,7 +1232,7 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
             if (op == 0x08 && ((lo >> 11) & 15u) == 0) targets.insert(((((lo >> 10) & 0x7800u) | (lo & 0x7FFu)) * 8u) & kMask);
         }
         for (std::uint32_t target : targets) {
-            const std::uint64_t key = ps2::vu::program_key(programs[i].code.data(), ps2::vu::reachable(programs[i].code.data(), kMask, target), target);
+            const std::uint64_t key = key_of(programs[i].unit, programs[i].code, target);
             if (ps2::vu::branch_in_delay_slot(programs[i].code.data(), kMask, target)) continue;
             if (keys.emplace(programs[i].unit, key).second) programs.push_back(Program{key, target, programs[i].code, programs[i].unit, programs[i].order, programs[i].root, true});
         }
@@ -1281,6 +1313,7 @@ void interpret(int unit, std::uint32_t pc) {{ g_host.interpret(unit, pc); }}
 void kick(int unit, std::uint32_t address) {{ g_host.kick(unit, address); }}
 std::uint32_t top() {{ return g_host.top(); }}
 std::uint32_t itop() {{ return g_host.itop(); }}
+std::uint32_t entry() {{ return g_host.entry(); }}
 }}
 
 PS2_LIVE_EXPORT std::uint64_t ps2_vu_live_stamp() {{ return 0x{:016X}ull; }}
@@ -1301,5 +1334,12 @@ PS2_LIVE_EXPORT const ps2::vu::Program *ps2_vu_live_init(const ps2::vu::LiveHost
     for (const Program &p : programs) result.keys.push_back(p.key);
     return result;
 }
+
+std::uint64_t input_key(const Input &in) {
+    if ((in.unit != 0 && in.unit != 1) || in.entry > (in.unit == 0 ? 4095u : 16383u) || (in.entry & 7u) || in.code.size() != (in.unit == 0 ? 4096u : 16384u)) return 0;
+    return key_of(in.unit, in.code, in.entry);
+}
+
+bool better_input(const Input &a, const Input &b) { return better_copy(a, b); }
 
 }  // namespace ps2::vurecomp

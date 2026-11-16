@@ -40,6 +40,12 @@ struct Result {
 // live compiling leaves them out and builds a target when the game really gets there.
 Result generate_files(std::vector<Input> inputs, const std::filesystem::path &out_dir, std::uint64_t live_stamp, std::size_t per_file = 16, bool with_targets = true);
 
+// For a tool that reads a folder of recordings: the key generate_files gives an input (0 for one it would reject as invalid), and which of
+// two inputs with the same key it builds from. A VU1 key does not hold the address of the code (ps2::vu::program_key_moved), so many recordings
+// are one program; keeping one of each while reading saves the memory of the others.
+std::uint64_t input_key(const Input &in);
+bool better_input(const Input &a, const Input &b);
+
 // The fingerprint a loadable library carries with its programs, so a library made by another version of the generator, the
 // headers or the compiler flags is not loaded again (vu_live.cpp mixes it into the stamp).
 extern const char *const kGeneratorVersion;

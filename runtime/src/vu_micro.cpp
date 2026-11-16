@@ -58,6 +58,7 @@ struct Unit {
 Vu0Regs g_vu1;
 std::uint32_t g_generation[2] = {1, 1};
 std::uint32_t g_top = 0, g_itop = 0;
+std::uint32_t g_vu1_entry = 0;  // where the VU1 program that runs was started (entry())
 
 struct QDelay {
     std::uint32_t generation = 0, value = 0;
@@ -963,15 +964,16 @@ struct EntryCache {
     std::uint32_t next = 0;
 };
 
-std::unordered_map<std::uint64_t, ProgramFn> g_jit_programs;
+std::unordered_map<std::uint64_t, ProgramFn> g_jit_programs;  // by key and address: the code the web JIT writes is made for the address it was started at
 std::vector<std::uint32_t> *g_kick_log = nullptr;
 std::int64_t *g_capture = nullptr;
 
 ProgramFn jit_program(std::uint64_t key, std::uint32_t address) {
-    const auto it = g_jit_programs.find(key);
+    const std::uint64_t slot = key ^ (0x9E3779B97F4A7C15ull * ((address & 16383u) + 1u));
+    const auto it = g_jit_programs.find(slot);
     if (it != g_jit_programs.end()) return it->second;
     const ProgramFn fn = jit::compile(g_vu1_code, address & 16383u);
-    g_jit_programs[key] = fn;
+    g_jit_programs[slot] = fn;
     return fn;
 }
 EntryCache g_entries[2048];
@@ -1058,6 +1060,7 @@ void runaway_summary() {
 std::uint32_t top() { return g_top; }
 std::uint32_t itop() { return g_itop; }
 std::uint32_t itop(int unit) { return unit == 0 ? vif::itop(0) : g_itop; }
+std::uint32_t entry() { return g_vu1_entry; }
 
 ProgramFn lookup(std::uint32_t address);
 
@@ -1137,6 +1140,7 @@ void interpret(int unit, std::uint32_t pc) {
             const EntryCache &e = g_entries[(pc & 16383u) >> 3];
             if (e.generation == g_generation[1] && e.function) {
                 g_trace_vu1_pc = pc;
+                g_vu1_entry = pc & 16383u;
                 e.function(g_vu1, g_vu1_mem);
             } else {
                 run_entry(1, pc);
@@ -1223,6 +1227,7 @@ void run_entry(int unit, std::uint32_t pc) {
         if (live::ready()) install_live();
         const ProgramFn fn = lookup(pc);
         if (fn) {
+            g_vu1_entry = pc & 16383u;
             ++compiled;
             const ProgramFn jit = g_entries[(pc & 16383u) >> 3].jit;
             static std::uint64_t sampled = 0;
@@ -1237,7 +1242,7 @@ void run_entry(int unit, std::uint32_t pc) {
                 const Vu0Regs before = g_vu1;
                 std::memcpy(before_mem, g_vu1_mem, sizeof before_mem);
                 std::int64_t escape = -1;
-                const std::uint64_t key = program_key(g_vu1_code, reachable(g_vu1_code, 16383u, pc & 16383u), pc & 16383u);
+                const std::uint64_t key = program_key_moved(g_vu1_code, reachable(g_vu1_code, 16383u, pc & 16383u), pc & 16383u, 16383u);
                 g_capture = &escape;
                 fn(g_vu1, g_vu1_mem);
                 g_capture = nullptr;
@@ -1314,7 +1319,7 @@ ProgramFn lookup(std::uint32_t address) {
             return e.function;
         }
     const std::vector<std::uint32_t> pcs = reachable(g_vu1_code, 16383u, address);
-    const std::uint64_t key = program_key(g_vu1_code, pcs, address & 16383u);
+    const std::uint64_t key = program_key_moved(g_vu1_code, pcs, address & 16383u, 16383u);
     g_last_key = key;
     e.key = key;
     const auto it = g_programs.find(key);
@@ -1334,16 +1339,29 @@ ProgramFn lookup(std::uint32_t address) {
     if (!e.function && (!record.empty() || g_options.on_vu_program)) {
         char name[64];
         std::snprintf(name, sizeof name, "%016llX_%04X.bin", static_cast<unsigned long long>(key), address & 16383u);
+        // Once per key, at whatever address the program was met first: the key does not depend on the address (program_key_moved), so a
+        // file for every address would be the same code again and again (Killzone: hundreds of files for one piece of code).
         if (g_options.on_vu_program) {
-            static std::unordered_set<std::string> reported;
-            if (reported.insert(name).second) g_options.on_vu_program(name, g_vu1_code, 16384);
+            static std::unordered_set<std::uint64_t> reported;
+            if (reported.insert(key).second) g_options.on_vu_program(name, g_vu1_code, 16384);
             return e.function;
         }
-        const std::filesystem::path path = ps2::os::path(record) / name;
-        static std::unordered_set<std::string> recorded;  // once per program and run, as for VU0 (lookup_vu0)
-        if (recorded.insert(name).second && !std::filesystem::exists(path)) {
-            std::filesystem::create_directories(ps2::os::path(record));
-            std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu1_code), 16384);
+        static std::unordered_set<std::uint64_t> recorded;  // the keys of the files the folder holds and of those this run wrote
+        static bool listed = false;
+        const std::filesystem::path dir = ps2::os::path(record);
+        if (!listed) {
+            // read once: the keys of earlier runs (a file name starts with its 16 hex digits and an underscore; a file of the old kind,
+            // whose key counted the address, is listed too and only costs a second file of the same code under a key of the new kind)
+            listed = true;
+            std::error_code error;
+            for (std::filesystem::directory_iterator it(dir, error), end; !error && it != end; it.increment(error)) {
+                const std::string file = ps2::os::utf8(it->path().filename());
+                if (file.size() > 17 && file[16] == '_') recorded.insert(std::strtoull(file.substr(0, 16).c_str(), nullptr, 16));
+            }
+        }
+        if (recorded.insert(key).second) {
+            std::filesystem::create_directories(dir);
+            std::ofstream(dir / name, std::ios::binary).write(reinterpret_cast<const char *>(g_vu1_code), 16384);
         }
     }
     return e.function;

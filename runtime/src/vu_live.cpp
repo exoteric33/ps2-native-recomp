@@ -115,7 +115,7 @@ bool load_library(const fs::path &path, std::size_t &count) {
     const auto init = reinterpret_cast<InitFn>(lb::find_symbol(library, "ps2_vu_live_init"));
     if (!stamp || !init || stamp() != g->stamp) return false;  // stays loaded: it cannot be unloaded safely, and it is rare
     crash::note_live_library(crash::Thread::LiveVu, reinterpret_cast<const void *>(init));  // a crash in it is named as live VU code
-    static const LiveHost host = {&ps2::vu::interpret, &ps2::vu::kick, &ps2::vu::top, &ps2::vu::itop};
+    static const LiveHost host = {&ps2::vu::interpret, &ps2::vu::kick, &ps2::vu::top, &ps2::vu::itop, &ps2::vu::entry};
     std::uint32_t n = 0;
     const Program *table = init(&host, &n);
     std::lock_guard lock(g->mutex);

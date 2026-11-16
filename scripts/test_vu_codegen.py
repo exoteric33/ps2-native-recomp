@@ -481,7 +481,7 @@ int main(int argc, char **argv) {
     const fs::path out = argv[1];
     std::ofstream native(out / "native.cpp");
     native << "#include <stdexcept>\n#include <chrono>\n#include <cstdio>\n#include <cstdlib>\n#include \"cases.h\"\n"
-              "namespace ps2::vu { void interpret(int, std::uint32_t) { throw std::runtime_error(\"unexpected fallback\"); } }\n"
+              "namespace ps2::vu { std::uint32_t entry() { return 0; } void interpret(int, std::uint32_t) { throw std::runtime_error(\"unexpected fallback\"); } }\n"
               "using namespace ps2; using namespace ps2::vuops;\n";
     constexpr std::uint32_t nop = 0x8000033C, unop = 0x000002FF, end = 0x40000000;
     const auto addi = [](unsigned it, unsigned is, unsigned imm) { return (8u << 25) | (it << 16) | (is << 11) | imm; };
@@ -546,7 +546,7 @@ int main(int argc, char **argv) {
         if (ps2::vu::jit::translate(p.code.data(), 0, {0x1000}, wasm) == at_entry) { std::fprintf(stderr, "Wasm translation of a double branch %s\n", at_entry ? "worked at the entry" : "failed further in"); return 1; }
         std::string name;
         const std::string text = generate(p, name);
-        if (text.find(std::format("vhop(hop, {}u)", at)) == std::string::npos && text.find(std::format("vu::interpret(1, {}u)", at)) == std::string::npos) { std::fprintf(stderr, "the double branch at %u is not left to the interpreter\n", at); return 1; }
+        if (text.find(std::format("vhop(hop, (({}u + sh) & 16383u))", at)) == std::string::npos && text.find(std::format("vu::interpret(1, (({}u + sh) & 16383u))", at)) == std::string::npos) { std::fprintf(stderr, "the double branch at %u is not left to the interpreter\n", at); return 1; }
     }
 
     // The pipeline stall cases: compiled here, run by the interpreter harness, the native main and node.

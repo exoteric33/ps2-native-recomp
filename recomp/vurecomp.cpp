@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -41,6 +42,10 @@ int main(int argc, char **argv) {
     }
     const fs::path out_dir = ps2::os::path(argv[2]);
     std::vector<ps2::vurecomp::Input> inputs;
+    // VU1: the key does not hold the address of the code, so a folder of recordings holds one program many times over (Killzone: a piece of
+    // code at hundreds of addresses, each its own file; 282,078 files of 16 KiB in one report). One copy of each program is kept while the
+    // folder is read, the earliest recorded, so that the memory is not the size of the folder.
+    std::unordered_map<std::uint64_t, std::size_t> copy_of;
     const auto load = [&](const fs::path &dir, int unit) {
         std::error_code error;
         if (!fs::is_directory(dir, error)) {
@@ -69,6 +74,13 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "VU%d recording must contain %u bytes: %s\n", unit, bytes, ps2::os::utf8(e.path()).c_str());
                 continue;
             }
+            if (unit == 1)
+                if (const std::uint64_t k = ps2::vurecomp::input_key(in)) {
+                    const auto [at, fresh] = copy_of.emplace(k, inputs.size());
+                    if (fresh) inputs.push_back(std::move(in));
+                    else if (ps2::vurecomp::better_input(in, inputs[at->second])) inputs[at->second] = std::move(in);
+                    continue;
+                }
             inputs.push_back(std::move(in));
         }
         return true;

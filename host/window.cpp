@@ -1,5 +1,6 @@
 #include "window.hpp"
 #include "big_stack_thread.hpp"
+#include "stick_map.hpp"
 
 #include "ps2/system.hpp"
 
@@ -238,9 +239,13 @@ bool attach_gpu() {
     return attached;
 }
 
-std::uint8_t axis(SDL_GameController *pad, SDL_GameControllerAxis a) {
-    const int v = SDL_GameControllerGetAxis(pad, a);
-    return static_cast<std::uint8_t>(std::clamp((v + 32768) >> 8, 0, 255));
+// A controller's stick, stretched from the pad's round gate to the console's square one (host/stick_map.hpp). An axis the keyboard
+// or the mouse already pushed (not 0x80) is left alone; the keyboard's own diagonal is shorter on purpose (push_stick).
+void stick(SDL_GameController *pad, SDL_GameControllerAxis ax, SDL_GameControllerAxis ay, std::uint8_t &x, std::uint8_t &y) {
+    std::uint8_t px, py;
+    stick_map::to_bytes(SDL_GameControllerGetAxis(pad, ax), SDL_GameControllerGetAxis(pad, ay), px, py);
+    if (x == 0x80) x = px;
+    if (y == 0x80) y = py;
 }
 
 void rumble(int port) {
@@ -796,10 +801,8 @@ void poll_port(int port) {
         };
         trigger(SDL_CONTROLLER_AXIS_TRIGGERLEFT, kL2, l2);
         trigger(SDL_CONTROLLER_AXIS_TRIGGERRIGHT, kR2, r2);
-        if (lx == 0x80) lx = axis(pad, SDL_CONTROLLER_AXIS_LEFTX);
-        if (ly == 0x80) ly = axis(pad, SDL_CONTROLLER_AXIS_LEFTY);
-        if (rx == 0x80) rx = axis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
-        if (ry == 0x80) ry = axis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
+        stick(pad, SDL_CONTROLLER_AXIS_LEFTX, SDL_CONTROLLER_AXIS_LEFTY, lx, ly);
+        stick(pad, SDL_CONTROLLER_AXIS_RIGHTX, SDL_CONTROLLER_AXIS_RIGHTY, rx, ry);
     }
     if (g_menu.is_open()) g_block_input[port] = true;
     if (g_block_input[port]) {

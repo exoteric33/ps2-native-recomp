@@ -988,7 +988,7 @@ void register_programs(const Program *programs, std::uint32_t count) {
         if (programs[i].function) (programs[i].unit == 0 ? g_vu0_programs : g_programs)[programs[i].key] = programs[i].function;
     for (Vu0Entry &entry : g_vu0_entries) entry.generation = 0;
     // The log head says how many programs of each vector unit the build holds (the old line "[vu1] Statically registered N compiled
-    // vector programs" counted both: N is the sum of the two numbers). Printed for 0 and 0 too: a first build with nothing compiled in.
+    // vector programs" counted both: N is the sum of the two numbers). Printed for 0 and 0 too (a build without any: register_generated_vu below).
     std::uint32_t in_vu0 = 0;
     for (std::uint32_t i = 0; i < count; ++i) in_vu0 += programs[i].unit == 0;
     std::fprintf(stderr, "[vu] compiled in: %u VU1 programs, %u VU0 programs\n", count - in_vu0, in_vu0);
@@ -1598,7 +1598,8 @@ void vcallms(Cpu &, std::uint32_t address) { vu::run(0, address); }
 
 }
 
-__attribute__((weak)) void register_generated_vu() {}
+// A build with no compiled vector programs (the table is only made when there are some) still says so in the log head.
+__attribute__((weak)) void register_generated_vu() { ps2::vu::register_programs(nullptr, 0); }
 
 namespace ps2::vu {
 

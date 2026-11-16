@@ -50,6 +50,22 @@ Image Image::load(std::span<const std::uint8_t> data) {
         // game rewrites it at runtime, so it holds no code to translate here
         // and any call into it walks to the images the game puts there.
         if (!filesz && (flags & 1u)) continue;
+        if (!filesz && !memsz) continue;
+        // Segments outside the 32 MiB of main memory (the scratchpad at
+        // 0x70000000, or an empty marker at 0x03000000..0x04000000) hold no
+        // main-memory code or data for the static translator.
+        if (vaddr >= 0x02000000u) continue;
+        if (!filesz) {
+            bool merged = false;
+            for (auto &existing : image.segments_) {
+                if (!existing.executable && existing.initialized_size == 0 && existing.address == vaddr) {
+                    if (memsz > existing.bytes.size()) existing.bytes.resize(memsz);
+                    merged = true;
+                    break;
+                }
+            }
+            if (merged) continue;
+        }
         Segment segment{vaddr, std::vector<std::uint8_t>(memsz), (flags & 1u) != 0, filesz};
         std::memcpy(segment.bytes.data(), data.data() + offset, filesz);
         image.segments_.push_back(std::move(segment));

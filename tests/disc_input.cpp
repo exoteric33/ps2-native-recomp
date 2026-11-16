@@ -3,6 +3,8 @@
 // module loader (iop/kernel.cpp) and the boot ELF loader (system.cpp), each with tiny hand-made images, plus one valid image of
 // each kind that must still load as before. Build: ninja ps2discinputtest, run build/.../ps2discinputtest (prints
 // "disc input: 0 failed").
+#include "eerecomp_gen.hpp"
+#include "elf.hpp"
 #include "iop/iop.hpp"
 #include "iop/kernel.hpp"
 #include "ps2/disc.hpp"
@@ -334,6 +336,37 @@ void elf_tests() {
     // Wholly outside: nothing is written, whatever the size says.
     { Segment e; e.vaddr = 0xFFFFFF00u; e.filesz = 0; e.memsz = 0x800; check(boot({}, 52, entry, &e), "boot ELF empty segment at the top of the address space: ignored"); }
     { Segment e; e.vaddr = ps2::kRamSize; e.filesz = 0; e.memsz = 0x800; check(boot({}, 52, entry, &e), "boot ELF empty segment right at the end of memory: ignored"); }
+
+    // The static translator and code-window scanner apply the same bounds: ignore empty or out-of-RAM segments
+    // (Champions of Norrath's 0-byte entry at 0, PES 6's 0x03000000, Onimusha's 0x03800000, WRC 3's 0x70000000) and
+    // bound 16 KiB window stepping by each overlay slot's extent (Yu-Gi-Oh! Duelists of the Roses's 833 overlay headers
+    // sharing a 32 KiB slot at 0x01E00000).
+    {
+        std::vector<std::uint8_t> elf(52 + 56 * 32 + 0x100);
+        std::memcpy(elf.data(), "\177ELF\1\1\1", 7);
+        put(elf, 24, 0x00100008u); put(elf, 28, 52u); put(elf, 42, std::uint16_t{32}); put(elf, 44, std::uint16_t{56});
+        const auto add_ph = [&](std::size_t idx, std::uint32_t off, std::uint32_t vaddr, std::uint32_t filesz, std::uint32_t memsz, std::uint32_t flags) {
+            const std::size_t at = 52 + idx * 32;
+            put(elf, at + 0, 1u); put(elf, at + 4, off); put(elf, at + 8, vaddr);
+            put(elf, at + 16, filesz); put(elf, at + 20, memsz); put(elf, at + 24, flags);
+        };
+        add_ph(0, 52 + 56 * 32, 0x00100000u, 0x20u, 0x40u, 5u);   // main executable code
+        add_ph(1, 0, 0x00000000u, 0u, 0u, 7u);                    // empty executable header at 0 (Champions of Norrath)
+        add_ph(2, 0, 0x03000000u, 0u, 0x800u, 7u);                // empty executable header past 32 MiB (PES 6 / Onimusha)
+        add_ph(3, 0, 0x70000000u, 0u, 0x1000u, 6u);               // scratchpad BSS header (WRC 3)
+        add_ph(4, 0, 0x00200000u, 0u, 0x1000u, 6u);               // overlapping non-executable BSS headers
+        add_ph(5, 0, 0x00200000u, 0u, 0x3000u, 6u);
+        for (std::size_t i = 0; i < 50; ++i)
+            add_ph(6 + i, 0, 0x01E00000u, 0u, 0x8000u, 7u);       // 50 overlay headers sharing one 32 KiB slot (2 x 16 KiB units)
+
+        const auto wins = recomp::code_windows(elf);
+        check(wins.size() == 2 && wins[0] == 0x01E00000u && wins[1] == 0x01E04000u,
+              "code_windows: ignores 0-size and out-of-RAM headers and bounds stepping to the overlay slot");
+        const auto img = recomp::Image::load(elf);
+        check(img.segments().size() == 2 && img.segments()[0].address == 0x00100000u &&
+              img.segments()[1].address == 0x00200000u && img.segments()[1].bytes.size() == 0x3000u,
+              "Image::load: skips scratchpad/out-of-RAM headers and merges overlapping zero-file-size BSS segments");
+    }
 }
 
 void disc_folder_tests() {

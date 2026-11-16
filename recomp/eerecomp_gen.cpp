@@ -121,11 +121,13 @@ std::vector<std::uint32_t> code_windows(const std::vector<std::uint8_t> &elf) {
     for (std::uint32_t i = 0; i < phnum; ++i) {
         const std::size_t at = static_cast<std::size_t>(phoff) + static_cast<std::size_t>(i) * phentsize;
         if (at + 32 > elf.size()) break;
-        const std::uint32_t type = u32(at), vaddr = u32(at + 8), filesz = u32(at + 16), flags = u32(at + 24);
-        if (type != 1 || filesz || !(flags & 1)) continue;  // no PT_LOAD, has contents, not executable
+        const std::uint32_t type = u32(at), vaddr = u32(at + 8), filesz = u32(at + 16), memsz = u32(at + 20), flags = u32(at + 24);
+        if (type != 1 || filesz || !memsz || !(flags & 1) || vaddr >= 0x02000000u) continue;  // no PT_LOAD, has contents, empty, not executable, or outside RAM
         std::uint32_t base = vaddr & ~(kWindowUnit - 1);
-        while (std::find(out.begin(), out.end(), base) != out.end()) base += kWindowUnit;
-        out.push_back(base);
+        const std::uint32_t limit = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(0x02000000ull, (std::uint64_t{vaddr} + memsz + kWindowUnit - 1) & ~std::uint64_t{kWindowUnit - 1}));
+        while (base < limit && std::find(out.begin(), out.end(), base) != out.end()) base += kWindowUnit;
+        if (base < limit) out.push_back(base);
     }
     return out;
 }
@@ -148,7 +150,7 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> file_segments(const std::ve
     for (std::uint32_t i = 0; i < phnum; ++i) {
         const std::size_t at = static_cast<std::size_t>(phoff) + static_cast<std::size_t>(i) * phentsize;
         if (at + 32 > elf.size()) break;
-        if (u32(at) == 1 && u32(at + 16)) out.emplace_back(u32(at + 8), u32(at + 20));
+        if (u32(at) == 1 && u32(at + 16) && u32(at + 8) < 0x02000000u) out.emplace_back(u32(at + 8), u32(at + 20));
     }
     return out;
 }
@@ -172,7 +174,7 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> code_segments(const std::ve
         const std::size_t at = static_cast<std::size_t>(phoff) + static_cast<std::size_t>(i) * phentsize;
         if (at + 32 > elf.size()) break;
         const std::uint32_t type = u32(at), vaddr = u32(at + 8), filesz = u32(at + 16), memsz = u32(at + 20), flags = u32(at + 24);
-        if (type == 1 && filesz && (flags & 1)) out.emplace_back(vaddr, memsz);
+        if (type == 1 && filesz && (flags & 1) && vaddr < 0x02000000u) out.emplace_back(vaddr, memsz);
     }
     return out;
 }

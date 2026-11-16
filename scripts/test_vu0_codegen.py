@@ -6,6 +6,7 @@ unit registry, cache, fallback and full-state verifier, including code replaceme
 """
 import ast
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -415,7 +416,8 @@ with tempfile.TemporaryDirectory(prefix='vu0-codegen-') as tmp:
     assert 'vu0_' + key in (tmp / 'only-zero' / 'vu1_table.cpp').read_text()
     run([cli, str(one_dir), str(tmp / 'mixed'), '--vu0-dir', str(record)])
     table = (tmp / 'mixed' / 'vu1_table.cpp').read_text()
-    assert 'vu0_' + key in table and 'vu1_' + key in table
+    # The VU1 copy of the same code has a key of its own: a VU1 key leaves the address out (program_key_moved), a VU0 key keeps it.
+    assert 'vu0_' + key in table and re.search(r'vu1_[0-9A-F]{16}', table)
     run([cli, str(one_dir), str(tmp / 'legacy')])
     assert 'vu0_' not in (tmp / 'legacy' / 'vu1_table.cpp').read_text()
     for args in [['-', str(tmp / 'bad')], [str(one_dir), str(tmp / 'bad'), '--unknown', str(record)],

@@ -46,6 +46,7 @@
 
 #include "keymap.hpp"
 #include "quickmenu.hpp"
+#include "ps2/crash.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
 #include "ps2/video.hpp"
@@ -153,6 +154,9 @@ int g_stick_step[2] = {};  // the left stick moving the highlight: -1 up, 1 down
 // The inner resolution (PS2_SCALE): the one of this run, and the one keys.ini holds for the next start (the menu changes that one).
 int g_scale_now = 1, g_scale_next = 1;
 bool g_scale_locked = false;  // PS2_SCALE was set before the start: keys.ini does not count
+// The filter of upscaled 2D art (PS2_SHARP_2D: 0 soft, 1 sharp, 2 sharpest), the same way: this run's and keys.ini's for the next start.
+int g_sharp_now = 1, g_sharp_next = 1;
+bool g_sharp_locked = false;
 // A short note drawn over the picture for a moment after the menu is closed ("Saved", "Loaded"): the menu asked for a quick save or load
 bool g_note_wanted = false;  // a save or load was asked by the menu: the next message about it is shown over the picture
 std::string g_note_text;  // not empty while the note is up
@@ -897,6 +901,9 @@ void menu_paint(bool show_again = true) {
         v.scale_now = g_scale_now;
         v.scale_next = g_scale_next;
         v.scale_locked = g_scale_locked;
+        v.sharp_now = g_sharp_now;
+        v.sharp_next = g_sharp_next;
+        v.sharp_locked = g_sharp_locked;
         v.fullscreen = SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN;
         if (g_menu.on_keys_page()) {
             for (int a = 0; a < keymap::kChangeableCount; ++a) v.key_rows.push_back({keymap::action_label(a), keymap::keys_text(g_keys, a)});
@@ -1078,11 +1085,22 @@ void menu_command(quickmenu::Command c, int step) {
             set_notice("The resolution is set by PS2_SCALE; remove it to choose here");
             break;
         }
-        g_scale_next = (g_scale_next - 1 + step + 3) % 3 + 1;
+        g_scale_next = (g_scale_next - 1 + step + 4) % 4 + 1;
         g_keys.scale = g_scale_next;
         rewrite_keys_file([](const std::string &t) { return keymap::with_scale(t, g_scale_next); }, "resolution");
         set_notice("Resolution " + std::to_string(g_scale_next) + "x" + (g_scale_next == g_scale_now ? "" : ": used when the game starts the next time"));
         std::fprintf(stderr, "[menu] resolution %dx for the next start (this run: %dx)\n", g_scale_next, g_scale_now);
+        break;
+    case Command::sharp_2d:
+        if (g_sharp_locked) {
+            set_notice("Text and menus are set by PS2_SHARP_2D; remove it to choose here");
+            break;
+        }
+        g_sharp_next = (g_sharp_next + step + 3) % 3;
+        g_keys.sharp_2d = g_sharp_next;
+        rewrite_keys_file([](const std::string &t) { return keymap::with_sharp_2d(t, g_sharp_next); }, "2D art filter");
+        set_notice(std::string("Text and menus: ") + keymap::sharp_2d_word(g_sharp_next) + (g_sharp_next == g_sharp_now ? "" : ", used when the game starts the next time"));
+        std::fprintf(stderr, "[menu] 2D art %s for the next start (this run: %s)\n", keymap::sharp_2d_word(g_sharp_next), keymap::sharp_2d_word(g_sharp_now));
         break;
     case Command::fullscreen: toggle_fullscreen(); break;
     case Command::change_keys: g_key_note.clear(); break;  // (the menu has switched to its keys page)
@@ -1390,9 +1408,61 @@ bool no_limit() {
     return on;
 }
 
+// PS2_PACE=audio: the sound device paces the game (the game waits while more than ~80 ms of sound is waiting), as before. A device
+// that takes its sound in large blocks (wireless headsets over WASAPI) then makes the frames uneven: seven of 20 ms, one of 30 ms, one
+// of 3 ms, about six times a second (measured with Urban Reign and a Corsair HS80), which shows as judder in every camera pan even
+// at a steady 50 fps. By default the clock paces the game instead, one frame every 1/50 or 1/60 s, and the sound only steers that
+// clock: frames up to 1% longer while more sound than kSteerMs is waiting, up to 1% shorter while less. The sound stretcher still
+// covers a game that runs slow.
+bool audio_paced() {
+    static const bool on = ps2::os::env("PS2_PACE") == "audio";
+    return on;
+}
+
+constexpr double kSteerMs = 90.0;  // the sound the clock-paced game keeps waiting for the device: enough that a device taking large blocks does not dip it under the stretcher's gap guard (~45 ms with a 20 ms frame), which would stretch the sound for no reason
+
+// Waits until the performance counter reaches `target`: sleeps while more than 2 ms are left, then spins, for a frame edge within
+// a few microseconds (SDL_Delay alone wakes up to a millisecond late, which is the unevenness this is meant to remove).
+void wait_until(std::uint64_t target) {
+    const std::uint64_t frequency = SDL_GetPerformanceFrequency();
+    for (;;) {
+        const std::uint64_t now = SDL_GetPerformanceCounter();
+        if (now >= target) return;
+        const double left_ms = static_cast<double>(target - now) * 1000.0 / static_cast<double>(frequency);
+        if (left_ms > 2.0) SDL_Delay(static_cast<Uint32>(left_ms - 1.5));
+        else std::this_thread::yield();
+    }
+}
+
 void pace() {
     if (no_limit()) return;
     static bool stuck = false;  // the device took no sound for a second; the clock paces the game until it takes some again
+    if (g_audio && !audio_paced() && !stuck) {
+        g_pipe->frame(audio_seconds());
+        const double started = audio_seconds();
+        const double frequency = static_cast<double>(SDL_GetPerformanceFrequency());
+        const double steer = std::clamp((g_pipe->queued_ms() - kSteerMs) / kSteerMs * 0.02, -0.01, 0.01);
+        const auto period = static_cast<std::uint64_t>(frequency / (ps2::g_options.pal ? 50.0 : 60.0) * (1.0 + steer));
+        const std::uint64_t now = SDL_GetPerformanceCounter();
+        // more than two frames behind (a load, a hold): start counting again from now rather than rushing to catch up
+        if (g_last && now < g_last + 2 * period) {
+            g_last += period;
+            wait_until(g_last);
+        } else {
+            g_last = now;
+        }
+        // a device that takes far less than the game makes (or none at all) must still hold the game: the old wait, as a ceiling
+        const double hold = audio_seconds();
+        while (g_pipe->queued_ms() > 3.0 * kSteerMs && audio_seconds() - hold < 1.0) SDL_Delay(1);
+        const double waited = audio_seconds() - started;
+        g_pipe->note_wait(waited);
+        note_audio();
+        if (audio_seconds() - hold >= 1.0) {
+            std::fprintf(stderr, "[audio] the sound device took no sound for a second (unplugged?); the clock paces the game until it does\n");
+            stuck = true;
+        }
+        return;
+    }
     if (g_audio && !(stuck && g_pipe->full())) {
         // The audio device clock paces emulation: wait while more than ~80 ms of sound is waiting. The pipe times the game between
         // the frames (how much it slows down decides how much the sound is stretched) and does not count this wait as slowness.
@@ -1679,6 +1749,12 @@ void queue_audio(const std::int16_t *samples, std::size_t frames) {
 // The sound device asks for its next block (its own thread): the pipe hands over the game's sound, stretched when the game is slow,
 // and the tone for F5, F8 and F9 is mixed on top.
 void audio_callback(void *, Uint8 *stream, int length) {
+    static thread_local bool named = false;  // the sound device's own thread
+    if (!named) {
+        named = true;
+        ps2::crash::enter_thread(ps2::crash::Thread::Sound);
+    }
+    ps2::crash::test_poll(ps2::crash::Thread::Sound);
     g_pipe->render(reinterpret_cast<std::int16_t *>(stream), static_cast<std::size_t>(length) / 4, audio_seconds(), mix_beep);
 }
 
@@ -1766,12 +1842,22 @@ bool open_window(bool fullscreen) {
     // The inner resolution: PS2_SCALE when it is set, else the 'scale' line of keys.ini (the quick menu writes it), else 1. It is read
     // when the graphics start (run_window, after this), so setting it here is in time.
     g_scale_locked = !ps2::os::env("PS2_SCALE").empty();
-    if (!g_scale_locked && g_keys.scale >= 1 && g_keys.scale <= 3) {
+    if (!g_scale_locked && g_keys.scale >= 1 && g_keys.scale <= 4) {
         ps2::os::set_env("PS2_SCALE", std::to_string(g_keys.scale));
         std::fprintf(stderr, "[video] resolution %dx from %s (scale = %d)\n", g_keys.scale, g_keys_path.c_str(), g_keys.scale);
     }
-    g_scale_now = std::clamp(std::atoi(ps2::os::env("PS2_SCALE").c_str()), 1, 3);
+    // The picture pace (ps2/pace.hpp): the 'pace' line of keys.ini, unless PS2_PACE is set. The runtime reads it at boot, after this.
+    if (!g_keys.pace.empty() && ps2::os::env("PS2_PACE").empty()) {
+        ps2::os::set_env("PS2_PACE", g_keys.pace);
+        ps2::os::set_env("PS2_PACE_FROM", g_keys_path);
+    }
+    g_scale_now = std::clamp(std::atoi(ps2::os::env("PS2_SCALE").c_str()), 1, 4);
     g_scale_next = g_scale_locked ? g_scale_now : (g_keys.scale >= 1 ? g_keys.scale : g_scale_now);
+    // the 2D art filter the same way: PS2_SHARP_2D, else the 'sharp_2d' line of keys.ini, else sharp (gpu.cpp reads it at its start)
+    g_sharp_locked = !ps2::os::env("PS2_SHARP_2D").empty();
+    if (!g_sharp_locked && g_keys.sharp_2d >= 0) ps2::os::set_env("PS2_SHARP_2D", std::to_string(g_keys.sharp_2d));
+    g_sharp_now = ps2::os::env("PS2_SHARP_2D").empty() ? 1 : std::clamp(std::atoi(ps2::os::env("PS2_SHARP_2D").c_str()), 0, 2);
+    g_sharp_next = g_sharp_locked ? g_sharp_now : (g_keys.sharp_2d >= 0 ? g_keys.sharp_2d : g_sharp_now);
     Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
 #ifdef __APPLE__
     if (!std::getenv("PS2_SDL_RENDERER")) flags |= SDL_WINDOW_METAL;
@@ -1916,6 +2002,7 @@ void report_threads(std::uint64_t frame, int stalled_seconds) {
 }
 
 void watchdog() {
+    ps2::crash::enter_thread(ps2::crash::Thread::Watchdog);
     std::signal(SIGUSR2, on_stack_request);
 #ifdef __GLIBC__
     void *warm[2];

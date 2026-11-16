@@ -13,7 +13,7 @@
 namespace quickmenu {
 
 enum class Command {
-    none, resume, save, load, look, scale, fullscreen, keys, quit,
+    none, resume, save, load, look, scale, sharp_2d, fullscreen, keys, quit,
     change_keys,   // the main menu's entry that opens the keys page (the menu switches page by itself)
     key_edit,      // keys page: the highlighted line waits for a key (capturing() is true from now on)
     key_defaults   // keys page: put back the default keys (asked once, like Quit)
@@ -25,6 +25,8 @@ struct Values {
     int scale_now = 1;      // the inner resolution the game runs at
     int scale_next = 1;     // the one written in keys.ini for the next start
     bool scale_locked = false;  // PS2_SCALE is set: keys.ini does not count
+    int sharp_now = 1, sharp_next = 1;  // the 2D art filter (0 soft, 1 sharp, 2 sharpest): this run's, and keys.ini's for the next start
+    bool sharp_locked = false;  // PS2_SHARP_2D is set
     bool fullscreen = false;
     // the keys page: one row per button (label and its keys, in the order of keys.ini) and a message line (what the last change did)
     struct KeyRow {

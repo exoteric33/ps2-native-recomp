@@ -14,10 +14,10 @@ mkdir -p "$target"
 url="https://github.com/libsdl-org/SDL/releases/download/release-$version/SDL2-devel-$version-mingw.zip"
 # curl from Git for Windows and tar.exe read their command line in the ANSI code page and cannot open a folder with letters
 # outside it (Chinese on a Western Windows), so both run inside the folder with a plain file name. MinGit has no unzip.
-(cd "$target" && curl -fL -o sdl2.zip "$url") || { rm -f "$target/sdl2.zip"; echo "SDL2: download failed: $url" >&2; exit 1; }
-# sha256sum on Linux and in Git Bash, shasum on macOS
-if command -v sha256sum > /dev/null; then got=$(cd "$target" && sha256sum sdl2.zip | cut -d' ' -f1)
-else got=$(cd "$target" && shasum -a 256 sdl2.zip | cut -d' ' -f1); fi
+# fetch_download retries, and uses a file saved by hand in downloads/ (scripts/fetch_lib.sh, docs/fetch-retry.md).
+. "$here/scripts/fetch_lib.sh"
+fetch_download SDL2 "$target" sdl2.zip "$url" "$sha256" || exit 1
+got=$(fetch_sha256 "$target/sdl2.zip")
 if [ "$got" != "$sha256" ]; then rm -f "$target/sdl2.zip"; echo "SDL2: wrong SHA-256 $got (expected $sha256)" >&2; exit 1; fi
 if command -v unzip > /dev/null; then unzip -o -q "$target/sdl2.zip" -d "$target"; else (cd "$target" && tar -xf sdl2.zip); fi
 cp -R "$target/SDL2-$version/x86_64-w64-mingw32/." "$target"

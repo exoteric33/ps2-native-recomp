@@ -7,6 +7,9 @@
 #include "ps2/system.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/pace.hpp"
+#include "ipu/ipu.hpp"
+#include "ps2/crash.hpp"
 
 #include <algorithm>
 #include <array>
@@ -23,7 +26,9 @@ namespace ps2::kernel {
 namespace {
 
 enum Status { kRun = 1, kReady = 2, kWait = 4, kSuspend = 8, kWaitSuspend = 12, kDormant = 16 };
-enum WaitType { kWaitNone, kWaitSleep, kWaitSema };
+// kWaitPace: held by the picture pace (ps2/pace.hpp) until the vertical blank in wait_id. On a PS2 the thread would still be
+// working, so the game sees it as ready, never as waiting.
+enum WaitType { kWaitNone, kWaitSleep, kWaitSema, kWaitPace };
 
 constexpr std::uint32_t kKernelStackTop = 0x00080000u;
 constexpr std::uint32_t kSyscallTable = 0x00001800u;
@@ -103,6 +108,15 @@ bool g_reschedule = false;
 std::vector<int> g_pending_alarms;
 std::uint32_t g_vsync_flag = 0, g_vsync_data = 0;
 std::uint32_t g_osd_config = 0;
+// The picture pace (ps2/pace.hpp). A hold that is due is noted here and served at the next safe point (service()), where the
+// thread's place in its code is exact: the thread that changed the shown buffer, or, for a change made in an interrupt handler,
+// the thread that runs after the handler (-1 until then). g_pace_until is 0 when no hold is due.
+pace::Hold g_pace;
+pace::Count g_pace_count;
+std::uint64_t g_pace_until = 0;
+int g_pace_thread = 0;
+std::uint64_t g_pace_decoded = 0;  // the decoder's commands at the last refresh
+int g_pace_held = 0;  // threads in kWaitPace (a hint for on_vblank_start, counted again there)
 
 template <typename Map>
 int lowest_free(const Map &map, int limit, int first = 1) {
@@ -358,7 +372,8 @@ void exit_current(Cpu &c, bool remove) {
 void write_thread_status(int id, std::uint32_t p) {
     Thread *t = thread(id);
     if (!t || !p) return;
-    st32(p + 0, static_cast<std::uint32_t>(t->status));
+    const bool held = t->wait == kWaitPace;  // working on a PS2: ready (or suspended), not waiting
+    st32(p + 0, static_cast<std::uint32_t>(held ? (t->status == kWaitSuspend ? kSuspend : kReady) : t->status));
     st32(p + 4, t->entry);
     st32(p + 8, t->stack);
     st32(p + 12, t->stack_size);
@@ -368,7 +383,7 @@ void write_thread_status(int id, std::uint32_t p) {
     st32(p + 28, t->attr);
     st32(p + 32, t->option);
     st32(p + 36, t->wait == kWaitSema ? 2u : t->wait == kWaitSleep ? 1u : 0u);
-    st32(p + 40, static_cast<std::uint32_t>(t->wait_id));
+    st32(p + 40, held ? 0u : static_cast<std::uint32_t>(t->wait_id));
     st32(p + 44, static_cast<std::uint32_t>(t->wakeups));
 }
 
@@ -425,13 +440,19 @@ void reset() {
     g_next_handler = 1;
     g_in_handler = g_reschedule = false;
     g_pending_alarms.clear();
+    g_pace.have_last = false;
+    g_pace.film_until = 0;
+    g_pace_until = 0;
+    g_pace_thread = 0;
+    g_pace_held = 0;
     // The console's setup word (the layout of ps2sdk's ConfigParam): screen type in bits 1-2 (2 is 16:9), "the system language is not
     // Japanese" in bit 4, version in bits 13-15 (2 is a console that knows the Japanese flag), language in bits 16-20. A game that
     // picks its text from it shows Japanese when it is 0 (Silent Hill 2 does, on its US disc). PS2_LANGUAGE=<n> picks another one (1 English,
     // 2 French, 3 Spanish, 4 German, 5 Italian, 6 Dutch, 7 Portuguese). It stays 0 by default: with English God of War II takes another way
     // at the start (an unhandled syscall 0x6F), so the default is not changed until that is understood.
-    unsigned language = 0;
-    if (const char *text = std::getenv("PS2_LANGUAGE")) language = static_cast<unsigned>(std::strtoul(text, nullptr, 10)) & 31u;
+    // --language (g_options.language) wins over the environment value.
+    unsigned language = g_options.language & 31u;
+    if (const char *text = std::getenv("PS2_LANGUAGE"); text && !language) language = static_cast<unsigned>(std::strtoul(text, nullptr, 10)) & 31u;
     g_osd_config = (g_options.widescreen ? 2u << 1 : 0u) | (language ? (1u << 4) | (2u << 13) | (language << 16) : 0u);
     std::memset(g_ram + kSyscallTable, 0, 0x400);
 }
@@ -468,6 +489,44 @@ bool in_handler() { return g_in_handler; }
 bool interruptible() { return interrupts_enabled() && !g_in_handler; }
 int current_thread() { return g_current; }
 
+// A hold of the picture pace is due: hold the thread it is for, at this safe point, until the refresh in g_pace_until.
+static void pace_serve(Cpu &c) {
+    if (frame_count() >= g_pace_until) {  // that refresh has come already: nothing to hold
+        g_pace_until = 0;
+        return;
+    }
+    if (g_pace_thread < 0) {  // the picture was shown by an interrupt handler: the thread that runs after it is held
+        if (g_reschedule || c.pc == kIdle) reschedule(c);
+        if (!g_current) return;  // none runs yet: the first one that does
+        g_pace_thread = g_current;
+    }
+    Thread *t = current();
+    if (!t || t->id != g_pace_thread || t->status != kRun || c.pc == kIdle) return;  // held when it runs again, or let go at that refresh
+    const std::uint64_t until = g_pace_until;
+    g_pace_until = 0;
+    ++g_pace_held;
+    ++g_pace_count.holds;
+    block_current(c, kWaitPace, static_cast<int>(until));
+}
+
+// At a vertical blank: threads held until this refresh go on. Their registers are untouched (they were stopped between two
+// instructions, not in a system call).
+static void pace_release() {
+    const std::uint64_t frame = frame_count();
+    int left = 0;
+    for (auto &[id, t] : g_threads) {
+        if (t.wait != kWaitPace) continue;
+        if (static_cast<std::uint64_t>(static_cast<std::uint32_t>(t.wait_id)) > frame) {
+            ++left;
+            continue;
+        }
+        t.wait = kWaitNone;
+        if (t.status == kWaitSuspend) t.status = kSuspend;
+        else make_ready(t);
+    }
+    g_pace_held = left;
+}
+
 void service(Cpu &c) {
     if (g_in_handler) return;
     run_alarms(c);
@@ -487,11 +546,44 @@ void service(Cpu &c) {
         const Thread *t = current();
         if (t && (t->status == kRun || t->status == kSuspend)) exit_current(c, false);
     }
+    if (g_pace_until) [[unlikely]] pace_serve(c);
     if (g_reschedule || c.pc == kIdle) reschedule(c);
     c.pc &= ~kUnwind;
 }
 
+// Interrupts that are pending when the program turns interrupts back on (EI, or MTC0 to Status) are taken right there on the
+// console, before the next instruction. The usual place to take them here is the next preemption point (a backward branch once
+// the slice is used up), which can be many instructions later. A driver that unmasks a channel inside DI ... EI and then reads
+// the state its handler keeps sees it from before the handler ran: GTA Vice City's DMA queue kick calls EnableDmac(1) while a
+// transfer that ended under the mask still has its status bit set, reads "not busy", and only later, in a polling loop, the
+// handler runs, starts and drains the whole queue; the kick then starts the empty slot after it, which nothing ever finishes,
+// and the game waits forever (black screen after the opening films). So the handlers run here, nested like those a system
+// call runs: the caller's registers are saved and restored around them. A thread switch they ask for waits for the next
+// preemption point, as before.
+void take_pending(Cpu &c) {
+    if (g_in_handler || !interrupts_enabled()) return;
+    for (unsigned guard = 0; guard < 16; ++guard) {
+        const std::uint32_t pending = hw::intc_pending();
+        const std::uint32_t dmac = hw::dmac_pending();
+        if (!pending && !dmac) break;
+        if (dmac) run_dmac(c, static_cast<unsigned>(std::countr_zero(dmac)));
+        else run_intc(c, static_cast<unsigned>(std::countr_zero(pending)));
+    }
+}
+
 void on_vblank_start() {
+    ++g_pace_count.refreshes;
+    static const bool trace_film = std::getenv("PS2_TRACE_DISPLAY") != nullptr;
+    if (g_pace.every > 1 || trace_film) [[unlikely]] {  // a film is playing while the video decoder is given work: no hold (pace.hpp, kFilmRefreshes)
+        const std::uint64_t decoded = ipu::decode_commands();
+        if (decoded != g_pace_decoded) {
+            if (g_pace.every > 1) g_pace.decoder(frame_count());
+            if (trace_film) std::fprintf(stderr, "[ipu] f%llu %llu decode commands\n", static_cast<unsigned long long>(frame_count()),
+                                         static_cast<unsigned long long>(decoded - g_pace_decoded));
+        }
+        g_pace_decoded = decoded;
+    }
+    if (g_pace_held) [[unlikely]] pace_release();
     if (!g_vsync_flag) return;
     st32(g_vsync_flag, 1);
     if (g_vsync_data) st64(g_vsync_data, hw::gs_csr());
@@ -500,10 +592,77 @@ void on_vblank_start() {
 
 void wake_idle() { g_reschedule = true; }
 
+void pace_setup(int every, const char *source) {
+    g_pace.every = every > 1 ? every : 1;
+    if (g_pace.every > 1) std::fprintf(stderr, "[pace] holding the game to one picture every %d refreshes (%s)\n", g_pace.every, source);
+    else if (source && *source) std::fprintf(stderr, "[pace] off (%s)\n", source);
+}
+
+int pace_every() { return g_pace.every; }
+
+void pace_picture() {
+    const std::uint64_t frame = frame_count();
+    g_pace_count.picture(frame);
+    if (g_pace.every <= 1) return;
+    const std::uint64_t until = g_pace.picture(frame);
+    if (!until) return;
+    g_pace_until = until;
+    g_pace_thread = g_in_handler ? -1 : g_current;
+    g_reschedule = true;  // served at the next safe point (service), at most one time slice later
+}
+
+void pace_report() {
+    const pace::Count &n = g_pace_count;
+    if (!n.refreshes) return;
+    char pace[64];
+    if (g_pace.every > 1) std::snprintf(pace, sizeof pace, "pace: one picture every %d refreshes", g_pace.every);
+    else std::snprintf(pace, sizeof pace, "pace: off");
+    if (!n.pictures) {
+        std::fprintf(stderr, "[pace] the shown buffer (DISPFB) never changed in %llu refreshes: the game copies its pictures into one buffer "
+                             "(or showed none), so this count cannot tell how often it shows a new one (%s)\n",
+                     static_cast<unsigned long long>(n.refreshes), pace);
+        return;
+    }
+    std::fprintf(stderr, "[pace] %llu new pictures in %llu refreshes (one every %.2f); gaps of 1 refresh %llu, 2 %llu, 3 %llu, 4 or more %llu; "
+                         "held %llu times (%s)\n",
+                 static_cast<unsigned long long>(n.pictures), static_cast<unsigned long long>(n.refreshes),
+                 static_cast<double>(n.refreshes) / static_cast<double>(n.pictures), static_cast<unsigned long long>(n.gaps[0]),
+                 static_cast<unsigned long long>(n.gaps[1]), static_cast<unsigned long long>(n.gaps[2]), static_cast<unsigned long long>(n.gaps[3]),
+                 static_cast<unsigned long long>(n.holds), pace);
+}
+
+// What a thread is doing, in words: the end-of-run list (dump) and the F9 report (thread_report) both use this. Not running: which
+// semaphore (with its count) or sleep it waits on, and for a semaphore the RPC call (server, function) that has no reply yet, if one
+// is known to use it.
+static std::string state_words(const Thread &t) {
+    char b[120];
+    if (t.status == kDormant) return "not started";
+    if (t.status == kRun) return "running";
+    if (t.status == kReady) return "ready (waits for the processor)";
+    if (t.status == kSuspend) return "suspended";
+    if (t.wait == kWaitPace) return "ready (held back a moment by the picture pace)";
+    std::string out;
+    if (t.wait == kWaitSema) {
+        const auto it = g_semas.find(t.wait_id);
+        if (it == g_semas.end()) std::snprintf(b, sizeof b, "waits on semaphore %d (gone)", t.wait_id);
+        else std::snprintf(b, sizeof b, "waits on semaphore %d (count %d, %zu waiting)", t.wait_id, it->second.count, it->second.waiters.size());
+        out = b;
+        const std::string rpc = sif::rpc_call_of_ee_semaphore(t.wait_id);
+        if (!rpc.empty()) out += "; " + rpc;
+    } else if (t.wait == kWaitSleep) {
+        out = "asleep (SleepThread: waits for a wake-up)";
+    } else {
+        std::snprintf(b, sizeof b, "waits (kind %d, id %d)", static_cast<int>(t.wait), t.wait_id);
+        out = b;
+    }
+    if (t.status == kWaitSuspend) out += ", and is suspended";
+    return out;
+}
+
 void dump() {
     for (const auto &[id, t] : g_threads) {
-        std::fprintf(stderr, "[thread] %d status %d prio %d wait %d/%d pc 0x%08X ra 0x%08X\n", id, t.status, t.priority, t.wait, t.wait_id,
-                     id == g_current ? g_cpu.pc : t.context.pc, id == g_current ? g_cpu.r[31].w[0] : t.context.r[31].w[0]);
+        std::fprintf(stderr, "[thread] %d status %d prio %d wait %d/%d pc 0x%08X ra 0x%08X (%s)\n", id, t.status, t.priority, t.wait, t.wait_id,
+                     id == g_current ? g_cpu.pc : t.context.pc, id == g_current ? g_cpu.r[31].w[0] : t.context.r[31].w[0], state_words(t).c_str());
         const std::uint32_t sp = id == g_current ? g_cpu.r[29].w[0] : t.context.r[29].w[0];
         std::fprintf(stderr, "[thread]   stack:");
         for (std::uint32_t i = 0; i < 512 && sp + i * 4 < kRamSize; ++i) {
@@ -516,10 +675,55 @@ void dump() {
         if (!s.waiters.empty()) std::fprintf(stderr, "[sema] %d count %d waiters %zu\n", id, s.count, s.waiters.size());
 }
 
+// The F9 report's thread list: one plain line, then a line per thread that has started. Reads only. Called by the
+// emulation thread between two instructions, like a quick save; the window must not call it (the maps are not locked).
+std::string thread_summary() {
+    int live = 0, waiting = 0;
+    std::string who;
+    int shown = 0;
+    for (const auto &[id, t] : g_threads) {
+        if (t.status == kDormant) continue;
+        ++live;
+        const bool waits = (t.status == kWait || t.status == kWaitSuspend) && t.wait != kWaitPace;
+        if (!waits) continue;
+        ++waiting;
+        if (++shown > 6) continue;
+        std::string w = state_words(t);
+        w = w.substr(0, w.find(';'));  // the RPC part belongs to the thread lines, not to this one
+        if (w.rfind("waits on ", 0) == 0) w.replace(0, 9, "on ");
+        else if (w.rfind("asleep", 0) == 0) w = "asleep";
+        who += (who.empty() ? "" : ", ") + (id == 1 ? std::string("main thread ") : "thread " + std::to_string(id) + " ") + w;
+    }
+    if (!live) return "no EE thread has started yet";
+    if (waiting == live) return "every EE thread waits: " + who + (shown > 6 ? ", and " + std::to_string(shown - 6) + " more" : std::string());
+    return std::to_string(live - waiting) + " of " + std::to_string(live) + " EE threads run or are ready, " + std::to_string(waiting) + " wait";
+}
+
+std::string thread_report() {
+    std::string out;
+    char b[200];
+    int dormant = 0;
+    for (const auto &[id, t] : g_threads) {
+        if (t.status == kDormant) {
+            ++dormant;
+            continue;
+        }
+        const std::uint32_t pc = (id == g_current ? g_cpu.pc : t.context.pc) & ~kUnwind;  // bit 0 of the running pc is the dispatcher's flag
+        std::snprintf(b, sizeof b, "    EE thread %d%s, priority %d: ", id, id == 1 ? " (main)" : "", t.priority);
+        out += b;
+        out += state_words(t);
+        std::snprintf(b, sizeof b, "; at 0x%08X, entry 0x%08X\n", pc, t.entry);
+        out += b;
+    }
+    if (dormant) out += "    (EE threads that exist but are not started: " + std::to_string(dormant) + ")\n";
+    return out;
+}
+
 void handle_syscall(Cpu &c, std::uint32_t pc) {
     std::uint32_t n = c.r[3].w[0];
     const bool interrupt_variant = (n & 0x80000000u) != 0;
     if (interrupt_variant) n = 0u - n;
+    crash::note_syscall(n, pc);  // a crash report names the game's last system call (one relaxed store)
     if (n < 0x100u) {
         const std::uint32_t custom = ld32(kSyscallTable + n * 4u);
         if (custom && has_code(custom & 0x1FFFFFFFu)) {
@@ -622,7 +826,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     }
     case 0x2D: case 0x2E: {
         Thread *t = thread(static_cast<int>(arg(c, 0)));
-        if (t && (t->status == kWait || t->status == kWaitSuspend)) {
+        if (t && (t->status == kWait || t->status == kWaitSuspend) && t->wait != kWaitPace) {
             for (auto &[id, s] : g_semas) s.waiters.erase(std::remove(s.waiters.begin(), s.waiters.end(), t->id), s.waiters.end());
             release(*t, -418);
             if (n == 0x2D) reschedule(c);
@@ -637,7 +841,8 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         // The kernel returns the status of the thread slot, which is 0 once its thread is gone; a game that waits for a worker
         // thread to disappear polls for that (follows upstream 507fe38). Ids outside the 256 slots still give -1.
         const Thread *t = thread(id);
-        ret(c, t ? t->status : id >= 0 && id < 256 ? 0 : -1);
+        const int status = t && t->wait == kWaitPace ? (t->status == kWaitSuspend ? kSuspend : kReady) : t ? t->status : 0;
+        ret(c, t ? status : id >= 0 && id < 256 ? 0 : -1);
         break;
     }
     case 0x32: {
@@ -929,6 +1134,13 @@ namespace ps2 {
 void syscall(Cpu &c, std::uint32_t pc) {
     ++hw::g_slow_seq;  // a system call is something a waiting loop is not skipped over (hw.cpp, spin_watch)
     kernel::handle_syscall(c, pc);
+    // On the console a system call returns with ERET, and an interrupt that is pending and enabled at that moment is taken at
+    // once, before the next instruction of the caller. That matters when the call itself unmasked it: EnableDmac(1) with the
+    // channel's status bit already set (a transfer that ended while the channel was masked) runs the DMAC handler right on
+    // return. Without this the handler ran only at the next preemption point, some instructions later, after the caller had
+    // already looked at the state the handler changes (GTA Vice City's DMA queue: the kick saw "not busy", the handler then
+    // started and drained the queue, and the kick started an empty slot that nothing ever finished: black screen after the films).
+    if (kernel::interruptible() && (hw::intc_pending() || hw::dmac_pending())) c.pc |= kUnwind;
 }
 
 std::uint32_t mfc0(Cpu &c, std::uint32_t reg, std::uint32_t) {
@@ -941,7 +1153,9 @@ std::uint32_t mfc0(Cpu &c, std::uint32_t reg, std::uint32_t) {
 }
 
 void mtc0(Cpu &c, std::uint32_t reg, std::uint32_t value) {
+    const bool was = kernel::interrupts_enabled();
     c.cop0[reg] = value;
+    if (reg == 12 && !was) kernel::take_pending(c);
 }
 
 std::uint32_t eret(Cpu &c) {
@@ -955,7 +1169,9 @@ std::uint32_t eret(Cpu &c) {
 }
 
 void set_interrupts(Cpu &c, bool enabled) {
+    const bool was = kernel::interrupts_enabled();
     c.cop0[12] = enabled ? (c.cop0[12] | 0x10000u) : (c.cop0[12] & ~0x10000u);
+    if (enabled && !was) kernel::take_pending(c);
 }
 
 }
@@ -992,6 +1208,20 @@ void state(ps2::state::Stream &s) {
     s.pod(g_osd_config);
     s.pod(g_boot_argc);
     s.pod(g_boot_argv);
+    if (s.version() >= 10) {  // the picture pace's last picture and a hold that is due (an older state has neither)
+        s.pod(g_pace.have_last);
+        s.pod(g_pace.last);
+        s.pod(g_pace_until);
+        s.pod(g_pace_thread);
+    } else if (s.loading()) {
+        g_pace.have_last = false;
+        g_pace_until = 0;
+        g_pace_thread = 0;
+    }
+    if (s.loading()) {
+        g_pace_held = 0;
+        for (const auto &[id, t] : g_threads) g_pace_held += t.wait == kWaitPace;
+    }
 }
 
 }

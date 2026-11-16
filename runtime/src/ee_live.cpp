@@ -16,6 +16,7 @@ void frame_tick() {}
 #include "live_build.hpp"
 
 #include "eerecomp_gen.hpp"
+#include "ps2/crash.hpp"
 #include "ps2/ee_live_abi.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
@@ -193,6 +194,7 @@ bool load_library(const fs::path &path, std::size_t &modules, int rank) {
     const auto stamp = reinterpret_cast<StampFn>(lb::find_symbol(library, "ps2_ee_live_stamp"));
     const auto init = reinterpret_cast<InitFn>(lb::find_symbol(library, "ps2_ee_live_init"));
     if (!stamp || !init || stamp() != g->stamp) return false;  // stays loaded: it cannot be unloaded safely, and it is rare
+    crash::note_live_library(crash::Thread::LiveEe, reinterpret_cast<const void *>(init));  // a crash in it is named as live game code
     std::uint32_t n = 0;
     const ModuleInfo *table = init(&host(), &n);
     if (!table || !n) return false;
@@ -506,12 +508,14 @@ Built build_library(recomp::LiveRequest request, const std::string &what, bool b
 
 // The worker thread: one background build at a time, in the order the windows settled.
 void worker_main() {
+    crash::enter_thread(crash::Thread::LiveEe);
     for (;;) {
         std::shared_ptr<BgJob> job;
         {
             std::unique_lock lock(g->mutex);
             g->wake.wait(lock, [] { return !g->queue.empty() || g->quitting.load(); });
             if (g->quitting.load()) return;
+            crash::test_poll(crash::Thread::LiveEe);
             job = g->queue.front();
             g->queue.pop_front();
             job->state = kRunning;
@@ -853,7 +857,11 @@ void drop_stale_jobs() {
 void prepare_in_background() {
     if (g->prepare_started) return;
     g->prepare_started = true;
-    g->prepare = std::thread([] { ensure_analysis(); });
+    g->prepare = std::thread([] {
+        crash::enter_thread(crash::Thread::LiveEe);
+        crash::test_poll(crash::Thread::LiveEe);
+        ensure_analysis();
+    });
 }
 
 void watch_windows() {

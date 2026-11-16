@@ -10,9 +10,10 @@ sha256=${3:-ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1}
 here=$(cd "$(dirname "$0")/.." && pwd)
 target="$here/third_party/dxc"
 mkdir -p "$target"
-(cd "$target" && curl -sSL -f -o dxc.zip "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$version/$file")
-if command -v sha256sum > /dev/null; then got=$(sha256sum "$target/dxc.zip" | cut -d' ' -f1)
-else got=$(python -I -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$target/dxc.zip"); fi
+# fetch_download retries, and uses a file saved by hand in downloads/ (scripts/fetch_lib.sh, docs/fetch-retry.md).
+. "$here/scripts/fetch_lib.sh"
+fetch_download dxc "$target" dxc.zip "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$version/$file" "$sha256" || exit 1
+got=$(fetch_sha256 "$target/dxc.zip")
 if [ "$got" != "$sha256" ]; then rm -f "$target/dxc.zip"; echo "dxc: wrong SHA-256 $got (expected $sha256)" >&2; exit 1; fi
 # curl from Git for Windows and tar.exe read their command line in the ANSI code page, so tar runs inside the folder with a plain
 # file name (see fetch_wgpu.sh). MinGit has no unzip.

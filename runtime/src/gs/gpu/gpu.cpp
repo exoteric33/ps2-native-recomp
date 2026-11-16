@@ -1,5 +1,8 @@
 #include "gpu.hpp"
+#include "hwdraw.hpp"
 #include "overlay.hpp"
+#include "setup.hpp"
+#include "tiles.hpp"
 #include "ps2/hitch.hpp"
 #include "ps2/os.hpp"
 #include "ps2/system.hpp"
@@ -12,18 +15,31 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
+#include "trusted.hpp"
+#include "hwcache.hpp"
+#include "hwstat.hpp"
 
 extern const char kGsShader[];
 extern const char kBlitShader[];
@@ -43,13 +59,22 @@ constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
+static_assert(kPrimWords == tiles::kPrimWords, "the tile lists (tiles.cpp) read the shape records");
+// word 1 of a shape: its kind (0 triangle, 1 sprite, 2 line, 3 point) in the low byte, and kUpscaledSource when its texture is an
+// upscaled picture the GS drew (gs.wgsl reads both)
+constexpr std::uint32_t kKindMask = 0xFFu, kUpscaledSource = 0x100u;
+static_assert(kKindMask == tiles::kKindMask, "the tile lists (tiles.cpp) read the shape records");
 constexpr std::uint32_t kSetupWords = 40;  // 25 fields, then the texture, frame and depth formats as the shader needs them (fmt_words)
+constexpr std::uint32_t kMipWords = 8;     // the mipmap words of a setup, in a table beside the setups (Batch::mips, make_mip)
 constexpr std::uint32_t kDecodedWords = 4u << 20;
+constexpr std::uint32_t kDecodedOverrideWords = 28u << 20;  // allocated in g_decoded only when PS2_TEX_OVERRIDES is enabled
 constexpr std::uint32_t kDecodePrims = 64;
 
 
 Mode g_mode = Mode::off;
+bool g_live = false;  // PS2_GPU_HW=1 (experimental, off by default; see the top of hwdraw.cpp): the plain shapes go through the card path
 std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
+std::uint64_t g_mip_setups = 0, g_mip_shapes = 0, g_filter_setups = 0, g_filter_shapes = 0;  // the mipmaps line of stats(): setups and shapes that read levels above 0 / only pick the filter per pixel
 
 WGPUInstance g_instance = nullptr;
 WGPUAdapter g_adapter = nullptr;
@@ -75,10 +100,12 @@ struct Overlay {
 std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
 bool g_have_previous = false;
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
+std::uint32_t g_sharp_2d = 1;
 
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
 bool g_timestamps = false;
+std::uint32_t g_vendor_id = 0;  // PCI vendor id of the chosen adapter (0x8086 Intel), 0 when unknown
 WGPUQuerySet g_queries = nullptr;
 WGPUBuffer g_query_resolve = nullptr, g_query_read = nullptr;
 bool g_query_pending = false, g_query_ready = false;
@@ -94,12 +121,34 @@ WGPUBindGroupLayout g_layout = nullptr;
 WGPUPipelineLayout g_pipeline_layout = nullptr;
 WGPUBindGroup g_group = nullptr;
 WGPUComputePipeline g_pipelines[kPipelines] = {};
+// The draw program with mipmap levels (HAS_MIP = true in gs.wgsl) takes as long to translate as all the others together on FXC, so it is built
+// in the background after the plain programs; a batch that needs it waits for it (pipeline_of), every other batch never does.
+WGPUComputePipeline g_raster_mip = nullptr;
+std::thread *g_raster_mip_thread = nullptr;  // never destroyed: a running thread's destructor at exit would end the program
+std::atomic<bool> g_raster_mip_ready{false};
+std::mutex g_raster_mip_lock;
 
 struct Command {
     Pipeline pipeline;
     std::uint32_t x, y;
     std::uint32_t param;
+    bool mip = false;  // kRaster only: the batch carries a mipmap table, so it needs the draw program built with HAS_MIP (g_raster_mip)
 };
+
+// The program a draw command runs. A batch with a mipmap table runs the HAS_MIP program, and waits here, once, until it is built.
+WGPUComputePipeline pipeline_of(const Command &c) {
+    if (!c.mip || c.pipeline != kRaster) return g_pipelines[c.pipeline];
+    if (!g_raster_mip_ready.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_raster_mip_lock);
+        if (!g_raster_mip_ready.load(std::memory_order_acquire)) {
+            const auto start = std::chrono::steady_clock::now();
+            if (g_raster_mip_thread && g_raster_mip_thread->joinable()) g_raster_mip_thread->join();
+            g_raster_mip_ready.store(true, std::memory_order_release);
+            std::fprintf(stderr, "[gpu] waited %.0f ms for the mipmap draw program\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        }
+    }
+    return g_raster_mip ? g_raster_mip : g_pipelines[kRaster];
+}
 
 struct CommandInfo {
     std::size_t index;
@@ -143,13 +192,126 @@ std::uint64_t g_vblanks = 0;
 
 // PS2_BATCH_LOG=1: once per frame, why the drawing batches ended (docs/speed.md, "The arena dip")
 enum Why { kWhyKey, kWhyTexel, kWhyUnder, kWhyOverlap, kWhyZ, kWhyUpload, kWhyClut, kWhyCopy, kWhySize, kWhyFlush,
+kWhyRoute,
 kWhys };
 const char *const kWhyName[kWhys] = {"buffers", "texel", "drawn-under", "overlap", "depth", "upload", "palette", "copy", "size", "other"
+, "route"
 };
 Why g_why = kWhyFlush;
 std::uint32_t g_why_runs[kWhys] = {}, g_why_prims[kWhys] = {};
 const bool g_batch_log = std::getenv("PS2_BATCH_LOG") != nullptr;
 const unsigned long long g_batch_log_frame = std::getenv("PS2_BATCH_LOG") ? std::strtoull(std::getenv("PS2_BATCH_LOG"), nullptr, 10) : 0;  // >1: print every "drawn-under" end of that frame
+// PS2_GPU_WGPU_TIME=<frames>: the drawing thread's time inside each kind of wgpu call (wall clock, so the waits show as waits), and the
+// calls, per frame, printed every <frames> vblanks (default 300). Off: one predictable branch per call site.
+namespace wt {
+enum Kind { kEncoder, kBeginPass, kSetPipeline, kSetGroup, kDispatch, kEndPass, kRenderPass, kFinish, kSubmit, kWrite, kPoll, kAcquire, kPresent,
+            kWait, kCopy, kDrain, kKinds };
+const char *const kName[kKinds] = {"create encoder", "begin compute pass", "set pipeline", "set bind group", "dispatch", "end compute pass", "present pass encode",
+                                   "finish", "submit", "write buffer", "poll", "acquire (wait)", "present", "read-back waits", "copy/map other",
+                                   "waiting for the submit thread"};
+std::uint64_t g_post_ns = 0, g_post_jobs = 0;  // the submit thread's totals at the block's start (post::State)
+bool post_totals(std::uint64_t &ns, std::uint64_t &jobs);
+const unsigned g_every = [] {
+    const char *v = std::getenv("PS2_GPU_WGPU_TIME");
+    return v ? std::max(1u, static_cast<unsigned>(std::strtoul(v, nullptr, 10) ? std::strtoul(v, nullptr, 10) : 300)) : 0u;
+}();
+const bool g_on = g_every != 0;
+std::uint64_t g_ns[kKinds] = {}, g_cpu[kKinds] = {}, g_calls[kKinds] = {}, g_bytes = 0, g_frames = 0, g_submits = 0;
+std::chrono::steady_clock::time_point g_since;
+double g_cpu_since = 0;
+// The thread's own processor clock for the calls that may wait (not per dispatch: the clock costs a little): on Windows the thread's
+// cycle counter, which counts at the time-stamp counter's rate (calibrated against the wall clock below), elsewhere CLOCK_THREAD_CPUTIME_ID in ns.
+#if defined(_WIN32) && defined(__x86_64__)
+extern "C" __declspec(dllimport) int __stdcall QueryThreadCycleTime(void *thread, unsigned long long *cycles);
+extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread();
+std::uint64_t cpu_ticks() {
+    unsigned long long c = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &c);
+    return c;
+}
+double ticks_per_ns() {  // the time-stamp counter against the wall clock, measured once over 50 ms
+    static const double rate = [] {
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::uint64_t c0 = __builtin_ia32_rdtsc();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const std::uint64_t c1 = __builtin_ia32_rdtsc();
+        return static_cast<double>(c1 - c0) / static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    }();
+    return rate;
+}
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+std::uint64_t cpu_ticks() {
+    timespec t{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return static_cast<std::uint64_t>(t.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(t.tv_nsec);
+}
+double ticks_per_ns() { return 1.0; }
+#else
+std::uint64_t cpu_ticks() { return 0; }
+double ticks_per_ns() { return 1.0; }
+#endif
+constexpr bool kClocked[kKinds] = {false, false, false, false, false, true, true, true, true, true, true, true, true, true, true, true};
+struct Scope {
+    Kind kind;
+    std::chrono::steady_clock::time_point from;
+    std::uint64_t cpu_from = 0;
+    explicit Scope(Kind k) : kind(k) {
+        if (!g_on) return;
+        from = std::chrono::steady_clock::now();
+        if (kClocked[k]) cpu_from = cpu_ticks();
+    }
+    ~Scope() {
+        if (!g_on) return;
+        if (kClocked[kind]) g_cpu[kind] += cpu_ticks() - cpu_from;
+        g_ns[kind] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
+        ++g_calls[kind];
+    }
+};
+void restart() {
+    for (int k = 0; k < kKinds; ++k) g_ns[k] = g_cpu[k] = g_calls[k] = 0;
+    g_bytes = g_submits = 0;
+    g_since = std::chrono::steady_clock::now();
+    g_cpu_since = ps2::hitch::thread_cpu_ms();
+    post_totals(g_post_ns, g_post_jobs);
+}
+// One line per block: wall ms a vblank, the thread's processor ms a vblank (GetThreadTimes / CLOCK_THREAD_CPUTIME_ID), and per kind of call
+// "wall/processor ms (calls)" a vblank; the processor part only for the calls that may wait. Own work = thread processor ms - the calls' processor ms.
+void frame() {
+    if (!g_on) return;
+    ++g_frames;
+    if (g_frames <= g_every) {  // the first block only starts the clock: start-up and warm-up are left out
+        if (g_frames == g_every) ticks_per_ns(), restart();
+        return;
+    }
+    if (g_frames % g_every) return;
+    const double f = g_every, wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_since).count() / f;
+    const double thread = (ps2::hitch::thread_cpu_ms() - g_cpu_since) / f, rate = ticks_per_ns();
+    double sum = 0, sum_cpu = 0;
+    for (int k = 0; k < kKinds; ++k) {
+        sum += static_cast<double>(g_ns[k]) / 1e6 / f;
+        sum_cpu += kClocked[k] ? static_cast<double>(g_cpu[k]) / rate / 1e6 / f : static_cast<double>(g_ns[k]) / 1e6 / f;
+    }
+    std::fprintf(stderr, "[wgpu-time] %u vblanks: %.2f ms a vblank, thread processor %.2f ms, in wgpu %.3f ms (processor %.3f), own work %.2f ms, %.1f submits, %.0f KiB written;",
+                 g_every, wall, thread, sum, sum_cpu, thread - sum_cpu, static_cast<double>(g_submits) / f, static_cast<double>(g_bytes) / 1024.0 / f);
+    for (int k = 0; k < kKinds; ++k) {
+        if (!g_calls[k]) continue;
+        if (kClocked[k]) std::fprintf(stderr, " %s %.3f/%.3f ms (%.1f),", kName[k], static_cast<double>(g_ns[k]) / 1e6 / f, static_cast<double>(g_cpu[k]) / rate / 1e6 / f, static_cast<double>(g_calls[k]) / f);
+        else std::fprintf(stderr, " %s %.3f ms (%.1f),", kName[k], static_cast<double>(g_ns[k]) / 1e6 / f, static_cast<double>(g_calls[k]) / f);
+    }
+    std::uint64_t post_ns = 0, post_jobs = 0;
+    if (post_totals(post_ns, post_jobs))
+        std::fprintf(stderr, " on the submit thread %.3f ms (%.1f jobs: writes, finish, submit, poll, present)", static_cast<double>(post_ns - g_post_ns) / 1e6 / f,
+                     static_cast<double>(post_jobs - g_post_jobs) / f);
+    std::fprintf(stderr, "\n");
+    restart();
+}
+inline void write(WGPUQueue queue, WGPUBuffer buffer, std::uint64_t offset, const void *data, std::size_t size) {
+    Scope s(kWrite);
+    if (g_on) g_bytes += size;
+    wgpuQueueWriteBuffer(queue, buffer, offset, data, size);
+}
+}  // namespace wt
+
 std::FILE *g_profile_out = nullptr;
 std::uint64_t g_profile_from = 0, g_profile_to = 0;
 WGPUQuerySet g_profile_queries = nullptr;
@@ -199,42 +361,129 @@ struct Range {
     }
 };
 
-// A growing array of 32-bit words for the shape records of the open batch. std::vector's insert costs more than the copy it makes
-// (it runs once per shape, about 50,000 times a frame), and growing it by hand does not zero the new words first.
-struct Words {
-    std::unique_ptr<std::uint32_t[]> words;
-    std::size_t used = 0, capacity = 0;
+using tiles::Words;
+
+// The shape records of the frame, in the order the batches were flushed, followed by the records of the open batch. draw() writes a record here once
+// and the chip reads it from here: at submit this array goes into the data buffer right after the arena (place_shapes), so the records are not copied
+// into the arena at flush any more. The open batch sees only its own records (`data()`, `size()` count from `begin`).
+// The tile helper reads the records of the batches it builds while this thread goes on appending; when the array has to move to grow, the old block is
+// kept until the next submit, where every job is finished (`retired`).
+struct Shapes {
+    Words words;
+    std::size_t begin = 0;  // the first word of the open batch
+    std::vector<std::unique_ptr<std::uint32_t[]>> retired;
 
     void append(const std::uint32_t *from, std::size_t count) {
-        if (used + count > capacity) grow(used + count);
-        std::memcpy(words.get() + used, from, count * 4);
-        used += count;
+        if (words.used + count > words.capacity) {
+            std::size_t next = std::max<std::size_t>(words.capacity * 2, 1u << 20);
+            while (next < words.used + count) next *= 2;
+            auto bigger = std::make_unique_for_overwrite<std::uint32_t[]>(next);
+            if (words.used) std::memcpy(bigger.get(), words.words.get(), words.used * 4);
+            if (tiles::backlog()) retired.push_back(std::move(words.words));  // a job may still read the old block: keep it until submit
+            words.words = std::move(bigger);
+            words.capacity = next;
+        }
+        std::memcpy(words.words.get() + words.used, from, count * 4);
+        words.used += count;
     }
-    void grow(std::size_t need) {
-        std::size_t next = std::max<std::size_t>(capacity * 2, 1u << 16);
-        while (next < need) next *= 2;
-        auto bigger = std::make_unique_for_overwrite<std::uint32_t[]>(next);
-        if (used) std::memcpy(bigger.get(), words.get(), used * 4);
-        words = std::move(bigger);
-        capacity = next;
+    // the open batch
+    std::size_t size() const { return words.used - begin; }
+    bool empty() const { return words.used == begin; }
+    std::uint32_t *data() { return words.data() + begin; }
+    const std::uint32_t *data() const { return words.data() + begin; }
+    std::uint32_t &operator[](std::size_t i) { return words[begin + i]; }
+    const std::uint32_t &operator[](std::size_t i) const { return words[begin + i]; }
+    void clear() { words.used = begin; }  // drops the open batch's records (a batch the card took, a test)
+    // flush: the open batch's records stay for the chip; returns their first word
+    std::uint32_t commit() {
+        const std::size_t at = begin;
+        begin = words.used;
+        return static_cast<std::uint32_t>(at);
     }
-    std::size_t size() const { return used; }
-    bool empty() const { return !used; }
-    void clear() { used = 0; }
-    std::uint32_t *data() { return words.get(); }
-    const std::uint32_t *data() const { return words.get(); }
-    std::uint32_t &operator[](std::size_t i) { return words[i]; }
-    const std::uint32_t &operator[](std::size_t i) const { return words[i]; }
+    // submit, once every tile job is finished: the flushed records have been uploaded; the open batch's (if any) move to the front
+    void restart() {
+        const std::size_t open = size();
+        if (open && begin) std::memmove(words.data(), words.data() + begin, open * 4);
+        words.used = open;
+        begin = 0;
+        retired.clear();
+    }
+} g_shapes;
+std::vector<std::uint32_t> g_shape_params;  // the parameter records of this submit's raster commands: word 1 (the records' offset) gets the arena's size added at submit
+
+// The submit thread. wgpu's part of a submit is the same work every frame: copying the frame's data into its staging memory
+// (wgpuQueueWriteBuffer, 5 to 8 MB a frame in the fights), turning the recorded commands into the backend's command list
+// (wgpuCommandEncoderFinish), the submit, and the present. On Direct3D 12 that is 1.5 to 2.5 ms of the drawing thread a frame. This
+// thread does it instead, while the drawing thread goes on with the next frame: submit() records the commands and hands the encoder over,
+// with the frame's arena, shape records and parameter records (swapped, not copied), and the surface texture to present.
+// Exactness: the queue sees the same operations in the same order. Only one hand-over is in flight, and every other queue or surface
+// operation (a buffer write, a read-back, the next acquire, a resize) waits for it first (drain()), so nothing can slip in between.
+// PS2_GPU_SUBMIT_THREAD=1 turns it on (off by default, see mode()). Always off in the browser build, with the card path, and with the
+// diagnostics that time the present (PS2_PRESENT_LOG, PS2_HITCH_LOG).
+namespace post {
+struct Job {
+    WGPUCommandEncoder enc = nullptr;
+    WGPUTexture texture = nullptr;  // present this surface texture after the submit (with its view)
+    WGPUTextureView view = nullptr;
+    WGPUBuffer data = nullptr, params = nullptr;
+    bool measure = false, writes = false;  // writes: the job writes the arena, shape and parameter records first
+    bool blit = false;                     // and before them present()'s picture parameters
+    std::uint32_t blit_words[8] = {};
+    Arena arena;
+    Words shapes;
+    std::size_t shape_words = 0;
+    std::vector<std::array<std::uint32_t, kParamStride / 4>> records;
 };
+struct State {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool busy = false;
+    Job job;
+    std::atomic<std::uint64_t> ns{0}, jobs{0};  // the thread's time in jobs, for PS2_GPU_WGPU_TIME
+};
+State *g_state = nullptr;  // made at the first hand-over and never freed (a detached thread may still wait on it at exit)
+void drain();
+WGPUTexture g_present_texture = nullptr;  // present() sets it around submit(view): the texture the job presents and releases
+bool g_presented_async = false;           // the last submit() handed its picture over: the job presents it
+std::uint32_t g_blit[8] = {};             // present()'s picture parameters for the present pass, written by the next submit
+bool g_blit_pending = false;
+// 0 off, 1 everything on the submit thread, 2 the writes stay on the drawing thread. Off by default on Windows and macOS: on a laptop with Intel graphics it frees
+// the drawing thread but costs the emulation thread 1 to 2 ms a frame (two fast cores, now four busy threads), and Silent Hill 2, held by that
+// thread, lost 1.5 % with it on (the God of War fights, held by the chip, gained 0.5 to 1 %). On by default on Linux (measured on a 16-thread
+// desktop in a window, limit off: God of War ship +14 %, film +7 %, Silent Hill 2 a tie); PS2_GPU_SUBMIT_THREAD=0 turns it off there.
+int mode() {
+#ifdef __EMSCRIPTEN__
+    return 0;
+#else
+    static const int m = [] {
+        const char *v = std::getenv("PS2_GPU_SUBMIT_THREAD");
+        if (std::getenv("PS2_PRESENT_LOG")) return 0;
+#ifdef __linux__
+        const int def = 1;
+#else
+        const int def = 0;
+#endif
+        const int r = v ? std::atoi(v) : def;
+        if (r != 0 && !v) std::fprintf(stderr, "[gpu] submit thread on by default (PS2_GPU_SUBMIT_THREAD=0 turns it off)\n");
+        return r;
+    }();
+    return m;
+#endif
+}
+bool enabled() { return mode() != 0; }
+}  // namespace post
 
 struct Batch {
-    Words prims;
+    Shapes &prims = g_shapes;
     std::vector<std::uint32_t> setups;
+    std::vector<std::uint32_t> mips;  // kMipWords per setup, the same index as `setups` (make_mip)
+    bool any_mip = false;             // a setup of the batch has mipmap words that are not zero: the table goes to the chip
     std::uint32_t setup_serial = 0;  // the cache serial of the setup that is the last one of `setups`; 0: none (see draw)
     std::uint64_t key = ~0ull;
     int minx = 1 << 30, miny = 1 << 30, maxx = -1, maxy = -1;
     std::uint32_t fbp = 0, fbw = 0, fpsm = 0, zbp = 0, zpsm = 0;
     bool zte = false, zwrite = false;
+    int route = 0;  // 1 when the card path draws this batch, else the painter
     std::uint32_t texflushes = 0;
     int rx0 = 0, ry0 = 0, rx1 = -2, ry1 = -2;
     Range fb_range, z_range;
@@ -244,9 +493,15 @@ struct SetupCache {
     std::uint32_t generation = ~0u, clut = ~0u, serial = 0;
     std::uint64_t attr = ~0ull;
     std::uint32_t setup[kSetupWords] = {};
+    std::uint32_t mip[kMipWords] = {};
+    std::uint32_t mip_top = 0;  // the highest mip level a pixel of this setup can read (make_mip); 0: only the base texture
     std::uint32_t flags = 0;
     std::uint64_t key = 0;
     Range tex;
+    int route = 0;  // hw::live_route of this setup: 0 painter, 1 card, 2 either
+    int look = -1;  // hw::live_look of this setup
+    bool waits = false;  // routed to the painter only because a pipeline was still being made: ask again when one finishes
+    std::uint64_t ready_seen = 0;
 } g_setup_cache;
 
 struct PreOp {
@@ -322,12 +577,12 @@ std::uint32_t word_at(const std::uint32_t *f, std::uint32_t x, std::uint32_t y) 
 constexpr std::uint32_t kExactPixels = 1024;  // the largest sprite whose pixels are listed word by word, and the most texels one sprite is asked about
 
 // The whole texel coordinates (before the wrap mode, `lo` to `hi` on each axis) that the pixels of a sprite can read, worked out the way the draw program does it
-// (shade_at, sample in gs.wgsl): a pixel's position is x + j / SCALE, the texture coordinate is linear in it, a nearest read takes floor(u) and a bilinear one the
+// (shade_at, sample in gs.wgsl): a pixel's position is x + j / SCALE (upscaled, moved back by (1 - 1 / SCALE) / 2), the texture coordinate is linear in it, a nearest read takes floor(u) and a bilinear one the
 // four texels from floor(u - 0.5) on. A texel more on each side only where the 32-bit float arithmetic of the draw program may not give exactly the number worked out here: in
 // the plain case (texture coordinates in 12.4 fixed point, a sprite whose width in pixels is a power of two) every step is exact and a coordinate that lies on a texel edge
 // (the usual half-texel offset of a bilinear sprite) is not widened, so the sprite does not touch the row above it.
 bool sprite_taps(const std::uint32_t *rec, const std::uint32_t *setup, int minx, int miny, int maxx, int maxy, int lo[2], int hi[2]) {
-    if (rec[1] != 1 || !(setup[0] & 2u)) return false;
+    if ((rec[1] & kKindMask) != 1 || !(setup[0] & 2u)) return false;
     const bool fst = setup[0] & 16u, bilinear = setup[0] & 16384u;
     float f[4], uv[6];
     std::memcpy(f, rec + 4, sizeof f);
@@ -347,7 +602,9 @@ bool sprite_taps(const std::uint32_t *rec, const std::uint32_t *setup, int minx,
         int exponent;
         if (!(std::fabs(d) < 4096.0) || (d != 0.0 && std::frexp(std::fabs(d), &exponent) != 0.5) || to - from > 63 || !(std::fabs(a) < 32768.0) || !(std::fabs(b) < 32768.0) || (g_scale != 1 && g_scale != 2)) exact = false;
         const auto at = [&](double p) { return (a + (b - a) * (d != 0.0 ? (p - origin) / d : 0.0)) * k; };
-        double u0 = at(static_cast<double>(from)), u1 = at(static_cast<double>(to) + (samples - 1.0) / samples);
+        // upscaled, a sample stands for the centre of its place less half a pixel (shade_at), up to (1 - 1 / SCALE) / 2 before x
+        const double centre = g_scale > 1 ? 0.5 / samples - 0.5 : 0.0;
+        double u0 = at(static_cast<double>(from) + centre), u1 = at(static_cast<double>(to) + (samples - 1.0) / samples);
         if (u0 > u1) std::swap(u0, u1);
         const double m = exact ? 0.0 : 1.0 / 64.0;
         if (!(std::fabs(u0) < 1e6) || !(std::fabs(u1) < 1e6)) return false;
@@ -416,7 +673,7 @@ bool sprite_read_range(const std::uint32_t *rec, const std::uint32_t *setup, int
 // colour format. The depth buffer is not listed: a read that comes near it cuts the batch by pages (draw).
 bool exact_add(const std::uint32_t *rec, const std::uint32_t *setup) {
     const std::uint32_t fpsm = setup[3];
-    if (rec[1] != 1 || (fpsm != PSMCT32 && fpsm != PSMCT24 && fpsm != PSMCT16 && fpsm != PSMCT16S)) return false;
+    if ((rec[1] & kKindMask) != 1 || (fpsm != PSMCT32 && fpsm != PSMCT24 && fpsm != PSMCT16 && fpsm != PSMCT16S)) return false;
     const std::uint32_t x0 = rec[2] & 0xFFFFu, y0 = rec[2] >> 16, x1 = rec[3] & 0xFFFFu, y1 = rec[3] >> 16;
     if (x1 < x0 || y1 < y0 || static_cast<std::uint64_t>(x1 - x0 + 1) * (y1 - y0 + 1) > kExactPixels) return false;
     Exact &e = g_exact;
@@ -506,9 +763,6 @@ bool exact_clear(const std::uint32_t *rec, const std::uint32_t *setup, int minx,
 }
 
 int g_tile = 8;  // pixels along one side of a screen tile (one workgroup of the raster program): 8 was the cheaper of 16, 8 and 4 on the arena and hall test frames; PS2_TILE=4, 8 or 16 to try others
-int g_tiles_per_row = 128;
-std::vector<std::uint32_t> g_tile_count(128 * 128 + 8), g_tile_fill(128 * 128 + 8);
-std::vector<std::uint32_t> g_touched(128 * 128 + 16);
 
 WGPUStringView view(const char *s) { return WGPUStringView{s, WGPU_STRLEN}; }
 
@@ -579,6 +833,7 @@ struct CacheEntry {
     std::uint32_t offset, words;
     std::size_t bytes;
     std::uint64_t used;
+    std::uint64_t uid;  // a number no other entry ever had: two uploads that find the same entry uploaded the same bytes (the decode cache's identities)
 };
 
 WGPUBuffer g_cache = nullptr;
@@ -588,6 +843,7 @@ std::unordered_multimap<std::uint64_t, CacheEntry *> g_cache_index;
 std::unordered_map<std::uint64_t, std::uint32_t> g_cache_seen;
 std::uint32_t g_cache_head = 0;
 std::uint64_t g_serial = 1;
+std::uint64_t g_cache_uids = 0, g_cache_uid = 0;  // entries made so far; the uid of the entry the last cache_find / cache_insert gave
 
 std::uint64_t content_key(const std::uint8_t *p, std::size_t n) {
     std::uint64_t h = static_cast<std::uint64_t>(n) * 0x9E3779B97F4A7C15ull;
@@ -614,6 +870,7 @@ bool cache_find(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std
         if (e.bytes != n || std::memcmp(g_cache_copy.data() + e.offset, bytes, n) != 0) continue;
         e.used = g_serial;
         offset = e.offset;
+        g_cache_uid = e.uid;
         return true;
     }
     return false;
@@ -646,8 +903,10 @@ bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, s
     to[words - 1] = 0;
     to[words - 2] = 0;
     std::memcpy(to, bytes, n);
-    wgpuQueueWriteBuffer(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
-    g_cache_ring.push_back({key, offset, words, n, g_serial});
+    post::drain();
+    wt::write(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
+    g_cache_ring.push_back({key, offset, words, n, g_serial, ++g_cache_uids});
+    g_cache_uid = g_cache_uids;
     g_cache_index.emplace(key, &g_cache_ring.back());
     g_cache_head += words;
     return true;
@@ -669,92 +928,9 @@ float u2f(std::uint32_t u) {
     return f;
 }
 
-struct Span {
-    std::int16_t ty, tx0, tx1;
-    std::uint16_t prim;  // index of the shape in the batch (a batch has at most 65536 shapes)
-};
-// The spans of the open batch's shapes, in order (add_spans). Filled by hand: the capacity is made sure of once per shape, not checked at every push.
-struct SpanBuf {
-    std::unique_ptr<Span[]> spans;
-    std::size_t used = 0, capacity = 0;
-
-    void ensure(std::size_t extra) {
-        if (used + extra <= capacity) return;
-        std::size_t next = std::max<std::size_t>(capacity * 2, 1u << 14);
-        while (next < used + extra) next *= 2;
-        auto bigger = std::make_unique_for_overwrite<Span[]>(next);
-        if (used) std::memcpy(bigger.get(), spans.get(), used * sizeof(Span));
-        spans = std::move(bigger);
-        capacity = next;
-    }
-    void push_back(Span s) { spans[used++] = s; }
-    std::size_t size() const { return used; }
-    void clear() { used = 0; }
-    Span &operator[](std::size_t i) { return spans[i]; }
-} g_spans;
-
-void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi, std::uint16_t prim) {
-    const int sc = static_cast<int>(g_scale);
-    const int tx0 = static_cast<int>(lo & 0xFFFFu) * sc / g_tile, ty0 = static_cast<int>(lo >> 16) * sc / g_tile;
-    const int tx1 = (static_cast<int>(hi & 0xFFFFu) * sc + sc - 1) / g_tile, ty1 = (static_cast<int>(hi >> 16) * sc + sc - 1) / g_tile;
-    g_spans.ensure(static_cast<std::size_t>(std::max(ty1 - ty0 + 1, 0)));  // at most one span per tile row
-    const auto whole = [&] {
-        for (int ty = ty0; ty <= ty1; ++ty) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(tx0), static_cast<std::int16_t>(tx1), prim});
-    };
-    if (rec[1] != 0 || tx1 - tx0 < 2) {
-        whole();
-        return;
-    }
-    // The three edges of the triangle are the lanes of a vector (lane 3 repeats lane 0 and is not used). Every lane does the same double
-    // operations, in the same order and without fused multiply-add, as the scalar loop of the earlier versions did, so the spans are the same.
-    typedef double V4 __attribute__((vector_size(32)));
-    typedef long long M4 __attribute__((vector_size(32)));
-    const double px0 = u2f(rec[4]), px1 = u2f(rec[6]), px2 = u2f(rec[8]), py0 = u2f(rec[5]), py1 = u2f(rec[7]), py2 = u2f(rec[9]);
-    const double inv = u2f(rec[10]);
-    const V4 xa = {px1, px2, px0, px0}, xb = {px2, px0, px1, px0}, ya = {py1, py2, py0, py0}, yb = {py2, py0, py1, py0};  // edge e runs from point a to point b: {1, 2}, {2, 0}, {0, 1}
-    const V4 ca = (ya - yb) * inv, cb = (xb - xa) * inv, cc = (xa * yb - xb * ya) * inv;
-    const V4 limit = {1.7976931348623157e308, 1.7976931348623157e308, 1.7976931348623157e308, 1.7976931348623157e308};  // DBL_MAX: a value is finite when |v| <= it
-    const M4 finite = (__builtin_elementwise_abs(ca) <= limit) & (__builtin_elementwise_abs(cb) <= limit) & (__builtin_elementwise_abs(cc) <= limit);
-    if (!(finite[0] & finite[1] & finite[2])) {
-        whole();
-        return;
-    }
-    const V4 zero = {0.0, 0.0, 0.0, 0.0};
-    const M4 positive = ca > zero, negative = ca < zero, slanted = positive | negative;
-    const V4 divided_m = (-cb) / ca, divided_q = (-cc) / ca;  // the lanes of a vertical edge (ca == 0) are not used
-    const V4 vm = (V4)(((M4)divided_m & slanted) | ((M4)cb & ~slanted)), vq = (V4)(((M4)divided_q & slanted) | ((M4)cc & ~slanted));
-    const M4 kind_v = negative - positive;  // +1 for an edge that bounds the triangle on the left, -1 on the right, 0 for a vertical one
-    const int kind[3] = {static_cast<int>(kind_v[0]), static_cast<int>(kind_v[1]), static_cast<int>(kind_v[2])};
-    const double span = static_cast<double>(g_tile) / static_cast<double>(sc);
-    // x / span is exactly x * (1 / span) when span is a power of two (4, 8, 2, 16 ...: every scale but 3), and a multiplication is cheaper than a division
-    const bool span_pow2 = g_tile % sc == 0 && ((g_tile / sc) & (g_tile / sc - 1)) == 0;
-    const double span_inverse = 1.0 / span;
-    for (int ty = ty0; ty <= ty1; ++ty) {
-        const double y0 = ty * span - 1.0, y1 = (ty + 1) * span + 1.0;
-        const V4 a0 = vm * y0, a1 = vm * y1;
-        // std::min(a0, a1) is (a1 < a0 ? a1 : a0), std::max(a0, a1) is (a0 < a1 ? a1 : a0)
-        const M4 smaller = a1 < a0, larger = a0 < a1;
-        const V4 low = (V4)(((M4)a1 & smaller) | ((M4)a0 & ~smaller)) + vq, high = (V4)(((M4)a1 & larger) | ((M4)a0 & ~larger)) + vq;
-        double left = -1e30, right = 1e30;
-        bool empty = false;
-        for (int e = 0; e < 3; ++e) {
-            if (kind[e] == 0) empty = empty || high[e] < 0.0;
-            else if (kind[e] > 0) left = std::max(left, low[e]);
-            else right = std::min(right, high[e]);
-        }
-        left -= 1.0;
-        right += 1.0;
-        if (empty || left > right) continue;
-        const double lo_x = std::max(left, -1.0), hi_x = std::min(right, 4096.0);
-        const int rx0 = std::max(tx0, static_cast<int>(std::floor(span_pow2 ? lo_x * span_inverse : lo_x / span)));
-        const int rx1 = std::min(tx1, static_cast<int>(std::floor(span_pow2 ? hi_x * span_inverse : hi_x / span)));
-        if (rx0 <= rx1) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(rx0), static_cast<std::int16_t>(rx1), prim});
-    }
-}
-
 bool reads_own_word(const std::uint32_t *rec, const std::uint32_t *setup) {
     const std::uint32_t fpsm = setup[3], tpsm = setup[14];
-    if (rec[1] != 1 || (setup[0] & (16u | 16384u)) != 16u || setup[12] != setup[1] || setup[13] != setup[2]) return false;
+    if ((rec[1] & kKindMask) != 1 || (setup[0] & (16u | 16384u)) != 16u || setup[12] != setup[1] || setup[13] != setup[2]) return false;
     float f[6], uv[6];
     std::memcpy(f, rec + 4, sizeof f);
     std::memcpy(uv, rec + 15, sizeof uv);
@@ -775,7 +951,7 @@ bool reads_own_word(const std::uint32_t *rec, const std::uint32_t *setup) {
 }
 
 Range read_range(const std::uint32_t *rec, const std::uint32_t *setup, const Range &whole) {
-    if (rec[1] != 1 || !(setup[0] & 16u)) return whole;
+    if ((rec[1] & kKindMask) != 1 || !(setup[0] & 16u)) return whole;
     // Wrap mode 3 (region repeat) reads (u & MINU) | MAXU, which need not lie between the corners of the sprite: the range is that of the words it can touch, else the whole texture.
     if (region_repeat(setup)) {
         Range r;
@@ -812,22 +988,865 @@ bool rendered(const Range &r) {
     return false;
 }
 
+// ---- The decode cache -----------------------------------------------------------------------------------------------------
+// Decoded textures stay in the first part of the decoded buffer (kCachedWords) across batches, submits and frames, and are used again while what
+// they were decoded from is unchanged. "Unchanged" is decided by identities, the idea of the card path's texture identities (hwcache.cpp) written
+// again here for the painter: every 256-byte block of graphics memory has a number that is equal when its bytes are equal.
+// - A host-to-local upload gives every block it writes completely a number made of where it wrote and which bytes: the upload cache's entry when
+//   the bytes are in it (found there byte for byte), a hash of the bytes when the upload is too small for that cache, else a new number. So the same
+//   upload again gives the same number whatever happened in between. A block it writes in part (an edge of the rectangle, or a format that keeps
+//   bits of the word: 24-bit, 8H, 4HL, 4HH) mixes its old number in.
+// - A draw, a local-to-local copy and a loaded state give every page they write a number nobody had (whole pages, a superset of what they write:
+//   cheaper than blocks for the full-screen passes). Pages last written by a draw or a copy hold pictures: textures there are decoded per submit as
+//   before (the transient part of the buffer) and not kept.
+// - A palette load gives the groups of 16 entries it writes in its slot a number made of its parameters and the numbers of the blocks it reads; the
+//   slot starts as a copy of the slot before it, as the load program does.
+// A decoded texture is found again by its set-up words (base, width, format, size, palette format and start, TEXA, AEM), the folded numbers of every
+// block its texels lie in and the numbers of the palette groups it reads. The numbers change in the order of the command stream: an upload or a palette
+// load when it is queued (emit_all dispatches every queued one before the batch whose decodes are then planned), a draw after its batch, a copy when it
+// is dispatched. Off with PS2_DECODE_CACHE=0; PS2_DECODE_CACHE_STAT=1 prints what it did every 300 frames.
+constexpr std::uint32_t kCachedOrder = 23;  // 8 Mi words (32 MB), handed out in powers of two (a decoded texture is 2^(tw + th) words)
+constexpr std::uint32_t kCachedWords = 1u << kCachedOrder;
+bool g_dec_on = true, g_dec_small = true, g_dec_stat = false;
+
+void fmt_words(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t *out);
+
+std::uint64_t mix64(std::uint64_t a, std::uint64_t b) {
+    std::uint64_t z = a ^ (b + 0x9E3779B97F4A7C15ull + (a << 6) + (a >> 2));
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+struct DecStat {
+    std::uint64_t walks = 0, cells = 0, picture_walks = 0, asked = 0, found = 0, decoded = 0, decoded_words = 0, pictures = 0, picture_words = 0, evicted = 0, refused = 0, in_place = 0;
+} g_dec_count;
+
+struct Identities {
+    std::uint64_t block[16384] = {}, block_seq[16384] = {};  // a block's own number and when it was set
+    std::uint64_t page[512] = {}, page_seq[512] = {};        // a page's number and when it was set: newer than a block's own, it is the block's
+    std::uint64_t touched[512] = {};                         // the last write of any kind into the page
+    std::uint64_t block_write[512] = {};                     // the last write of a block's own number in the page
+    bool page_drawn[512] = {};
+    std::uint64_t seq = 0, fresh = 0;
+    std::vector<std::array<std::uint64_t, 32>> slot;  // palette slots: the number of each group of 16 entries
+} g_id;
+
+std::uint64_t fresh_id() { return mix64(0xF7E5Bull, ++g_id.fresh) | 1; }
+
+inline std::uint64_t block_id(std::uint32_t b, bool &drawn) {
+    const std::uint32_t p = b >> 5;
+    if (g_id.page_seq[p] > g_id.block_seq[b]) {
+        drawn = drawn || g_id.page_drawn[p];
+        return mix64(g_id.page[p], b);
+    }
+    return g_id.block[b];
+}
+
+// Every page the bytes lo .. hi - 1 lie in gets a new number.
+void stamp_pages(const Range &r, bool drawn) {
+    if (r.hi <= r.lo) return;
+    const std::uint64_t first = r.lo >> 13, last = (r.hi - 1) >> 13;
+    for (std::uint64_t q = first; q <= last && q - first < 512; ++q) {
+        const std::uint32_t p = static_cast<std::uint32_t>(q & 511u);
+        g_id.page[p] = fresh_id();
+        g_id.page_seq[p] = g_id.touched[p] = ++g_id.seq;
+        g_id.page_drawn[p] = drawn;
+    }
+}
+
+// The blocks of the rectangle x0..x1, y0..y1 of a format (fmt_words `f`), one call per block-sized cell: fn(block, cell x0, y0, x1, y1). A block of
+// the GS holds a whole aligned cell of 8 x 8 (32-bit), 16 x 8 (16-bit), 16 x 16 (8-bit) or 32 x 16 (4-bit) pixels.
+template <typename Fn> void for_cells(const std::uint32_t *f, std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1, Fn &&fn) {
+    const std::uint32_t pws = f[3] & 15u, phs = (f[3] >> 4) & 15u;
+    const std::uint32_t bw = pws == 7 ? (phs == 7 ? 32u : 16u) : (phs == 6 ? 16u : 8u), bh = pws == 7 ? 16u : 8u;
+    for (std::uint32_t cy = y0 / bh; cy <= y1 / bh; ++cy)
+        for (std::uint32_t cx = x0 / bw; cx <= x1 / bw; ++cx) fn(word_at(f, cx * bw, cy * bh) >> 6, cx * bw, cy * bh, cx * bw + bw - 1, cy * bh + bh - 1);
+}
+
+void everything_fresh() {
+    stamp_pages(Range{0, kMemorySize}, false);
+    for (auto &s : g_id.slot)
+        for (auto &g : s) g = fresh_id();
+}
+
+// A host-to-local upload (`rec` as queue_upload builds it: dbp, dbw, dpsm, dsax, dsay, rrw, done, pixels, offset, lead bits, bits per pixel) of
+// bytes whose number is `content`.
+void id_upload(const std::uint32_t *rec, std::uint64_t content) {
+    const std::uint32_t rrw = rec[5], done = rec[6], pixels = rec[7], psm = rec[2];
+    if (!rrw || !pixels) return;
+    const std::uint32_t x0 = rec[3], x1 = rec[3] + rrw - 1, y0 = rec[4] + done / rrw, y1 = rec[4] + (done + pixels - 1) / rrw;
+    if (x1 > 2047 || y1 > 2047) {  // wraps around the 2048 x 2048 space: not followed, everything counts as written
+        everything_fresh();
+        return;
+    }
+    const std::uint32_t full0 = rec[4] + (done + rrw - 1) / rrw, full_end = rec[4] + (done + pixels) / rrw;  // the rows written whole
+    const bool whole_words = psm != 0x01 && psm != 0x31 && psm != 0x1B && psm != 0x24 && psm != 0x2C;
+    std::uint64_t chunk = mix64(content, 0x0B10Cull);
+    for (int k : {0, 1, 2, 3, 4, 5, 6, 7, 9}) chunk = mix64(chunk, rec[k]);
+    chunk = mix64(chunk, rec[10] & 0x7FFFFFFFu);
+    std::uint32_t f[5];
+    fmt_words(psm, rec[0], rec[1], f);
+    for_cells(f, x0, y0, x1, y1, [&](std::uint32_t b, std::uint32_t cx0, std::uint32_t cy0, std::uint32_t cx1, std::uint32_t cy1) {
+        const bool full = whole_words && cx0 >= x0 && cx1 <= x1 && cy0 >= full0 && cy1 < full_end;
+        bool drawn = false;
+        g_id.block[b] = (full ? mix64(chunk, b) : mix64(mix64(block_id(b, drawn), chunk), b)) | 1;
+        g_id.block_seq[b] = ++g_id.seq;
+        g_id.touched[b >> 5] = g_id.block_write[b >> 5] = g_id.seq;
+    });
+}
+
+std::uint64_t bytes_id(const std::uint8_t *p, std::size_t n) {
+    std::uint64_t h = mix64(0xB17E5ull, n), v;
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        std::memcpy(&v, p + i, 8);
+        h = mix64(h, v);
+    }
+    v = 0;
+    std::memcpy(&v, p + i, n - i);
+    return mix64(h, v) | 1;
+}
+
+// A palette load (`rec` as load_clut builds it: from slot, to slot, cbp, cpsm, csm, csa, 8-bit, cbw, cou, cov), as the load program in gs.wgsl does it.
+void id_clut(const std::uint32_t *rec) {
+    const std::uint32_t cpsm = rec[3], csm = rec[4], csa = rec[5], entries = rec[6] ? 256u : 16u;
+    std::uint64_t h = 0xC1u;
+    for (int k = 2; k < 10; ++k) h = mix64(h, rec[k]);
+    std::uint32_t f[5];
+    fmt_words(cpsm, rec[2], csm ? rec[7] : 1u, f);
+    const auto fold = [&](std::uint32_t b, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {
+        bool drawn = false;
+        h = mix64(h, block_id(b, drawn));
+    };
+    if (csm) for_cells(f, rec[8] * 16, rec[9], rec[8] * 16 + entries - 1, rec[9], fold);
+    else if (entries == 256) for_cells(f, 0, 0, 15, 15, fold);
+    else for_cells(f, 0, 0, 7, 1, fold);
+    h |= 1;
+    std::array<std::uint64_t, 32> next = g_id.slot[rec[0] % kClutSlots];
+    if (csm)
+        for (std::uint32_t g = 0; g < entries / 16; ++g) next[(csa + g) & 31u] = mix64(h, g);
+    else if (entries == 256)
+        for (std::uint32_t g = 0; g < 16; ++g) next[g] = mix64(h, g);
+    else next[csa & 15u] = h;
+    g_id.slot[rec[1] % kClutSlots] = next;
+}
+
+// The palette groups a set-up's texture reads (convert in gs.wgsl): 0 to 255 for 8-bit indices, the 16 entries at CSA for 4-bit ones.
+std::uint64_t palette_id(const std::uint32_t *w) {
+    const std::uint32_t psm = w[14];
+    const bool eight = psm == 0x13 || psm == 0x1B, four = psm == 0x14 || psm == 0x24 || psm == 0x2C;
+    if (!eight && !four) return 0;
+    const std::array<std::uint64_t, 32> &s = g_id.slot[w[22] % kClutSlots];
+    if (four) return mix64(s[w[17] & 15u], 4);
+    std::uint64_t h = 8;
+    for (std::uint32_t g = 0; g < 16; ++g) h = mix64(h, s[g]);
+    return h;
+}
+
+// The folded numbers of the blocks a texture's texels lie in (2^tw x 2^th from its base); false when one of them holds a picture. A texture asked for
+// again while none of its pages was written since gives the remembered answer; one that has a page drawn over as a whole since is a picture at once
+// (the pages a texture lies in are remembered, they depend only on its base, width, format and size).
+struct TexMemo {
+    std::uint64_t ident = 0, seq = 0;
+    bool picture = false;
+    std::vector<std::uint16_t> pages;
+};
+std::unordered_map<std::uint64_t, TexMemo> g_tex_memo;
+
+bool texture_id(const std::uint32_t *w, std::uint64_t &ident) {
+    const std::uint64_t key = mix64(mix64(mix64(w[12], w[13]), w[14]), w[15]);
+    auto it = g_tex_memo.find(key);
+    if (it != g_tex_memo.end()) {
+        const TexMemo &m = it->second;
+        bool valid = true;
+        for (std::uint16_t p : m.pages) {
+            if (g_id.page_drawn[p] && g_id.page_seq[p] > g_id.block_write[p]) return false;  // every block of the page is drawn
+            valid = valid && g_id.touched[p] <= m.seq;
+        }
+        if (valid) {
+            ident = m.ident;
+            return !m.picture;
+        }
+    } else {
+        if (g_tex_memo.size() >= 4096) g_tex_memo.clear();
+        it = g_tex_memo.emplace(key, TexMemo{}).first;
+    }
+    TexMemo &m = it->second;
+    m.pages.clear();
+    m.seq = g_id.seq;
+    std::uint64_t h = key;
+    bool drawn = false;
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    const std::uint32_t *f = w + 25;  // the texture's format words (fmt_words)
+    for_cells(f, 0, 0, (1u << tw) - 1, (1u << th) - 1, [&](std::uint32_t b, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {
+        h = mix64(h, block_id(b, drawn));
+        const std::uint16_t p = static_cast<std::uint16_t>(b >> 5);
+        if (m.pages.empty() || m.pages.back() != p) m.pages.push_back(p);
+    });
+    std::sort(m.pages.begin(), m.pages.end());
+    m.pages.erase(std::unique(m.pages.begin(), m.pages.end()), m.pages.end());
+    m.ident = ident = h;
+    m.picture = drawn;
+    ++g_dec_count.walks;
+    g_dec_count.picture_walks += drawn;
+    g_dec_count.cells += (1ull << (tw + th)) * 32 / ((1ull << (f[3] & 15u)) << ((f[3] >> 4) & 15u));
+    return !drawn;
+}
+
+// The decoded textures kept, and the free space of the kept part (a buddy allocator: a free block of 2^k words at an offset that is a multiple of it).
+struct Kept {
+    std::uint32_t key[8];
+    std::uint64_t pal, ident, used, batch;
+    std::uint32_t offset, order;
+    bool live;
+};
+std::vector<Kept> g_kept;
+std::vector<std::uint32_t> g_kept_free;
+std::unordered_multimap<std::uint64_t, std::uint32_t> g_kept_index;
+std::vector<std::uint32_t> g_space[kCachedOrder + 1];
+std::uint64_t g_dec_batch = 0;
+
+void key_of(const std::uint32_t *w, std::uint32_t *key) {
+    static const int kWords[] = {12, 13, 14, 15, 16, 17, 20};
+    for (int k = 0; k < 7; ++k) key[k] = w[kWords[k]];
+    key[7] = w[0] & 32768u;  // AEM
+}
+
+std::uint64_t kept_hash(const std::uint32_t *key, std::uint64_t pal, std::uint64_t ident) {
+    std::uint64_t h = mix64(pal, ident);
+    for (int k = 0; k < 8; ++k) h = mix64(h, key[k]);
+    return h;
+}
+
+void space_free(std::uint32_t offset, std::uint32_t order) {
+    while (order < kCachedOrder) {
+        std::vector<std::uint32_t> &list = g_space[order];
+        const auto buddy = std::find(list.begin(), list.end(), offset ^ (1u << order));
+        if (buddy == list.end()) break;
+        *buddy = list.back();
+        list.pop_back();
+        offset &= ~(1u << order);
+        ++order;
+    }
+    g_space[order].push_back(offset);
+}
+
+bool space_take(std::uint32_t order, std::uint32_t &offset) {
+    std::uint32_t k = order;
+    while (k <= kCachedOrder && g_space[k].empty()) ++k;
+    if (k > kCachedOrder) return false;
+    offset = g_space[k].back();
+    g_space[k].pop_back();
+    while (k > order) {  // split, keep the lower half
+        --k;
+        g_space[k].push_back(offset + (1u << k));
+    }
+    return true;
+}
+
+void kept_drop(std::uint32_t i) {
+    Kept &e = g_kept[i];
+    const auto [first, last] = g_kept_index.equal_range(kept_hash(e.key, e.pal, e.ident));
+    for (auto it = first; it != last; ++it)
+        if (it->second == i) {
+            g_kept_index.erase(it);
+            break;
+        }
+    space_free(e.offset, e.order);
+    e.live = false;
+    g_kept_free.push_back(i);
+}
+
+void dec_reset() {
+    g_kept.clear();
+    g_kept_free.clear();
+    g_kept_index.clear();
+    for (auto &list : g_space) list.clear();
+    g_space[kCachedOrder].push_back(0);
+    g_tex_memo.clear();
+    if (g_id.slot.empty()) g_id.slot.assign(kClutSlots, {});
+    everything_fresh();
+}
+
+// Room for 2^order words: the least recently used textures leave as needed (never one this batch reads; none at all while the frame is captured for
+// PS2_GPU_BENCH, whose replays use what was kept before the frame and must find it unchanged).
+bool kept_room(std::uint32_t order, std::uint32_t &offset) {
+    for (;;) {
+        if (space_take(order, offset)) return true;
+        if (g_bench.capturing) return false;
+        std::uint32_t victim = ~0u;
+        for (std::uint32_t i = 0; i < g_kept.size(); ++i) {
+            const Kept &e = g_kept[i];
+            if (e.live && e.batch != g_dec_batch && (victim == ~0u || e.used < g_kept[victim].used)) victim = i;
+        }
+        if (victim == ~0u) return false;
+        kept_drop(victim);
+        ++g_dec_count.evicted;
+    }
+}
+
+void dec_stat_frame() {
+    if (!g_dec_stat || frame_count() % 300 != 0) return;
+    const DecStat &c = g_dec_count;
+    std::uint64_t live = 0, words = 0;
+    for (const Kept &e : g_kept)
+        if (e.live) ++live, words += 1ull << e.order;
+    std::fprintf(stderr, "[decode-cache] frame %llu, last 300 frames: %llu asked, %llu found (%.1f %%), %llu decoded (%.1f MB), %llu pictures decoded (%.1f MB), %llu evicted, "
+                         "%llu refused, %llu read in place; kept %llu (%.1f MB); %llu walks (%llu of pictures), %llu cells\n",
+                 static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(c.asked), static_cast<unsigned long long>(c.found),
+                 c.asked ? 100.0 * static_cast<double>(c.found) / static_cast<double>(c.asked) : 0.0, static_cast<unsigned long long>(c.decoded),
+                 static_cast<double>(c.decoded_words) * 4 / 1e6, static_cast<unsigned long long>(c.pictures), static_cast<double>(c.picture_words) * 4 / 1e6,
+                 static_cast<unsigned long long>(c.evicted), static_cast<unsigned long long>(c.refused), static_cast<unsigned long long>(c.in_place), static_cast<unsigned long long>(live),
+                 static_cast<double>(words) * 4 / 1e6, static_cast<unsigned long long>(c.walks), static_cast<unsigned long long>(c.picture_walks),
+                 static_cast<unsigned long long>(c.cells));
+    g_dec_count = DecStat{};
+}
+
+// Live .png texture override system (1x & HD 2x/4x/8x, off by default; enabled via PS2_TEX_OVERRIDES=1, PS2_TEX_OVERRIDES=<path>, or PS2_TEX_OVERRIDE_DIR=<path>).
+// Maps 64-bit upload content_key -> .png on disk. File metadata (stat) is checked once when a texture is first uploaded to VRAM,
+// and optionally every 120 frames at frame end (poll_tex_overrides_frame) when PS2_TEX_HOT_RELOAD=1 is set, never while drawing (plan_decodes).
+struct TexCandidateFile {
+    std::string png_path;
+    std::uint64_t orig_mtime_ns = 0, orig_size = 0;
+};
+
+struct TexIndexEntry {
+    std::uint32_t orig_w = 0, orig_h = 0;
+    std::vector<TexCandidateFile> files;
+    std::string active_path;
+    std::uint32_t cached_dec = 0xFFFFFFFFu;
+    std::uint64_t disk_mtime_sec = 0, disk_size = 0;
+    bool tracked = false;
+    bool modified = false;
+    bool dirty = false;
+};
+
+std::unordered_map<std::uint64_t, TexIndexEntry> g_tex_index;
+std::vector<std::uint64_t> g_tracked_tex_keys;
+std::uint64_t g_dbp_tex_key[16384] = {};
+std::vector<std::uint8_t> g_state_vram_1x;
+std::uint32_t g_override_used = 0;
+bool g_tex_overrides_enabled = false;
+bool g_tex_override_all = false;
+bool g_tex_hot_reload = false;
+
+// Canonical Huffman table construction (Huff::build, decode_huff) and RFC 1951 block
+// decoding in inflate_rfc1951 are derived from Mark Adler's puff.c / puff.h
+// (zlib contrib/puff, version 2.3). This is an altered version, rewritten in C++.
+//
+// Copyright (C) 2002-2013 Mark Adler, all rights reserved
+// version 2.3, 21 Jan 2013
+//
+// This software is provided 'as-is', without any express or implied
+// warranty.  In no event will the author be held liable for any damages
+// arising from the use of this software.
+//
+// Permission is granted to anyone to use this software for any purpose,
+// including commercial applications, and to alter it and redistribute it
+// freely, subject to the following restrictions:
+//
+// 1. The origin of this software must not be misrepresented; you must not
+//    claim that you wrote the original software. If you use this software
+//    in a product, an acknowledgment in the product documentation would be
+//    appreciated but is not required.
+// 2. Altered source versions must be plainly marked as such, and must not be
+//    misrepresented as being the original software.
+// 3. This notice may not be removed or altered from any source distribution.
+//
+// Mark Adler    madler@alumni.caltech.edu
+bool inflate_rfc1951(const std::uint8_t *src, std::size_t src_len, std::vector<std::uint8_t> &out) {
+    std::size_t bit_pos = 0;
+    const std::size_t total_bits = src_len * 8;
+    const auto read_bits = [&](int n) -> std::uint32_t {
+        std::uint32_t v = 0;
+        for (int i = 0; i < n; ++i) {
+            if (bit_pos >= total_bits) return 0;
+            v |= static_cast<std::uint32_t>((src[bit_pos >> 3] >> (bit_pos & 7)) & 1u) << i;
+            ++bit_pos;
+        }
+        return v;
+    };
+    struct Huff {
+        std::uint16_t counts[16] = {};
+        std::uint16_t symbols[320] = {};
+        void build(const std::uint8_t *lengths, int n) {
+            std::memset(counts, 0, sizeof counts);
+            for (int i = 0; i < n; ++i)
+                if (lengths[i] < 16) ++counts[lengths[i]];
+            counts[0] = 0;
+            std::uint16_t offs[16] = {};
+            for (int i = 1; i < 15; ++i) offs[i + 1] = offs[i] + counts[i];
+            for (int i = 0; i < n; ++i)
+                if (lengths[i]) symbols[offs[lengths[i]]++] = static_cast<std::uint16_t>(i);
+        }
+    };
+    const auto decode_huff = [&](const Huff &h) -> int {
+        int code = 0, first = 0, index = 0;
+        for (int len = 1; len <= 15; ++len) {
+            code |= static_cast<int>(read_bits(1));
+            int count = h.counts[len];
+            if (code - count < first) return h.symbols[index + (code - first)];
+            index += count;
+            first += count;
+            first <<= 1;
+            code <<= 1;
+        }
+        return -1;
+    };
+    static const int kLenBase[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static const int kLenExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static const int kDistBase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+    static const int kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+    static const int kClOrder[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+
+    while (bit_pos < total_bits) {
+        const std::uint32_t bfinal = read_bits(1);
+        const std::uint32_t btype = read_bits(2);
+        if (btype == 0) {
+            bit_pos = (bit_pos + 7) & ~static_cast<std::size_t>(7);
+            if (bit_pos + 32 > total_bits) return false;
+            const std::size_t byte_pos = bit_pos >> 3;
+            const std::uint16_t len = static_cast<std::uint16_t>(src[byte_pos] | (src[byte_pos + 1] << 8));
+            bit_pos += 32;
+            if ((bit_pos >> 3) + len > src_len) return false;
+            out.insert(out.end(), src + (bit_pos >> 3), src + (bit_pos >> 3) + len);
+            bit_pos += static_cast<std::size_t>(len) * 8;
+        } else if (btype == 1 || btype == 2) {
+            Huff lit_huff, dist_huff;
+            if (btype == 1) {
+                std::uint8_t lit_lens[288], dist_lens[32];
+                for (int i = 0; i < 144; ++i) lit_lens[i] = 8;
+                for (int i = 144; i < 256; ++i) lit_lens[i] = 9;
+                for (int i = 256; i < 280; ++i) lit_lens[i] = 7;
+                for (int i = 280; i < 288; ++i) lit_lens[i] = 8;
+                for (int i = 0; i < 32; ++i) dist_lens[i] = 5;
+                lit_huff.build(lit_lens, 288);
+                dist_huff.build(dist_lens, 32);
+            } else {
+                const int hlit = static_cast<int>(read_bits(5)) + 257;
+                const int hdist = static_cast<int>(read_bits(5)) + 1;
+                const int hclen = static_cast<int>(read_bits(4)) + 4;
+                std::uint8_t cl_lens[19] = {};
+                for (int i = 0; i < hclen; ++i) cl_lens[kClOrder[i]] = static_cast<std::uint8_t>(read_bits(3));
+                Huff cl_huff;
+                cl_huff.build(cl_lens, 19);
+                std::uint8_t lens[320] = {};
+                int idx = 0;
+                while (idx < hlit + hdist) {
+                    const int sym = decode_huff(cl_huff);
+                    if (sym < 0) return false;
+                    if (sym < 16) {
+                        lens[idx++] = static_cast<std::uint8_t>(sym);
+                    } else if (sym == 16) {
+                        if (idx == 0) return false;
+                        const int rep = static_cast<int>(read_bits(2)) + 3;
+                        const std::uint8_t prev = lens[idx - 1];
+                        for (int r = 0; r < rep && idx < hlit + hdist; ++r) lens[idx++] = prev;
+                    } else if (sym == 17) {
+                        const int rep = static_cast<int>(read_bits(3)) + 3;
+                        for (int r = 0; r < rep && idx < hlit + hdist; ++r) lens[idx++] = 0;
+                    } else {
+                        const int rep = static_cast<int>(read_bits(7)) + 11;
+                        for (int r = 0; r < rep && idx < hlit + hdist; ++r) lens[idx++] = 0;
+                    }
+                }
+                lit_huff.build(lens, hlit);
+                dist_huff.build(lens + hlit, hdist);
+            }
+            for (;;) {
+                const int sym = decode_huff(lit_huff);
+                if (sym < 0) return false;
+                if (sym < 256) {
+                    out.push_back(static_cast<std::uint8_t>(sym));
+                } else if (sym == 256) {
+                    break;
+                } else {
+                    const int li = sym - 257;
+                    if (li >= 29) return false;
+                    const int length = kLenBase[li] + static_cast<int>(read_bits(kLenExtra[li]));
+                    const int di = decode_huff(dist_huff);
+                    if (di < 0 || di >= 30) return false;
+                    const std::size_t dist = static_cast<std::size_t>(kDistBase[di] + read_bits(kDistExtra[di]));
+                    if (dist == 0 || dist > out.size()) return false;
+                    for (int k = 0; k < length; ++k) out.push_back(out[out.size() - dist]);
+                }
+            }
+        } else {
+            return false;
+        }
+        if (bfinal) break;
+    }
+    return true;
+}
+
+bool decode_png_rgba_ps2(const std::string &path, std::uint32_t &out_w, std::uint32_t &out_h, std::vector<std::uint32_t> &out_words) {
+    std::ifstream f(os::path(path), std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    const auto sz = f.tellg();
+    if (sz < 33 || sz > 64 * 1024 * 1024) return false;
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(sz));
+    f.seekg(0);
+    if (!f.read(reinterpret_cast<char *>(data.data()), sz)) return false;
+    static const std::uint8_t kSig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    if (std::memcmp(data.data(), kSig, 8) != 0) return false;
+
+    const auto be32 = [](const std::uint8_t *p) -> std::uint32_t {
+        return (static_cast<std::uint32_t>(p[0]) << 24) | (static_cast<std::uint32_t>(p[1]) << 16) |
+               (static_cast<std::uint32_t>(p[2]) << 8) | static_cast<std::uint32_t>(p[3]);
+    };
+    std::uint32_t w = 0, h = 0;
+    std::uint8_t bit_depth = 0, color_type = 0, interlace = 0;
+    std::vector<std::uint8_t> idat, plte, trns;
+    std::size_t pos = 8;
+    while (pos + 12 <= data.size()) {
+        const std::uint32_t clen = be32(data.data() + pos);
+        const char *ctype = reinterpret_cast<const char *>(data.data() + pos + 4);
+        const std::uint8_t *cdata = data.data() + pos + 8;
+        if (pos + 12 + clen > data.size()) break;
+        if (std::memcmp(ctype, "IHDR", 4) == 0 && clen >= 13) {
+            w = be32(cdata);
+            h = be32(cdata + 4);
+            bit_depth = cdata[8];
+            color_type = cdata[9];
+            interlace = cdata[12];
+        } else if (std::memcmp(ctype, "PLTE", 4) == 0) {
+            plte.assign(cdata, cdata + clen);
+        } else if (std::memcmp(ctype, "tRNS", 4) == 0) {
+            trns.assign(cdata, cdata + clen);
+        } else if (std::memcmp(ctype, "IDAT", 4) == 0) {
+            idat.insert(idat.end(), cdata, cdata + clen);
+        } else if (std::memcmp(ctype, "IEND", 4) == 0) {
+            break;
+        }
+        pos += 12 + clen;
+    }
+    if (!w || !h || bit_depth != 8 || interlace != 0 || idat.size() < 6) return false;
+    const std::size_t bpp = (color_type == 6) ? 4 : (color_type == 2) ? 3 : (color_type == 4) ? 2 : (color_type == 0 || color_type == 3) ? 1 : 0;
+    if (!bpp) return false;
+    const std::size_t z_start = (idat[0] & 0x0Fu) == 8 && (idat[1] & 0x20u) ? 6 : 2;
+    if (idat.size() <= z_start + 4) return false;
+    std::vector<std::uint8_t> raw;
+    const std::size_t stride = static_cast<std::size_t>(w) * bpp;
+    raw.reserve(static_cast<std::size_t>(h) * (1 + stride));
+    if (!inflate_rfc1951(idat.data() + z_start, idat.size() - z_start - 4, raw)) return false;
+    if (raw.size() < static_cast<std::size_t>(h) * (1 + stride)) return false;
+
+    std::vector<std::uint8_t> recon(static_cast<std::size_t>(h) * stride, 0);
+    for (std::uint32_t y = 0; y < h; ++y) {
+        const std::uint8_t ftype = raw[static_cast<std::size_t>(y) * (1 + stride)];
+        const std::uint8_t *src_row = raw.data() + static_cast<std::size_t>(y) * (1 + stride) + 1;
+        std::uint8_t *dst_row = recon.data() + static_cast<std::size_t>(y) * stride;
+        const std::uint8_t *up_row = y > 0 ? (dst_row - stride) : nullptr;
+        for (std::size_t i = 0; i < stride; ++i) {
+            const int a = i >= bpp ? dst_row[i - bpp] : 0;
+            const int b = up_row ? up_row[i] : 0;
+            const int c = (up_row && i >= bpp) ? up_row[i - bpp] : 0;
+            int pred = 0;
+            if (ftype == 1) pred = a;
+            else if (ftype == 2) pred = b;
+            else if (ftype == 3) pred = (a + b) >> 1;
+            else if (ftype == 4) {
+                const int p = a + b - c;
+                const int pa = std::abs(p - a), pb = std::abs(p - b), pc = std::abs(p - c);
+                pred = (pa <= pb && pa <= pc) ? a : (pb <= pc) ? b : c;
+            }
+            dst_row[i] = static_cast<std::uint8_t>((src_row[i] + pred) & 0xFF);
+        }
+    }
+    out_w = w;
+    out_h = h;
+    out_words.resize(static_cast<std::size_t>(w) * h);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i) {
+        std::uint8_t r = 0, g = 0, b = 0, a = 255;
+        if (color_type == 6) {
+            r = recon[i * 4]; g = recon[i * 4 + 1]; b = recon[i * 4 + 2]; a = recon[i * 4 + 3];
+        } else if (color_type == 2) {
+            r = recon[i * 3]; g = recon[i * 3 + 1]; b = recon[i * 3 + 2];
+        } else if (color_type == 3) {
+            const std::size_t idx = recon[i];
+            if (idx * 3 + 2 < plte.size()) {
+                r = plte[idx * 3]; g = plte[idx * 3 + 1]; b = plte[idx * 3 + 2];
+            }
+            if (idx < trns.size()) a = trns[idx];
+        } else if (color_type == 4) {
+            r = g = b = recon[i * 2]; a = recon[i * 2 + 1];
+        } else {
+            r = g = b = recon[i];
+        }
+        const std::uint32_t ps2_a = (static_cast<std::uint32_t>(a) * 128u + 127u) / 255u;
+        out_words[i] = static_cast<std::uint32_t>(r) | (static_cast<std::uint32_t>(g) << 8) |
+                       (static_cast<std::uint32_t>(b) << 16) | (ps2_a << 24);
+    }
+    return true;
+}
+
+void check_tex_entry_stat(TexIndexEntry &e) {
+    for (const TexCandidateFile &cf : e.files) {
+#if defined(_WIN32)
+        struct _stat64 st = {};
+        if (::_wstat64(os::path(cf.png_path).c_str(), &st) != 0) continue;
+#else
+        struct stat st = {};
+        if (::stat(cf.png_path.c_str(), &st) != 0) continue;
+#endif
+        const auto cur_size = static_cast<std::uint64_t>(st.st_size);
+        const auto cur_mtime_sec = static_cast<std::uint64_t>(st.st_mtime);
+#if defined(__linux__)
+        const std::uint64_t cur_mtime_ns = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
+        const bool mod = g_tex_override_all || cur_size != cf.orig_size || cur_mtime_ns != cf.orig_mtime_ns;
+#else
+        const bool mod = g_tex_override_all || cur_size != cf.orig_size || cur_mtime_sec != (cf.orig_mtime_ns / 1000000000ULL);
+#endif
+        if (mod) {
+            e.modified = true;
+            if (e.cached_dec == 0xFFFFFFFFu || e.active_path != cf.png_path || e.disk_size != cur_size || e.disk_mtime_sec != cur_mtime_sec) {
+                e.active_path = cf.png_path;
+                e.disk_size = cur_size;
+                e.disk_mtime_sec = cur_mtime_sec;
+                e.dirty = true;
+            }
+            return;
+        }
+    }
+    e.modified = false;
+}
+
+void note_tex_upload_key(std::uint32_t dbp, std::uint64_t key) {
+    g_dbp_tex_key[dbp & 0x3FFFu] = key;
+    if (!g_tex_overrides_enabled) return;
+    auto it = g_tex_index.find(key);
+    if (it == g_tex_index.end()) return;
+    TexIndexEntry &e = it->second;
+    if (!e.tracked) {
+        e.tracked = true;
+        g_tracked_tex_keys.push_back(key);
+        check_tex_entry_stat(e);
+    }
+}
+
+void poll_tex_overrides_frame() {
+    if (!g_tex_overrides_enabled || !g_tex_hot_reload || g_tracked_tex_keys.empty() || frame_count() % 120 != 0) return;
+    for (std::uint64_t key : g_tracked_tex_keys) {
+        auto it = g_tex_index.find(key);
+        if (it != g_tex_index.end()) check_tex_entry_stat(it->second);
+    }
+}
+
+void load_tex_index_file(const std::filesystem::path &tsv_path) {
+    std::ifstream f(tsv_path);
+    if (!f) return;
+    const std::filesystem::path base_dir = tsv_path.parent_path();
+    std::string line;
+    std::size_t count = 0;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        unsigned long long key = 0, mtime_ns = 0, fsize = 0;
+        unsigned int w = 0, h = 0;
+        char rel_buf[1024] = {};
+        if (std::sscanf(line.c_str(), "%llx\t%u\t%u\t%llu\t%llu\t%1023[^\r\n]", &key, &w, &h, &mtime_ns, &fsize, rel_buf) == 6) {
+            TexIndexEntry &e = g_tex_index[static_cast<std::uint64_t>(key)];
+            e.orig_w = w;
+            e.orig_h = h;
+            e.files.push_back({os::utf8(base_dir / os::path(rel_buf)), mtime_ns, fsize});
+            if (e.active_path.empty()) e.active_path = e.files.back().png_path;
+            ++count;
+        }
+    }
+    if (count > 0) {
+        g_tex_overrides_enabled = true;
+        std::fprintf(stderr, "[gpu] indexed %zu moddable textures from %s (live 1x/HD .png overrides active)\n", count, os::utf8(tsv_path).c_str());
+    }
+}
+
+void init_tex_overrides() {
+    g_tex_index.clear();
+    g_tracked_tex_keys.clear();
+    g_override_used = 0;
+    g_tex_overrides_enabled = false;
+    g_tex_override_all = os::env("PS2_TEX_OVERRIDE_ALL") == "1";
+    g_tex_hot_reload = os::env("PS2_TEX_HOT_RELOAD") == "1";
+    std::string opt = os::env("PS2_TEX_OVERRIDES");
+    const std::string opt_dir = os::env("PS2_TEX_OVERRIDE_DIR");
+    if (!opt_dir.empty() && opt_dir != "0") opt = opt_dir;
+    if (opt.empty() || opt == "0") return;
+
+    if (opt != "1") {
+        std::filesystem::path p = os::path(opt);
+        std::error_code ec;
+        if (std::filesystem::is_directory(p, ec)) p /= "textures_index.tsv";
+        if (std::filesystem::is_regular_file(p, ec)) {
+            load_tex_index_file(p);
+            return;
+        }
+    }
+    for (const char *cand : {"assets_unpacked/textures_index.tsv", "mods/textures_index.tsv", "../assets_unpacked/textures_index.tsv"}) {
+        std::error_code ec;
+        const std::filesystem::path p = os::path(cand);
+        if (std::filesystem::is_regular_file(p, ec)) {
+            load_tex_index_file(p);
+            return;
+        }
+    }
+    for (const char *games_root : {"games", "../games"}) {
+        std::error_code ec;
+        const std::filesystem::path root_p = os::path(games_root);
+        if (!std::filesystem::is_directory(root_p, ec)) continue;
+        for (const auto &entry : std::filesystem::directory_iterator(root_p, ec)) {
+            if (!entry.is_directory(ec)) continue;
+            const auto tsv = entry.path() / "assets_unpacked" / "textures_index.tsv";
+            if (std::filesystem::is_regular_file(tsv, ec)) {
+                load_tex_index_file(tsv);
+            } else {
+                const auto unpacked = entry.path() / "assets_unpacked";
+                if (std::filesystem::is_directory(unpacked, ec)) {
+                    for (const auto &sub : std::filesystem::directory_iterator(unpacked, ec)) {
+                        const auto sub_tsv = sub.path() / "textures_index.tsv";
+                        if (std::filesystem::is_regular_file(sub_tsv, ec)) load_tex_index_file(sub_tsv);
+                    }
+                }
+            }
+        }
+        if (g_tex_overrides_enabled) return;
+    }
+}
+
+std::uint64_t recover_state_vram_tex_key(const std::uint32_t *w, std::uint32_t base_w, std::uint32_t base_h) {
+    if (g_state_vram_1x.size() < kMemorySize || g_swizzle.empty() || base_w > 1024 || base_h > 1024) return 1ull;
+    const std::uint32_t psm = w[14];
+    const std::uint32_t *f = w + 25;
+    const std::uint32_t pws = f[3] & 15u, phs = (f[3] >> 4) & 15u, nbit = (f[3] >> 10) & 1u;
+    const auto addr_of = [&](std::uint32_t x, std::uint32_t y, std::uint32_t &n_out) -> std::uint32_t {
+        const std::uint32_t n = g_swizzle[f[2] + ((y & ((1u << phs) - 1u)) << pws) + (x & ((1u << pws) - 1u))];
+        n_out = n;
+        return (f[0] + ((x >> pws) + (y >> phs) * f[1]) * 8192u + (n >> nbit)) & (kMemorySize - 1u);
+    };
+    std::vector<std::uint8_t> unswiz;
+    if (psm == PSMT8) {
+        unswiz.resize(static_cast<std::size_t>(base_w) * base_h);
+        for (std::uint32_t y = 0; y < base_h; ++y)
+            for (std::uint32_t x = 0; x < base_w; ++x) {
+                std::uint32_t n = 0;
+                unswiz[y * base_w + x] = g_state_vram_1x[addr_of(x, y, n)];
+            }
+    } else if (psm == PSMT4) {
+        unswiz.assign((static_cast<std::size_t>(base_w) * base_h) / 2, 0);
+        for (std::uint32_t y = 0; y < base_h; ++y)
+            for (std::uint32_t x = 0; x < base_w; ++x) {
+                std::uint32_t n = 0;
+                const std::uint8_t b = g_state_vram_1x[addr_of(x, y, n)];
+                const std::uint8_t nib = (n & 1u) ? (b >> 4) : (b & 0xFu);
+                const std::size_t idx = static_cast<std::size_t>(y) * base_w + x;
+                if (idx & 1u) unswiz[idx >> 1] |= static_cast<std::uint8_t>(nib << 4);
+                else unswiz[idx >> 1] = nib;
+            }
+    } else if (psm == PSMCT32) {
+        unswiz.resize(static_cast<std::size_t>(base_w) * base_h * 4);
+        for (std::uint32_t y = 0; y < base_h; ++y)
+            for (std::uint32_t x = 0; x < base_w; ++x) {
+                std::uint32_t n = 0;
+                const std::uint32_t a = addr_of(x, y, n) & ~3u;
+                std::memcpy(&unswiz[(y * base_w + x) * 4], &g_state_vram_1x[a], 4);
+            }
+    } else if (psm == PSMCT16 || psm == PSMCT16S) {
+        unswiz.resize(static_cast<std::size_t>(base_w) * base_h * 2);
+        for (std::uint32_t y = 0; y < base_h; ++y)
+            for (std::uint32_t x = 0; x < base_w; ++x) {
+                std::uint32_t n = 0;
+                const std::uint32_t a = addr_of(x, y, n) & ~1u;
+                std::memcpy(&unswiz[(y * base_w + x) * 2], &g_state_vram_1x[a], 2);
+            }
+    } else {
+        return 1ull;
+    }
+    const std::uint64_t key = content_key(unswiz.data(), unswiz.size());
+    return key ? key : 1ull;
+}
+
+// Called during plan_decodes: never calls stat(); reads only in-memory flags updated at upload time and every 120 frames at frame end.
+std::uint32_t resolve_tex_override(const std::uint32_t *w, std::uint32_t base_w, std::uint32_t base_h) {
+    if (!g_tex_overrides_enabled) return 0xFFFFFFFFu;
+    const std::uint32_t dbp = w[12] & 0x3FFFu;
+    std::uint64_t key = g_dbp_tex_key[dbp];
+    if (!key && !g_state_vram_1x.empty()) {
+        key = recover_state_vram_tex_key(w, base_w, base_h);
+        note_tex_upload_key(dbp, key);
+    }
+    if (!key || key == 1ull) return 0xFFFFFFFFu;
+    auto it = g_tex_index.find(key);
+    if (it == g_tex_index.end()) return 0xFFFFFFFFu;
+    TexIndexEntry &e = it->second;
+    if (!e.modified || base_w != e.orig_w || base_h != e.orig_h) return 0xFFFFFFFFu;
+    if (!e.dirty && e.cached_dec != 0xFFFFFFFFu) return e.cached_dec;
+
+    std::uint32_t png_w = 0, png_h = 0;
+    std::vector<std::uint32_t> words;
+    if (!decode_png_rgba_ps2(e.active_path, png_w, png_h, words)) {
+        e.dirty = false;
+        return 0xFFFFFFFFu;
+    }
+
+    std::uint32_t hd_shift = 0;
+    if (png_w == base_w * 2 && png_h == base_h * 2) hd_shift = 1;
+    else if (png_w == base_w * 4 && png_h == base_h * 4) hd_shift = 2;
+    else if (png_w == base_w * 8 && png_h == base_h * 8) hd_shift = 3;
+    else if (png_w != base_w || png_h != base_h) {
+        e.dirty = false;
+        return 0xFFFFFFFFu;
+    }
+
+    const auto word_count = static_cast<std::uint32_t>(words.size());
+    if (g_override_used + word_count > kDecodedOverrideWords) {
+        g_override_used = 0;
+        for (auto &kv : g_tex_index) kv.second.cached_dec = 0xFFFFFFFFu;
+        if (word_count > kDecodedOverrideWords) return 0xFFFFFFFFu;
+    }
+    const std::uint32_t dec_offset = kCachedWords + kDecodedWords + g_override_used;
+    g_override_used += word_count;
+    wgpuQueueWriteBuffer(g_queue, g_decoded, static_cast<std::uint64_t>(dec_offset) * 4, words.data(), static_cast<std::uint64_t>(word_count) * 4);
+    e.cached_dec = dec_offset | (hd_shift << 28);
+    e.dirty = false;
+    std::fprintf(stderr, "[gpu] loaded live %ux .png texture override: %s (%ux%u)\n", 1u << hd_shift, e.active_path.c_str(), png_w, png_h);
+    return e.cached_dec;
+}
+
 struct Decode {
     std::uint32_t setup, offset, words;
 };
-std::vector<Decode> g_decodes;
+std::vector<Decode> g_decodes;   // the decodes this batch dispatches
+std::vector<Decode> g_assigned;  // every decoded texture a setup of this batch reads, dispatched or kept, for setups that share it
+std::vector<double> g_setup_taps;  // per setup of the batch: pixels in the boxes of its shapes (plan_decodes, filled when first asked)
 
 void plan_decodes(std::uint32_t prims) {
     Batch &b = g_batch;
     g_decodes.clear();
-    if (!g_decode || prims <= kDecodePrims) return;
+    g_assigned.clear();
+    g_setup_taps.clear();
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
+    if (g_tex_overrides_enabled) {
+        for (std::uint32_t i = 0; i < setups; ++i) {
+            std::uint32_t *w = b.setups.data() + i * kSetupWords;
+            if (!(w[0] & 2u)) continue;
+            const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+            const std::uint32_t ov = resolve_tex_override(w, 1u << tw, 1u << th);
+            if (ov != 0xFFFFFFFFu) w[24] = ov;
+        }
+    }
+    if (!g_decode) return;
+    const bool big = prims > kDecodePrims, cache = g_dec_on && !hw::enabled();
+    if (!big && !(cache && g_dec_small)) return;  // a small batch decodes nothing, but may read what is kept
+    ++g_dec_batch;
     static const int kKey[] = {12, 13, 14, 15, 16, 17, 20, 22};
     for (std::uint32_t i = 0; i < setups; ++i) {
         std::uint32_t *w = b.setups.data() + i * kSetupWords;
-        if (!(w[0] & 2u)) continue;
+        if (!(w[0] & 2u) || w[24] != 0xFFFFFFFFu) continue;
+        const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+        const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
+        const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
+        // every set-up checks its own clamp or repeat region against the texture, also one that would share a decode (it reads past it otherwise)
+        if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
         bool shared = false;
-        for (const Decode &d : g_decodes) {
+        for (const Decode &d : g_assigned) {
             const std::uint32_t *o = b.setups.data() + d.setup * kSetupWords;
             bool same = (o[0] & 32768u) == (w[0] & 32768u);
             for (int k : kKey) same = same && o[k] == w[k];
@@ -838,18 +1857,92 @@ void plan_decodes(std::uint32_t prims) {
             }
         }
         if (shared) continue;
-        const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
-        const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
-        const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
-        if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
         const std::uint32_t words = 1u << (tw + th);
+        // Decoding costs the chip about one read per texel of the whole texture, reading in place about one per tap of the pixels that use it.
+        // A texture whose shapes cover few pixels is read in place, as a small batch's are (the same texels either way): Silent Hill 2 draws
+        // its 512 x 512 palette pages with a few pixels per set-up and many palettes, and decoded 6 to 8 million texels a frame for that.
+        // The pixels are the shapes' boxes (more than they cover), four taps each when filtered, and decoding wins from an eighth of the texels on.
+        const auto worth = [&] {
+            if (g_setup_taps.empty()) {
+                g_setup_taps.assign(setups, 0.0);
+                for (std::uint32_t q = 0; q < prims; ++q) {
+                    const std::uint32_t *rec = b.prims.data() + q * kPrimWords;
+                    if (rec[0] < setups)
+                        g_setup_taps[rec[0]] += static_cast<double>((rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1) * static_cast<double>((rec[3] >> 16) - (rec[2] >> 16) + 1);
+                }
+            }
+            const double taps = g_setup_taps[i] * ((w[0] & 16384u) ? 4.0 : 1.0) * g_scale * g_scale;
+            return taps * 8.0 >= static_cast<double>(words);
+        };
+        if (cache && tw <= 10 && th <= 10) {
+            std::uint64_t ident;
+            if (texture_id(w, ident) && !(g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1)))) {
+                ++g_dec_count.asked;
+                std::uint32_t key[8];
+                key_of(w, key);
+                const std::uint64_t pal = palette_id(w);
+                const auto [first, last] = g_kept_index.equal_range(kept_hash(key, pal, ident));
+                Kept *found = nullptr;
+                for (auto it = first; it != last && !found; ++it) {
+                    Kept &e = g_kept[it->second];
+                    if (e.pal == pal && e.ident == ident && std::equal(key, key + 8, e.key)) found = &e;
+                }
+                if (found) {
+                    ++g_dec_count.found;
+                    found->used = g_serial;
+                    found->batch = g_dec_batch;
+                    w[24] = found->offset;
+                    g_assigned.push_back({i, found->offset, words});
+                    continue;
+                }
+                if (!big) continue;
+                if (!worth()) {
+                    ++g_dec_count.in_place;
+                    continue;
+                }
+                std::uint32_t offset;
+                if (kept_room(tw + th, offset)) {
+                    std::uint32_t at;
+                    if (!g_kept_free.empty()) {
+                        at = g_kept_free.back();
+                        g_kept_free.pop_back();
+                    } else {
+                        at = static_cast<std::uint32_t>(g_kept.size());
+                        g_kept.emplace_back();
+                    }
+                    Kept &e = g_kept[at];
+                    std::copy(key, key + 8, e.key);
+                    e.pal = pal, e.ident = ident, e.used = g_serial, e.batch = g_dec_batch, e.offset = offset, e.order = tw + th, e.live = true;
+                    g_kept_index.emplace(kept_hash(key, pal, ident), at);
+                    ++g_dec_count.decoded;
+                    g_dec_count.decoded_words += words;
+                    w[24] = offset;
+                    g_decodes.push_back({i, offset, words});
+                    g_assigned.push_back({i, offset, words});
+                    continue;
+                }
+                ++g_dec_count.refused;
+            }
+        }
+        if (!big) continue;
+        // a picture (or no room): decoded for this submit only, after the kept part
+        if (!worth()) {
+            ++g_dec_count.in_place;
+            continue;
+        }
         if (g_decoded_used + words > kDecodedWords) continue;
         if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) continue;
-        w[24] = g_decoded_used;
-        g_decodes.push_back({i, g_decoded_used, words});
+        ++g_dec_count.pictures;
+        g_dec_count.picture_words += words;
+        w[24] = kCachedWords + g_decoded_used;
+        g_decodes.push_back({i, w[24], words});
+        g_assigned.push_back({i, w[24], words});
         g_decoded_used += words;
     }
 }
+
+std::uint32_t mip_top_of(const std::uint32_t *mip);
+Range mip_range(const std::uint32_t *setup, const std::uint32_t *mip, std::uint32_t top);
 
 std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi) {
     Batch &b = g_batch;
@@ -865,10 +1958,17 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
     for (std::uint32_t i = 0; i < prims; ++i) {
         const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
         const std::uint32_t *setup = b.setups.data() + rec[0] * kSetupWords;
-        if (!(setup[0] & 2u) || reads_own_word(rec, setup)) continue;
+        const std::uint32_t *mip = b.any_mip && (rec[0] + 1) * kMipWords <= b.mips.size() ? b.mips.data() + rec[0] * kMipWords : nullptr;
+        const std::uint32_t top = mip ? mip_top_of(mip) : 0u;
+        if (!(setup[0] & 2u) || (!top && reads_own_word(rec, setup))) continue;
         const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
-        const bool listed = rec[1] == 1 && region_repeat(setup) && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
-        const Range t = listed ? g_exact.reads : read_range(rec, setup, region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1));
+        const Range whole = region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1);
+        const bool listed = !top && (rec[1] & kKindMask) == 1 && region_repeat(setup) && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
+        Range t = top ? whole : listed ? g_exact.reads : read_range(rec, setup, whole);
+        if (top) {  // a shape that reads mip levels: the whole of every level it can reach (mip_range)
+            const Range levels = mip_range(setup, mip, top);
+            t.add(levels.lo, levels.hi);
+        }
         for (const Range *w : {&fb, b.zwrite ? &z : nullptr})
             if (w && t.overlaps(w->lo, w->hi)) shared.add(std::max(t.lo, w->lo), std::min(t.hi, w->hi));
     }
@@ -899,7 +1999,7 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
             ++info.kinds[rec[1] & 3u];
             const double bw = static_cast<double>((rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1), bh = static_cast<double>((rec[3] >> 16) - (rec[2] >> 16) + 1);
             info.bbox += bw * bh;
-            info.area += rec[1] == 0 ? std::fabs(0.5 / static_cast<double>(u2f(rec[10]))) : bw * bh;
+            info.area += (rec[1] & kKindMask) == 0 ? std::fabs(0.5 / static_cast<double>(u2f(rec[10]))) : bw * bh;
             info.textured += (flags & 2u) ? 1u : 0u;
             info.blended += (flags & 8u) ? 1u : 0u;
             info.ztest += (flags & 512u) ? 1u : 0u;
@@ -919,17 +2019,60 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
     g_command_info.push_back({g_commands.size(), {prims, tiles, entries, snapshot, b.prims[1], first[3] | (first[14] << 8) | (first[6] << 16), first[0], textured}});
 }
 
+// The open batch's lists, started on the tile helper while the batch is still being drawn (tiles.hpp, kStreamStep); nullptr when there is none.
+tiles::Job *g_stream = nullptr;
+
+// The open batch's records are dropped, or move at a submit: its started lists are given up (flush_batch then builds them another way).
+void drop_stream() {
+    if (!g_stream) return;
+    tiles::cancel(g_stream);
+    g_stream = nullptr;
+}
+
 void reset_batch() {
+    drop_stream();
     Batch &b = g_batch;
     exact_reset();
     b.prims.clear();
     b.setups.clear();
+    b.mips.clear();
+    b.any_mip = false;
     b.setup_serial = 0;
     g_batch_reads.clear();
     b.key = ~0ull;
     b.minx = b.miny = 1 << 30;
     b.maxx = b.maxy = -1;
 }
+
+// Puts the lists of a job the helper has finished into the arena and fills in the parameter record and the command that flush_batch left open for them.
+void place_tiles(tiles::Job *job) {
+    const tiles::Lists &lists = job->result;
+    if (job->param >= g_param_records.size() || job->command >= g_commands.size()) {  // cannot happen; a started job always has its slots before it is finished
+        std::fprintf(stderr, "[tiles] BAD job: parameter record %u of %zu, command %u of %zu\n", job->param, g_param_records.size(), job->command, g_commands.size());
+        std::abort();
+    }
+    const std::uint32_t tile_offset = static_cast<std::uint32_t>(g_arena.size());
+    std::memcpy(g_arena.grow(lists.words), job->lists.data(), static_cast<std::size_t>(lists.words) * 4);
+    if (tiles::logging()) tiles::note_lists(job->lists.data(), lists);
+    std::array<std::uint32_t, kParamStride / 4> &record = g_param_records[job->param];
+    record[0] = tile_offset;
+    record[3] = lists.tiles;
+    record[4] = tile_offset + lists.tiles * 2 + 2;
+    Command &c = g_commands[job->command];
+    c.x = std::min(lists.tiles, 1024u);
+    c.y = (lists.tiles + 1023) / 1024;
+    tiles::release(job);
+}
+
+// Places the finished jobs, oldest first; with `all` it waits for the jobs that are not done yet.
+void finish_tiles(bool all) {
+    if (all) drop_stream();  // a submit while a batch is open: its records move to the front of the array (Shapes::restart)
+    if (all) tiles::build_waiting();  // the jobs the helper has not reached: built here rather than waited for
+    while (tiles::Job *job = tiles::next_finished(all)) place_tiles(job);
+}
+
+// The tile helper may build the lists (tiles.hpp); see flush_batch.
+bool tiles_to_helper() { return tiles::threaded() && !g_live && !g_bench.capturing && !g_profile_out && !hw::enabled(); }
 
 void flush_batch() {
     Batch &b = g_batch;
@@ -938,109 +2081,105 @@ void flush_batch() {
         return;
     }
     const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
-    // Count how many shapes touch each tile. `touched` lists the tiles in the order they are first touched. The tiles of a span are mostly one to four,
-    // so the first four are done without a branch per tile (the extra ones only read and write back their own count); the old loop left after a
-    // different number of rounds for every span, and that cost more than the tiles. g_tile_count, g_tile_fill and g_touched have 8 words to spare.
-    std::uint32_t *const count = g_tile_count.data();
-    std::uint32_t *const touched = g_touched.data();
-    std::uint32_t touched_n = 0;
-    const std::int32_t tiles_per_row = g_tiles_per_row;
-    g_spans.clear();
-    for (std::uint32_t i = 0; i < prims; ++i)
-        add_spans(b.prims.data() + i * kPrimWords, b.prims[i * kPrimWords + 2], b.prims[i * kPrimWords + 3], static_cast<std::uint16_t>(i));
-    // One loop over all the spans of the batch (not one per shape): its exits are easy to predict.
-    const Span *const spans = g_spans.spans.get();
-    const std::size_t span_count = g_spans.size();
-    for (std::size_t k = 0; k < span_count; ++k) {
-        const Span sp = spans[k];
-        const std::uint32_t t = static_cast<std::uint32_t>(sp.ty * tiles_per_row + sp.tx0);
-        const std::int32_t len = sp.tx1 - sp.tx0 + 1;
-        for (std::int32_t j = 0; j < 4; ++j) {
-            const std::uint32_t valid = j < len ? 1u : 0u;
-            const std::uint32_t c = count[t + j];
-            touched[touched_n] = t + j;
-            touched_n += valid & (c == 0 ? 1u : 0u);
-            count[t + j] = c + valid;
+    if (g_live) {  // the card takes the batch, or the painter does and the card's pictures are told what it reads and writes
+        static_assert(sizeof(Range) == 16, "the card path reads the texture ranges as pairs of 64-bit numbers");
+        hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
+        const hw::LiveBatch lb{b.prims.data(), prims, b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords), b.fbp, b.fbw, b.fpsm, b.zbp, b.zpsm, b.zte, b.zwrite,
+                               b.minx, b.miny, b.maxx, b.maxy, reinterpret_cast<const std::uint64_t *>(g_batch_reads.data()), static_cast<std::uint32_t>(g_batch_reads.size()), frame_count()};
+        hw::pal_write(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);  // the palette record sees what this batch overwrites
+        if (b.zwrite) hw::pal_write(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
+        if (b.route == 1 && hw::live_batch(lb)) {
+            reset_batch();
+            return;
         }
-        for (std::int32_t j = 4; j < len; ++j) {
-            const std::uint32_t c = count[t + j];
-            touched[touched_n] = t + j;
-            touched_n += c == 0 ? 1u : 0u;
-            count[t + j] = c + 1;
-        }
+        hw::live_painter(lb);
     }
+    // The tile lists (tiles.cpp): which tiles every shape touches, and the table and lists the raster program reads. On a threaded run the helper builds them
+    // while this thread goes on with the batch, and finish_tiles fills in what they are for (the numbers in the parameter record and the command) when they are
+    // done; else they are built here, as they always were. The card path and the replay capture (PS2_GPU_BENCH) want the numbers at once, so they build here.
+    finish_tiles(false);
+    // A big batch whose lists the helper started while it was drawn (draw, kStreamStep): it gets the last records now (unless the lists are now wanted at once).
+    if (g_stream && !tiles_to_helper()) drop_stream();
+    tiles::Job *const streamed = g_stream;
+    if (streamed) tiles::close(streamed, b.prims.data(), prims);
+    g_stream = nullptr;
+    // With kMaxBacklog jobs waiting the helper is behind (mostly on one big batch while many small ones follow): this batch's lists are then built here
+    // at once instead of waiting for the oldest job, so neither thread waits for the other. A batch of a few shapes is built here too: handing it
+    // over (and waking the helper) costs more than building it (the God of War ship fight ends about 100 batches a frame after one shape).
+    tiles::Job *const job = streamed ? streamed
+                            : tiles_to_helper() && prims >= tiles::kMinJob && tiles::backlog() < tiles::kMaxBacklog ? tiles::start(b.prims.data(), prims) : nullptr;
     plan_decodes(prims);
-    const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
+    const std::uint32_t prim_offset = static_cast<std::uint32_t>(b.prims.begin);  // the records stay where draw() wrote them (g_shapes, kept by commit() below); place_shapes adds the arena's size at submit
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
+    // The mipmap table only when a setup of the batch has one (the draw program then reads it for every setup; prm 9 is ~0 otherwise)
+    const std::uint32_t mip_offset = b.any_mip && b.mips.size() / kMipWords == b.setups.size() / kSetupWords ? arena_append(b.mips.data(), b.mips.size() * 4) : 0xFFFFFFFFu;
     for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
-    std::uint32_t total = 0;
-    for (std::uint32_t n = 0; n < touched_n; ++n) total += count[touched[n]];
-    const std::uint32_t tiles = touched_n;
-    const std::uint32_t tile_offset = static_cast<std::uint32_t>(g_arena.size());
-    const std::uint32_t list_offset = tile_offset + tiles * 2 + 2;
-    const std::uint32_t list_words = (total + 1) / 2;
-    std::uint32_t *grown = g_arena.grow(tiles * 2 + 2 + list_words);
-    if (list_words) grown[tiles * 2 + 2 + list_words - 1] = 0;
-    std::uint32_t cursor = 0;
-    std::uint32_t *const fill = g_tile_fill.data();
-    const std::uint32_t row_width = static_cast<std::uint32_t>(tiles_per_row);
-    const bool row_pow2 = (row_width & (row_width - 1)) == 0;
-    const std::uint32_t row_mask = row_width - 1, row_shift = static_cast<std::uint32_t>(__builtin_ctz(row_width));
-    for (std::uint32_t i = 0; i < tiles; ++i) {
-        const std::uint32_t t = touched[i];
-        const std::uint32_t tx = row_pow2 ? (t & row_mask) : (t % row_width), ty = row_pow2 ? (t >> row_shift) : (t / row_width);
-        grown[i * 2] = tx | (ty << 16);
-        grown[i * 2 + 1] = cursor;
-        fill[t] = cursor;
-        cursor += count[t];
+    std::uint32_t tile_offset = 0;
+    tiles::Lists lists;
+    if (!job) {
+        tile_offset = static_cast<std::uint32_t>(g_arena.size());
+        lists = tiles::build_now(b.prims.data(), prims, [](void *, std::size_t words) { return g_arena.grow(words); }, nullptr);
+        if (tiles::logging()) tiles::note_lists(g_arena.data() + tile_offset, lists);
     }
-    grown[tiles * 2] = 0;
-    grown[tiles * 2 + 1] = cursor;
-    auto *halves = reinterpret_cast<unsigned char *>(grown + tiles * 2 + 2);
-    unsigned char scratch[2];  // where the unused rounds of the unrolled part below put their index
-    for (std::size_t k = 0; k < span_count; ++k) {
-        const Span sp = spans[k];
-        const std::uint16_t index = sp.prim;
-        const std::uint32_t t = static_cast<std::uint32_t>(sp.ty * tiles_per_row + sp.tx0);
-        const std::int32_t len = sp.tx1 - sp.tx0 + 1;
-        for (std::int32_t j = 0; j < 4; ++j) {
-            const std::uint32_t valid = j < len ? 1u : 0u;
-            const std::uint32_t f = fill[t + j];
-            fill[t + j] = f + valid;
-            unsigned char *const to = valid ? halves + 2u * f : scratch;
-            std::memcpy(to, &index, 2);
-        }
-        for (std::int32_t j = 4; j < len; ++j) {
-            const std::uint32_t f = fill[t + j]++;
-            std::memcpy(halves + 2u * f, &index, 2);
-        }
-    }
-    for (std::uint32_t n = 0; n < touched_n; ++n) count[touched[n]] = 0;
+    const std::uint32_t list_offset = tile_offset + lists.tiles * 2 + 2;
     std::uint32_t snapshot_lo, snapshot_hi;
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
-    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi});
-    note_raster(prims, tiles, total, snapshot);
+    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, lists.tiles, list_offset, snapshot_lo, snapshot_hi, 1u, 0u, mip_offset});
+    note_raster(prims, lists.tiles, lists.total, snapshot);
+    if (stat::g_on) {
+        stat::batch(prims, kWhyName[g_why]);
+        if (!g_batch_log) g_why = kWhyFlush;
+    }
     if (g_batch_log) {
         if (g_batch_log_frame > 1 && frame_count() == g_batch_log_frame) std::fprintf(stderr, "[break] %s %u\n", kWhyName[g_why], prims);
         ++g_why_runs[g_why];
         g_why_prims[g_why] += prims;
         g_why = kWhyFlush;
     }
-    g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
+    if (g_bench.capturing && hw::enabled()) hw::capture_batch(static_cast<std::uint32_t>(g_bench.subs.size()), static_cast<std::uint32_t>(g_commands.size()), b.prims.data(), prims, b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords));
+    g_commands.push_back({kRaster, std::min(lists.tiles, 1024u), (lists.tiles + 1023) / 1024, param, mip_offset != 0xFFFFFFFFu});
+    g_shape_params.push_back(param);
+    if (job) {  // the helper has the records; the slots wait for its numbers
+        job->param = param;
+        job->command = static_cast<std::uint32_t>(g_commands.size() - 1);
+    }
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
+    if (g_dec_on) {  // the decode cache: this batch's decodes saw memory as it was, its draws are writers
+        stamp_pages(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy), true);
+        if (b.zwrite) stamp_pages(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy), true);
+    }
+    if (hwcache::g_on) {  // the texture cache (hwcache.hpp): this batch reads its textures as they are now, then its draws are writers
+        if (hwcache::counting()) hwcache::batch_textures(b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords), kSetupWords);
+        hwcache::write_region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy, hwcache::kDraw);
+        if (b.zwrite) hwcache::write_region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy, hwcache::kDraw);
+    }
+    if (g_bench.capturing && hw::enabled() && hw::match())  // PS2_GPU_HW_MATCH=1: neutralise the shapes the trial does not draw, so both pictures lack them (after
+        for (std::uint32_t i = 0; i < prims; ++i) {           // everything above has read the records as they were)
+            std::uint32_t *rec = b.prims.data() + i * kPrimWords;
+            if (!hw::left_out(rec, b.setups.data() + rec[0] * kSetupWords)) continue;
+            rec[2] = 0x7FFF7FFFu;
+            rec[3] = 0;
+        }
+    b.prims.commit();
     reset_batch();
 }
 
-void batch_ranges() {
+[[gnu::noinline]] void batch_ranges_now() {
     Batch &b = g_batch;
-    if (b.rx0 == b.minx && b.ry0 == b.miny && b.rx1 == b.maxx && b.ry1 == b.maxy) return;
     b.rx0 = b.minx;
     b.ry0 = b.miny;
     b.rx1 = b.maxx;
     b.ry1 = b.maxy;
     b.fb_range = region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
     b.z_range = region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
+}
+
+// The ranges are made again only when the batch's box grew; the check is inlined, as draw() asks for every textured shape.
+[[gnu::always_inline]] inline void batch_ranges() {
+    const Batch &b = g_batch;
+    if (b.rx0 == b.minx && b.ry0 == b.miny && b.rx1 == b.maxx && b.ry1 == b.maxy) return;
+    batch_ranges_now();
 }
 
 bool batch_conflict(const Range &r, bool clut) {
@@ -1078,11 +2217,23 @@ void emit_pre() {
                 total += g_pre[k].rec[7];
             }
         }
-        if (clut) g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
+        if (g_live) {  // the card's pictures are told at the point of the command stream where the upload (a writer) or the palette load (a reader) runs
+            hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
+            for (std::size_t k = i; k < j; ++k) clut ? hw::live_reader(g_pre[k].range.lo, g_pre[k].range.hi) : hw::live_writer(g_pre[k].range.lo, g_pre[k].range.hi);
+        }
+        const std::size_t before = g_commands.size();
+        if (clut) g_commands.push_back({kLoadClut, (count + 15) / 16, 1, push_params({offset, count})});  // one workgroup per 16 palette loads (CLUT_CHUNK in gs.wgsl)
         else dispatch_linear(kUpload, total, push_params({offset, count, total}));
+        if (g_bench.capturing && hw::enabled() && g_commands.size() > before) {
+            Range both;
+            for (std::size_t k = i; k < j; ++k) both.add(g_pre[k].range.lo, g_pre[k].range.hi);
+            hw::capture_pre(static_cast<std::uint32_t>(g_bench.subs.size()), static_cast<std::uint32_t>(before), clut, both.lo, both.hi);
+            if (hwcache::g_on) hwcache::capture_pre(static_cast<std::uint32_t>(g_bench.subs.size()), static_cast<std::uint32_t>(before), i, j);
+        }
         i = j;
     }
     g_pre.clear();
+    if (hwcache::g_on) hwcache::pending_clear();
 }
 
 void emit_all() {
@@ -1109,8 +2260,10 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     PreOp op;
     const auto n = static_cast<std::size_t>((used + 7) / 8);
     std::uint32_t offset = 0, source = 0;
+    std::uint64_t upload_key = 0;
     if (n >= kCacheMinBytes) {
         const std::uint64_t key = content_key(bytes, n);
+        upload_key = key;
         bool cached = cache_find(key, bytes, n, offset);
         if (!cached && ++g_cache_seen[key] >= 2) {
             cached = cache_insert(key, bytes, n, offset);
@@ -1125,6 +2278,8 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
         }
         if (cached) source = 0x80000000u;
         if (g_cache_seen.size() > 65536) g_cache_seen.clear();
+    } else if (g_tex_overrides_enabled && im.done == 0 && n >= 64) {
+        upload_key = content_key(bytes, n);
     }
     if (!source) offset = arena_append(bytes, n);
     const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, lead_bits, im.bpp | source};
@@ -1137,7 +2292,21 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     op.y0 = im.dsay + first;
     op.y1 = im.dsay + last;
     op.image = im.id;
+    const Range pal_range_of_upload = op.range;
     queue_pre(op);
+    if (g_tex_overrides_enabled) {
+        if (op.range.lo < op.range.hi) {
+            const std::uint32_t b0 = static_cast<std::uint32_t>(op.range.lo >> 8) & 0x3FFFu;
+            const std::uint32_t b1 = static_cast<std::uint32_t>((op.range.hi - 1) >> 8) & 0x3FFFu;
+            for (std::uint32_t b = b0; b <= b1; ++b) g_dbp_tex_key[b] = 1ull;
+        }
+        if (im.done == 0 && im.dsax == 0 && im.dsay == 0 && upload_key != 0) note_tex_upload_key(im.dbp, upload_key);
+    }
+    if (g_dec_on) id_upload(op.rec, source ? mix64(g_cache_uid, 0xCAC4Eull) : n < kCacheMinBytes ? bytes_id(bytes, n) : fresh_id());  // after queue_pre, as hwcache below
+    if (g_live) hw::pal_upload(im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, static_cast<std::uint32_t>(lead_bits), im.bpp, bytes, size, pal_range_of_upload.lo, pal_range_of_upload.hi);
+    if (hwcache::g_on)  // after queue_pre: a batch that reads this memory was flushed by it and saw the old numbers
+        hwcache::write_upload(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1), static_cast<int>(im.dsay + last),
+                               lead_bits == 0 && im.done % im.rrw == 0 && (pixels % im.rrw == 0 || im.done + pixels >= im.total), bytes, size);
     im.done += pixels;
     return used;
 }
@@ -1151,9 +2320,12 @@ void finish_image_if_done() {
     if (psm != PSMCT32 && psm != PSMCT16 && psm != PSMCT16S && psm != PSMT8 && psm != PSMT4 && psm != PSMZ32 && psm != PSMZ16 && psm != PSMZ16S) return;
     std::uint32_t pw, ph;
     page_size(psm, pw, ph);
+    // every page the upload touches, even in part: a texture sheet smaller than a page (Urban Reign's 128 x 64 4-bit button icons, put
+    // where the fights draw their glow) must not be read as an upscaled picture (kUpscaledSource)
     const std::uint32_t per_row = std::max<std::uint32_t>(1, im.dbw * 64 / pw), rows = im.rrw ? im.total / im.rrw : 0;
-    for (std::uint32_t py = (im.dsay + ph - 1) / ph; py < (im.dsay + rows) / ph; ++py)
-        for (std::uint32_t px = (im.dsax + pw - 1) / pw; px < (im.dsax + im.rrw) / pw; ++px)
+    if (!rows) return;
+    for (std::uint32_t py = im.dsay / ph; py <= (im.dsay + rows - 1) / ph; ++py)
+        for (std::uint32_t px = im.dsax / pw; px <= (im.dsax + im.rrw - 1) / pw; ++px)
             g_rendered[((im.dbp * 256 + (px + py * per_row) * 8192) >> 13) & 511u] = false;
 }
 
@@ -1190,6 +2362,107 @@ void wait_until(const bool &flag) {
     while (!flag) pump();
 }
 
+void query_mapped(WGPUMapAsyncStatus status, WGPUStringView, void *, void *) {
+    if (status == WGPUMapAsyncStatus_Success) g_query_ready = true;
+    else g_query_pending = false;
+}
+
+namespace post {
+// The calls submit() makes after recording, in the same order (upload_data, the parameter records, finish, submit, the timestamps' map,
+// the poll; then present()'s present and releases).
+void run(Job &j) {
+    const auto from = std::chrono::steady_clock::now();
+    if (j.blit) wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, j.blit_words, sizeof j.blit_words);
+    j.blit = false;
+    if (j.writes) {
+        wgpuQueueWriteBuffer(g_queue, j.data, 0, j.arena.data(), j.arena.size() * 4);
+        if (j.shape_words) wgpuQueueWriteBuffer(g_queue, j.data, j.arena.size() * 4, j.shapes.data(), j.shape_words * 4);
+        wgpuQueueWriteBuffer(g_queue, j.params, 0, j.records.data(), j.records.size() * kParamStride);
+    }
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(j.enc, nullptr);
+    wgpuQueueSubmit(g_queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(j.enc);
+    if (j.measure) {
+        WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+        cb.mode = WGPUCallbackMode_AllowProcessEvents;
+        cb.callback = query_mapped;
+        wgpuBufferMapAsync(g_query_read, WGPUMapMode_Read, 0, 16, cb);
+    }
+    wgpuDevicePoll(g_device, false, nullptr);
+    if (j.view) {
+        wgpuSurfacePresent(g_surface);
+        wgpuTextureViewRelease(j.view);
+        wgpuTextureRelease(j.texture);
+    }
+    j.enc = nullptr;
+    j.view = nullptr;
+    j.texture = nullptr;
+    j.arena.clear();
+    j.shapes.used = 0;
+    j.shape_words = 0;
+    j.records.clear();
+    g_state->ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
+    ++g_state->jobs;
+}
+
+#ifdef _WIN32
+extern "C" __declspec(dllimport) void *__stdcall GetModuleHandleW(const wchar_t *name);
+extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread();
+extern "C" __declspec(dllimport) void *__stdcall GetProcAddress(void *module, const char *name);
+#endif
+void loop() {
+#ifdef _WIN32  // the name shows in profilers and speedcheck (SetThreadDescription, Windows 10 1607 on, looked up so older systems still start)
+    using SetDescription = long(__stdcall *)(void *, const wchar_t *);
+    if (void *kernel = GetModuleHandleW(L"kernel32.dll"))
+        if (const auto set = reinterpret_cast<SetDescription>(GetProcAddress(kernel, "SetThreadDescription"))) set(GetCurrentThread(), L"ps2 submit");
+#elif defined(__linux__)
+    pthread_setname_np(pthread_self(), "ps2 submit");
+#endif
+    std::unique_lock<std::mutex> lock(g_state->mutex);
+    for (;;) {
+        g_state->cv.wait(lock, [] { return g_state->busy; });
+        lock.unlock();
+        run(g_state->job);
+        lock.lock();
+        g_state->busy = false;
+        g_state->cv.notify_all();
+    }
+}
+
+void drain() {
+    if (!g_state) return;
+    std::unique_lock<std::mutex> lock(g_state->mutex);
+    if (!g_state->busy) return;
+    wt::Scope s(wt::kDrain);
+    g_state->cv.wait(lock, [] { return !g_state->busy; });
+}
+
+// The job to fill: the last one is done, the thread exists.
+Job &slot() {
+    if (!g_state) {
+        g_state = new State;
+        std::thread(loop).detach();
+        std::atexit([] { drain(); });  // the last picture is submitted before the library is torn down
+    }
+    drain();
+    return g_state->job;
+}
+
+void go() {
+    std::lock_guard<std::mutex> lock(g_state->mutex);
+    g_state->busy = true;
+    g_state->cv.notify_all();
+}
+}  // namespace post
+
+bool wt::post_totals(std::uint64_t &ns, std::uint64_t &jobs) {
+    if (!post::g_state) return false;
+    ns = post::g_state->ns;
+    jobs = post::g_state->jobs;
+    return true;
+}
+
 WGPUBuffer make_buffer(std::uint64_t size, WGPUBufferUsage usage) {
     WGPUBufferDescriptor d = WGPU_BUFFER_DESCRIPTOR_INIT;
     d.size = size;
@@ -1218,9 +2491,23 @@ void rebuild_group() {
     g_group = make_group(g_params, g_data);
 }
 
+// The data buffer holds the arena and then the frame's shape records (g_shapes): the raster commands' parameter word 1 (where their records start)
+// gets the arena's size added. Called once per submit, after the tile jobs are placed (they add to the arena).
+void place_shapes() {
+    const std::uint32_t base = static_cast<std::uint32_t>(g_arena.size());
+    for (const std::uint32_t p : g_shape_params) g_param_records[p][1] += base;
+    g_shape_params.clear();
+}
+
+// One write each: the arena, and the shape records right after it, from where draw() put them.
+void upload_data() {
+    wt::write(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    if (g_shapes.begin) wt::write(g_queue, g_data, g_arena.size() * 4, g_shapes.words.data(), g_shapes.begin * 4);
+}
+
 void ensure_capacity() {
     bool changed = false;
-    const std::uint64_t data_bytes = std::max<std::uint64_t>(g_arena.size() * 4, 16);
+    const std::uint64_t data_bytes = std::max<std::uint64_t>((g_arena.size() + g_shapes.begin) * 4, 16);
     if (data_bytes > g_data_size) {
         if (g_data) wgpuBufferRelease(g_data);
         g_data_size = std::max<std::uint64_t>(g_data_size * 2, (data_bytes + (4u << 20) - 1) & ~((4ull << 20) - 1));
@@ -1248,8 +2535,8 @@ void profile_submit() {
         g_profile_read = make_buffer(kMax * 16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
     ensure_capacity();
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    upload_data();
+    wt::write(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
     for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
@@ -1261,7 +2548,7 @@ void profile_submit() {
         WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
         if (i < n) cd.timestampWrites = &writes;
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
-        wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
+        wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
         const std::uint32_t offset = c.param * kParamStride;
         wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
@@ -1301,6 +2588,7 @@ void profile_submit() {
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
+    g_shapes.restart();
     g_decoded_used = 0;
     g_clut_loads = 0;
 }
@@ -1311,31 +2599,58 @@ void bench_capture() {
     sub.params.resize(g_param_records.size() * (kParamStride / 4));
     if (!g_param_records.empty()) std::memcpy(sub.params.data(), g_param_records.data(), g_param_records.size() * kParamStride);
     sub.arena.assign(g_arena.data(), g_arena.data() + g_arena.size());
+    sub.arena.insert(sub.arena.end(), g_shapes.words.data(), g_shapes.words.data() + g_shapes.begin);  // as the chip gets them (place_shapes)
     sub.info = std::move(g_bench_info);
     g_bench_info.clear();
 }
 
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
 void submit(WGPUTextureView present_view = nullptr) {
+    const auto write_blit = [] {  // present()'s parameters, when this submit does not hand them to the job
+        if (!post::g_blit_pending) return;
+        post::drain();
+        wt::write(g_queue, g_blit_params, 0, post::g_blit, sizeof post::g_blit);
+        post::g_blit_pending = false;
+    };
     if (g_commands.empty() && !present_view
-        ) return;
+        && !(g_live && hw::live_pending())
+        ) {
+        write_blit();
+        return;
+    }
+    post::drain();  // the last hand-over is submitted (and its picture presented) before anything of this one reaches the queue
+    finish_tiles(true);  // the helper's lists go into the arena before it is measured, copied or uploaded
+    place_shapes();
     if (g_bench.capturing) bench_capture();
     if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
+        write_blit();
         profile_submit();
         return;
     }
     ensure_capacity();
+    const bool card_work = g_live && hw::live_pending();
+    if (card_work) hw::live_prepare();
     if (ps2::hitch::on()) {
         for (const Command &c : g_commands) {
             ++g_hitch_now.commands[c.pipeline];
             g_hitch_now.groups[c.pipeline] += static_cast<std::uint64_t>(c.x) * c.y;
         }
-        g_hitch_now.arena_bytes += g_arena.size() * 4;
+        g_hitch_now.arena_bytes += (g_arena.size() + g_shapes.begin) * 4;
         ++g_hitch_now.submits;
     }
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    // the submit thread takes the writes, finish, submit and present (post above); a present only with its surface texture (present())
+    const bool async = post::enabled() && !g_live && !hwcache::g_on && !ps2::hitch::on() && !g_bench.configured && !hw::g_memlog
+        && (!present_view || post::g_present_texture);
+    post::g_presented_async = false;
+    const bool post_writes = async && post::mode() == 1;
+    const bool post_blit = post::g_blit_pending && post_writes && present_view;
+    if (!post_blit) write_blit();  // first, as present() did before
+    if (!post_writes) {
+        upload_data();
+        wt::write(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    }
     if (g_query_ready) {
+        wt::Scope s(wt::kCopy);
         const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
         if (mapped) {
             std::uint64_t t[2];
@@ -1349,16 +2664,27 @@ void submit(WGPUTextureView present_view = nullptr) {
         g_query_ready = g_query_pending = false;
     }
     const bool measure = g_timestamps && !g_query_pending
+        && !card_work
         ;
-    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    if (wt::g_on) ++wt::g_submits;
+    WGPUCommandEncoder enc;
+    {
+        wt::Scope s(wt::kEncoder);
+        enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    }
     WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
     writes.querySet = g_queries;
     writes.beginningOfPassWriteIndex = 0;
     writes.endOfPassWriteIndex = 1;
     WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
     if (measure) cd.timestampWrites = &writes;
-    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+    WGPUComputePassEncoder pass;
+    {
+        wt::Scope s(wt::kBeginPass);
+        pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+    }
     Pipeline current = kPipelines;
+    bool current_mip = false;
     ++g_submits;
     ++g_total_passes;
     static const unsigned skip = [] {  // PS2_GPU_SKIP=raster,snapshot: leave these kinds of work out (the picture is wrong; only to see what they cost)
@@ -1368,24 +2694,42 @@ void submit(WGPUTextureView present_view = nullptr) {
             if (list.find(kEntryPoints[k]) != std::string::npos) mask |= 1u << k;
         return mask;
     }();
+    std::uint32_t command_index = 0;
     for (const Command &c : g_commands) {
+        if (card_work && hw::live_before(command_index)) {  // the card's work that goes before this command (the order of the command stream)
+            pass = hw::live_encode(enc, command_index, pass);  // may go on in this compute pass or end it
+            if (!pass) pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+            current = kPipelines;
+        }
+        ++command_index;
         ++g_dispatches[c.pipeline];
         if (skip & (1u << c.pipeline)) continue;
-        if (c.pipeline != current) {
-            wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
+        if (c.pipeline != current || c.mip != current_mip) {
+            wt::Scope s(wt::kSetPipeline);
+            wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
             current = c.pipeline;
+            current_mip = c.mip;
         }
         const std::uint32_t offset = c.param * kParamStride;
-        wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        {
+            wt::Scope s(wt::kSetGroup);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        }
+        wt::Scope s(wt::kDispatch);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
     }
-    wgpuComputePassEncoderEnd(pass);
-    wgpuComputePassEncoderRelease(pass);
+    if (card_work) pass = hw::live_encode(enc, ~0u, pass);
+    if (pass) {
+        wt::Scope s(wt::kEndPass);
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+    }
     if (measure) {
         wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
     }
     if (present_view) {
+        wt::Scope s(wt::kRenderPass);
         WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
         color.view = present_view;
         color.loadOp = WGPULoadOp_Clear;
@@ -1414,30 +2758,77 @@ void submit(WGPUTextureView present_view = nullptr) {
         wgpuRenderPassEncoderEnd(rp);
         wgpuRenderPassEncoderRelease(rp);
     }
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
-    wgpuQueueSubmit(g_queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
-    wgpuCommandEncoderRelease(enc);
+    if (async) {
+        post::Job &j = post::slot();
+        j.enc = enc;
+        j.measure = measure;
+        j.data = g_data;
+        j.params = g_params;
+        if (present_view) j.view = present_view, j.texture = post::g_present_texture;
+        j.writes = post_writes;
+        j.blit = post_blit;
+        if (post_blit) std::memcpy(j.blit_words, post::g_blit, sizeof post::g_blit), post::g_blit_pending = false;
+        if (post_writes) {
+        if (wt::g_on) wt::g_bytes += (g_arena.size() + g_shapes.begin) * 4 + g_param_records.size() * kParamStride;
+        // the frame's words go with the job and the drawing thread goes on with the job's emptied ones from last time
+        std::swap(j.arena, g_arena);
+        std::swap(j.records, g_param_records);
+        j.shape_words = g_shapes.begin;
+        if (g_shapes.begin) {
+            const std::size_t open = g_shapes.size();  // the open batch's records stay here, at the front (as Shapes::restart)
+            std::swap(j.shapes, g_shapes.words);
+            g_shapes.words.used = 0;
+            if (open) g_shapes.words.append(j.shapes.data() + j.shape_words, open);
+            g_shapes.begin = 0;
+        }
+        }
+        if (measure) g_query_pending = true;
+        post::go();
+        post::g_presented_async = present_view != nullptr;
+    } else {
+    const std::uint64_t t_finish = g_live ? hw::live_clock() : 0;  // PS2_GPU_HW_TIME=1 times wgpu's finish and submit
+    WGPUCommandBuffer cmd;
+    {
+        wt::Scope s(wt::kFinish);
+        cmd = wgpuCommandEncoderFinish(enc, nullptr);
+    }
+    const std::uint64_t t_submit = g_live ? hw::live_clock() : 0;
+    {
+        wt::Scope s(wt::kSubmit);
+        wgpuQueueSubmit(g_queue, 1, &cmd);
+    }
+    if (g_live) hw::live_wgpu_time(card_work, t_finish, t_submit, hw::live_clock());
+    {
+        wt::Scope s(wt::kSubmit);  // the releases belong to the submit's cost (wgpu frees the recorded commands here)
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+    }
+    if (wt::g_on) --wt::g_calls[wt::kSubmit];
+    if (g_live) hw::live_submitted();
+    hw::memlog_tick(g_instance, g_queue, frame_count());  // PS2_GPU_HW_MEMLOG=<n>
     if (measure) {
+        wt::Scope s(wt::kCopy);
         g_query_pending = true;
         WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
         cb.mode = WGPUCallbackMode_AllowProcessEvents;
-        cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *, void *) {
-            if (status == WGPUMapAsyncStatus_Success) g_query_ready = true;
-            else g_query_pending = false;
-        };
+        cb.callback = query_mapped;
         wgpuBufferMapAsync(g_query_read, WGPUMapMode_Read, 0, 16, cb);
     }
+    {
+        wt::Scope s(wt::kPoll);
 #ifdef __EMSCRIPTEN__
-    wgpuInstanceProcessEvents(g_instance);
+        wgpuInstanceProcessEvents(g_instance);
 #else
-    wgpuDevicePoll(g_device, false, nullptr);
+        wgpuDevicePoll(g_device, false, nullptr);
 #endif
+    }
+    }
     g_commands.clear();
     g_command_info.clear();
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
+    g_shapes.restart();
     g_decoded_used = 0;
     g_clut_loads = 0;
 }
@@ -1455,6 +2846,7 @@ bool log_slow_readback(double ms) {
 }
 
 void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) {
+    post::drain();
     const bool diagnose = readback_log_enabled();
     const auto started = diagnose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
@@ -1472,6 +2864,7 @@ void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t 
     };
     const auto submitted = diagnose ? std::chrono::steady_clock::now() : started;
     cb.userdata1 = &done;
+    wt::Scope s(wt::kWait);
     wgpuBufferMapAsync(g_readback, WGPUMapMode_Read, 0, bytes, cb);
     wait_until(done);
     const auto ready = diagnose ? std::chrono::steady_clock::now() : started;
@@ -1486,6 +2879,7 @@ void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t 
 }
 
 void wait_gpu() {
+    post::drain();
     bool done = false;
     WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
     cb.mode = WGPUCallbackMode_AllowProcessEvents;
@@ -1505,6 +2899,7 @@ void bench_start() {
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     g_bench.capturing = true;
+    if (hw::enabled()) hw::capture_begin();
     g_bench.subs.clear();
     g_bench_info.clear();
     std::fprintf(stderr, "[bench] capturing the chip work of vblank %llu (game frame %llu)\n", static_cast<unsigned long long>(g_bench.vblank),
@@ -1530,14 +2925,16 @@ double bench_time(const std::vector<BenchBuffers> &bufs, unsigned skip, unsigned
         for (std::size_t i = 0; i < g_bench.subs.size(); ++i) {
             WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
             Pipeline current = kPipelines;
+            bool current_mip = false;
             for (std::size_t n = 0; n < g_bench.subs[i].commands.size(); ++n) {
                 const Command &c = g_bench.subs[i].commands[n];
                 if (skip & (1u << c.pipeline)) continue;
                 if (size_filter && size_filter <= 2 && c.pipeline == kRaster && ((c.x * c.y <= 8u) == (size_filter == 1))) continue;  // 1: leave out the small runs (8 tiles or fewer), 2: leave out the big ones
                 if (size_filter >= 3 && c.pipeline == kRaster && (g_bench_glow[i][n] != 0) == (size_filter == 3)) continue;  // 3: leave out the full-screen sprite passes (lane glow), 4: leave out all the others
-                if (c.pipeline != current) {
-                    wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
+                if (c.pipeline != current || c.mip != current_mip) {
+                    wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
                     current = c.pipeline;
+                    current_mip = c.mip;
                 }
                 const std::uint32_t offset = c.param * kParamStride;
                 wgpuComputePassEncoderSetBindGroup(pass, 0, bufs[i].group, 1, &offset);
@@ -1562,7 +2959,7 @@ double bench_time(const std::vector<BenchBuffers> &bufs, unsigned skip, unsigned
 double bench_one(const BenchBuffers &buf, const Command &c, unsigned count) {
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
-    wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
+    wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
     const std::uint32_t offset = c.param * kParamStride;
     for (unsigned i = 0; i < count; ++i) {
         wgpuComputePassEncoderSetBindGroup(pass, 0, buf.group, 1, &offset);
@@ -1590,12 +2987,173 @@ std::uint64_t fnv_hash(const std::vector<std::uint32_t> &words, std::size_t firs
     return h;
 }
 
+// PS2_GPU_BENCH_SHOT=<prefix> (with PS2_GPU_HW=1): writes the picture in the frame buffer after a replay to <prefix>-<tag>.ppm. PS2_GPU_BENCH_SHOT_FB=fbp,fbw,width,height picks the buffer (256,8,512,448).
+void bench_shot(const char *tag) {
+    const std::string prefix = os::env("PS2_GPU_BENCH_SHOT");
+    if (prefix.empty()) return;
+    unsigned fbp = 256, fbw = 8, w = 512, h = 448;
+    if (const std::string spec = os::env("PS2_GPU_BENCH_SHOT_FB"); !spec.empty()) std::sscanf(spec.c_str(), "%u,%u,%u,%u", &fbp, &fbw, &w, &h);
+    std::vector<std::uint32_t> rgba;
+    std::uint32_t pw = 0, ph = 0;
+    display(DisplaySource{fbp, fbw, PSMCT32, 0, 0, w, h, false}, rgba, pw, ph);
+    if (std::FILE *f = os::open((prefix + "-" + tag + ".ppm").c_str(), "wb")) {
+        std::fprintf(f, "P6\n%u %u\n255\n", pw, ph);
+        for (std::uint32_t c : rgba) {
+            const unsigned char px[3] = {static_cast<unsigned char>(c), static_cast<unsigned char>(c >> 8), static_cast<unsigned char>(c >> 16)};
+            std::fwrite(px, 1, 3, f);
+        }
+        std::fclose(f);
+    }
+}
+
+std::uint64_t bytes_of_vram() { return static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale; }
+
+// PS2_GPU_HW_CLASS=1 (with PS2_GPU_BENCH): sorts every shape of the captured frame into the classes of hw::shape_class
+// (what a render pipeline could draw, and why not), counts shapes, covered pixels and drawing runs per class, and measures what the compute path
+// spends on each class: the replay is timed again with that class's shapes made invisible (their screen box is emptied, so the drawing program
+// skips them at the first test; the walk through the tile lists stays). The difference to the unchanged replay is the class's chip time.
+void bench_classes(const std::vector<BenchBuffers> &bufs, unsigned reps) {
+    const int kinds = hw::class_count();
+    struct Total {
+        std::uint64_t shapes = 0, runs = 0, only = 0;
+        double area = 0, ms = 0, ms_median = 0;
+    };
+    std::vector<Total> tot(kinds);
+    std::vector<std::vector<std::vector<std::uint32_t>>> where(g_bench.subs.size(), std::vector<std::vector<std::uint32_t>>(kinds));  // [submit][class] -> word offset of each shape's record
+    std::uint64_t runs = 0, hw_runs = 0, shapes = 0;
+    double area_all = 0;
+    for (std::size_t i = 0; i < g_bench.subs.size(); ++i) {
+        const BenchSubmit &sub = g_bench.subs[i];
+        std::size_t info = 0;
+        for (std::size_t n = 0; n < sub.commands.size(); ++n) {
+            const Command &c = sub.commands[n];
+            if (c.pipeline != kRaster) continue;
+            while (info < sub.info.size() && sub.info[info].index < n) ++info;
+            if (info >= sub.info.size() || sub.info[info].index != n) continue;
+            const BenchInfo &bi = sub.info[info];
+            const std::uint32_t *param = sub.params.data() + static_cast<std::size_t>(c.param) * (kParamStride / 4);
+            const std::uint32_t prim_offset = param[1], setup_offset = param[2];
+            std::vector<bool> seen(kinds, false);
+            int classes_in_run = 0;
+            for (std::uint32_t j = 0; j < bi.prims; ++j) {
+                const std::uint32_t at = prim_offset + j * kPrimWords;
+                const std::uint32_t *rec = sub.arena.data() + at;
+                const int k = hw::shape_class(rec, sub.arena.data() + setup_offset + rec[0] * kSetupWords);
+                const double bw = static_cast<double>((rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1), bh = static_cast<double>((rec[3] >> 16) - (rec[2] >> 16) + 1);
+                const double area = (rec[1] & kKindMask) == 0 ? std::fabs(0.5 / static_cast<double>(u2f(rec[10]))) : bw * bh;
+                ++tot[k].shapes;
+                tot[k].area += area;
+                area_all += area;
+                ++shapes;
+                where[i][k].push_back(at);
+                if (!seen[k]) {
+                    seen[k] = true;
+                    ++tot[k].runs;
+                    ++classes_in_run;
+                }
+            }
+            ++runs;
+            bool all_hw = true;
+            for (int k = 0; k < kinds; ++k) all_hw = all_hw && (!seen[k] || hw::class_is_hardware(k));
+            if (all_hw) ++hw_runs;
+            if (classes_in_run == 1)
+                for (int k = 0; k < kinds; ++k)
+                    if (seen[k]) ++tot[k].only;
+        }
+    }
+    const auto timed = [&](double &median) {
+        std::vector<double> t;
+        for (int trial = 0; trial < 5; ++trial) t.push_back(bench_time(bufs, 0, reps, true));
+        std::sort(t.begin(), t.end());
+        median = t[t.size() / 2];
+        return t.front();
+    };
+    const auto upload = [&](std::size_t i, const std::vector<std::uint32_t> &arena) {
+        if (!arena.empty()) wgpuQueueWriteBuffer(g_queue, bufs[i].data, 0, arena.data(), arena.size() * 4);
+    };
+    const auto hide = [&](std::vector<std::vector<std::uint32_t>> &copies, std::size_t i, const std::vector<std::uint32_t> &offsets) {
+        for (std::uint32_t at : offsets) copies[i][at + 2] = 0x7FFF7FFFu, copies[i][at + 3] = 0;  // the box test of the drawing program fails everywhere
+    };
+    double base_median = 0;
+    bench_time(bufs, 0, 3, true);
+    const double base = timed(base_median);
+    std::fprintf(stderr, "[class] the unchanged frame: best %.3f ms, median %.3f ms per frame (5 trials of %u replays)\n", base, base_median, reps);
+    std::vector<std::vector<std::uint32_t>> copies;
+    for (const BenchSubmit &sub : g_bench.subs) copies.push_back(sub.arena);
+    const auto run_without = [&](const std::vector<int> &which, double &median) {
+        for (std::size_t i = 0; i < copies.size(); ++i) {
+            copies[i] = g_bench.subs[i].arena;
+            for (int k : which) hide(copies, i, where[i][k]);
+            upload(i, copies[i]);
+        }
+        wait_gpu();
+        const double best = timed(median);
+        for (std::size_t i = 0; i < copies.size(); ++i) upload(i, g_bench.subs[i].arena);
+        wait_gpu();
+        return best;
+    };
+    {  // control: the arena uploaded again with nothing hidden must time like the unchanged frame, or the differences below are an artefact of the upload
+        double median = 0;
+        const double control = run_without({}, median);
+        std::fprintf(stderr, "[class] control (arena uploaded again, nothing hidden): best %.3f / median %.3f ms\n", control, median);
+    }
+    for (int k = 0; k < kinds; ++k) {
+        if (!tot[k].shapes) continue;
+        double median = 0;
+        const double without = run_without({k}, median);
+        tot[k].ms = base - without;
+        tot[k].ms_median = base_median - median;
+    }
+    std::vector<int> tricky, friendly;
+    for (int k = 0; k < kinds; ++k)
+        if (tot[k].shapes) (hw::class_is_hardware(k) ? friendly : tricky).push_back(k);
+    double only_hw = 0, only_hw_median = 0, only_tricky = 0, only_tricky_median = 0;
+    if (!tricky.empty()) only_hw = run_without(tricky, only_hw_median);
+    if (!friendly.empty()) only_tricky = run_without(friendly, only_tricky_median);
+    std::fprintf(stderr, "[class] %zu drawing runs, %llu shapes, %.0f covered pixels (before the depth test); runs with only card-friendly shapes: %llu (%.1f%%)\n", static_cast<std::size_t>(runs), static_cast<unsigned long long>(shapes), area_all, static_cast<unsigned long long>(hw_runs),
+                 100.0 * static_cast<double>(hw_runs) / static_cast<double>(std::max<std::uint64_t>(1, runs)));
+    for (int k = 0; k < kinds; ++k) {
+        if (!tot[k].shapes) continue;
+        std::fprintf(stderr, "[class] %-62s runs %4llu (only this: %4llu) shapes %6llu (%5.1f%%) pixels %10.0f (%5.1f%%) chip ms %6.3f best / %6.3f median\n", hw::class_name(k), static_cast<unsigned long long>(tot[k].runs), static_cast<unsigned long long>(tot[k].only),
+                     static_cast<unsigned long long>(tot[k].shapes), 100.0 * static_cast<double>(tot[k].shapes) / static_cast<double>(std::max<std::uint64_t>(1, shapes)), tot[k].area, 100.0 * tot[k].area / std::max(1.0, area_all), tot[k].ms, tot[k].ms_median);
+    }
+    std::fprintf(stderr, "[class] compute path, only the card-friendly shapes (the rest hidden): best %.3f / median %.3f ms; only the other shapes: best %.3f / median %.3f ms; the frame: best %.3f / median %.3f ms\n", only_hw, only_hw_median, only_tricky, only_tricky_median, base, base_median);
+}
+
+// The card path's replay of the captured frame; `vram` is the memory after the painter's replay of the same frame.
+void bench_card(const std::vector<std::uint32_t> &vram, std::vector<BenchBuffers> &bufs, unsigned reps, void (*shot)(const char *)) {
+    hw::Context ctx{g_device, g_queue, g_vram, g_tables, g_clut, g_scratch, g_cache, g_layout, {}, kUpload, kLoadClut, kRaster, kDecode, kSnapshot, g_scale, g_bench.vram_copy, bytes_of_vram(), kGsShader};
+    ctx.pipelines.assign(g_pipelines, g_pipelines + kPipelines);
+    ctx.read_vram = [](std::vector<std::uint32_t> &out) {
+        out.resize(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
+        read_back(g_vram, out.size() * 4, out.data());
+    };
+    ctx.read_before = [](std::vector<std::uint32_t> &out) {
+        out.resize(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
+        read_back(g_bench.vram_copy, out.size() * 4, out.data());
+    };
+    ctx.painter_vram = &vram;
+    std::vector<hw::Sub> subs;
+    for (std::size_t i = 0; i < g_bench.subs.size(); ++i) {
+        hw::Sub sub;
+        for (const Command &c : g_bench.subs[i].commands) sub.commands.push_back({static_cast<std::uint32_t>(c.pipeline), c.x, c.y, c.param});
+        sub.group = bufs[i].group;
+        subs.push_back(std::move(sub));
+    }
+    hw::run(ctx, subs, reps, [] { wait_gpu(); }, shot);
+}
 
 void bench_run() {
     g_bench.capturing = false;
     g_bench.done = true;
     if (g_bench.subs.empty()) {
         std::fprintf(stderr, "[bench] no chip work in that frame\n");
+        if (hw::enabled() && hw::diff_enabled()) {  // arm for the next frame
+            if (g_bench.vram_copy) wgpuBufferRelease(g_bench.vram_copy);
+            g_bench.vram_copy = nullptr;
+            g_bench.done = false;
+            g_bench.vblank = g_vblanks + 2;
+        }
         return;
     }
     wait_gpu();
@@ -1614,6 +3172,22 @@ void bench_run() {
         for (const Command &c : sub.commands) ++kind_count[c.pipeline];
     }
     wait_gpu();
+    if (hw::enabled() && hw::diff_enabled()) {  // tests/hwalpha.cpp: the painter once, the card path once, then arm the bench for the next frame
+        bench_time(bufs, 0, 1, true);
+        std::vector<std::uint32_t> painter(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
+        read_back(g_vram, painter.size() * 4, painter.data());
+        bench_card(painter, bufs, 1, nullptr);
+        for (BenchBuffers &b : bufs) {
+            wgpuBindGroupRelease(b.group);
+            wgpuBufferRelease(b.params);
+            wgpuBufferRelease(b.data);
+        }
+        wgpuBufferRelease(g_bench.vram_copy);
+        g_bench.vram_copy = nullptr;
+        g_bench.done = false;
+        g_bench.vblank = g_vblanks + 2;
+        return;
+    }
     std::fprintf(stderr, "[bench] %zu submits, %zu commands:", g_bench.subs.size(), total_commands);
     for (int k = 0; k < kPipelines; ++k) std::fprintf(stderr, " %s %llu", kEntryPoints[k], static_cast<unsigned long long>(kind_count[k]));
     std::fprintf(stderr, "\n");
@@ -1656,6 +3230,7 @@ void bench_run() {
         for (int trial = 0; trial < 3; ++trial) best = std::min(best, bench_time(bufs, v.skip, reps, v.restore, v.size_filter));
         std::fprintf(stderr, "[bench] %-32s %8.3f ms per frame\n", v.name, best);
     }
+    if (hw::class_enabled()) bench_classes(bufs, reps);
     // what one dispatch costs when it does next to nothing: 64 words copied by a snapshot
     {
         BenchBuffers micro;
@@ -1702,6 +3277,7 @@ void bench_run() {
     }
     // the memory after one more copy of the frame: a fingerprint to compare builds (and the whole memory in a file if asked for)
     bench_time(bufs, 0, 1, true);
+    if (hw::enabled()) bench_shot("compute");
     std::vector<std::uint32_t> vram(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
     read_back(g_vram, vram.size() * 4, vram.data());
     std::fprintf(stderr, "[bench] memory after the frame: hash %016llx\n", static_cast<unsigned long long>(fnv_hash(vram, 0, vram.size())));
@@ -1711,11 +3287,29 @@ void bench_run() {
             std::fclose(f);
         }
     }
+    if (hw::enabled()) {
+        hw::survey_print();
+        bench_card(vram, bufs, reps, bench_shot);
+    }
     for (BenchBuffers &b : bufs) {
         wgpuBindGroupRelease(b.group);
         wgpuBufferRelease(b.params);
         wgpuBufferRelease(b.data);
     }
+}
+
+// The highest mip level the mipmap words `mip` (make_mip) let a pixel read: 0 when only the base texture is read. With LCM = 1 the level of
+// detail is K alone, so at most the level after floor(K) is reached (the *_MIPMAP_LINEAR blend); K <= 0 magnifies (level 0).
+std::uint32_t mip_top_of(const std::uint32_t *mip) {
+    if (!mip[0]) return 0;
+    const std::uint32_t mxl = (mip[0] >> 1) & 7u, mmin = (mip[0] >> 5) & 7u;
+    if (mxl == 0 || mmin < 2) return 0;
+    if (mip[0] & 1u) {
+        const float lod = static_cast<float>(static_cast<std::int32_t>(((mip[0] >> 16) & 0xFFFu) << 20) >> 20) / 16.0f;
+        if (lod <= 0.0f) return 0;
+        return std::min(static_cast<std::uint32_t>(std::floor(lod)) + 1u, mxl);
+    }
+    return mxl;
 }
 
 // The shader's picture of a memory format: base address, pages per row, swizzle table, packed layout bits, pixel mask (what fmt_of in gs.wgsl used to compute per tile pass).
@@ -1796,6 +3390,39 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     fmt_words(w[3], w[1], w[2], w + 30);
     fmt_words(w[6], w[5], w[2], w + 35);
     return flags;
+}
+
+// The mipmap words of a setup (docs/mipmap.md), kept out of the 40 setup words: [0] is 0 when the texture
+// is sampled as before (one level and the same filter for magnification and reduction), else bit 31 plus TEX1's LCM (bit 0), MXL (bits 1-3,
+// at most 6), MMAG (4), MMIN (5-7), L (8-9) and K (16-27, signed 7.4); [1..6] base pointer | buffer width << 14 of levels 1 to 6 (mip_levels).
+// Returns the highest level a pixel can read: 0 when only the base texture is read.
+std::uint32_t make_mip(const State &st, std::uint64_t attr, std::uint32_t *m) {
+    std::fill(m, m + kMipWords, 0u);
+    static const bool off = std::getenv("PS2_MIPMAP") && std::getenv("PS2_MIPMAP")[0] == '0';  // PS2_MIPMAP=0: level 0 and MMAG's filter, as before (an A/B aid)
+    if (!(attr & 0x10u) || off) return 0;
+    const Context &c = st.ctx[(attr >> 9) & 1u];
+    const std::uint32_t lcm = c.tex1 & 1u, mxl = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex1 >> 2) & 7u, 6u), mmag = static_cast<std::uint32_t>(c.tex1 >> 5) & 1u;
+    const std::uint32_t mmin = static_cast<std::uint32_t>(c.tex1 >> 6) & 7u, l = static_cast<std::uint32_t>(c.tex1 >> 19) & 3u, kraw = static_cast<std::uint32_t>(c.tex1 >> 32) & 0xFFFu;
+    const bool min_linear = mmin == 1 || mmin >= 4, levels = mxl > 0 && mmin >= 2;
+    if (mmag == (min_linear ? 1u : 0u) && !levels) return 0;
+    m[0] = 0x80000000u | lcm | (mxl << 1) | (mmag << 4) | (mmin << 5) | (l << 8) | (kraw << 16);
+    std::uint32_t bp[7], bw[7];
+    mip_levels(c, bp, bw);
+    for (int n = 1; n <= 6; ++n) m[n] = bp[n] | (bw[n] << 14);
+    return mip_top_of(m);
+}
+
+// The bytes the mip levels 1 to `top` of a setup span (the base texture is cache.tex, the region of setup words 12 to 14).
+Range mip_range(const std::uint32_t *setup, const std::uint32_t *mip, std::uint32_t top) {
+    Range r;
+    const std::uint32_t tw = setup[15] & 0xFFu, th = setup[15] >> 8;
+    for (std::uint32_t n = 1; n <= top; ++n) {
+        const std::uint32_t lw = tw > n ? tw - n : 0u, lh = th > n ? th - n : 0u;
+        const int w = std::max(1 << lw, static_cast<int>((setup[18] >> 16) >> n) + 1), h = std::max(1 << lh, static_cast<int>((setup[19] >> 16) >> n) + 1);
+        const Range level = region(mip[n] & 0x3FFFu, (mip[n] >> 14) & 0x3Fu, setup[14], 0, 0, w - 1, h - 1);
+        r.add(level.lo, level.hi);
+    }
+    return r;
 }
 
 // The smallest and largest texel position (u0, v0, u1, v1, in texels, before any wrap mode) that the corners of a shape name; false when they cannot be said.
@@ -1954,7 +3581,8 @@ void exact_selftest() {
                 const float origin = geometry[axis], d = geometry[2 + axis], a = uv[axis], bb = uv[3 + axis];
                 for (int p = axis ? miny : minx; p <= (axis ? maxy : maxx); ++p)
                     for (std::uint32_t j = 0; j <= g_scale; ++j) {
-                        const float position = j == g_scale ? static_cast<float>(p) : static_cast<float>(p) + static_cast<float>(j) / static_cast<float>(g_scale);
+                        const float centre = g_scale > 1 ? 0.5f / static_cast<float>(g_scale) - 0.5f : 0.0f;
+                        const float position = j == g_scale ? static_cast<float>(p) : static_cast<float>(p) + static_cast<float>(j) / static_cast<float>(g_scale) + centre;
                         const float t = d != 0.0f ? (position - origin) / d : 0.0f;
                         for (const bool fused : {false, true}) {
                             const float u = (fused ? std::fma(bb - a, t, a) : a + (bb - a) * t) / 16.0f;
@@ -2110,9 +3738,11 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
         return give_up();
     }
     bool selected_dx12 = false;
+    g_vendor_id = 0;
     WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
     if (wgpuAdapterGetInfo(adapter, &info) == WGPUStatus_Success) {
         selected_dx12 = info.backendType == WGPUBackendType_D3D12;
+        g_vendor_id = info.vendorID;
         const char *api = info.backendType == WGPUBackendType_Vulkan ? "Vulkan" : info.backendType == WGPUBackendType_D3D12 ? "Direct3D 12" : info.backendType == WGPUBackendType_Metal ? "Metal" : "other";
         const bool software = info.adapterType == WGPUAdapterType_CPU;
         if (software && !software_ok)
@@ -2132,6 +3762,7 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
     WGPUFeatureName features[2];
     g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
     if (g_timestamps) features[dd.requiredFeatureCount++] = WGPUFeatureName_TimestampQuery;
+    if (hw::enabled() && wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending)) features[dd.requiredFeatureCount++] = WGPUFeatureName_DualSourceBlending;  // stored alpha in one draw; asked for only when the card path is on and the adapter offers it
     dd.requiredFeatures = features;
     dd.uncapturedErrorCallbackInfo.callback = on_error;
     bool device_done = false;
@@ -2158,6 +3789,8 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
 
 bool init(Mode m) {
     if (m == Mode::off) return false;
+    stat::init();
+    hwcache::init();
     struct Try {
         std::uint32_t backends;  // WGPUInstanceBackend flags (the web build has none)
         const char *name;
@@ -2178,6 +3811,10 @@ bool init(Mode m) {
     }
     if (order.empty()) {
 #ifdef _WIN32
+        if (hw::enabled()) {  // PS2_GPU_HW=1: on the one Windows laptop tried the card path ran faster on Vulkan while the painter is faster on Direct3D 12; PS2_GPU_BACKEND still wins.
+            order.push_back({WGPUInstanceBackend_Vulkan, "Vulkan"});
+            order.push_back({WGPUInstanceBackend_DX12, "Direct3D 12"});
+        } else
         {
             order.push_back({WGPUInstanceBackend_DX12, "Direct3D 12"});
             order.push_back({WGPUInstanceBackend_Vulkan, "Vulkan"});
@@ -2213,6 +3850,7 @@ bool init(Mode m) {
     if (!chosen) return false;
     if (forced) std::fprintf(stderr, "[gpu] graphics API: %s (asked for by PS2_GPU_BACKEND)\n", chosen->name);
     else if (chosen == &order[0] && order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (the default on Windows%s; PS2_GPU_BACKEND=vulkan or dx12 picks)\n", chosen->name,
+                 hw::enabled() ? " with PS2_GPU_HW=1" :
                  "");
     else if (order.size() > 1) std::fprintf(stderr, "[gpu] graphics API: %s (%s could not be used, see above)\n", chosen->name, order[0].name);
     if (g_dx12_compiler) std::fprintf(stderr, "[gpu] Direct3D 12 shader compiler: %s (PS2_DX12_COMPILER=fxc|dxc picks)\n", g_dx12_compiler);
@@ -2235,13 +3873,13 @@ bool init(Mode m) {
             g_bench.reps = std::clamp<unsigned long long>(reps, 1, 500);
         }
     }
-    if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
+    if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 4u);
+    // PS2_SHARP_2D: how upscaled 2D art (text, icons, menus) is filtered, see SHARP in gs.wgsl: 0 plain bilinear, 1 sharp (the
+    // default), 2 sharpest
+    if (const char *sharp = std::getenv("PS2_SHARP_2D")) g_sharp_2d = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(sharp)), 0u, 2u);
     g_copy_words = (1u << 20) * g_scale * g_scale;
     if (const int tile = std::atoi(os::env("PS2_TILE").c_str()); tile == 4 || tile == 8 || tile == 16) g_tile = tile;
-    g_tiles_per_row = (2048 * static_cast<int>(g_scale) + g_tile - 1) / g_tile;
-    g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row + 8, 0);
-    g_tile_fill.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row + 8, 0);
-    g_touched.assign(g_tile_count.size() + 8, 0);
+    tiles::configure(static_cast<int>(g_scale), g_tile);
     g_field_words = (1u << 19) * g_scale * g_scale;
     g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     std::vector<std::uint32_t> tables;
@@ -2253,8 +3891,14 @@ bool init(Mode m) {
     g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
-    g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
+    init_tex_overrides();
+    const std::uint64_t decoded_words = static_cast<std::uint64_t>(kCachedWords) + kDecodedWords + (g_tex_overrides_enabled ? kDecodedOverrideWords : 0);
+    const WGPUBufferUsage decoded_usage = WGPUBufferUsage_Storage | (g_tex_overrides_enabled ? WGPUBufferUsage_CopyDst : 0);
+    g_decoded = make_buffer(decoded_words * 4, decoded_usage);  // the kept textures, then this submit's pictures (plus override space only when PS2_TEX_OVERRIDES is on)
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
+    if (const char *cache = std::getenv("PS2_DECODE_CACHE")) g_dec_on = std::atoi(cache) != 0, g_dec_small = std::atoi(cache) != 2;  // 0 off, 2 not for small batches
+    g_dec_stat = !os::env("PS2_DECODE_CACHE_STAT").empty();
+    dec_reset();
     g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     if (g_timestamps) {
@@ -2313,30 +3957,98 @@ bool init(Mode m) {
     const bool explicit_fma = g_dx12_compiler && std::strcmp(g_dx12_compiler, "DXC") == 0 && os::env("PS2_EXPLICIT_FMA") != "0";
     if (explicit_fma) std::fprintf(stderr, "[gpu] shader sums written as fma() (DXC)\n");
     const auto compile_start = std::chrono::steady_clock::now();
+#ifdef __EMSCRIPTEN__
     WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
-    for (int i = 0; i < kPipelines; ++i) {
+#else
+    // wgpu normally adds its own run-time checks to the shader: every buffer index clamped where the graphics API does not
+    // bound it already, and a counter in every loop that breaks out after very many rounds. gs.wgsl keeps its indices inside
+    // its buffers itself (the explicit bounds there) and all its loops end, so PS2_GPU_TRUSTED=1 makes
+    // the built-in draw program without them (wgpu-native's wgpuDeviceCreateShaderModuleTrusted). On by default only for Intel graphics on Windows (trusted.hpp), where it was measured (a laptop); a shader loaded with PS2_GS_SHADER always keeps the checks.
+#ifdef _WIN32
+    const bool is_windows = true;
+#else
+    const bool is_windows = false;
+#endif
+    const char *trusted_why = "";
+    // (PS2_GS_SHADER_TRUSTED=1 lets a shader loaded from a file go without them too, so a shader experiment is timed as the built-in one runs)
+    const bool trusted = (shader_text.empty() || os::env("PS2_GS_SHADER_TRUSTED") == "1") &&
+                         trusted_shader(g_vendor_id, is_windows, os::env("PS2_GPU_TRUSTED"), &trusted_why);
+    if (trusted) std::fprintf(stderr, "[gpu] draw program without wgpu's run-time checks (%s)\n", trusted_why);
+    WGPUShaderModule module = trusted ? wgpuDeviceCreateShaderModuleTrusted(g_device, &md, WGPUShaderRuntimeChecks_None) : wgpuDeviceCreateShaderModule(g_device, &md);
+#endif
+    // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE, EXPLICIT_FMA, SHARP and HAS_MIP are listed only when it declares them
+    const bool has_tile = shader_text.empty() || shader_text.find("override TILE") != std::string::npos;
+    const bool has_fma = shader_text.empty() || shader_text.find("override EXPLICIT_FMA") != std::string::npos;
+    const bool has_mip = shader_text.empty() || shader_text.find("override HAS_MIP") != std::string::npos;
+    const bool has_sharp = shader_text.empty() || shader_text.find("override SHARP") != std::string::npos;
+    const int scale = static_cast<int>(g_scale), tile = g_tile;
+    const std::uint32_t sharp = g_sharp_2d;
+    // `mip`: the draw program that reads mipmap levels (HAS_MIP in gs.wgsl); without it the program is the plain one
+    auto make_pipeline = [=](int entry, bool mip) {
         WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
         cd.layout = g_pipeline_layout;
         cd.compute.module = module;
-        cd.compute.entryPoint = view(kEntryPoints[i]);
-        WGPUConstantEntry constants[3] = {WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT};
-        constants[0].key = view("SCALE");
-        constants[0].value = static_cast<double>(g_scale);
-        constants[1].key = view("TILE");
-        constants[1].value = static_cast<double>(g_tile);
-        constants[2].key = view("EXPLICIT_FMA");
-        constants[2].value = explicit_fma ? 1.0 : 0.0;
-        // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE and EXPLICIT_FMA are listed only when it declares them
-        const bool has_tile = shader_text.empty() || shader_text.find("override TILE") != std::string::npos;
-        const bool has_fma = shader_text.empty() || shader_text.find("override EXPLICIT_FMA") != std::string::npos;
-        cd.compute.constantCount = has_tile ? (has_fma ? 3 : 2) : 1;
+        cd.compute.entryPoint = view(kEntryPoints[entry]);
+        // a shader loaded with PS2_GS_SHADER may lack the later constants; each is listed only when the shader declares it
+        WGPUConstantEntry constants[5];
+        std::size_t count = 0;
+        const auto set = [&](bool declared, const char *key, double value) {
+            if (!declared) return;
+            constants[count] = WGPU_CONSTANT_ENTRY_INIT;
+            constants[count].key = view(key);
+            constants[count].value = value;
+            ++count;
+        };
+        set(true, "SCALE", static_cast<double>(scale));
+        set(has_tile, "TILE", static_cast<double>(tile));
+        set(has_fma, "EXPLICIT_FMA", explicit_fma ? 1.0 : 0.0);
+        set(has_sharp, "SHARP", static_cast<double>(sharp));
+        set(has_mip, "HAS_MIP", mip ? 1.0 : 0.0);
+        cd.compute.constantCount = count;
         cd.compute.constants = constants;
-        g_pipelines[i] = wgpuDeviceCreateComputePipeline(g_device, &cd);
+        return wgpuDeviceCreateComputePipeline(g_device, &cd);
+    };
+    // The mipmap variant of the draw program: most games never use it, and on FXC it would double the start. Built in a thread beside the
+    // plain programs and the game's own start (the browser build has none and does it after them); a batch with a mipmap table waits for
+    // it (pipeline_of).
+    if (g_raster_mip_thread) {
+        if (g_raster_mip_thread->joinable()) g_raster_mip_thread->join();
+        delete g_raster_mip_thread;
+        g_raster_mip_thread = nullptr;
+    }
+    g_raster_mip = nullptr;
+    g_raster_mip_ready.store(true, std::memory_order_release);  // nothing to wait for unless the thread below starts
+    // the module is released by whoever finishes last: this function after the plain programs, the thread after its one
+    auto users = std::make_shared<std::atomic<int>>(has_mip ? 2 : 1);
+    const auto release_module = [users, module]() {
+        if (users->fetch_sub(1) == 1) wgpuShaderModuleRelease(module);
+    };
+    const auto build_mip = [make_pipeline, release_module]() {
+        const auto start = std::chrono::steady_clock::now();
+        g_raster_mip = make_pipeline(kRaster, true);
+        std::fprintf(stderr, "[gpu] mipmap draw program %s in %.0f ms\n", g_raster_mip ? "compiled" : "FAILED (levels are ignored)", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        release_module();
+    };
+#ifndef __EMSCRIPTEN__
+    if (has_mip) {
+        g_raster_mip_ready.store(false, std::memory_order_release);
+        g_raster_mip_thread = new std::thread(build_mip);
+    }
+#endif
+    for (int i = 0; i < kPipelines; ++i) {
+        g_pipelines[i] = make_pipeline(i, false);
         if (!g_pipelines[i]) return false;
     }
     std::fprintf(stderr, "[gpu] %d shaders compiled in %.0f ms\n", kPipelines, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count());
-    wgpuShaderModuleRelease(module);
+#ifdef __EMSCRIPTEN__
+    if (has_mip) build_mip();  // the browser build has no threads
+#endif
+    release_module();
     ensure_capacity();
+    if (hw::enabled() && !g_bench.configured && os::env("PS2_GPU_HW_LIVE") != "0") {  // PS2_GPU_HW=1 without the bench draws the running game's plain shapes on the card
+        hw::Context hc{g_device, g_queue, g_vram, g_tables, g_clut, g_scratch, g_cache, g_layout, {}, kUpload, kLoadClut, kRaster, kDecode, kSnapshot, g_scale, nullptr, bytes_of_vram(), kGsShader};
+        g_live = hw::live_init(hc);
+    }
     g_mode = m;
     g_current_mode = m;
     return true;
@@ -2350,6 +4062,7 @@ void draw(const State &st, const Vertex *v, int count) {
     const Context &c = st.ctx[(attr >> 9) & 1u];
     SetupCache &cache = g_setup_cache;
     if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot
+        || (cache.waits && hw::live_ready_changed(cache.ready_seen))
         ) {
         cache.generation = g_setup_generation;
         cache.attr = attr;
@@ -2357,12 +4070,20 @@ void draw(const State &st, const Vertex *v, int count) {
         cache.serial = ++g_setup_serials;
         const std::uint32_t *w = cache.setup;
         cache.flags = make_setup(st, attr, cache.setup);
+        cache.route = g_live ? hw::live_route(cache.setup) : 0;
+        cache.look = g_live ? hw::live_look() : -1;
+        cache.waits = g_live && cache.route == 0 && hw::live_waits();
         cache.key = static_cast<std::uint64_t>(w[1]) | (static_cast<std::uint64_t>(w[2]) << 14) | (static_cast<std::uint64_t>(w[3]) << 20) |
                     (static_cast<std::uint64_t>(w[5]) << 26) | (static_cast<std::uint64_t>(w[6]) << 40);
+        cache.mip_top = make_mip(st, attr, cache.mip);
         if (cache.flags & 2u) {
             const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
             const int tex_w = std::max(1 << tw, static_cast<int>(w[18] >> 16) + 1), tex_h = std::max(1 << th, static_cast<int>(w[19] >> 16) + 1);
             cache.tex = region(w[12], w[13], w[14], 0, 0, tex_w - 1, tex_h - 1);
+            if (cache.mip_top) {  // the other levels are read too: uploads, palette loads and the cuts below must see their memory as well
+                const Range levels = mip_range(w, cache.mip, cache.mip_top);
+                cache.tex.add(levels.lo, levels.hi);
+            }
         }
     }
     const std::uint32_t *setup = cache.setup;
@@ -2374,34 +4095,19 @@ void draw(const State &st, const Vertex *v, int count) {
     const auto sx = [&](const Vertex &p) { return (static_cast<float>(p.x) - static_cast<float>(ofx)) / 16.0f; };
     const auto sy = [&](const Vertex &p) { return (static_cast<float>(p.y) - static_cast<float>(ofy)) / 16.0f; };
     const float samples = static_cast<float>(g_scale);
-    const auto first = [&](float lo) { return static_cast<int>(std::floor(std::ceil(lo * samples) / samples)); };
 
     std::uint32_t rec[kPrimWords] = {};
     int minx, miny, maxx, maxy;
     switch (prim) {
     case 3: case 4: case 5: {
         if (count < 3) return;
-        const float x0 = sx(v[0]), y0 = sy(v[0]), x1 = sx(v[1]), y1 = sy(v[1]), x2 = sx(v[2]), y2 = sy(v[2]);
-        const float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
-        if (area == 0.0f) return;
-        minx = std::max(scax0, first(std::min({x0, x1, x2})));
-        maxx = std::min(scax1, static_cast<int>(std::ceil(std::max({x0, x1, x2}))) - 1);
-        miny = std::max(scay0, first(std::min({y0, y1, y2})));
-        maxy = std::min(scay1, static_cast<int>(std::ceil(std::max({y0, y1, y2}))) - 1);
-        rec[1] = 0;
-        const float xy[6] = {x0, y0, x1, y1, x2, y2};
-        for (int i = 0; i < 6; ++i) rec[4 + i] = f2u(xy[i]);
-        rec[10] = f2u(1.0f / area);
-        const float sg = area > 0.0f ? 1.0f : -1.0f;
-        const auto inclusive = [&](float ax, float ay, float bx, float by) {
-            const float gx = (ay - by) * sg, gy = (bx - ax) * sg;
-            return gx > 0.0f || (gx == 0.0f && gy > 0.0f);
-        };
-        rec[27] = (inclusive(x1, y1, x2, y2) ? 1u : 0u) | (inclusive(x2, y2, x0, y0) ? 2u : 0u) | (inclusive(x0, y0, x1, y1) ? 4u : 0u);
-        for (int i = 0; i < 3; ++i) attrs(rec, i, v[i], fst, iip ? nullptr : &v[2]);
-        rec[24] = v[0].z;
-        rec[25] = f2u(static_cast<float>(static_cast<std::int64_t>(v[1].z) - static_cast<std::int64_t>(v[0].z)));
-        rec[26] = f2u(static_cast<float>(static_cast<std::int64_t>(v[2].z) - static_cast<std::int64_t>(v[0].z)));
+        // the corners, the edge rule and the box as vectors (setup.hpp; tests/draw_setup.cpp checks it against the scalar arithmetic)
+        int box[4];
+        if (!prim_setup::triangle(rec, box, v, ofx, ofy, samples, setup[10], setup[11], fst, iip)) return;
+        minx = box[0];
+        miny = box[1];
+        maxx = box[2];
+        maxy = box[3];
         break;
     }
     case 6: {
@@ -2459,6 +4165,7 @@ void draw(const State &st, const Vertex *v, int count) {
     maxx = std::min(maxx, 2047);
     maxy = std::min(maxy, 2047);
     if (minx > maxx || miny > maxy) return;
+    if (stat::g_on) stat::shape(st, attr, v, count, flags, minx, miny, maxx, maxy, cache.tex.lo, cache.tex.hi);
     if (g_batch_log_frame > 1 && frame_count() == g_batch_log_frame) {  // PS2_BATCH_LOG=<frame>: every shape of that frame, for working out how the batches could be cut differently offline
         int r[4] = {0, 0, 0, 0};
         const bool ok = (flags & 2u) && texel_rect(setup, v, count, prim, fst, r);
@@ -2472,6 +4179,15 @@ void draw(const State &st, const Vertex *v, int count) {
     if (b.key != ~0ull && b.key != key) {
         g_why = kWhyKey;
         emit_all();
+    }
+    int sroute = 0;
+    if (g_live) {  // a batch is wholly card or wholly painter, cut at a switch; lines and points are the painter's, a shape the chip draws nothing for goes with the batch it is in
+        sroute = (rec[1] & kKindMask) > 1 ? 0 : cache.route;
+        if (sroute == 2) sroute = b.prims.empty() ? 0 : b.route;
+        if (!b.prims.empty() && sroute != b.route) {
+            g_why = kWhyRoute;
+            emit_all();
+        }
     }
     const Range &tex = cache.tex;
     if (flags & 2u) {
@@ -2488,7 +4204,11 @@ void draw(const State &st, const Vertex *v, int count) {
             const bool fb_untouched = upper_byte && b.fpsm == PSMCT24;
             const auto written = [&](const Range &t) { return (!fb_untouched && t.overlaps(b.fb_range.lo, b.fb_range.hi)) || (b.zwrite && !z_untouched && t.overlaps(b.z_range.lo, b.z_range.hi)); };
             int rect[4];
-            if (written(tex)) {
+            if (written(tex) && cache.mip_top) {
+                // The rectangle and word-set tests below know only the base level: a shape that reads other levels too is cut off whenever any level was drawn on.
+                g_why = kWhyTexel;
+                emit_all();
+            } else if (written(tex)) {
                 // The tests below are page and box tests. A sprite that reads the memory of the frame in another layout (indices of 8 bits read as the pixels of 32 bits, a
                 // texture window with wrap mode 3) is cut off by them although it often touches no word that an earlier shape wrote: exact_clear looks at the words.
                 const bool exact_ok = prim == 6 && !shares_frame(setup, b);
@@ -2537,6 +4257,7 @@ void draw(const State &st, const Vertex *v, int count) {
         b.zpsm = setup[6];
         b.zte = false;
         b.zwrite = false;
+        b.route = sroute;
         b.rx1 = -2;
     }
     b.zte = b.zte || zte;
@@ -2547,14 +4268,21 @@ void draw(const State &st, const Vertex *v, int count) {
         // the setup words did not change since the shape that wrote the last entry (the cache is only rebuilt in the block at the top)
         setup_index = static_cast<std::uint32_t>(setups - 1);
     } else {
-        if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, kSetupWords * 4) == 0) {
+        if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, kSetupWords * 4) == 0 &&
+            std::memcmp(b.mips.data() + (setups - 1) * kMipWords, cache.mip, kMipWords * 4) == 0) {
             setup_index = static_cast<std::uint32_t>(setups - 1);
         } else {
             setup_index = static_cast<std::uint32_t>(setups);
             b.setups.insert(b.setups.end(), setup, setup + kSetupWords);
+            b.mips.insert(b.mips.end(), cache.mip, cache.mip + kMipWords);
+            if (cache.mip[0]) {
+                b.any_mip = true;
+                ++(cache.mip_top ? g_mip_setups : g_filter_setups);
+            }
         }
         b.setup_serial = cache.serial;
     }
+    if (cache.mip[0]) ++(cache.mip_top ? g_mip_shapes : g_filter_shapes);
     if (flags & 2u) {
         if (g_batch_reads.empty() || g_batch_reads.back().lo != tex.lo || g_batch_reads.back().hi != tex.hi) {
             bool known = false;
@@ -2562,11 +4290,31 @@ void draw(const State &st, const Vertex *v, int count) {
             if (!known) g_batch_reads.push_back(tex);
         }
     }
+    // Upscaled, a bilinear texture the GS drew itself (a copy of the picture for an effect) holds SCALE x SCALE samples per texel: the
+    // shader then filters between those samples instead of between whole texels (kUpscaledSource, sample_upscaled in gs.wgsl). Only
+    // the texels this shape reads count: a big texture may reach round to the frame buffer without reading it.
+    if (g_scale > 1 && (flags & 2u) && (flags & 16384u)) {
+        int rect[4];
+        if (texel_rect(setup, v, count, prim, fst, rect)) {
+            const Range used = region(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]);
+            if (rendered(pages(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3])) ||
+                (!b.prims.empty() && used.overlaps(b.fb_range.lo, b.fb_range.hi)))
+                rec[1] |= kUpscaledSource;
+        }
+    }
     rec[0] = setup_index;
     rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
     rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
+    const bool fresh_batch = b.prims.empty();
     b.prims.append(rec, kPrimWords);
-    exact_follow(rec, setup);
+    // Every kStreamStep shapes of a big batch go to the tile helper at once (tiles.hpp), so its lists are mostly built when the batch ends.
+    if (const std::size_t words = b.prims.size(); words % (kPrimWords * tiles::kStreamStep) == 0) {
+        const std::uint32_t shapes = static_cast<std::uint32_t>(words / kPrimWords);
+        if (g_stream) tiles::feed(g_stream, b.prims.data(), shapes);
+        else if (tiles_to_helper() && tiles::backlog() < tiles::kMaxBacklog) g_stream = tiles::open(b.prims.data(), shapes);
+    }
+    if (g_exact.pending_valid || g_exact.state == 1) exact_follow(rec, setup);  // it does nothing else (most shapes: a call saved)
+    if (g_live && b.route == 1) hw::live_shape(cache.look, setup, rec, fresh_batch);  // the card's checks start now
     b.minx = std::min(b.minx, minx);
     b.miny = std::min(b.miny, miny);
     b.maxx = std::max(b.maxx, maxx);
@@ -2592,6 +4340,7 @@ void image_begin(const State &s) {
     im.bpp = bits_per_pixel(im.dpsm);
     im.id = ++g_image_ids ? g_image_ids : ++g_image_ids;
     im.active = im.total != 0;
+    if (stat::g_on && im.active) stat::upload(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay), im.rrw, im.total / im.rrw, static_cast<std::uint64_t>(im.total) * im.bpp / 8);
 }
 
 void image_data(const std::uint8_t *data, std::size_t bytes) {
@@ -2615,9 +4364,29 @@ void local_copy(const State &s) {
     const std::uint64_t buf = s.bitbltbuf, pos = s.trxpos, reg = s.trxreg;
     const std::uint32_t w = static_cast<std::uint32_t>(reg) & 0xFFFu, h = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
     if (!w || !h) return;
+    if (g_live) {  // the copy reads the source rectangle and overwrites the destination rectangle
+        const int sx = static_cast<int>(pos) & 0x7FF, sy = static_cast<int>(pos >> 16) & 0x7FF, dx = static_cast<int>(pos >> 32) & 0x7FF, dy = static_cast<int>(pos >> 48) & 0x7FF;
+        const Range from = pages(static_cast<std::uint32_t>(buf) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 16) & 0x3Fu, static_cast<std::uint32_t>(buf >> 24) & 0x3Fu, sx, sy, sx + static_cast<int>(w) - 1, sy + static_cast<int>(h) - 1);
+        const Range to = pages(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu, dx, dy, dx + static_cast<int>(w) - 1, dy + static_cast<int>(h) - 1);
+        hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
+        hw::live_reader(from.lo, from.hi);
+        hw::live_writer(to.lo, to.hi);
+        hw::pal_write(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu, dx, dy, dx + static_cast<int>(w) - 1, dy + static_cast<int>(h) - 1);
+    }
+    if (hwcache::g_on)
+        hwcache::write_region(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
+                              static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, (static_cast<int>(pos >> 32) & 0x7FF) + static_cast<int>(w) - 1,
+                              (static_cast<int>(pos >> 48) & 0x7FF) + static_cast<int>(h) - 1, hwcache::kCopy);
+    if (stat::g_on) stat::local_copy(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
+                                     static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, w, h);
     mark_rendered(pages(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
                         static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, (static_cast<int>(pos >> 32) & 0x7FF) + static_cast<int>(w) - 1,
                         (static_cast<int>(pos >> 48) & 0x7FF) + static_cast<int>(h) - 1));
+    if (g_dec_on)
+        stamp_pages(pages(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
+                          static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, (static_cast<int>(pos >> 32) & 0x7FF) + static_cast<int>(w) - 1,
+                          (static_cast<int>(pos >> 48) & 0x7FF) + static_cast<int>(h) - 1),
+                    true);
     const std::uint32_t read = push_params({static_cast<std::uint32_t>(buf) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 16) & 0x3Fu, static_cast<std::uint32_t>(buf >> 24) & 0x3Fu,
                                             static_cast<std::uint32_t>(pos) & 0x7FFu, static_cast<std::uint32_t>(pos >> 16) & 0x7FFu, w, h});
     const std::uint32_t write = push_params({static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
@@ -2639,13 +4408,22 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     const std::uint32_t tc = static_cast<std::uint32_t>(texclut);
     const std::uint32_t cbp = static_cast<std::uint32_t>(tex0 >> 37) & 0x3FFFu, csm = static_cast<std::uint32_t>(tex0 >> 55) & 1u;
     const std::uint32_t cbw = tc & 0x3Fu, cou = (tc >> 6) & 0x3Fu, cov = (tc >> 12) & 0x3FFu;
+    if (stat::g_on) stat::clut_load();
     PreOp op;
     op.clut = true;
     const std::uint32_t rec[10] = {g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u, cbw, cou, cov};
     std::memcpy(op.rec, rec, sizeof rec);
+    {  // word 10: the slot entries the load writes, for load_clut in gs.wgsl (clut_entry): the first, and how many from there (wrapping at 512)
+        const bool eight = rec[6] != 0;
+        const std::uint32_t csa = rec[5], start = csm ? (csa * 16u) & 511u : eight ? 0u : (csa & 15u) * 16u;
+        op.rec[10] = start | (eight ? 256u : 16u) << 16;
+    }
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
+    if (g_dec_on) id_clut(op.rec);
+    if (g_live) hw::pal_clut(g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, psm == PSMT8 || psm == PSMT8H);  // after queue_pre (a pending batch that overwrites the palette was flushed by it)
+    if (hwcache::g_on) hwcache::clut_load(g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u, cbw, cou, cov);
     g_clut_slot = next;
     ++g_clut_loads;
 }
@@ -2656,6 +4434,18 @@ void flush() {
     if (g_mode == Mode::off) return;
     flush_all();
     submit();
+    wt::frame();
+    if (stat::g_on) stat::frame_end();
+    dec_stat_frame();
+    poll_tex_overrides_frame();
+    if (hwcache::g_on && hwcache::counting()) {
+        if (hwcache::verify_on()) {
+            static std::vector<std::uint8_t> memory(kMemorySize);
+            download(memory.data(), 0, kMemorySize);
+            hwcache::verify(memory.data());
+        }
+        hwcache::frame_end();
+    }
     if (g_batch_log) {
         std::uint32_t runs = 0, prims = 0;
         for (int w = 0; w < kWhys; ++w) runs += g_why_runs[w], prims += g_why_prims[w];
@@ -2679,6 +4469,7 @@ void flush() {
 void wait_idle() {
     flush_all();
     submit();
+    post::drain();
     bool done = false;
     WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
     cb.mode = WGPUCallbackMode_AllowProcessEvents;
@@ -2713,8 +4504,11 @@ bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t by
         g_pending.buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
     flush_all();
+    if (g_live) hw::live_position(static_cast<std::uint32_t>(g_commands.size())), hw::live_reader(offset, static_cast<std::uint64_t>(offset) + bytes);
     if (g_scale != 1) dispatch_linear(kResolve, bytes / 4, push_params({offset / 4}));
     submit();
+    post::drain();
+    wt::Scope s(wt::kCopy);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     wgpuCommandEncoderCopyBufferToBuffer(enc, g_scale == 1 ? g_vram : g_scratch, offset, g_pending.buffer, 0, bytes);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
@@ -2740,6 +4534,7 @@ bool finish_download(std::uint32_t serial) {
     if (!g_pending.busy || g_pending.serial != serial) return false;
     const bool diagnose = readback_log_enabled();
     const auto started = diagnose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    wt::Scope s(wt::kWait);
     while (g_pending.busy && !g_pending.ready) pump();
     if (diagnose && log_slow_readback(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count())) std::fprintf(stderr, "[readback] async frame %llu serial %u bytes %u: wait %.3f ms\n",
         static_cast<unsigned long long>(frame_count()), serial, g_pending.bytes,
@@ -2751,6 +4546,7 @@ bool finish_download(std::uint32_t serial) {
 
 void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
     flush_all();
+    if (g_live) hw::live_position(static_cast<std::uint32_t>(g_commands.size())), hw::live_reader(offset, static_cast<std::uint64_t>(offset) + bytes);
     if (g_scale == 1) {
         submit();
         read_back(g_vram, bytes, memory + offset, offset);
@@ -2763,6 +4559,7 @@ void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
 
 void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut) {
     flush_all();
+    if (g_live) hw::live_position(static_cast<std::uint32_t>(g_commands.size())), hw::live_reader(0, kMemorySize);  // states are the judge: everything the card holds goes back first
     submit();
     scale = g_scale;
     vram.resize(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
@@ -2773,9 +4570,30 @@ void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vec
 
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut) {
     wait_idle();
+    if (stat::g_on) stat::state_loaded();
+    if (hwcache::g_on) hwcache::state_loaded();
+    dec_reset();  // memory and palette are new: nothing kept is valid
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
-    std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
+    if (g_tex_overrides_enabled && from > 0 && vram.size() >= words * from) {
+        std::memset(g_dbp_tex_key, 0, sizeof g_dbp_tex_key);
+        g_state_vram_1x.resize(kMemorySize);
+        for (std::size_t w = 0; w < words; ++w) {
+            const std::uint32_t word = vram[w * from];
+            std::memcpy(&g_state_vram_1x[w * 4], &word, 4);
+        }
+    }
+    // A page counts as drawn by the GS when its samples differ within a texel; one that is the same in all of them was uploaded (or
+    // is flat, which reads the same either way).
+    std::fill(std::begin(g_rendered), std::end(g_rendered), false);
+    if (from == to && to > 1 && vram.size() == words * to)
+        for (std::size_t page = 0; page < 512; ++page)
+            for (std::size_t w = page * 2048; w < (page + 1) * 2048 && !g_rendered[page]; ++w)
+                for (std::uint32_t k = 1; k < to; ++k)
+                    if (vram[w * to + k] != vram[w * to]) {
+                        g_rendered[page] = true;
+                        break;
+                    }
     if (from == to && vram.size() == words * to) {
         wgpuQueueWriteBuffer(g_queue, g_vram, 0, vram.data(), vram.size() * 4);
     } else {
@@ -2785,17 +4603,29 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
         wgpuQueueWriteBuffer(g_queue, g_vram, 0, layers.data(), layers.size() * 4);
     }
     if (clut.size() >= kClutEntries) wgpuQueueWriteBuffer(g_queue, g_clut, static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4, clut.data(), kClutEntries * 4);
+    if (g_live) hw::pal_state(from == to && to == 1 && vram.size() == words ? vram.data() : nullptr, vram.size());
+    if (g_live) hw::live_state_loaded();  // memory is the truth: the card's pictures are dropped, nothing is written back
     wait_idle();
 }
 
 void stats() {
     if (g_mode == Mode::off) return;
+    if (g_live) hw::live_stats();
+    if (tiles::owner()) finish_tiles(true);  // the lists of the batches that were flushed but not submitted yet count in the fingerprint below; not from the emulation thread,
+                                             // which calls this at the end of a run while the window thread may still be placing jobs (a crash at the end, 2026-11-11)
+    tiles::report();
+    stat::report();
+    hwcache::report();
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "[gpu] mipmaps: %llu setups (%llu shapes) read levels above 0, %llu setups (%llu shapes) only pick the filter per pixel\n",
+                 static_cast<unsigned long long>(g_mip_setups), static_cast<unsigned long long>(g_mip_shapes), static_cast<unsigned long long>(g_filter_setups),
+                 static_cast<unsigned long long>(g_filter_shapes));
 }
 
 void configure_surface() {
+    post::drain();  // no present of the old swap chain may be in flight
     WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
     config.device = g_device;
     config.format = g_surface_format;
@@ -2827,6 +4657,7 @@ const char *present_mode_name(WGPUPresentMode mode) {
 
 bool attach_surface(const SurfaceTarget &target) {
     if (g_mode != Mode::primary || !g_device) return false;
+    post::drain();
     WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
 #ifdef __EMSCRIPTEN__
     WGPUEmscriptenSurfaceSourceCanvasHTMLSelector canvas = WGPU_EMSCRIPTEN_SURFACE_SOURCE_CANVAS_HTML_SELECTOR_INIT;
@@ -3050,7 +4881,23 @@ struct FakeStatus {
 
 // The parameters of the display kernel (gs.wgsl): the picture of the main read circuit, where to put it in the scratch buffer, and the
 // rectangle of the second read circuit that goes over it (all zero when there is none).
+// The display kernel's work: the picture comes from a card target when one holds it current, else from memory (after what the card holds newer there is written back).
 void push_display(const DisplaySource &src, std::uint32_t scratch_at, std::uint32_t param) {
+    if (g_live) {
+        const DisplayOverlay &o = src.overlay;
+        hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
+        const std::uint32_t words[19] = {src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, scratch_at,
+                                         o.active ? 1u : 0u, o.fbp, o.fbw, o.psm, o.dbx, o.dby, static_cast<std::uint32_t>(o.x), static_cast<std::uint32_t>(o.y), o.width, o.height};
+        const hw::LiveDisplay d{src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, scratch_at, src.halved, o.active};
+        if (hw::live_display(d, words, 19)) return;
+        const int rows = src.halved ? static_cast<int>((src.height + 1) / 2) : static_cast<int>(src.height);
+        const Range r = pages(src.fbp, src.fbw, src.psm, static_cast<int>(src.dbx), static_cast<int>(src.dby), static_cast<int>(src.dbx + src.width) - 1, static_cast<int>(src.dby) + rows - 1);
+        hw::live_reader(r.lo, r.hi);
+        if (o.active) {
+            const Range q = pages(o.fbp, o.fbw, o.psm, static_cast<int>(o.dbx), static_cast<int>(o.dby), static_cast<int>(o.dbx + o.width) - 1, static_cast<int>(o.dby + o.height) - 1);
+            hw::live_reader(q.lo, q.hi);
+        }
+    }
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
 }
 
@@ -3076,7 +4923,9 @@ bool present(const DisplaySource &src) {
     const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
     const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
     const std::uint32_t blit[8] = {src.width * g_scale, src.height * g_scale, current, previous, blend ? 1u : 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), ps2::video_options()};
-    wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, blit, sizeof blit);
+    post::drain();  // the last picture is presented before this one's acquire
+    std::memcpy(post::g_blit, blit, sizeof blit);  // written by the next submit (its job with the submit thread), before the frame's other writes
+    post::g_blit_pending = true;
     ++g_field;
     g_have_previous = true;
     g_last_width = src.width;
@@ -3089,7 +4938,10 @@ bool present(const DisplaySource &src) {
     const bool faked = fake.hit();
     if (faked && !fake.status) std::this_thread::sleep_for(std::chrono::seconds(12));
     if (faked && fake.status) st.status = static_cast<WGPUSurfaceGetCurrentTextureStatus>(fake.status);
-    else wgpuSurfaceGetCurrentTexture(g_surface, &st);
+    else {
+        wt::Scope s(wt::kAcquire);
+        wgpuSurfaceGetCurrentTexture(g_surface, &st);
+    }
     ps2::hitch::enter_present_stage(nullptr);
     const double acquire_ms = std::chrono::duration<double, std::milli>(PresentLog::Clock::now() - acquire_from).count();
     if (log.on) log.lap(log.acquire);
@@ -3103,21 +4955,29 @@ bool present(const DisplaySource &src) {
     WGPUTextureView target = wgpuTextureCreateView(st.texture, nullptr);
     const auto submit_from = PresentLog::Clock::now();
     ps2::hitch::enter_present_stage("submitting the picture (submit)");
+    post::g_present_texture = st.texture;
     submit(target);
+    post::g_present_texture = nullptr;
     if (log.on) log.lap(log.submit);
+    if (!post::g_presented_async) {  // else the submit thread presents it and releases the texture (post)
 #ifndef __EMSCRIPTEN__
-    ps2::hitch::enter_present_stage("presenting the picture (wgpuSurfacePresent)");
-    wgpuSurfacePresent(g_surface);
+        ps2::hitch::enter_present_stage("presenting the picture (wgpuSurfacePresent)");
+        {
+            wt::Scope s(wt::kPresent);
+            wgpuSurfacePresent(g_surface);
+        }
 #endif
-    ps2::hitch::enter_present_stage(nullptr);
-    if (log.on) log.lap(log.present);
-    if (const double ms = std::chrono::duration<double, std::milli>(PresentLog::Clock::now() - submit_from).count(); ms > kSlowMs) {
-        static unsigned slow = 0;
-        if (slow < 20 || slow % 100 == 0) std::fprintf(stderr, "[present] submitting and presenting a picture took %.0f ms (slow %u)\n", ms, slow + 1);
-        ++slow;
+        ps2::hitch::enter_present_stage(nullptr);
+        if (log.on) log.lap(log.present);
+        if (const double ms = std::chrono::duration<double, std::milli>(PresentLog::Clock::now() - submit_from).count(); ms > kSlowMs) {
+            static unsigned slow = 0;
+            if (slow < 20 || slow % 100 == 0) std::fprintf(stderr, "[present] submitting and presenting a picture took %.0f ms (slow %u)\n", ms, slow + 1);
+            ++slow;
+        }
+        wgpuTextureViewRelease(target);
+        wgpuTextureRelease(st.texture);
     }
-    wgpuTextureViewRelease(target);
-    wgpuTextureRelease(st.texture);
+    ps2::hitch::enter_present_stage(nullptr);
     if (ps2::hitch::on()) {  // PS2_HITCH_LOG=<ms>: a picture whose hand-over took long, with the steps of it (docs/hitches.md)
         const double f = log.flush - flush0, a = log.acquire - acquire0, s = log.submit - submit0, p = log.present - present0;
         ps2::hitch::picture_times() = {f, a, s, p};
@@ -3214,6 +5074,7 @@ bool make_overlay_pipeline() {
 }  // namespace
 
 void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height, std::uint32_t x, std::uint32_t y) {
+    post::drain();
     if (!rgba || !width || !height || !g_surface) {
         g_overlay.on = false;
         return;
@@ -3250,6 +5111,7 @@ void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t h
 
 bool present_again() {
     if (!g_surface || !g_have_previous) return false;
+    post::drain();
     // the same picture as the last present (its fields are still in the scratch buffer: the game draws nothing while it waits), with the
     // window's size and the picture look of now
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
@@ -3289,6 +5151,7 @@ Copy g_copies[3];
 std::uint64_t g_copy_order = 0;
 
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+    post::drain();
 #ifdef __EMSCRIPTEN__
     wgpuInstanceProcessEvents(g_instance);
 #else

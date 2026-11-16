@@ -93,8 +93,29 @@ function Is-Installed($tool) {
         (Test-Path -LiteralPath (Join-Path (Join-Path $Dir $tool.Name) $tool.Probe))
 }
 
-# Downloads $tool.Url to $dest, continuing a half-finished <dest>.part when the server allows it.
+# Downloads $tool.Url to $dest. GitHub's servers time out now and then for some players, so a failed try is repeated (5 tries,
+# 5 seconds apart; every try continues the half-finished file). Only when the last one fails does the script stop, and then
+# it says how to fetch the file by hand (docs\fetch-retry.md).
 function Download-File($tool, [string]$dest) {
+    $tries = 5
+    for ($try = 1; $try -le $tries; $try++) {
+        try { Download-Once $tool $dest; return }
+        catch {
+            if ($try -lt $tries) {
+                Say "  $(($_.Exception.Message -split "`n")[0].Trim())"
+                Say "  trying again in 5 seconds (try $($try + 1) of $tries)"
+                Start-Sleep -Seconds 5
+                continue
+            }
+            $hand = Join-Path $repo 'downloads'
+            Fail ($_.Exception.Message + "`n  To get it by hand: open $($tool.Url) in a browser, save the file as $($tool.File), " +
+                  "put it into $hand, then run this again (in the app: press Try again).")
+        }
+    }
+}
+
+# One try to download $tool.Url to $dest, continuing a half-finished <dest>.part when the server allows it.
+function Download-Once($tool, [string]$dest) {
     $part = "$dest.part"
     $total = [int64]$tool.Size
     $have = 0
@@ -153,7 +174,17 @@ function Download-File($tool, [string]$dest) {
 function Get-Verified($tool) {
     $zip = Join-Path $archives $tool.File
     for ($attempt = 1; $attempt -le 2; $attempt++) {
-        if (-not (Test-Path -LiteralPath $zip)) { Download-File $tool $zip }
+        if (-not (Test-Path -LiteralPath $zip)) {
+            # A file the player saved by hand into <repo>\downloads (its name from the URL) is used instead of downloading.
+            # It is copied, so a wrong one is only thrown away as a copy (the check below) and the next try downloads.
+            $hand = Join-Path (Join-Path $repo 'downloads') $tool.File
+            if (($attempt -eq 1) -and (Test-Path -LiteralPath $hand)) {
+                Say "  using the file you saved by hand: $hand"
+                New-Item -ItemType Directory -Force -Path $archives | Out-Null
+                Copy-Item -LiteralPath $hand -Destination $zip -Force
+            }
+            else { Download-File $tool $zip }
+        }
         $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
         if ($actual -eq $tool.Sha256) { Say '  checksum ok'; return $zip }
         Remove-Item -LiteralPath $zip -Force

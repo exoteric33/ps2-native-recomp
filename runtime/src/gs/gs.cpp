@@ -4,6 +4,7 @@
 #include "queue.hpp"
 #include "raster.hpp"
 #include "../hw.hpp"
+#include "../kernel.hpp"
 #ifdef PS2_GPU
 #include "gpu/gpu.hpp"
 #endif
@@ -228,7 +229,13 @@ struct CachedDownload {
     DownloadKey key;
     std::vector<std::uint8_t> data;
     std::uint64_t used;
+    std::uint64_t frame = 0;  // the frame the game last asked for this rectangle (frames_run)
 };
+
+// A cached download stands in for a fresh one only while the game reads the same rectangle every frame or so (the case the cache is
+// for: the answer is then one frame old). A read of a rectangle last asked for longer ago than this waits for the real contents:
+// Urban Reign reads its pause background once per pause, and the cache gave it the picture of the pause before.
+constexpr std::uint64_t kCacheFrames = 2;
 
 std::mutex g_cache_mutex;
 std::vector<CachedDownload> g_download_cache;
@@ -246,6 +253,7 @@ void remember(const DownloadKey &key, const std::uint8_t *data, std::size_t byte
     }
     it->data.assign(data, data + bytes);
     it->used = ++g_cache_clock;
+    it->frame = frames_run();
 }
 
 void forget(const DownloadKey &key) {
@@ -433,6 +441,30 @@ void swizzle_tables(std::vector<std::uint32_t> &out) {
     for (auto &row : g_offz16s) out.insert(out.end(), std::begin(row), std::end(row));
     for (auto &row : g_off8) out.insert(out.end(), std::begin(row), std::end(row));
     for (auto &row : g_off4) out.insert(out.end(), std::begin(row), std::end(row));
+}
+
+// The base pointer (in 256-byte blocks) and buffer width of mip levels 0 to 6 (GS User's Manual: TEX0, TEX1 MTBA, MIPTBP1/2; docs/mipmap.md).
+// MIPTBP1 holds levels 1 to 3 and MIPTBP2 levels 4 to 6, each as a 14-bit base pointer and a 6-bit width, 20 bits a level.
+// With MTBA = 1 the chip works out levels 1 to 3 itself; the rule used here (each level right after the one before, the buffer width halved)
+// is the natural packing and a guess in its details: the manual's restrictions on that mode are not checked.
+void mip_levels(const Context &c, std::uint32_t bp[7], std::uint32_t bw[7]) {
+    bp[0] = static_cast<std::uint32_t>(c.tex0) & 0x3FFFu;
+    bw[0] = static_cast<std::uint32_t>(c.tex0 >> 14) & 0x3Fu;
+    for (int n = 1; n <= 6; ++n) {
+        const std::uint64_t r = n <= 3 ? c.miptbp1 : c.miptbp2;
+        const int shift = ((n - 1) % 3) * 20;
+        bp[n] = static_cast<std::uint32_t>(r >> shift) & 0x3FFFu;
+        bw[n] = static_cast<std::uint32_t>(r >> (shift + 14)) & 0x3Fu;
+    }
+    if (!((c.tex1 >> 9) & 1u)) return;
+    const std::uint32_t psm = static_cast<std::uint32_t>(c.tex0 >> 20) & 0x3Fu;
+    const std::uint32_t tw = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 26) & 0xFu, 10u), th = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 30) & 0xFu, 10u);
+    for (std::uint32_t n = 1; n <= 3; ++n) {
+        const std::uint32_t w = 1u << (tw > n - 1 ? tw - (n - 1) : 0u), h = 1u << (th > n - 1 ? th - (n - 1) : 0u);
+        const std::uint32_t bytes = w * h * bits_per_pixel(psm) / 8u;
+        bp[n] = (bp[n - 1] + std::max(1u, (bytes + 255u) / 256u)) & 0x3FFFu;
+        bw[n] = std::max(1u, bw[n - 1] / 2u);
+    }
 }
 
 std::uint32_t address32(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {
@@ -725,7 +757,8 @@ void transfer(const State &s, std::uint64_t dir) {
 
 }
 
-static void kick(bool draw) {
+// Inlined into the PACKED run (write_packed_run): as a call of its own it cost the ship about 0.15 ms of the drawing thread a frame.
+[[gnu::always_inline]] static inline void kick(bool draw) {
     State &s = g_state;
     const std::uint32_t prim = static_cast<std::uint32_t>(s.prim) & 7u;
     const int needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
@@ -933,11 +966,7 @@ static void write_packed_generic(std::uint32_t reg, const Reg128 &q);
 // stores them; write() would unpack the vertex words into one 64-bit value just for vertex() to take them apart again. It counts the register
 // in g_writes (statistics) and does not change g_setup_generation for these registers, as write() does. The rest, and everything while
 // PS2_TRACE_GSSEQ prints the writes, goes the old way.
-void write_packed(std::uint32_t reg, const Reg128 &q) {
-    if (g_gsseq) [[unlikely]] {
-        write_packed_generic(reg, q);
-        return;
-    }
+[[gnu::always_inline]] static inline void packed_one(std::uint32_t reg, const Reg128 &q) {
     State &s = g_state;
     switch (reg) {
     case 0x1: {
@@ -965,6 +994,28 @@ void write_packed(std::uint32_t reg, const Reg128 &q) {
         break;
     }
     default: write_packed_generic(reg, q); break;
+    }
+}
+
+void write_packed(std::uint32_t reg, const Reg128 &q) {
+    if (g_gsseq) [[unlikely]] {
+        write_packed_generic(reg, q);
+        return;
+    }
+    packed_one(reg, q);
+}
+
+// `count` qwords of PACKED data in a row, the first for descriptor `reg` of `regs` (`nreg` of them): the same writes in the same order as
+// write_packed for each one, but one call for the run instead of one per qword. On the God of War ship (about 53,000 small triangles a
+// frame, nine qwords each) the calls, the trace check and the reloads around them took about 0.3 ms of the drawing thread a frame.
+void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg) {
+    for (std::uint32_t k = 0; k < count; ++k) {
+        Reg128 q;
+        std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
+        const std::uint32_t r = static_cast<std::uint32_t>(regs >> (reg * 4)) & 0xFu;
+        if (g_gsseq) [[unlikely]] write_packed_generic(r, q);
+        else packed_one(r, q);
+        if (++reg >= nreg) reg = 0;
     }
 }
 
@@ -1025,12 +1076,18 @@ void read_image(std::uint8_t *data, std::uint32_t qwords) {
     key.qwords = qwords;
     g_shadow.offset += qwords * 16;
     const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
-    {
+    // A depth buffer is always read as it is now: a game that reads its depth and writes it back (Digital Devil Saga does it in
+    // every frame) would otherwise put the depth of the frame before back and draw against it (lights that are tested against
+    // the ceiling go missing while the camera moves).
+    const std::uint32_t spsm = static_cast<std::uint32_t>(key.buf >> 24) & 0x3Fu;
+    const bool depth = spsm == PSMZ32 || spsm == PSMZ24 || spsm == PSMZ16 || spsm == PSMZ16S;
+    if (!depth) {
         std::lock_guard lock(g_cache_mutex);
         const auto it = std::find_if(g_download_cache.begin(), g_download_cache.end(), [&](const CachedDownload &c) { return c.key == key; });
-        if (it != g_download_cache.end() && it->data.size() == bytes) {
+        if (it != g_download_cache.end() && it->data.size() == bytes && frames_run() - it->frame <= kCacheFrames) {
             std::memcpy(data, it->data.data(), bytes);
             it->used = ++g_cache_clock;
+            it->frame = frames_run();
             queue::post(queue::kDownloadAsync, qwords, 0, &key, sizeof key);
             return;
         }
@@ -1115,7 +1172,10 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
     case 0x0050: g_synch2 = value; break;
     case 0x0060: g_syncv = value; break;
     case 0x0070:
-        if (trace_display() && value != g_dispfb[0]) std::fprintf(stderr, "[gs] dispfb1 0x%llX\n", static_cast<unsigned long long>(value));
+        if (value != g_dispfb[0]) {
+            if (trace_display()) std::fprintf(stderr, "[gs] dispfb1 0x%llX f%llu\n", static_cast<unsigned long long>(value), static_cast<unsigned long long>(frame_count()));
+            kernel::pace_picture();  // a new picture shown (the end-of-run count; the hold of a game with a picture pace)
+        }
         g_dispfb[0] = value;
         break;
     case 0x0080:
@@ -1123,7 +1183,10 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
         g_display[0] = value;
         break;
     case 0x0090:
-        if (trace_display() && value != g_dispfb[1]) std::fprintf(stderr, "[gs] dispfb2 0x%llX\n", static_cast<unsigned long long>(value));
+        if (value != g_dispfb[1]) {
+            if (trace_display()) std::fprintf(stderr, "[gs] dispfb2 0x%llX f%llu\n", static_cast<unsigned long long>(value), static_cast<unsigned long long>(frame_count()));
+            kernel::pace_picture();  // a new picture shown (the end-of-run count; the hold of a game with a picture pace)
+        }
         g_dispfb[1] = value;
         break;
     case 0x00A0:
@@ -1331,7 +1394,13 @@ void flush_and_wait() {
 #endif
 }
 
-void start_thread() { queue::render().start(32u << 20); }
+// The drawing thread's ring, 8 MiB: the largest message seen in nine games is 256 KiB, anything over
+// 2 MiB goes through a heap copy (queue.cpp), and a smaller ring keeps the copy in the cache (Silent Hill 2 6 % faster than with 32 MiB).
+// PS2_GS_RING_MB=<n> sets another size (a power of two is taken).
+void start_thread() {
+    const char *mb = std::getenv("PS2_GS_RING_MB");
+    queue::render().start((mb && std::atoi(mb) > 0 ? static_cast<std::size_t>(std::atoi(mb)) : 8u) << 20);
+}
 
 std::uint32_t g_present_frame = 0;
 

@@ -19,6 +19,10 @@ struct Input {
     std::uint32_t entry = 0;
     std::vector<std::uint8_t> code;
     int unit = 1;
+    // When the input was recorded (any increasing number; 0 = unknown). With times, a program goes into a file chosen by its place in the
+    // recording order, so recording more programs changes the last files and leaves the earlier ones as they were: the tool gives the time
+    // of the .bin file. Without times (live compiling) the programs are sorted by key and cut into files in that order.
+    std::uint64_t order = 0;
 };
 
 struct Result {

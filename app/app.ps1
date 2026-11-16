@@ -385,8 +385,9 @@ function Test-GameRunning([string]$exe) {
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Updates (the Update button). The only network use is two small lookups at the start (the newest version of the public repo)
-# and, when the player presses Update, the download of that version's zip. Nothing is ever uploaded.
+# Updates. The only network use is two small lookups at the start (the newest version of the public repo) and, when a newer
+# version is out, the download of its zip: by itself when the app opens and nothing else is going on (docs/auto-update.md), or
+# when the player presses Update on the welcome card (a build or game was started first). Nothing is ever uploaded.
 #
 # How the versions are told apart: the newest one is the commit id GitHub names for the branch main of the public repo (a 40-digit
 # hex text, asked with the "sha" media type). The installed one is tools\update\installed.txt, written by an update. A copy that
@@ -401,7 +402,10 @@ $UpdateArchive = "https://github.com/$UpdateRepo/archive"
 if ($env:PS2APP_UPDATE_TEST -match '^http://(127\.0\.0\.1|localhost):\d+$') { $UpdateApi = $env:PS2APP_UPDATE_TEST + '/api'; $UpdateArchive = $env:PS2APP_UPDATE_TEST + '/archive' }
 $UpdateDir = Join-Path $Root 'tools\update'
 # What an update never touches: everything the player made or downloaded, and a git clone's own folder.
-$UpdateKeep = @('games', 'tools', 'build', 'generated', 'isos', 'third_party', 'wt', 'logs', '.git')
+# The look for a newer version gets 10 s to answer; comparing the app's own files (no network) gets 40 s in all.
+$CheckLimitSec = 10
+$CheckCompareLimitSec = 40
+$UpdateKeep = @('games', 'tools', 'build', 'generated', 'isos', 'third_party', 'wt', 'logs', 'downloads', '.git')
 
 function Get-InstalledVersion {
     $file = Join-Path $UpdateDir 'installed.txt'
@@ -515,6 +519,7 @@ try {
         if ($installed -eq $newest) { $sh.Result = 'current'; return }
         # Not the version this app recorded (or none): are the files the same as the newest version's anyway?
         $tree = (Get-Text "$api/git/trees/${newest}?recursive=1" 'application/vnd.github+json') | ConvertFrom-Json
+        $sh.Phase = 'compare'   # the network part is over; hashing the own files is not held to the short limit
         $cmp = Compare-TreeToFiles $tree $root
         $same = $cmp.Same
         $count = $cmp.Count
@@ -706,7 +711,7 @@ if (-not $created) {
 # ---------------------------------------------------------------------------------------------------------------------
 # Child processes
 
-$State = @{ Build = $null; Image = ''; Name = ''; Game = $null; Playing = $null; PlayStarted = [datetime]::MinValue; Seq = 0; Patch = $null; Newest = ''; UpdateJob = $null; Batch = $null; Restarting = $false }
+$State = @{ Build = $null; Image = ''; Name = ''; Game = $null; Playing = $null; PlayStarted = [datetime]::MinValue; Seq = 0; Patch = $null; Newest = ''; UpdateJob = $null; Batch = $null; Restarting = $false; AutoUpdate = $false; CheckStarted = [datetime]::MinValue; PackOut = '' }
 
 # PCSX2 patches of the chosen game (optional). Status: idle (not asked yet), working, found, none (the collection has no file for
 # this game) or error. Chosen holds the ticked section names; Items the tick boxes (Key = section name, S = what pnach.py says).
@@ -925,7 +930,7 @@ $form.Font = New-Font 11
 try { $form.Icon = New-AppIcon } catch { Write-AppLog $_.Exception.ToString() }
 
 $P = @{}   # the screens
-foreach ($screen in 'welcome', 'choose', 'patches', 'build', 'done', 'update') {
+foreach ($screen in 'welcome', 'choose', 'patches', 'build', 'done', 'update', 'pack') {
     $panel = New-Object Ps2Ui.Page
     $panel.Name = "screen-$screen"
     $panel.Dock = 'Fill'
@@ -946,6 +951,9 @@ $steps = @(
 )
 $x = 40
 $U.stepCards = @()
+# One plain line about the quiet look for a newer version (see Set-UpdateLine); right-aligned in the row of the title, on top of it.
+$U.updLine = Add-Label $w 'updLine' '' 380 44 380 22 (New-Font 10) $C.Muted 'TopRight'
+$U.updLine.BringToFront()
 foreach ($s in $steps) {
     $card = New-Glass $w "stepcard$($s[0])" $x 104 232 142
     $U.stepCards += $card
@@ -1067,8 +1075,8 @@ $U.bar.Size = New-Size 684 22
 $U.bar.Minimum = 0
 $U.bar.Maximum = 1000
 $U.buildCard.Controls.Add($U.bar)
-$U.elapsed = Add-Label $U.buildCard 'elapsed' '' 18 158 360 22 (New-Font 10.5) $C.Muted
-$U.percent = Add-Label $U.buildCard 'percent' '' 502 156 200 24 (New-Font 11 $true) $C.Ink 'TopRight'
+$U.elapsed = Add-Label $U.buildCard 'elapsed' '' 18 158 480 22 (New-Font 10.5) $C.Muted
+$U.percent = Add-Label $U.buildCard 'percent' '' 542 156 160 24 (New-Font 11 $true) $C.Ink 'TopRight'
 $U.buildExtras = Add-Label $U.buildCard 'buildExtras' '' 18 180 684 20 (New-Font 10) $C.Muted
 $U.tip = Add-Label $w 'tip' 'This can take a while. You can leave this window open and use your PC for other things. Please do not shut the PC down.' 42 306 716 50 (New-Font 11) $C.Muted
 $U.log = New-Object Windows.Forms.TextBox
@@ -1102,7 +1110,8 @@ $U.doneText = Add-Label $U.doneCard 'doneText' '' 76 52 628 40 (New-Font 11) $C.
 $U.doneChipsLabel = Add-Label $U.doneCard 'doneExtrasLabel' 'Extras:' 76 98 60 26 (New-Font 10.5 $true) $C.Muted 'MiddleLeft'
 $U.doneHint = Add-Label $U.doneCard 'doneHint' '' 76 130 628 42 (New-Font 10) $C.Muted
 $U.play = Add-Button $w 'Play' 'Play' 220 236 360 66 'primary' 22
-$U.shortcut = Add-Button $w 'MakeShortcut' 'Make desktop shortcut' 220 308 360 46 'secondary' 14
+$U.shortcut = Add-Button $w 'MakeShortcut' 'Make desktop shortcut' 130 308 260 46 'secondary' 13
+$U.onefile = Add-Button $w 'MakeOneFile' 'Make one file...' 410 308 260 46 'secondary' 13
 $U.doneResult = Add-Label $w 'doneResult' '' 40 358 720 22 (New-Font 11) $C.Muted 'TopCenter'
 # Make it faster: shown only when vector programs were recorded since the last build (see Get-RecordedCount).
 $U.fasterBox = New-Glass $w 'FasterBox' 40 384 720 80
@@ -1136,6 +1145,16 @@ $U.updRetry = Add-Button $w 'UpdateTryAgain' 'Try again' 400 502 180 58 'primary
 $U.updBack = Add-Button $w 'UpdateBack' 'Back' 600 508 160 52 'secondary' 13
 $U.updDone = Add-Button $w 'UpdateDone' 'Done' 440 502 320 60 'primary' 17
 
+# --- pack: the one file is made (Make one file)
+$w = $P['pack']
+[void](Add-Label $w 'packTitle' 'Your one file is ready' 38 16 720 54 (New-Font 26 $false $TitleFont) $C.Ink)
+$U.packCard = New-Glass $w 'PackCard' 40 84 720 330
+$U.packStatus = Add-Label $U.packCard 'packStatus' '' 18 14 684 60 (New-Font 14 $true) $C.Ink
+$U.packStatus.AutoEllipsis = $true
+$U.packDetail = Add-Label $U.packCard 'packDetail' '' 18 84 684 236 (New-Font 11) $C.Muted
+$U.packOpen = Add-Button $w 'OpenFolder' 'Open folder' 440 502 320 60 'primary' 17
+$U.packBack = Add-Button $w 'PackBack' 'Back' 40 508 200 52 'secondary' 13
+
 function Show-Screen([string]$name) {
     foreach ($key in @($P.Keys)) { $P[$key].Visible = ($key -eq $name) }
     switch ($name) {
@@ -1144,6 +1163,7 @@ function Show-Screen([string]$name) {
         'patches' { $form.AcceptButton = $U.patchesDone; Update-PatchScreen }
         'done' { $form.AcceptButton = $U.play; Update-FasterOffers }
         'update' { $form.AcceptButton = $null }
+        'pack' { $form.AcceptButton = $U.packOpen }
         default { $form.AcceptButton = $null }
     }
 }
@@ -1318,23 +1338,27 @@ function Update-Welcome {
         $gameName = $g.name
         $row = New-Glass $U.again "Game-$gameName" 0 $y 720 66 1
         $row.Strong = $false
-        $title = Add-Label $row "GameTitle-$gameName" $gameName 64 6 270 26 (New-Font 13 $true) $C.Ink
+        $title = Add-Label $row "GameTitle-$gameName" $gameName 64 6 180 26 (New-Font 13 $true) $C.Ink
         $title.AutoEllipsis = $true
         $built = Format-Built $g.built
         $caption = if ($built) { "Built $built" } else { 'Built' }
         $line = Add-Label $row "GameBuilt-$gameName" $caption 64 36 150 20 (New-Font 9.5) $C.Muted
         $labels = @(Get-ExtraLabels $g)
-        if ($labels.Count -gt 0) { Add-ExtraChips $row $labels (S 216) 36 515 "GameExtra-$gameName" }
+        if ($labels.Count -gt 0) { Add-ExtraChips $row $labels (S 216) 36 400 "GameExtra-$gameName" }
         else { [void](Add-Label $row "GameNoExtras-$gameName" 'no extras' 216 36 100 20 (New-Font 9.5) $C.Muted) }
         $b = Add-Button $row "Play-$gameName" 'Play' 626 9 86 48 'primary' 13
         $b.AccessibleName = "Play $gameName"
         $b.Add_Click({ if (Start-Game $gameName) { } }.GetNewClosure())
-        $e = Add-Button $row "Extras-$gameName" 'Extras...' 526 9 94 48 'secondary' 10.5
+        $e = Add-Button $row "Extras-$gameName" 'Extras...' 532 9 88 48 'secondary' 10.5
         $e.AccessibleName = "Change the extras of $gameName"
         $Tip.SetToolTip($e, 'Change the extras (widescreen, 60 fps ...) of this game. The game is built again with them.')
         $e.Add_Click({ Open-ExtrasFor $gameName }.GetNewClosure())
+        $o = Add-Button $row "OneFile-$gameName" 'Make one file' 406 9 120 48 'secondary' 10
+        $o.AccessibleName = "Make one file of $gameName"
+        $Tip.SetToolTip($o, $PackHint)
+        $o.Add_Click({ Start-PackAsk $gameName }.GetNewClosure())
         # Next to the title, only while vector programs were recorded since the build: same action as on the Done screen.
-        $f = Add-Button $row "Faster-$gameName" 'Make it faster' 340 5 180 30 'secondary' 9.5
+        $f = Add-Button $row "Faster-$gameName" 'Make it faster' 248 5 154 30 'secondary' 9.5
         $f.Visible = $false
         $f.Add_Click({ Start-Faster $gameName }.GetNewClosure())
         $U.fasterButtons[$gameName] = $f
@@ -1976,7 +2000,7 @@ function Start-Build([string]$name, [string]$image, [bool]$faster = $false, $pat
     if (-not $faster) { $patch = Get-BuildPatches }
     $b = @{ Name = $name; Image = $image; Plan = @(); Index = -1; Pending = (New-Object 'Collections.Generic.List[string]'); Clock = [Diagnostics.Stopwatch]::StartNew()
             LogFile = (Get-GameFile $name 'build.log'); Child = $null; Bar = 0.0; Tail = New-Object 'Collections.Generic.List[string]'; Error = ''; Failed = $false; Step = 0
-            Patch = $patch; Wide = $false; Faster = $faster; Batch = $batch }
+            Patch = $patch; Wide = $false; Faster = $faster; Batch = $batch; Pack = $null }
     New-Item -ItemType Directory -Force -Path (Join-Path $GamesDir $name) | Out-Null
     [IO.File]::WriteAllText($b.LogFile, '', (New-Object Text.UTF8Encoding($false)))
     $State.Build = $b
@@ -2033,7 +2057,7 @@ function Start-Stage([int]$index) {
     $stage = $b.Plan[$index]
     $b.Stage = $stage
     $b.StageClock = [Diagnostics.Stopwatch]::StartNew()
-    $b.Step = 0; $b.Round = 0; $b.F = 0.0; $b.ExitSeen = $null; $b.Error = ''; $b.Phase = 0; $b.Ninja = $null; $b.NinjaAt = [DateTime]::MinValue
+    $b.Step = 0; $b.Round = 0; $b.Testing = 0; $b.TestMax = 8; $b.TestSeen = $false; $b.TestClock = [Diagnostics.Stopwatch]::StartNew(); $b.LastLine = [DateTime]::Now; $b.F = 0.0; $b.ExitSeen = $null; $b.Error = ''; $b.Phase = 0; $b.Ninja = $null; $b.NinjaAt = [DateTime]::MinValue
     $bash = Join-Path $ToolsDir 'mingit\usr\bin\bash.exe'
     switch ($stage.Id) {
         'tools' {
@@ -2047,6 +2071,23 @@ function Start-Stage([int]$index) {
             Add-LogLine $b '--- Preparing the libraries and translator tools ---'
             Set-Status 'Preparing the translator tools' 'Fetching the graphics and window libraries and building the translator.'
             $b.Child = Start-Child $bash ('"{0}" --native-only' -f (ConvertTo-PosixPath (Join-Path $Root 'scripts\setup.sh'))) $true
+        }
+        'packrunner' {
+            Add-LogLine $b '--- Making the program for the one file ---'
+            Set-Status 'Preparing the one-file program' 'The game program is made once more so that it needs no other file. This is done once for each game.'
+            $b.Child = Start-Child $bash ('"{0}" {1}' -f (ConvertTo-PosixPath (Join-Path $Root 'scripts\pack_runner.sh')), $b.Name) $true
+        }
+        'packextract' {
+            Add-LogLine $b '--- Copying the files off the disc image ---'
+            Set-Status 'Copying the files off the disc image' 'They go into a temporary folder that is deleted again when the file is made.'
+            Remove-PackFiles $b.Name
+            $b.Child = Start-Child (Join-Path $ToolsDir 'python\python.exe') ('-X utf8 -I "{0}" extract "{1}" "{2}"' -f (Join-Path $Root 'scripts\extract_disc.py'), $b.Pack.Disc, (Get-GameFile $b.Name 'disc_files')) $true
+        }
+        'packbundle' {
+            Add-LogLine $b '--- Putting everything into one file ---'
+            Set-Status 'Putting everything into one file' ('The game and its disc go into ' + [IO.Path]::GetFileName($b.Pack.Out) + '.')
+            $b.Pack.Writing = $true
+            $b.Child = Start-Child (Join-Path $ToolsDir 'python\python.exe') ('-X utf8 -I "{0}" bundle --game {1} --os windows --binary "{2}" --out "{3}"' -f (Join-Path $Root 'scripts\extract_disc.py'), $b.Name, $b.Pack.Runner, $b.Pack.Out) $true
         }
         'port' {
             Add-LogLine $b $(if ($b.Faster) { '--- Making the game faster ---' } else { '--- Building the game ---' })
@@ -2070,6 +2111,7 @@ function Start-Stage([int]$index) {
 function Read-BuildLine($b, [string]$raw) {
     $line = $raw.TrimEnd()
     if ($line -eq '') { return }
+    $b.LastLine = [DateTime]::Now   # the "last sign of life" under the bar
     switch ($b.Stage.Id) {
         'tools' {
             $t = $b.Tools
@@ -2097,19 +2139,64 @@ function Read-BuildLine($b, [string]$raw) {
             }
             elseif ($line -match '^== ready') { $b.F = 1.0 }
         }
+        'packrunner' {
+            if ($line -match '^== runner ready') { $b.F = 1.0 }
+        }
+        'packextract' {
+            if ($line -match '^\[ps2-disc-toolkit\] (\d+)/(\d+) files') { $b.F = [Math]::Max($b.F, [double]$Matches[1] / [Math]::Max(1.0, [double]$Matches[2])) }
+        }
         'port' {
             if ($line -match '^== \[(\d)/6\]') {
                 $b.Step = [int]$Matches[1]; $b.StepClock = [Diagnostics.Stopwatch]::StartNew()
                 $text = Get-StepText $b $b.Step
                 Set-Status $text[0] $text[1]
             }
-            elseif ($line -match '^round (\d+):') { $b.Round = [int]$Matches[1] }
+            elseif ($line -match '^round (\d+):') { $b.Round = [int]$Matches[1]; $b.Testing = 0 }
+            elseif ($line -match '^\[port\] testing round (\d+) of at most (\d+)') {
+                $b.Testing = [int]$Matches[1]; $b.TestMax = [Math]::Max(1, [int]$Matches[2]); $b.TestSeen = $true; $b.TestClock = [Diagnostics.Stopwatch]::StartNew()
+            }
             elseif ($line -match '^Play it natively:.* --widescreen( |$)') { $b.Wide = $true }   # a ticked section is made for a 16:9 screen
         }
     }
     Add-LogLine $b $line
     $b.Tail.Add($line)
     if ($b.Tail.Count -gt 40) { $b.Tail.RemoveAt(0) }
+}
+
+# Testing rounds on the bar (fraction of step 4): round 1 to 4 end at 1/2, 3/4, 7/8 and 15/16 as always; rounds 5 and on share the last
+# stretch up to 99 %, so a long game does not look frozen. Never the end: step 5 and 6 still follow.
+function Get-RoundCeiling([int]$round, [int]$max) {
+    if ($round -le 0) { return 0.0 }
+    if ($round -le 4) { return 1 - [Math]::Pow(0.5, $round) }
+    0.9375 + 0.0525 * [Math]::Min(1.0, ($round - 4) / [Math]::Max(1.0, $max - 4))
+}
+
+# Step 4 while a round runs: from the end of the last round toward the end of this one, slower and slower (about 90 s). Without the
+# "testing round" line (an older port.sh) it is the time-based creep of before.
+function Get-ExploreFraction($b, [double]$timeG) {
+    $floor = Get-RoundCeiling $b.Round $b.TestMax
+    if (-not $b.TestSeen) { return [Math]::Max($timeG, $floor) }
+    if ($b.Testing -le 0) { return $floor }
+    $top = Get-RoundCeiling $b.Testing $b.TestMax
+    $floor + ($top - $floor) * (1 - [Math]::Exp(-$b.TestClock.Elapsed.TotalSeconds / 90))
+}
+
+# Seconds since the build last showed a sign of life: a line on its output, and while a testing round runs (port.sh is silent then)
+# also the game's own log and the folder of its pictures.
+function Get-LastSign($b) {
+    $t = $b.LastLine
+    if ($b.Step -eq 4 -and $b.Testing -gt 0) {
+        $dir = Join-Path $GamesDir $b.Name
+        foreach ($path in @((Join-Path $dir 'explore.log'), (Join-Path $dir 'shots'))) {
+            try { $i = Get-Item -LiteralPath $path -ErrorAction Stop; if ($i.LastWriteTime -gt $t) { $t = $i.LastWriteTime } } catch { }
+        }
+    }
+    [Math]::Max(0.0, ([DateTime]::Now - $t).TotalSeconds)
+}
+
+function Format-Ago([double]$seconds) {
+    if ($seconds -lt 60) { return '{0} s ago' -f [int]$seconds }
+    '{0} min {1} s ago' -f [int][Math]::Floor($seconds / 60), [int]($seconds % 60)
 }
 
 # The bar: where we are on the whole plan, never going back.
@@ -2127,12 +2214,29 @@ function Update-Progress($b) {
             $creep = 0.4 * (1 - [Math]::Exp(-$seconds / 40))
             $f = [Math]::Max($b.F, [Math]::Max($creep, @(0, 0.05, 0.25, 0.4)[$b.Phase]))
         }
+        'packrunner' {
+            $f = [Math]::Max($b.F, 1 - [Math]::Exp(-$seconds / 120))
+            if (([DateTime]::Now - $b.NinjaAt).TotalSeconds -ge 1) {
+                $b.NinjaAt = [DateTime]::Now
+                $b.Ninja = Get-NinjaProgress (Join-Path $Root "build\pack-$($b.Name)\ninja.log")
+                if ($b.Ninja) { $b.LastLine = [DateTime]::Now }
+            }
+            if ($b.Ninja -and $b.Ninja.M -gt 0) {
+                $f = [Math]::Max($f, [double]$b.Ninja.N / $b.Ninja.M)
+                Set-Status 'Compiling the one-file program' ('Compiling file {0} of {1}. This is done once for each game.' -f $b.Ninja.N, $b.Ninja.M)
+            }
+        }
+        'packextract' { $f = [Math]::Max($b.F, 0.9 * (1 - [Math]::Exp(-$seconds / 60))) }
+        'packbundle' {
+            $f = 0.9 * (1 - [Math]::Exp(-$seconds / 30))
+            try { $f = [Math]::Max($f, [Math]::Min(0.98, ([double](New-Object IO.FileInfo($b.Pack.Out)).Length) / [double]$b.Pack.Expect)) } catch { }
+        }
         'port' {
             if ($b.Step -ge 1) {
                 $r = if ($b.Faster) { $FasterRange[$b.Step] } else { $StepRange[$b.Step] }
                 $stepSeconds = $b.StepClock.Elapsed.TotalSeconds
                 $g = 1 - [Math]::Exp(-$stepSeconds / $r[2])
-                if ($b.Step -eq 4) { $g = [Math]::Max($g, 1 - [Math]::Pow(0.5, $b.Round)) }
+                if ($b.Step -eq 4) { $g = Get-ExploreFraction $b $g }
                 if ($b.Step -eq 4 -or $b.Step -eq 6) {
                     if (([DateTime]::Now - $b.NinjaAt).TotalSeconds -ge 1) {
                         $b.NinjaAt = [DateTime]::Now
@@ -2141,12 +2245,15 @@ function Update-Progress($b) {
                         $runtime = @(Get-ChildItem -LiteralPath (Join-Path $Root 'build') -Directory -Filter 'runtime-native-*' -ErrorAction SilentlyContinue |
                             ForEach-Object { Get-NinjaProgress (Join-Path $_.FullName 'ninja.log') } | Where-Object { $_ })
                         if ($runtime.Count -gt 0) { $b.Ninja = $runtime[0]; $kind = 'runtime' } elseif ($game) { $b.Ninja = $game } else { $b.Ninja = $null }
-                        if ($b.Ninja) { $b.Ninja.Kind = $kind }
+                        if ($b.Ninja) { $b.Ninja.Kind = $kind; $b.LastLine = [DateTime]::Now }   # the compiler's log moved: a sign of life, too
                     }
                     if ($b.Ninja -and $b.Ninja.N -gt 0 -and $b.Ninja.M -gt 0) {
                         if ($b.Step -eq 4) { $g = [Math]::Max($g, 0.45 * $b.Ninja.N / $b.Ninja.M) }
                         if ($b.Ninja.Kind -eq 'runtime') { Set-Status 'Building the PS2 runtime' ('Compiling file {0} of {1}. This is done once and reused by every game.' -f $b.Ninja.N, $b.Ninja.M) }
                         else { Set-Status 'Compiling the translated game' ('Compiling file {0} of {1}.' -f $b.Ninja.N, $b.Ninja.M) }
+                    } elseif ($b.Step -eq 4 -and $b.Testing -gt 0) {
+                        # which round runs, and whether the build is alive: a slow round is not a hang
+                        Set-Status ('Testing the game: round {0} of at most {1}' -f $b.Testing, $b.TestMax) 'The game is started without a window to find code the first pass missed. Each round can take a minute or more, big games much longer.'
                     } elseif ($b.Step -eq 4 -and $b.Round -gt 0) {
                         Set-Status $StepText[4][0] ("Round $($b.Round) is done. Each round can take a minute or more.")
                     } elseif ($U.status.Text -like 'Compiling*' -or $U.status.Text -like 'Building the PS2*') {
@@ -2154,7 +2261,7 @@ function Update-Progress($b) {
                         Set-Status $text[0] $text[1]
                     }
                 }
-                $inner = $r[0] + ($r[1] - $r[0]) * [Math]::Min($g, 0.97)
+                $inner = $r[0] + ($r[1] - $r[0]) * [Math]::Min($g, $(if ($b.Step -eq 4 -and $b.TestSeen) { 0.99 } else { 0.97 }))
                 $f = $inner / 100
             }
         }
@@ -2164,6 +2271,7 @@ function Update-Progress($b) {
     $U.bar.Value = [int][Math]::Min(1000, $b.Bar * 10)
     $U.percent.Text = '{0} %' -f [int]$b.Bar
     $U.elapsed.Text = 'Time so far: ' + (Format-Time $b.Clock.Elapsed.TotalSeconds)
+    if ($stage.Id -eq 'port' -and $b.Step -ge 1) { $U.elapsed.Text += '     Last sign of life: ' + (Format-Ago (Get-LastSign $b)) }
 }
 
 function Update-Build {
@@ -2193,8 +2301,23 @@ function Complete-Stage($b) {
     Complete-Build $b
 }
 
+# A download that keeps failing (GitHub's servers are slow in some countries): the way out by hand, docs/fetch-retry.md.
+# The scripts retry by themselves; the hint shows only when the log says a download failed.
+function Get-DownloadHint($b) {
+    if (-not $b.ContainsKey('Stage') -or @('tools', 'setup') -notcontains $b.Stage.Id) { return '' }
+    if (($b.Tail -join "`n") -notmatch 'download failed|Could not reach|download of .* stopped') { return '' }
+    'Still failing? Open the link from Show details in a browser, save the file into ' + (Join-Path $Root 'downloads') + ', then press Try again.' + "`n"
+}
+
 function Get-FailureMessage($b) {
     $tail = ($b.Tail -join "`n")
+    if ($b.Pack) {
+        switch ($b.Stage.Id) {
+            'packrunner' { return 'The one-file program could not be made. The log (Show details) has the details.' }
+            'packextract' { return 'The files could not be copied off the disc image. Is there enough free disk space, and is the image still where it was?' }
+            default { return 'The one file could not be written. Is there enough free space in the folder you chose?' }
+        }
+    }
     switch ($b.Stage.Id) {
         'tools' {
             if ($b.Error -match 'SHA-256') { return 'A downloaded file failed its checksum test and was thrown away. Please try again. If it keeps failing, a proxy or virus scanner may be changing the download.' }
@@ -2223,6 +2346,7 @@ function Get-FailureMessage($b) {
 function Set-BuildFailed($b, [string]$message) {
     $timer.Stop()
     if ($b.Child) { Stop-Child $b.Child; $b.Child = $null }
+    if ($b.Pack) { Clear-PackLeftovers $b }
     # Build my games again: one game that does not build does not stop the others (a failure of the tools does).
     if ($b.Batch -and $b.ContainsKey('Stage') -and $b.Stage.Id -eq 'port') {
         $b.Failed = $true
@@ -2232,18 +2356,20 @@ function Set-BuildFailed($b, [string]$message) {
     }
     $State.Build = $b
     $b.Failed = $true
-    $U.buildTitle.Text = 'The build stopped'
+    $U.buildTitle.Text = if ($b.Pack) { 'Making the file stopped' } else { 'The build stopped' }
     $U.status.ForeColor = $C.Danger
     $U.status.Text = $message
     $U.status.Height = S 84
     $U.detail.Top = S 100
-    $U.detail.Height = S 110
-    $U.buildCard.Height = S 232
+    $hint = Get-DownloadHint $b
+    $more = if ($hint) { 36 } else { 0 }   # room for the extra lines
+    $U.detail.Height = S (110 + $more)
+    $U.buildCard.Height = S (232 + $more)
     $U.buildExtras.Visible = $false
     Set-LogPlace
     $extra = if ($b.Error) { "$($b.Error)`n" } else { '' }
-    $advice = if ($b.Batch) { 'Press Try again to go on with your games, or Back.' } else { 'Press Try again, or Back to choose another disc image or other extras.' }
-    $U.detail.Text = "${extra}${advice}`nThe full log is saved here (Show details has it too):`n$($b.LogFile)"
+    $advice = if ($b.Pack) { 'Press Try again, or Back to return to your game.' } elseif ($b.Batch) { 'Press Try again to go on with your games, or Back.' } else { 'Press Try again, or Back to choose another disc image or other extras.' }
+    $U.detail.Text = "${extra}${hint}${advice}`nThe full log is saved here (Show details has it too):`n$($b.LogFile)"
     $U.bar.Visible = $false; $U.elapsed.Visible = $false; $U.percent.Visible = $false; $U.tip.Visible = $false
     $U.cancel.Visible = $false; $U.retry.Visible = $true; $U.buildBack.Visible = $true
     Flush-Log $b
@@ -2251,6 +2377,7 @@ function Set-BuildFailed($b, [string]$message) {
 }
 
 function Complete-Build($b) {
+    if ($b.Pack) { Complete-Pack $b; return }
     $timer.Stop()
     $name = $b.Name
     $exe = Join-Path $Root "build\native-$name\ps2run.exe"
@@ -2358,10 +2485,19 @@ $U.details.Add_Click({
     if ($show) { $U.log.SelectionStart = $U.log.TextLength; $U.log.ScrollToCaret() }
 })
 $U.cancel.Add_Click({
-    $answer = [Windows.Forms.MessageBox]::Show('Stop the build? What was already done is kept, so the next build continues from there.', $AppTitle, 'YesNo', 'Question')
+    $isPack = [bool]($State.Build -and $State.Build.Pack)
+    $question = if ($isPack) { 'Stop making the file? The game here is not changed.' } else { 'Stop the build? What was already done is kept, so the next build continues from there.' }
+    $answer = [Windows.Forms.MessageBox]::Show($question, $AppTitle, 'YesNo', 'Question')
     if ($answer -eq 'Yes' -and $State.Build) {
         $timer.Stop()
         Stop-Child $State.Build.Child
+        if ($isPack) {
+            $packed = $State.Build
+            $State.Build = $null
+            Clear-PackLeftovers $packed
+            Show-Ready $packed.Name "$($packed.Name) is as it was before. Play opens the game in its own window; close that window to stop it."
+            return
+        }
         $faster = $State.Build.Faster
         $name = $State.Build.Name
         $wasBatch = [bool]$State.Build.Batch
@@ -2372,14 +2508,16 @@ $U.cancel.Add_Click({
     }
 })
 $U.retry.Add_Click({
-    if ($State.Build -and $State.Build.Batch) { Start-RebuildAll }
+    if ($State.Build -and $State.Build.Pack) { Start-PackRun $State.Build.Pack.Name $State.Build.Pack.Folder }
+    elseif ($State.Build -and $State.Build.Batch) { Start-RebuildAll }
     elseif ($State.Build -and $State.Build.Faster) { Start-Faster $State.Build.Name }
     elseif ($State.Name -and $State.Image) { Start-Build $State.Name $State.Image }
 })
 $U.buildBack.Add_Click({
     $b = $State.Build
     $State.Build = $null
-    if ($b -and $b.Batch) { $State.Batch = $null; Show-Screen 'welcome' }
+    if ($b -and $b.Pack) { Show-Ready $b.Name "$($b.Name) is as it was before. Play opens the game in its own window; close that window to stop it." }
+    elseif ($b -and $b.Batch) { $State.Batch = $null; Show-Screen 'welcome' }
     elseif ($b -and $b.Faster) { Show-Ready $b.Name "$($b.Name) is as it was before. Play opens the game in its own window; close that window to stop it." }
     else { Show-Screen 'choose' }
 })
@@ -2424,6 +2562,153 @@ function Start-Faster([string]$name) {
     }
     Start-Build $name $plan.Image $true $plan.Patch
 }
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Make one file: a built game packed into one .exe that runs on another PC.
+# Three steps through the same build screen: (1) scripts\pack_runner.sh makes the game's program once more, linked so that it needs
+# no other file (build\pack-<name>, a folder of its own: the normal build and Play are not touched); (2) extract_disc.py extract
+# copies the files off the disc image into games\<name>\disc_files, (3) extract_disc.py bundle writes <folder>\<name>.exe. The
+# copied disc files are deleted again afterwards (they are as big as the disc, only the pack needs them, and step 2 makes them
+# again in under a minute). The player's own disc image, built game and saves are never changed.
+
+$PackHint = 'Puts the game into one file you can copy to another PC. It is about as big as the disc. Only for your own copy.'
+
+# What a pack of this game needs, or why it cannot start: @{ Error = <plain sentence> } or @{ Iso; Size; Extras }.
+function Get-PackPlan([string]$name) {
+    $game = Read-Game $name
+    $exe = Join-Path $Root "build\native-$name\ps2run.exe"
+    if (-not $game -or -not $game.built -or -not (Test-Path -LiteralPath $exe) -or -not (Test-Path -LiteralPath (Join-Path $Root "generated\$name") -PathType Container)) {
+        return @{ Error = "The game '$name' is not built yet (or its files are gone). Please build it again." }
+    }
+    if ((Test-SetupNeeded) -or -not (Test-Path -LiteralPath (Join-Path $ToolsDir 'python\python.exe')) -or -not (Test-Path -LiteralPath (Join-Path $ToolsDir 'mingit\usr\bin\bash.exe'))) {
+        return @{ Error = 'Some of the build tools are missing. Build a game again (Add a game) and the app downloads them.' }
+    }
+    $iso = Resolve-AppPath $game.iso
+    if (-not (Test-Path -LiteralPath $iso)) { $iso = $game.source }
+    if (-not $iso -or -not (Test-Path -LiteralPath $iso)) {
+        return @{ Error = "The disc image of '$name' is not at its old place any more:`n$iso`nPut it back, or build the game again." }
+    }
+    @{ Iso = $iso; Size = [int64](Get-Item -LiteralPath $iso).Length; Extras = (@(Get-ExtraLabels $game).Count -gt 0) }
+}
+
+# The copied disc files of a pack (deleted after every pack, made or not).
+function Remove-PackFiles([string]$name) {
+    $dir = Get-GameFile $name 'disc_files'
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    try { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction Stop } catch { Write-AppLog ("could not delete ${dir}: " + $_.Exception.Message) }
+}
+
+# After a pack that stopped (failed or cancelled): no copied disc files and no half-written file.
+function Clear-PackLeftovers($b) {
+    Remove-PackFiles $b.Name
+    if ($b.Pack.Writing -and -not $b.Pack.Done) { try { Remove-Item -LiteralPath $b.Pack.Out -Force -ErrorAction Stop } catch { } }
+}
+
+# The button "Make one file": say what it does, ask where to put it, then run.
+function Start-PackAsk([string]$name) {
+    if ($State.Build -and $State.Build.Child) {
+        [void][Windows.Forms.MessageBox]::Show('A build is still running. Wait until it is done.', $AppTitle, 'OK', 'Information')
+        return
+    }
+    $plan = Get-PackPlan $name
+    if ($plan.ContainsKey('Error')) { [void][Windows.Forms.MessageBox]::Show($plan.Error, $AppTitle, 'OK', 'Information'); return }
+    $size = Format-Size ($plan.Size + 70MB)
+    $text = "Make one file of '$name'?`n`nThis puts the game into one file you can copy to another PC. It is about as big as the disc (about $size). Only for your own copy."
+    if ($plan.Extras) { $text += "`n`nThe extras you chose (widescreen, 60 fps ...) are not part of the one file: it plays like the plain disc." }
+    $text += "`n`nThe first time takes a few minutes more, because the game's program is made once more for it. Next you choose the folder to save the file in."
+    if ([Windows.Forms.MessageBox]::Show($text, $AppTitle, 'OKCancel', 'Question') -ne 'OK') { return }
+    $dialog = New-Object Windows.Forms.FolderBrowserDialog
+    $dialog.Description = "Choose the folder for $name.exe (about $size)"
+    $dialog.SelectedPath = [Environment]::GetFolderPath('Desktop')
+    $dialog.ShowNewFolderButton = $true
+    $folder = ''
+    if ($dialog.ShowDialog($form) -eq 'OK') { $folder = $dialog.SelectedPath }
+    $dialog.Dispose()
+    if (-not $folder) { return }
+    $out = Join-Path $folder "$name.exe"
+    if ((Test-Path -LiteralPath $out) -and ([Windows.Forms.MessageBox]::Show("There is a file '$name.exe' in that folder already. Replace it?", $AppTitle, 'YesNo', 'Question') -ne 'Yes')) { return }
+    # room for the copied disc files here, and for the file where it goes
+    foreach ($check in @(@{ Path = $Root; Need = ($plan.Size + 1GB); Where = 'the app''s folder' }, @{ Path = $folder; Need = ($plan.Size + 200MB); Where = 'the folder you chose' })) {
+        $drive = [IO.Path]::GetPathRoot($check.Path)
+        if (-not $drive -or $drive.StartsWith('\\')) { continue }
+        $free = (New-Object IO.DriveInfo($drive)).AvailableFreeSpace
+        if ($free -lt $check.Need) {
+            [void][Windows.Forms.MessageBox]::Show("There is not enough free disk space in $($check.Where) (drive $drive has $(Format-Size $free) free, about $(Format-Size $check.Need) are needed). Free some space and try again.", $AppTitle, 'OK', 'Information')
+            return
+        }
+    }
+    Start-PackRun $name $folder
+}
+
+function Start-PackRun([string]$name, [string]$folder) {
+    $plan = Get-PackPlan $name
+    if ($plan.ContainsKey('Error')) { [void][Windows.Forms.MessageBox]::Show($plan.Error, $AppTitle, 'OK', 'Information'); Show-Ready $name "$name is as it was before."; return }
+    $out = Join-Path $folder "$name.exe"
+    $runner = Join-Path $Root "build\pack-$name\ps2run.exe"
+    $b = @{ Name = $name; Image = ''; Plan = @(); Index = -1; Pending = (New-Object 'Collections.Generic.List[string]'); Clock = [Diagnostics.Stopwatch]::StartNew()
+            LogFile = (Get-GameFile $name 'pack.log'); Child = $null; Bar = 0.0; Tail = New-Object 'Collections.Generic.List[string]'; Error = ''; Failed = $false; Step = 0
+            Patch = @{ File = ''; Sections = @(); Chosen = @() }; Wide = $false; Faster = $false; Batch = $null
+            Pack = @{ Name = $name; Folder = $folder; Out = $out; Runner = $runner; Disc = $plan.Iso; Expect = ($plan.Size + 70MB); Writing = $false; Done = $false } }
+    New-Item -ItemType Directory -Force -Path (Join-Path $GamesDir $name) | Out-Null
+    [IO.File]::WriteAllText($b.LogFile, '', (New-Object Text.UTF8Encoding($false)))
+    $State.Build = $b
+    $U.log.Clear()
+    $U.buildTitle.Text = "Making one file: $name"
+    $U.cancel.Text = 'Cancel'
+    $U.tip.Text = 'This takes a while for a big game. You can leave this window open and use your PC for other things.'
+    $U.bar.Value = 0
+    $U.percent.Text = '0 %'
+    $U.elapsed.Text = ''
+    $U.log.Visible = $false
+    $U.tip.Visible = $true
+    $U.details.Text = 'Show details'
+    $U.bar.Visible = $true; $U.elapsed.Visible = $true; $U.percent.Visible = $true
+    $U.status.ForeColor = $C.Ink
+    $U.status.Height = S 58
+    $U.detail.Top = S 74
+    $U.detail.Height = S 44
+    $U.buildCard.Height = S 206
+    $U.buildExtras.Visible = $true
+    $U.buildExtras.Text = "The file will be saved as: $out"
+    Set-LogPlace
+    Set-Status 'Getting ready' ''
+    $U.cancel.Visible = $true; $U.retry.Visible = $false; $U.buildBack.Visible = $false
+    $first = if (Test-Path -LiteralPath $runner) { 4 } else { 50 }   # the program is made once per game; later only a check
+    $b.Plan = @(@{ Id = 'packrunner'; Weight = $first }, @{ Id = 'packextract'; Weight = 24 }, @{ Id = 'packbundle'; Weight = 26 })
+    $sum = 0.0
+    foreach ($s in $b.Plan) { $sum += $s.Weight }
+    $base = 0.0
+    foreach ($s in $b.Plan) { $s.Base = $base / $sum * 100; $s.Span = $s.Weight / $sum * 100; $base += $s.Weight }
+    Show-Screen 'build'
+    Start-Stage 0
+    $timer.Start()
+}
+
+# The last step is done: the file is there. The screen with "Done: <path>" and the button that opens its folder.
+function Complete-Pack($b) {
+    $timer.Stop()
+    $out = $b.Pack.Out
+    if (-not (Test-Path -LiteralPath $out)) { Set-BuildFailed $b 'The file was not made. The log has the details.'; return }
+    $b.Pack.Done = $true
+    $size = (Get-Item -LiteralPath $out).Length
+    Remove-PackFiles $b.Name
+    $State.Game = $b.Name
+    $State.PackOut = $out
+    $U.packStatus.Text = "Done: $out"
+    $U.packDetail.Text = ("Size: {0}. Copy this one file to another PC and double-click it: nothing else is needed.`n`n" -f (Format-Size $size)) +
+        "Its saves and settings are kept in a folder called 'saves' next to the file. The first start can take up to ten seconds.`n`n" +
+        "This is only for your own copy of the game: please do not share it.`n`n" +
+        "The temporary copy of the disc files was deleted again; $($b.Name) here in the app is as it was."
+    try { [Media.SystemSounds]::Asterisk.Play() } catch { }
+    Show-Screen 'pack'
+}
+
+$U.packOpen.Add_Click({
+    if ($State.PackOut -and (Test-Path -LiteralPath $State.PackOut)) { [void][Diagnostics.Process]::Start('explorer.exe', ('/select,"{0}"' -f $State.PackOut)) }
+    elseif ($State.PackOut) { [void][Diagnostics.Process]::Start('explorer.exe', ('"{0}"' -f (Split-Path -Parent $State.PackOut))) }
+})
+$U.packBack.Add_Click({ $State.Build = $null; Show-Ready $State.Game "$($State.Game) is as it was before. Play opens the game in its own window; close that window to stop it." })
+$U.onefile.Add_Click({ if ($State.Game) { Start-PackAsk $State.Game } })
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Update, and Build my games again
@@ -2492,6 +2777,11 @@ function Update-UpdateJob {
             $U.updCancel.Visible = $false
         }
     }
+    # The look for a newer version must never hold the app up: no answer in time counts as "could not check".
+    if ($job.Mode -eq 'check' -and $sh.Result -eq '') {
+        $limit = if ($sh.Phase -eq 'compare') { $CheckCompareLimitSec } else { $CheckLimitSec }
+        if (((Get-Date) - $State.CheckStarted).TotalSeconds -gt $limit) { $sh.Result = 'timeout'; $sh.Error = "no answer within $limit s" }
+    }
     if ($sh.Result -eq '') {
         # The worker ended without an answer: treat it as a failure.
         if ($job.Handle.IsCompleted) { $sh.Result = 'failed'; $sh.Error = 'the worker ended' } else { return }
@@ -2501,7 +2791,23 @@ function Update-UpdateJob {
     Close-UpdateJob
     $updTimer.Stop()
     if ($job.Mode -eq 'check') {
-        if ($result -eq 'newer') { $State.Newest = [string]$sh.Sha; if ($P['welcome'].Visible) { Update-Banner } }
+        switch ($result) {
+            'newer' {
+                $State.Newest = [string]$sh.Sha
+                # Update by itself only when nothing else is going on; otherwise the card with the Update button waits on the welcome screen.
+                if (Test-AutoUpdateNow) { Start-UpdateDownload -Auto }
+                else {
+                    Write-AppLog "A newer version is out ($($State.Newest.Substring(0, 7))); not updating now."
+                    Set-UpdateLine 'A newer version is out. It is installed at the next start.'
+                    if ($P['welcome'].Visible) { Update-Banner }
+                }
+            }
+            'current' { Set-UpdateLine '' }
+            default {
+                Write-AppLog "Could not look for a newer version ($result): $error_"
+                Set-UpdateLine 'Could not check for updates. Using this version.'
+            }
+        }
         return
     }
     switch ($result) {
@@ -2513,9 +2819,10 @@ function Update-UpdateJob {
                 Show-UpdateFailed 'The update could not be put in place, so nothing was changed.' "A file may be in use. Close other windows that show this folder, then try again.`n$($_.Exception.Message)"
                 return
             }
+            if ($State.AutoUpdate) { try { Set-Content -LiteralPath (Join-Path $UpdateDir 'auto.txt') -Value ([string]$sh.Sha) -Encoding ASCII } catch { } }
             Restart-App
         }
-        'cancelled' { Show-Screen 'welcome' }
+        'cancelled' { $State.AutoUpdate = $false; Show-Screen 'welcome' }
         'invalid' {
             Write-AppLog "Update refused: $error_"
             Show-UpdateFailed 'The downloaded file is not a version of this app, so it was not used.' 'Nothing was changed. If this happens again, download the zip from the project page by hand.'
@@ -2530,11 +2837,39 @@ function Update-UpdateJob {
         }
     }
 }
-$updTimer.Add_Tick({ try { Update-UpdateJob } catch { $updTimer.Stop(); Write-AppLog $_.Exception.ToString(); Close-UpdateJob; Show-UpdateFailed 'The update hit a problem, so nothing was changed.' $_.Exception.Message } })
+$updTimer.Add_Tick({ try { Update-UpdateJob } catch {
+    $updTimer.Stop(); Write-AppLog $_.Exception.ToString(); Close-UpdateJob
+    if ($P['update'].Visible) { Show-UpdateFailed 'The update hit a problem, so nothing was changed.' $_.Exception.Message }
+    else { Set-UpdateLine 'Could not check for updates. Using this version.' }   # the quiet look never opens a screen
+} })
 
 function Start-UpdateCheck {
     if (-not (Test-UpdateAllowed) -or $InstallProblem) { return }
-    try { $State.UpdateJob = Start-UpdateWorker 'check' ''; $updTimer.Start() } catch { Write-AppLog $_.Exception.ToString() }
+    try {
+        $State.CheckStarted = Get-Date
+        Set-UpdateLine 'Looking for a newer version...'
+        $State.UpdateJob = Start-UpdateWorker 'check' ''
+        $updTimer.Start()
+    } catch { Write-AppLog $_.Exception.ToString(); Set-UpdateLine '' }
+}
+
+# The line on the welcome screen about the quiet look (and the automatic update): one plain sentence, or nothing.
+function Set-UpdateLine([string]$text) { $U.updLine.Text = $text }
+
+# The file auto.txt in tools\update names the version an automatic update installed last. If the newest version is still that one after
+# the restart (something made the app think it is out of date although it was just installed), no second automatic update starts: no loop.
+function Get-AutoTried {
+    try { $t = (Get-Content -LiteralPath (Join-Path $UpdateDir 'auto.txt') -Raw).Trim(); if ($t -match '^[0-9a-f]{40}$') { return $t } } catch { }
+    ''
+}
+
+# Is it a good moment? Only on the welcome screen with the window free: no build, rebuild, patch run or game started from the app,
+# and no message box open (a window with a message box on top cannot take the focus).
+function Test-AutoUpdateNow {
+    if (-not $P['welcome'].Visible -or -not $form.CanFocus) { return $false }
+    if ($State.Build -or $State.Batch -or $State.Playing -or $State.Patch.Run) { return $false }
+    if ($State.Newest -and (Get-AutoTried) -eq $State.Newest) { return $false }
+    $true
 }
 
 # --- The update itself
@@ -2551,10 +2886,14 @@ function Show-UpdateScreen([string]$title, [string]$status, [string]$detail) {
     Show-Screen 'update'
 }
 
-function Start-UpdateDownload {
+function Start-UpdateDownload([switch]$Auto) {
     if (-not $State.Newest) { return }
     Close-UpdateJob
-    Show-UpdateScreen 'Updating the app' 'Downloading the newest version' 'Only the app''s own files are replaced. Your games, saves, quick saves and the build tools stay where they are.'
+    $State.AutoUpdate = [bool]$Auto
+    Set-UpdateLine ''
+    $detail = 'Only the app''s own files are replaced. Your games, saves, quick saves and the build tools stay where they are.'
+    if ($Auto) { Write-AppLog "Updating by itself to $($State.Newest)"; $detail = 'A newer version was found, so the app updates itself. ' + $detail }
+    Show-UpdateScreen 'Updating the app' 'Downloading the newest version' $detail
     $U.updCancel.Visible = $true
     try {
         $State.UpdateJob = Start-UpdateWorker 'download' $State.Newest
@@ -2567,6 +2906,14 @@ function Start-UpdateDownload {
 
 function Show-UpdateFailed([string]$message, [string]$detail) {
     $updTimer.Stop()
+    if ($State.AutoUpdate) {
+        # An update the player did not ask for never stops them: back to the welcome screen with the version they have.
+        $State.AutoUpdate = $false
+        Write-AppLog "Automatic update stopped: $message $detail"
+        Set-UpdateLine 'The update did not work. Using this version for now.'
+        Show-Screen 'welcome'
+        return
+    }
     Show-UpdateScreen 'The update stopped' $message $detail
     $U.updStatus.ForeColor = $C.Danger
     $U.updBar.Visible = $false
@@ -2596,7 +2943,11 @@ $U.noteLater.Add_Click({
     $answer = [Windows.Forms.MessageBox]::Show('Your games keep working as they are; only the new fixes are missing in them. Skip building them again?', $AppTitle, 'YesNo', 'Question')
     if ($answer -eq 'Yes') { Set-PendingRebuild @(); Update-Banner }
 })
-$U.updCancel.Add_Click({ Close-UpdateJob; $updTimer.Stop(); Show-Screen 'welcome' })
+$U.updCancel.Add_Click({
+    Close-UpdateJob; $updTimer.Stop()
+    if ($State.AutoUpdate) { $State.AutoUpdate = $false; Write-AppLog 'Automatic update cancelled.'; Set-UpdateLine 'Update cancelled. Using this version.' }
+    Show-Screen 'welcome'
+})
 $U.updRetry.Add_Click({ if ($State.Newest) { Start-UpdateDownload } else { Show-Screen 'welcome' } })
 $U.updBack.Add_Click({ Show-Screen 'welcome' })
 $U.updDone.Add_Click({ Show-Screen 'welcome' })

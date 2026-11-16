@@ -1,12 +1,15 @@
 // No game data: checks that the memory card file and save states are never lost. A card file that is there but cannot be used
 // (too short, too long, a folder, held open by another program) must stay byte for byte as it was, and the run uses a fresh card
 // beside it; a write that is cut off right before its final rename (as a crash there would) must leave the old file whole; after a
-// crash the newest card goes beside the card file, never over it. Each card case runs this program again as a child process, since
-// the card is loaded once per run. Build: ninja ps2savetest, run build/.../ps2savetest [work folder] (prints "save files: 0 failed").
+// crash the newest card goes beside the card file, never over it. A card is checked when it is loaded (the ECC of every page): a
+// damaged one is replaced by the newest good backup and kept aside, the backups are made and pruned, and a second run cannot use a
+// card that a run holds. Each card case runs this program again as a child process, since the card is loaded once per run. Build: ninja ps2savetest, run build/.../ps2savetest [work folder] (prints "save files: 0 failed").
 #include "iop/sio2.hpp"
 #include "ps2/os.hpp"
 #include "ps2/system.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -21,6 +24,8 @@
 #include <share.h>
 #include <sys/stat.h>
 #else
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -32,6 +37,12 @@ using Bytes = std::vector<std::uint8_t>;
 
 constexpr std::size_t kCardBytes = 16384 * 528, kMarkerAt = 4000 * 528;
 const char kMarker[] = "ps2-native-recomp card flush test, frame ";
+
+#ifdef _WIN32
+constexpr bool g_windows = true;  // the lock file is deleted when the run ends (elsewhere an empty one stays, unlocked)
+#else
+constexpr bool g_windows = false;
+#endif
 
 int failed = 0, checks = 0;
 void check(bool ok, const std::string &message) {
@@ -55,14 +66,43 @@ Bytes pattern(std::size_t size, unsigned seed) {
     for (std::size_t i = 0; i < size; ++i) b[i] = static_cast<std::uint8_t>((i * 31 + seed * 7 + (i >> 9)) & 0xFF);
     return b;
 }
+// A card that passes the check of sio2.cpp, different for each seed: page 0 the superblock of a formatted 8 MB card, pages 1 to
+// 200 and the marker page 4000 data, every one with the ECC mcman writes; the rest erased (0xFF), as on a card a game formatted
+// and saved on.
+Bytes valid_card(unsigned seed) {
+    Bytes card(kCardBytes, 0xFF);
+    const Bytes data = pattern(201 * 512, seed);
+    for (std::size_t page = 0; page <= 201; ++page) {
+        std::uint8_t *p = card.data() + (page == 201 ? kMarkerAt : page * 528);
+        std::memcpy(p, data.data() + (page == 201 ? 1 : page) * 512, 512);
+        if (page == 0) {
+            const char magic[] = "Sony PS2 Memory Card Format 1.2.0.0";
+            std::memcpy(p, magic, sizeof magic);
+            const std::uint8_t sizes[12] = {0x00, 0x02, 2, 0, 16, 0, 0, 0xFF, 0x00, 0x20, 0x00, 0x00};  // page 512, 2 per cluster, 16 per block, 8192 clusters
+            std::memcpy(p + 40, sizes, sizeof sizes);
+        }
+        ps2::iop::sio2::page_ecc(p, p + 512);
+    }
+    return card;
+}
 bool has_marker(const Bytes &card) {
     return card.size() == kCardBytes && std::memcmp(card.data() + kMarkerAt, kMarker, sizeof kMarker - 1) == 0;
 }
-// the card with the marker page put back to what it was: equal to `before` when only the marker changed
+// the card with the marker page (data and ECC) put back to what it was: equal to `before` when only the marker changed
 bool same_but_marker(Bytes card, const Bytes &before) {
-    if (card.size() != before.size() || card.size() < kMarkerAt + 64) return false;
-    std::memcpy(card.data() + kMarkerAt, before.data() + kMarkerAt, 64);
+    if (card.size() != before.size() || card.size() < kMarkerAt + 528) return false;
+    std::memcpy(card.data() + kMarkerAt, before.data() + kMarkerAt, 528);
     return card == before;
+}
+bool whole(const Bytes &card) { return ps2::iop::sio2::card_problem(card.data(), card.size()).empty(); }
+// the files in a folder whose names start with `prefix`, by name
+std::vector<fs::path> files_starting(const fs::path &dir, const std::string &prefix) {
+    std::vector<fs::path> found;
+    std::error_code error;
+    for (fs::directory_iterator it(dir, error), end; !error && it != end; it.increment(error))
+        if (it->path().filename().string().rfind(prefix, 0) == 0) found.push_back(it->path());
+    std::sort(found.begin(), found.end());
+    return found;
 }
 
 std::string g_self;
@@ -92,7 +132,7 @@ int child(const char *mode, const fs::path &p) {
 // as if the game had saved, then end the run the usual way (the card file is written) or as after a crash.
 int run_child(const std::string &mode, const std::string &card) {
     ps2::g_options.memcard_path = card;
-    ps2::os::set_env("PS2_TEST_CARD_DIRTY", "0");
+    ps2::os::set_env("PS2_TEST_CARD_DIRTY", mode == "raw-card" ? "0,raw" : "0");
     if (mode == "cut-card" || mode == "cut-file") ps2::os::set_env("PS2_TEST_CUT_BEFORE_RENAME", "1");
     if (mode == "cut-file") {
         const char text[] = "the new file";
@@ -129,10 +169,11 @@ void card_cases() {
         const fs::path dir = fresh_folder(), card = dir / "card.ps2";
         check(child("card", card) == 0 && has_marker(read_file(card)), "no card file: a new card is written");
         check(!fs::exists(dir / "card.fresh.ps2") && !fs::exists(dir / "card.ps2.tmp"), "no card file: no other file is left");
+        check(!fs::exists(dir / "card.ps2.lock") || !g_windows, "no card file: the lock file is gone after the run");
     }
     {
         const fs::path dir = fresh_folder(), card = dir / "card.ps2";
-        const Bytes before = pattern(kCardBytes, 1);
+        const Bytes before = valid_card(1);
         write_file(card, before);
         check(child("card", card) == 0, "valid card: the run ended normally");
         const Bytes after = read_file(card);
@@ -157,7 +198,7 @@ void card_cases() {
     {
         // a valid card that another program holds open so that nobody else can read it (Windows), or that may not be read (others)
         const fs::path dir = fresh_folder(), card = dir / "card.ps2";
-        const Bytes before = pattern(kCardBytes, 5);
+        const Bytes before = valid_card(5);
         write_file(card, before);
 #ifdef _WIN32
         int fd = -1;
@@ -182,7 +223,7 @@ void card_cases() {
     {
         // a fresh card made by an earlier run is loaded and kept, while the bad card file stays as it is
         const fs::path dir = fresh_folder(), card = dir / "card.ps2", fresh = dir / "card.fresh.ps2";
-        const Bytes bad = pattern(1000, 6), earlier = pattern(kCardBytes, 7);
+        const Bytes bad = pattern(1000, 6), earlier = valid_card(7);
         write_file(card, bad);
         write_file(fresh, earlier);
         check(child("card", card) == 0, "earlier fresh card: the run ended normally");
@@ -202,7 +243,7 @@ void card_cases() {
     {
         // the card write is cut off right before the rename: the old card is whole
         const fs::path dir = fresh_folder(), card = dir / "card.ps2";
-        const Bytes before = pattern(kCardBytes, 10);
+        const Bytes before = valid_card(10);
         write_file(card, before);
         check(child("cut-card", card) == 3, "card write cut before the rename: the run was cut off there");
         check(read_file(card) == before, "card write cut before the rename: the old card file is whole");
@@ -210,12 +251,155 @@ void card_cases() {
     {
         // after a crash the newest card goes to card.crash.ps2, the card file is not touched
         const fs::path dir = fresh_folder(), card = dir / "card.ps2";
-        const Bytes before = pattern(kCardBytes, 11);
+        const Bytes before = valid_card(11);
         write_file(card, before);
         check(child("crash-card", card) == 0, "crash: the copy was written");
         check(read_file(card) == before, "crash: the card file is byte for byte as it was");
         const Bytes copy = read_file(dir / "card.crash.ps2");
         check(has_marker(copy) && same_but_marker(copy, before), "crash: card.crash.ps2 holds the newest card");
+    }
+}
+
+// A damaged card file is replaced by the newest good backup, and kept beside it as card.damaged-<time>.ps2 (an empty one has
+// nothing to keep).
+void damaged_case(const std::string &what, const Bytes &damage) {
+    const fs::path dir = fresh_folder(), card = dir / "card.ps2", backups = dir / "card.backups";
+    fs::create_directories(backups);
+    const Bytes good = valid_card(60), older = valid_card(61);
+    write_file(backups / "card_2000-01-01_00-00-00.ps2", older);
+    fs::last_write_time(backups / "card_2000-01-01_00-00-00.ps2", fs::file_time_type::clock::now() - std::chrono::hours(2));
+    write_file(backups / "card_2000-01-01_00-00-01.ps2", good);
+    write_file(card, damage);
+    check(child("card", card) == 0, what + ": the run ended normally");
+    const Bytes now = read_file(card);
+    check(has_marker(now) && same_but_marker(now, good), what + ": the card was restored from the newest backup, and the game's save is on it");
+    const std::vector<fs::path> aside = files_starting(dir, "card.damaged-");
+    if (damage.empty()) check(aside.empty(), what + ": nothing was kept aside");
+    else check(aside.size() == 1 && read_file(aside[0]) == damage, what + ": the damaged file is kept byte for byte");
+    check(!fs::exists(dir / "card.fresh.ps2"), what + ": no fresh card was needed");
+}
+
+// The check of a card, the backups and the lock.
+void guard_cases() {
+    {
+        Bytes card = valid_card(20);
+        check(whole(card), "check: a formatted card with the right ECC passes");
+        check(whole(Bytes(kCardBytes, 0xFF)), "check: a blank card passes");
+        check(!whole(Bytes(kCardBytes, 0x00)), "check: a card of zeros fails");
+        card[5 * 528 + 100] ^= 0x10;
+        check(whole(card), "check: one wrong bit in a page passes (a card repairs it)");
+        card[5 * 528 + 512] ^= 0x01;  // two wrong bits in the ECC of the first 128 bytes: more than a card can repair
+        card[5 * 528 + 513] ^= 0x01;
+        check(!whole(card), "check: two wrong bits in a page fail");
+        Bytes no_magic = valid_card(21);
+        no_magic[0] = 'X';
+        ps2::iop::sio2::page_ecc(no_magic.data(), no_magic.data() + 512);
+        check(!whole(no_magic), "check: a page 0 that is not a superblock fails");
+    }
+    {
+        // each run copies the card file into card.backups before it first replaces it; the same card is not copied twice
+        const fs::path dir = fresh_folder(), card = dir / "card.ps2", backups = dir / "card.backups";
+        const Bytes before = valid_card(22);
+        write_file(card, before);
+        check(child("card", card) == 0, "backups: the first run ended normally");
+        std::vector<fs::path> made = files_starting(backups, "card_");
+        check(made.size() == 1 && read_file(made[0]) == before, "backups: the first run kept the card as it was");
+        const Bytes after = read_file(card);
+        check(child("card", card) == 0, "backups: the second run ended normally");
+        made = files_starting(backups, "card_");
+        check(made.size() == 2 && (read_file(made[0]) == after || read_file(made[1]) == after), "backups: the second run kept the card the first one wrote");
+        check(child("card", card) == 0 && files_starting(backups, "card_").size() == 2, "backups: a card the same as the newest copy is not copied again");
+        check(read_file(card) == after, "backups: the card file is the newest card");
+    }
+    {
+        // the newest 10 copies are kept
+        const fs::path dir = fresh_folder(), card = dir / "card.ps2", backups = dir / "card.backups";
+        fs::create_directories(backups);
+        const auto old = fs::file_time_type::clock::now() - std::chrono::hours(48);
+        for (unsigned i = 0; i < 12; ++i) {
+            const fs::path copy = backups / ("card_2000-01-01_00-00-" + std::to_string(10 + i) + ".ps2");
+            write_file(copy, valid_card(30 + i));
+            fs::last_write_time(copy, old + std::chrono::minutes(i));
+        }
+        write_file(card, valid_card(50));
+        check(child("card", card) == 0, "pruning: the run ended normally");
+        const std::vector<fs::path> left = files_starting(backups, "card_");
+        bool newest_kept = false;
+        for (const fs::path &p : left) newest_kept = newest_kept || read_file(p) == valid_card(50);
+        const bool oldest_gone = !fs::exists(backups / "card_2000-01-01_00-00-10.ps2") && !fs::exists(backups / "card_2000-01-01_00-00-11.ps2") &&
+                                 !fs::exists(backups / "card_2000-01-01_00-00-12.ps2");
+        check(left.size() == 10 && newest_kept && oldest_gone, "pruning: the newest 10 copies are kept, the oldest go");
+    }
+    damaged_case("card of zeros", Bytes(kCardBytes, 0x00));
+    {
+        Bytes cut = valid_card(62);
+        std::fill(cut.begin() + 100 * 528, cut.end(), 0x00);  // the end of a file that a power cut left as zeros
+        damaged_case("card zeroed from page 100", cut);
+    }
+    {
+        const Bytes whole_card = valid_card(63);
+        damaged_case("card cut short", Bytes(whole_card.begin(), whole_card.begin() + 4096 * 528));
+    }
+    damaged_case("empty card file", Bytes());
+    {
+        // the newest backup is damaged too: the one before it is used
+        const fs::path dir = fresh_folder(), card = dir / "card.ps2", backups = dir / "card.backups";
+        fs::create_directories(backups);
+        const Bytes good = valid_card(64);
+        write_file(backups / "card_2000-01-01_00-00-00.ps2", good);
+        fs::last_write_time(backups / "card_2000-01-01_00-00-00.ps2", fs::file_time_type::clock::now() - std::chrono::hours(2));
+        write_file(backups / "card_2000-01-01_00-00-01.ps2", Bytes(kCardBytes, 0x00));
+        write_file(card, Bytes(kCardBytes, 0x00));
+        check(child("card", card) == 0 && same_but_marker(read_file(card), good), "damaged backup: the older good backup is used");
+    }
+    {
+        // damaged, the right size, no backup: used as it is, after a copy was put aside
+        const fs::path dir = fresh_folder(), card = dir / "card.ps2";
+        Bytes damage = valid_card(65);
+        damage[7 * 528 + 512] ^= 0x01;
+        damage[7 * 528 + 513] ^= 0x01;
+        check(!whole(damage), "damaged, no backup: the card is damaged");
+        write_file(card, damage);
+        check(child("card", card) == 0, "damaged, no backup: the run ended normally");
+        const std::vector<fs::path> aside = files_starting(dir, "card.damaged-");
+        check(aside.size() == 1 && read_file(aside[0]) == damage, "damaged, no backup: a copy is kept as it was");
+        check(same_but_marker(read_file(card), damage), "damaged, no backup: the card was used as it is (the save is on it)");
+    }
+    {
+        // the game's card fails the check when it is written (a page cut in the middle): the file it replaces is copied first, and
+        // the next run goes back to that copy
+        const fs::path dir = fresh_folder(), card = dir / "card.ps2", backups = dir / "card.backups";
+        const Bytes before = valid_card(66);
+        write_file(card, before);
+        check(child("raw-card", card) == 0, "broken write: the run ended normally");
+        const std::vector<fs::path> made = files_starting(backups, "card_");
+        check(made.size() == 1 && read_file(made[0]) == before, "broken write: the whole card was copied before it was replaced");
+        check(!whole(read_file(card)), "broken write: the card file holds what the game had");
+        check(child("card", card) == 0 && same_but_marker(read_file(card), before), "broken write: the next run went back to the whole card");
+    }
+    {
+        // a run holds the card (its lock file): a second run gets no card and writes nothing
+        const fs::path dir = fresh_folder(), card = dir / "card.ps2", lock = dir / "card.ps2.lock";
+        const Bytes before = valid_card(67);
+        write_file(card, before);
+#ifdef _WIN32
+        int fd = -1;
+        _wsopen_s(&fd, lock.c_str(), _O_RDWR | _O_CREAT | _O_BINARY, _SH_DENYRW, _S_IREAD | _S_IWRITE);
+        const bool held = fd >= 0;
+#else
+        const int fd = open(lock.c_str(), O_RDWR | O_CREAT, 0644);
+        const bool held = fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0;
+#endif
+        check(held, "lock: the test holds the lock file");
+        check(child("card", card) == 0, "lock: the second run ended normally");
+        check(read_file(card) == before && !fs::exists(dir / "card.fresh.ps2") && !fs::exists(dir / "card.backups"), "lock: the second run wrote nothing");
+#ifdef _WIN32
+        if (fd >= 0) _close(fd);
+        fs::remove(lock);
+#else
+        if (fd >= 0) close(fd);
+#endif
+        check(child("card", card) == 0 && has_marker(read_file(card)), "lock: once it is free, a run uses the card again");
     }
 }
 
@@ -271,6 +455,7 @@ int main(int argc, char **argv) {
     fs::create_directories(g_work);
     game_folders();
     card_cases();
+    guard_cases();
     file_cases();
     std::printf("save files: %d of %d checks passed, %d failed\n", checks - failed, checks, failed);
     if (!failed) fs::remove_all(g_work, error);

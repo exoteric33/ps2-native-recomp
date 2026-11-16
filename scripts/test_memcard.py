@@ -391,7 +391,8 @@ def main():
         code, log = run(exe, program, disc, card, 100000, "62,stop")
         data = card.read_bytes()
         check("marker of the new run is there", b"frame 62" in data[MARKER_AT:MARKER_AT + 64])
-        same = data[:MARKER_AT] == first_card[:MARKER_AT] and data[MARKER_AT + 64:] == first_card[MARKER_AT + 64:]
+        # the marker page as a whole: the runner writes its ECC (spare bytes) with the marker, as mcman does
+        same = data[:MARKER_AT] == first_card[:MARKER_AT] and data[MARKER_AT + 528:] == first_card[MARKER_AT + 528:]
         check("everything outside the marker is the same as before", same and len(data) == CARD_BYTES)
 
         print("4. the write cannot get its temporary file: the old card stays")

@@ -1,5 +1,6 @@
 #include "ps2/vu_live.hpp"
 
+#include "ps2/crash.hpp"
 #include "ps2/os.hpp"
 
 #ifdef __EMSCRIPTEN__
@@ -113,6 +114,7 @@ bool load_library(const fs::path &path, std::size_t &count) {
     const auto stamp = reinterpret_cast<StampFn>(lb::find_symbol(library, "ps2_vu_live_stamp"));
     const auto init = reinterpret_cast<InitFn>(lb::find_symbol(library, "ps2_vu_live_init"));
     if (!stamp || !init || stamp() != g->stamp) return false;  // stays loaded: it cannot be unloaded safely, and it is rare
+    crash::note_live_library(crash::Thread::LiveVu, reinterpret_cast<const void *>(init));  // a crash in it is named as live VU code
     static const LiveHost host = {&ps2::vu::interpret, &ps2::vu::kick, &ps2::vu::top, &ps2::vu::itop};
     std::uint32_t n = 0;
     const Program *table = init(&host, &n);
@@ -198,7 +200,9 @@ bool build(const std::vector<Pending> &batch, const std::string &id, Timing &tim
 }
 
 void worker() {
+    crash::enter_thread(crash::Thread::LiveVu);
     for (;;) {
+        crash::test_poll(crash::Thread::LiveVu);
         std::vector<Pending> batch;
         bool delay = true;
         {

@@ -90,6 +90,8 @@ inline void ld128(std::uint32_t a, Reg128 &out) {
     slow_ld128(a, out);
 }
 
+#ifdef PS2_LIVE_EE
+// A library of code compiled while the game runs keeps the plain store path: its watch switch is a copy (ee_live_abi.hpp).
 inline void st8(std::uint32_t a, std::uint8_t v) {
     watched<std::uint8_t>(a, v);
     if (auto *p = fast<std::uint8_t>(a)) { *p = v; return; }
@@ -119,6 +121,45 @@ inline void st128(std::uint32_t a, const Reg128 &v) {
     if (auto *p = fast<std::uint8_t>(a)) { std::memcpy(p, &v, 16); return; }
     slow_st128(a, v);
 }
+#else
+// A guest store is one compare and one write when it goes to main memory: g_store_ram_end is the end of main memory, or 0
+// while the write watch (PS2_WATCH) is on. Every other store (scratchpad, registers, mirrors, and every store while the
+// watch is on) takes st*_other in memory.cpp, which is the old path: the watch check, then scratchpad or main memory, then
+// slow_st*. The order of what happens is the same as before; only the test for the common case is shorter. It is an inline
+// variable so the generated code reaches it directly (an extern variable costs a load of its address on mingw).
+inline std::uint32_t g_store_ram_end = kRamSize;
+
+void st8_other(std::uint32_t a, std::uint8_t v);
+void st16_other(std::uint32_t a, std::uint16_t v);
+void st32_other(std::uint32_t a, std::uint32_t v);
+void st64_other(std::uint32_t a, std::uint64_t v);
+void st128_other(std::uint32_t a, const Reg128 &v);
+
+inline void st8(std::uint32_t a, std::uint8_t v) {
+    if (a < g_store_ram_end) [[likely]] { PS2_RAM[a] = v; return; }
+    st8_other(a, v);
+}
+
+inline void st16(std::uint32_t a, std::uint16_t v) {
+    if (a < g_store_ram_end) [[likely]] { store(PS2_RAM + a, v); return; }
+    st16_other(a, v);
+}
+
+inline void st32(std::uint32_t a, std::uint32_t v) {
+    if (a < g_store_ram_end) [[likely]] { store(PS2_RAM + a, v); return; }
+    st32_other(a, v);
+}
+
+inline void st64(std::uint32_t a, std::uint64_t v) {
+    if (a < g_store_ram_end) [[likely]] { store(PS2_RAM + a, v); return; }
+    st64_other(a, v);
+}
+
+inline void st128(std::uint32_t a, const Reg128 &v) {
+    if (a < g_store_ram_end) [[likely]] { std::memcpy(PS2_RAM + a, &v, 16); return; }
+    st128_other(a, v);
+}
+#endif
 
 inline std::uint64_t mask_below(std::uint32_t bits) { return bits >= 64 ? ~0ull : (1ull << bits) - 1; }
 

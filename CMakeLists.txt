@@ -16,8 +16,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(PS2_GENERATED "" CACHE PATH "Folder with the C++ generated for a game")
 set(PS2_RUNTIME_LIB "" CACHE FILEPATH "libps2runtime.a built earlier from this source tree (scripts/runtime.sh); a game links it instead of compiling the runtime again")
 
+# ps2run.exe with no DLL next to it (SDL2 and winpthread linked in): the single-file pack (scripts/extract_disc.py bundle). The normal Windows build
+# keeps SDL2.dll beside the program.
+option(PS2_WIN_STATIC "Link ps2run.exe fully static, for the single-file pack" OFF)
+
 if(WIN32)
     add_link_options(-static-libgcc -static-libstdc++)
+    if(PS2_WIN_STATIC)
+        add_link_options(-static)
+    endif()
 endif()
 
 if(EMSCRIPTEN)
@@ -54,12 +61,15 @@ else()
     set(PS2_API PUBLIC)
     add_library(ps2runtime STATIC
         runtime/src/memory.cpp
+        runtime/src/os.cpp
         runtime/src/dispatch.cpp
         runtime/src/system.cpp
         runtime/src/kernel.cpp
         runtime/src/hw.cpp
         runtime/src/cop.cpp
         runtime/src/disc.cpp
+        runtime/src/disc_folder.cpp
+        runtime/src/disc_bundle.cpp
         runtime/src/dmac.cpp
         runtime/src/vif.cpp
         runtime/src/vu_micro.cpp
@@ -68,6 +78,7 @@ else()
         runtime/src/live_build.cpp
         runtime/src/vu_live.cpp
         runtime/src/ee_live.cpp
+        runtime/src/ipu/idct.cpp
         runtime/src/ipu/ipu.cpp
         runtime/src/gs/gs.cpp
         runtime/src/gs/gif.cpp
@@ -130,6 +141,12 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2savetest PRIVATE synchronization)
     endif()
+    # which graphics chips get the draw program without wgpu's run-time checks by default (no game, no graphics): ninja ps2trustedtest
+    add_executable(ps2trustedtest EXCLUDE_FROM_ALL tests/trusted_shader.cpp)
+    target_include_directories(ps2trustedtest PRIVATE runtime/src)
+    # the picture pace's hold (runtime/include/ps2/pace.hpp) with made-up games, no game and no runtime needed: ninja ps2pacetest
+    add_executable(ps2pacetest EXCLUDE_FROM_ALL tests/pace.cpp)
+    target_include_directories(ps2pacetest PRIVATE runtime/include)
     # the lines of the picture each video mode shows (480p must not be cut like a TV picture): ninja ps2displaylinestest
     add_executable(ps2displaylinestest EXCLUDE_FROM_ALL tests/display_lines.cpp)
     target_include_directories(ps2displaylinestest PRIVATE runtime/src)
@@ -149,9 +166,26 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
     add_custom_command(OUTPUT "${PS2_BLIT_WGSL}"
         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/blit.wgsl -DOUT=${PS2_BLIT_WGSL} -DNAME=kBlitShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         DEPENDS runtime/src/gs/gpu/blit.wgsl cmake/embed.cmake)
+    # The experimental hardware drawing path (hwdraw*, hwcache*, hwstat*): off unless PS2_GPU_HW=1 is set. The browser build
+    # compiles the three files as empty stubs and embeds none of its shaders.
+    set(PS2_HW_SOURCES runtime/src/gs/gpu/hwdraw.cpp runtime/src/gs/gpu/hwstat.cpp runtime/src/gs/gpu/hwcache.cpp)
+    if(NOT EMSCRIPTEN)
+        set(PS2_HW_WGSL "${CMAKE_BINARY_DIR}/hw_wgsl.cpp")
+        add_custom_command(OUTPUT "${PS2_HW_WGSL}"
+            COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/hwdraw.wgsl -DOUT=${PS2_HW_WGSL} -DNAME=kHwShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+            DEPENDS runtime/src/gs/gpu/hwdraw.wgsl cmake/embed.cmake)
+        set(PS2_CACHE_WGSL "${CMAKE_BINARY_DIR}/cache_wgsl.cpp")
+        add_custom_command(OUTPUT "${PS2_CACHE_WGSL}"
+            COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/hwcache.wgsl -DOUT=${PS2_CACHE_WGSL} -DNAME=kCacheShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+            DEPENDS runtime/src/gs/gpu/hwcache.wgsl cmake/embed.cmake)
+        set(PS2_HW_SYNC_WGSL "${CMAKE_BINARY_DIR}/hw_sync_wgsl.cpp")
+        add_custom_command(OUTPUT "${PS2_HW_SYNC_WGSL}"
+            COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/hwdraw_sync.wgsl -DOUT=${PS2_HW_SYNC_WGSL} -DNAME=kHwSyncShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+            DEPENDS runtime/src/gs/gpu/hwdraw_sync.wgsl cmake/embed.cmake)
+        list(APPEND PS2_HW_SOURCES "${PS2_HW_WGSL}" "${PS2_HW_SYNC_WGSL}" "${PS2_CACHE_WGSL}")
+    endif()
     if(NOT PS2_PREBUILT)
-        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}"
-            )
+        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp runtime/src/gs/gpu/tiles.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" ${PS2_HW_SOURCES})
     endif()
     target_compile_definitions(ps2runtime ${PS2_API} PS2_GPU)
     if(EMSCRIPTEN)
@@ -170,8 +204,37 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
             target_link_libraries(ps2runtime ${PS2_API} "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework CoreFoundation" "-framework IOKit" "-framework IOSurface" objc)
         endif()
     endif()
+    # the GS's mipmapping in the software reference and the draw program, no game data (docs/mipmap.md): ninja ps2mipmaptest
+    if(NOT EMSCRIPTEN)
+        add_executable(ps2mipmaptest EXCLUDE_FROM_ALL tests/mipmap.cpp)
+        target_include_directories(ps2mipmaptest PRIVATE runtime/src)
+        target_link_libraries(ps2mipmaptest PRIVATE ps2runtime)
+    endif()
 endif()
 
+# Differential test of the experimental card path (hwdraw.cpp) against the painter: ninja ps2hwalpha. Links the runtime (the draw path is the game's own).
+if(NOT EMSCRIPTEN AND EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
+    add_executable(ps2hwalpha EXCLUDE_FROM_ALL tests/hwalpha.cpp)
+    target_include_directories(ps2hwalpha PRIVATE runtime/src "${PS2_WGPU_DIR}/include")
+    target_link_libraries(ps2hwalpha PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2hwalpha PRIVATE synchronization)
+    endif()
+endif()
+
+# Stand-alone measurements of what the card path asks of a graphics card: ninja ps2hwprobe. Uses wgpu only, not the runtime.
+if(NOT EMSCRIPTEN AND EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
+    add_executable(ps2hwprobe EXCLUDE_FROM_ALL tests/hwprobe.cpp)
+    target_include_directories(ps2hwprobe PRIVATE "${PS2_WGPU_DIR}/include")
+    if(WIN32)
+        target_link_libraries(ps2hwprobe PRIVATE "${PS2_WGPU_DIR}/lib/libwgpu_native.a" ws2_32 userenv ntdll synchronization pthread m)
+    else()
+        target_link_libraries(ps2hwprobe PRIVATE "${PS2_WGPU_DIR}/lib/libwgpu_native.a" dl pthread m)
+    endif()
+    if(APPLE)
+        target_link_libraries(ps2hwprobe PRIVATE "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework CoreFoundation" "-framework IOKit" "-framework IOSurface" objc)
+    endif()
+endif()
 
 if(NOT EMSCRIPTEN)
     add_executable(ps2sifcmdtest EXCLUDE_FROM_ALL tests/sif_cmd_intr.cpp)
@@ -180,12 +243,45 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2sifcmdtest PRIVATE synchronization)  # the GS queue's WaitOnAddress, which the wgpu line above adds only with wgpu
     endif()
+    # the four-lane VU0 macro helpers the recompiler calls against the one-lane ones, and the flag liveness that goes with
+    # them (headers and the decoder only, no game needed): ninja ps2vu0inlinetest && ./ps2vu0inlinetest [rounds]
+    add_executable(ps2vu0inlinetest EXCLUDE_FROM_ALL tests/vu0_inline.cpp recomp/r5900.cpp)
+    target_include_directories(ps2vu0inlinetest PRIVATE runtime/include recomp)
     # VU control-flow, E-bit return, and ILW/branch-register timing regression fixture: ninja ps2vuregtest
     add_executable(ps2vuregtest EXCLUDE_FROM_ALL tests/test_vu_regression.cpp)
     target_include_directories(ps2vuregtest PRIVATE runtime/src)
     target_link_libraries(ps2vuregtest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2vuregtest PRIVATE synchronization)
+    endif()
+    # the GS message ring between two threads (wrap, full ring, held batches, sleeps and wake-ups), no game needed: ninja ps2queuestresstest
+    add_executable(ps2queuestresstest EXCLUDE_FROM_ALL tests/gs_queue_stress.cpp)
+    target_include_directories(ps2queuestresstest PRIVATE runtime/src)
+    target_link_libraries(ps2queuestresstest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2queuestresstest PRIVATE synchronization)
+    endif()
+    # the late float clean-up of the compiled VU1 programs against the old one, on every bit pattern and with the processor's
+    # "denormals are zero" bit set (ps2/vu_ops.hpp), no game needed: ninja ps2vucleanuptest
+    add_executable(ps2vucleanuptest EXCLUDE_FROM_ALL tests/test_vu_cleanup.cpp)
+    target_include_directories(ps2vucleanuptest PRIVATE runtime/include)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        target_compile_options(ps2vucleanuptest PRIVATE -msse4.1)
+    endif()
+    # the decode cache's blocks (runtime/src/gs/gpu/gpu.cpp, for_cells) against the drawing program's address tables, no game needed: ninja ps2decodecachetest
+    add_executable(ps2decodecachetest EXCLUDE_FROM_ALL tests/decode_cache.cpp)
+    target_link_libraries(ps2decodecachetest PRIVATE ps2runtime)
+    # the triangle set-up of the drawing thread (vectors, runtime/src/gs/gpu/setup.hpp) against the scalar arithmetic, bit for bit,
+    # no game needed: ninja ps2drawsetuptest
+    add_executable(ps2drawsetuptest EXCLUDE_FROM_ALL tests/draw_setup.cpp)
+    target_include_directories(ps2drawsetuptest PRIVATE runtime/include runtime/src)
+    # the tile lists of a drawing batch (runtime/src/gs/gpu/tiles.cpp) against the way they were built before, word for word; also times
+    # batches recorded from a game. No game needed: ninja ps2tilelisttest
+    add_executable(ps2tilelisttest EXCLUDE_FROM_ALL tests/tile_lists.cpp)
+    target_include_directories(ps2tilelisttest PRIVATE runtime/include runtime/src)
+    target_link_libraries(ps2tilelisttest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2tilelisttest PRIVATE synchronization)
     endif()
     # damaged disc images, IOP modules and boot ELFs refused cleanly, no game needed: ninja ps2discinputtest
     add_executable(ps2discinputtest EXCLUDE_FROM_ALL tests/disc_input.cpp)
@@ -201,12 +297,40 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2iopboundstest PRIVATE synchronization)
     endif()
+    # the IOP interpreter's decode table against the interpreter before it, and code that changes under it (no game needed): ninja ps2iopdecodetest
+    add_executable(ps2iopdecodetest EXCLUDE_FROM_ALL tests/iop_decode.cpp)
+    target_include_directories(ps2iopdecodetest PRIVATE runtime/src)
+    target_link_libraries(ps2iopdecodetest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2iopdecodetest PRIVATE synchronization)
+    endif()
     # modload #9 and cdvdman #44 (Tales of Destiny 2 / Director's Cut, no game needed): ninja ps2talestest
     add_executable(ps2talestest EXCLUDE_FROM_ALL tests/iop_tales.cpp)
     target_include_directories(ps2talestest PRIVATE runtime/src)
     target_link_libraries(ps2talestest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2talestest PRIVATE synchronization)
+    endif()
+    # the sound lines of the F9 problem report, no game needed: ninja ps2spu2summarytest
+    add_executable(ps2spu2summarytest EXCLUDE_FROM_ALL tests/spu2_summary.cpp)
+    target_include_directories(ps2spu2summarytest PRIVATE runtime/src)
+    target_link_libraries(ps2spu2summarytest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2spu2summarytest PRIVATE synchronization)
+    endif()
+    # the thread lists of the F9 problem report, no game needed: ninja ps2threadreporttest
+    add_executable(ps2threadreporttest EXCLUDE_FROM_ALL tests/thread_report.cpp)
+    target_include_directories(ps2threadreporttest PRIVATE runtime/src)
+    target_link_libraries(ps2threadreporttest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2threadreporttest PRIVATE synchronization)
+    endif()
+    # an EE sceSifSetDma whose transfer list or packet is in the scratchpad (issues 96 and 101, no game needed): ninja ps2sifsprtest
+    add_executable(ps2sifsprtest EXCLUDE_FROM_ALL tests/sif_spr_dma.cpp)
+    target_include_directories(ps2sifsprtest PRIVATE runtime/src)
+    target_link_libraries(ps2sifsprtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2sifsprtest PRIVATE synchronization)
     endif()
     # an IOP reset with no image (SifIopReset("", 0), Need for Speed) and the waits after it, no game needed: ninja ps2iopresettest
     add_executable(ps2iopresettest EXCLUDE_FROM_ALL tests/iop_reboot_empty.cpp)
@@ -222,12 +346,125 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2iopbootflagstest PRIVATE synchronization)
     endif()
+    # a SIF command from the EE that no IOP module handles (public issue 70, Madagascar's 0x80000004), no game needed: ninja ps2sifunhandledtest
+    add_executable(ps2sifunhandledtest EXCLUDE_FROM_ALL tests/sif_unhandled_cmd.cpp)
+    target_include_directories(ps2sifunhandledtest PRIVATE runtime/src)
+    target_link_libraries(ps2sifunhandledtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2sifunhandledtest PRIVATE synchronization)
+    endif()
+    # an interrupt pending at EI (or MTC0 Status, or a system call's return) is taken at once (issue 100, GTA Vice City, no game needed): ninja ps2eipendingtest
+    add_executable(ps2eipendingtest EXCLUDE_FROM_ALL tests/ei_pending.cpp)
+    target_include_directories(ps2eipendingtest PRIVATE runtime/src)
+    target_link_libraries(ps2eipendingtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2eipendingtest PRIVATE synchronization)
+    endif()
+    # the IPU's inverse transform (BDEC) gives the same pixels bit for bit as the one it replaced, on millions of random blocks (no game needed): ninja ps2idctexacttest
+    add_executable(ps2idctexacttest EXCLUDE_FROM_ALL tests/idct_exact.cpp)
+    target_include_directories(ps2idctexacttest PRIVATE runtime/src)
+    target_link_libraries(ps2idctexacttest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2idctexacttest PRIVATE synchronization)
+    endif()
+    # a sound stream sent by auto-DMA moves the IOP DMA channel's address on as the chip takes it in (issue 100, GTA Vice City, no game needed): ninja ps2admaprogresstest
+    add_executable(ps2admaprogresstest EXCLUDE_FROM_ALL tests/adma_progress.cpp)
+    target_include_directories(ps2admaprogresstest PRIVATE runtime/src)
+    target_link_libraries(ps2admaprogresstest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2admaprogresstest PRIVATE synchronization)
+    endif()
+    # an IOP sceSifSetDma with SIF_DMA_INT_O raises the EE's SIF0 interrupt, channel 5 (public report 71, no game needed): ninja ps2sifdmatest
+    add_executable(ps2sifdmatest EXCLUDE_FROM_ALL tests/sif_dma_intr.cpp)
+    target_include_directories(ps2sifdmatest PRIVATE runtime/src)
+    target_link_libraries(ps2sifdmatest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2sifdmatest PRIVATE synchronization)
+    endif()
+    # the SIF log names the server of an EE call and the run's summary counts the calls per server (public report 71, no game needed): ninja ps2sifcalllogtest
+    add_executable(ps2sifcalllogtest EXCLUDE_FROM_ALL tests/sif_call_log.cpp)
+    target_include_directories(ps2sifcalllogtest PRIVATE runtime/src)
+    target_link_libraries(ps2sifcalllogtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2sifcalllogtest PRIVATE synchronization)
+    endif()
+    # cdvdman's sceCdSC (#50) and sceCdRC (#51) answer like a drive with a disc (issue 57, no game needed): ninja ps2cdvdsctest
+    add_executable(ps2cdvdsctest EXCLUDE_FROM_ALL tests/cdvd_sc_rc.cpp)
+    target_include_directories(ps2cdvdsctest PRIVATE runtime/src)
+    target_link_libraries(ps2cdvdsctest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2cdvdsctest PRIVATE synchronization)
+    endif()
+    # a two-layer disc's plain search reads layer 0, cdvdman sceCdRM (#64), the i.LINK link chip with no cable (issues 57 and 91, no game needed): ninja ps2disclayerstest
+    add_executable(ps2disclayerstest EXCLUDE_FROM_ALL tests/disc_layers_ilink.cpp)
+    target_include_directories(ps2disclayerstest PRIVATE runtime/src)
+    target_link_libraries(ps2disclayerstest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2disclayerstest PRIVATE synchronization)
+    endif()
+    # the EE's FILEIO calls in the old and the newer packet layout, rom0:ROMVER (issue 78, no game needed): ninja ps2fileiolayoutstest
+    add_executable(ps2fileiolayoutstest EXCLUDE_FROM_ALL tests/fileio_layouts.cpp)
+    target_include_directories(ps2fileiolayoutstest PRIVATE runtime/src)
+    target_link_libraries(ps2fileiolayoutstest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2fileiolayoutstest PRIVATE synchronization)
+    endif()
+    # LOADFILE call 1 (sceSifLoadElf) copies an EE program from the disc into the EE's memory (issue 98, no game needed): ninja ps2loadfileelftest
+    add_executable(ps2loadfileelftest EXCLUDE_FROM_ALL tests/loadfile_elf.cpp)
+    target_include_directories(ps2loadfileelftest PRIVATE runtime/src)
+    target_link_libraries(ps2loadfileelftest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2loadfileelftest PRIVATE synchronization)
+    endif()
+    # the stream command sceCdStStat answers the sectors in the stream buffer (issue 44, no game needed): ninja ps2cdvdstreamstattest
+    add_executable(ps2cdvdstreamstattest EXCLUDE_FROM_ALL tests/cdvd_stream_stat.cpp)
+    target_include_directories(ps2cdvdstreamstattest PRIVATE runtime/src)
+    target_link_libraries(ps2cdvdstreamstattest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2cdvdstreamstattest PRIVATE synchronization)
+    endif()
+    # two RPC calls on one EE client before the first ended: each end wakes its own caller (issue 106, no game needed): ninja ps2sifcalloverlaptest
+    add_executable(ps2sifcalloverlaptest EXCLUDE_FROM_ALL tests/sif_call_overlap.cpp)
+    target_include_directories(ps2sifcalloverlaptest PRIVATE runtime/src)
+    target_link_libraries(ps2sifcalloverlaptest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2sifcalloverlaptest PRIVATE synchronization)
+    endif()
+    # ioman AddDrv and DelDrv call the driver's init and deinit and keep a table of its devices (no game needed): ninja ps2iomandrvtest
+    add_executable(ps2iomandrvtest EXCLUDE_FROM_ALL tests/ioman_drivers.cpp)
+    target_include_directories(ps2iomandrvtest PRIVATE runtime/src)
+    target_link_libraries(ps2iomandrvtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2iomandrvtest PRIVATE synchronization)
+    endif()
     # an UNPACK with CL 0 (or before any STCYCL) takes its data and the stream stays in step, no game needed: ninja ps2viftest
     add_executable(ps2viftest EXCLUDE_FROM_ALL tests/vif_cycle.cpp)
     target_include_directories(ps2viftest PRIVATE runtime/src)
     target_link_libraries(ps2viftest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2viftest PRIVATE synchronization)
+    endif()
+    # every UNPACK form under every STMOD, mask and write cycle equals the lane-by-lane rules, no game needed: ninja ps2vifunpacktest
+    add_executable(ps2vifunpacktest EXCLUDE_FROM_ALL tests/vif_unpack_modes.cpp)
+    target_include_directories(ps2vifunpacktest PRIVATE runtime/src)
+    target_link_libraries(ps2vifunpacktest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2vifunpacktest PRIVATE synchronization)
+    endif()
+    # an XGKICK packet without an end does not swallow the next kick's packet (public issue 69), no game needed: ninja ps2gifrunawaytest
+    add_executable(ps2gifrunawaytest EXCLUDE_FROM_ALL tests/gif_runaway.cpp)
+    target_include_directories(ps2gifrunawaytest PRIVATE runtime/src)
+    target_link_libraries(ps2gifrunawaytest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2gifrunawaytest PRIVATE synchronization)
+    endif()
+    # VIF1 holds a program started by MSCAL until the UNPACKs behind it are done, and PS2_VIF_DEFER=0 starts it at the MSCAL (public issue 69), no game
+    # needed: ninja ps2vifdefertest, run it twice (once with the argument off)
+    add_executable(ps2vifdefertest EXCLUDE_FROM_ALL tests/vif_defer.cpp)
+    target_include_directories(ps2vifdefertest PRIVATE runtime/src)
+    target_link_libraries(ps2vifdefertest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2vifdefertest PRIVATE synchronization)
     endif()
 endif()
 
@@ -261,7 +498,7 @@ if(PS2_GENERATED)
         return()
     endif()
 
-    add_executable(ps2run host/main.cpp)
+    add_executable(ps2run host/main.cpp host/crash.cpp)  # crash.cpp: the lines a crash writes to the log
     target_link_libraries(ps2run PRIVATE ps2game ps2runtime)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         target_sources(ps2run PRIVATE host/profile.cpp)
@@ -290,9 +527,15 @@ if(PS2_GENERATED)
     if(SDL2_FOUND AND NOT EMSCRIPTEN)
         target_sources(ps2run PRIVATE host/window.cpp host/keymap.cpp host/quickmenu.cpp host/stretch.cpp)
         target_compile_definitions(ps2run PRIVATE PS2_WINDOW)
-        target_link_libraries(ps2run PRIVATE SDL2::SDL2)
+        if(WIN32 AND PS2_WIN_STATIC AND TARGET SDL2::SDL2-static)
+            target_link_libraries(ps2run PRIVATE SDL2::SDL2-static)
+        else()
+            target_link_libraries(ps2run PRIVATE SDL2::SDL2)
+            if(WIN32)
+                add_custom_command(TARGET ps2run POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:ps2run>)
+            endif()
+        endif()
         if(WIN32)
-            add_custom_command(TARGET ps2run POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:ps2run>)
             # Microsoft's shader compiler for Direct3D 12 (scripts/fetch_dxc.sh): used when the two DLLs sit next to ps2run.exe,
             # FXC otherwise. Not shipped with the source: each PC downloads it.
             foreach(dxc_dll dxcompiler.dll dxil.dll)

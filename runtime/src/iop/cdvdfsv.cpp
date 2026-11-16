@@ -54,6 +54,19 @@ std::uint8_t bcd(int v) { return static_cast<std::uint8_t>(((v / 10) << 4) | (v 
 
 bool g_streaming = false;
 std::uint32_t g_stream_pos = 0;
+// The stream buffer the game set up with sceCdStInit (ps2sdk cdvdstm.c, command 5: the buffer's size in sectors and its number of banks);
+// not part of a save state (0 after loading one: sceCdStStat then answers kStreamBufferDefault until the game sets the stream up again).
+std::uint32_t g_stream_buffer = 0;
+std::uint32_t g_stream_banks = 0;
+constexpr std::uint32_t kStreamBufferDefault = 16;
+
+// sceCdStStat of a full buffer. cdvdstm.c fills one bank after the other and never the bank the reader is in, so a full buffer holds all
+// banks but one: (banks - 1) times the sectors of a bank.
+std::uint32_t stream_full() {
+    if (!g_stream_buffer) return kStreamBufferDefault;
+    if (g_stream_banks < 2) return g_stream_buffer;
+    return (g_stream_banks - 1) * (g_stream_buffer / g_stream_banks);
+}
 
 std::uint64_t delay(std::uint32_t sectors) { return usec_to_cycles(400) + static_cast<std::uint64_t>(sectors) * usec_to_cycles(200); }
 
@@ -70,6 +83,8 @@ void read_to_ee(std::uint32_t sector, std::uint32_t count, std::uint32_t dst) {
 void install_cdvdfsv() {
     g_streaming = false;
     g_stream_pos = 0;
+    g_stream_buffer = 0;
+    g_stream_banks = 0;
     register_job(kJobFsvRead, [](const Job &j) {
         if (g_trace_hle) std::fprintf(stderr, "[cdvdfsv] stream write lsn %u count %u to 0x%08X\n", j.a, j.b, j.c);
         if (!disc::ready(j.a, j.b)) {
@@ -97,14 +112,15 @@ void install_cdvdfsv() {
     sif::register_hle_server(0x80000593u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t ret_size) {
         switch (method) {
         case 0x01: {
-            const std::time_t t = static_cast<std::time_t>(rtc_seconds());
+            // in Japan time (UTC+9) as the console's clock chip keeps it, the whole date shifted (cdvd.cpp write_clock)
+            const std::time_t t = static_cast<std::time_t>(rtc_seconds() + 9 * 3600);
             const std::tm *tm = std::gmtime(&t);
             set_ee32(ret, 1);
             std::uint8_t *clock = ps2::g_ram + ret + 4;
             clock[0] = 0;
             clock[1] = bcd(tm->tm_sec);
             clock[2] = bcd(tm->tm_min);
-            clock[3] = bcd((tm->tm_hour + 9) % 24);
+            clock[3] = bcd(tm->tm_hour);
             clock[4] = 0;
             clock[5] = bcd(tm->tm_mday);
             clock[6] = bcd(tm->tm_mon + 1);
@@ -162,8 +178,11 @@ void install_cdvdfsv() {
             }
             case 3: g_streaming = false; set_ee32(ret, 1); return true;
             case 4: case 9: g_stream_pos = sector; set_ee32(ret, 1); return true;
-            case 5: set_ee32(ret, 1); return true;
-            case 6: set_ee32(ret, sector); return true;
+            case 5: g_stream_buffer = sector; g_stream_banks = count; set_ee32(ret, 1); return true;
+            // sceCdStStat: how many sectors the stream buffer holds now (ps2sdk cdvdstm.c, command 6: the filled banks times the sectors
+            // per bank). The disc is always ahead here, so a started stream has its buffer full, a stopped one nothing.
+            // This used to answer the lbn field of the call, which is 0, so a game waiting for data in the buffer waited for ever.
+            case 6: set_ee32(ret, g_streaming ? stream_full() : 0u); return true;
             default: set_ee32(ret, 1); return true;
             }
         }
@@ -186,12 +205,15 @@ void install_cdvdfsv() {
     sif::register_hle_server(0x80000597u, [](std::uint32_t, std::uint32_t args, std::uint32_t size, std::uint32_t ret, std::uint32_t) {
         const std::uint32_t offset = size == 0x124 ? 0x20u : 0x24u;
         const std::string path = ee_text((args & (ps2::kRamSize - 1)) + offset, 1024);
-        const auto entry = disc::find(path);
+        // The 0x12C packet (ps2sdk libcdvd-rpc.h cdvdfsv_rpc4_sz12c_inpacket_t: file, attributes, path, EE address, layer) is
+        // sceCdLayerSearchFile; the newer EE library's sceCdSearchFile sends it too, with layer 0. The smaller packets have no layer.
+        const int layer = size == 0x12C ? static_cast<int>(ee32(args + 0x128)) : 0;
+        const auto entry = disc::find(path, layer);
         if (entry) {
             set_ee32(args, entry->sector);
             set_ee32(args + 4, entry->size);
         }
-        std::fprintf(stderr, "[cdvdfsv] search %s -> %s\n", path.c_str(), entry ? "found" : "missing");
+        std::fprintf(stderr, "[cdvdfsv] search %s%s -> %s\n", path.c_str(), layer ? " (layer 1)" : "", entry ? "found" : "missing");
         set_ee32(ret, entry ? 1u : 0u);
         return true;
     });

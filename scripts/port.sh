@@ -82,6 +82,11 @@ export EMSDK="${EMSDK:-$ROOT/tools/emsdk}"
 setup=()
 [ "$web" = 1 ] || setup=(--native-only)
 if { [ "$web" = 1 ] && [ ! -f "$EMSDK/emsdk_env.sh" ]; } || [ ! -x "$tools/eerecomp" ] || [ ! -x "$tools/vurecomp" ]; then "$here/setup.sh" "${setup[@]}"; fi
+# An update can bring a newer translator (the app replaces recomp/ but keeps build/): ninja compiles the tools again when their
+# sources changed, about a second when nothing did. Without this, games built after an update would still use the old translator.
+if [ -f "$tools/build.ninja" ]; then
+  ninja -C "$tools" eerecomp vurecomp > "$tools/ninja-port.log" 2>&1 || { tail -n 30 "$tools/ninja-port.log" >&2; echo "building the translator tools failed" >&2; exit 1; }
+fi
 mkdir -p "$game/disc" "$game/vu1" "$game/vu0" "$game/shots" "$generated"
 
 echo "== [1/6] disc"
@@ -208,6 +213,7 @@ echo "== [4/6] exploring"
 if [ "$explore" = 1 ]; then
   for ((round = 1; round <= rounds; round++)); do
     build_native
+    echo "[port] testing round $round of at most $rounds"
     rm -f "$game/misses.txt" "$game/explore.ps2" "$game/explore_ram.bin"
     code=0
     PS2_DUMP="$game/explore_ram.bin" PS2_GPU_LOW_POWER=1 PS2_VU0_RECORD="$game/vu0" PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" --memcard "$game/explore.ps2" \

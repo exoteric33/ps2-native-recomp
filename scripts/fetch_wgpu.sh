@@ -26,10 +26,10 @@ mkdir -p "$target"
 url="https://github.com/gfx-rs/wgpu-native/releases/download/$version/wgpu-$os-$arch-release.zip"
 # curl from Git for Windows and tar.exe read their command line in the ANSI code page and cannot open a folder with letters
 # outside it (Chinese on a Western Windows), so both run inside the folder with a plain file name. MinGit has no unzip.
-(cd "$target" && curl -fL -o wgpu.zip "$url") || { rm -f "$target/wgpu.zip"; echo "wgpu-native: download failed: $url" >&2; exit 1; }
-# sha256sum on Linux and in Git Bash, shasum on macOS
-if command -v sha256sum > /dev/null; then got=$(cd "$target" && sha256sum wgpu.zip | cut -d' ' -f1)
-else got=$(cd "$target" && shasum -a 256 wgpu.zip | cut -d' ' -f1); fi
+# fetch_download retries, and uses a file saved by hand in downloads/ (scripts/fetch_lib.sh, docs/fetch-retry.md).
+. "$here/scripts/fetch_lib.sh"
+fetch_download wgpu-native "$target" wgpu.zip "$url" "$sha256" || exit 1
+got=$(fetch_sha256 "$target/wgpu.zip")
 if [ "$got" != "$sha256" ]; then rm -f "$target/wgpu.zip"; echo "wgpu-native: wrong SHA-256 $got (expected $sha256)" >&2; exit 1; fi
 if command -v unzip > /dev/null; then unzip -o -q "$target/wgpu.zip" -d "$target"; else (cd "$target" && tar -xf wgpu.zip); fi
 rm "$target/wgpu.zip"

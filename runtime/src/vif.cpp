@@ -9,7 +9,9 @@
 #include "ps2/state.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -23,9 +25,9 @@ namespace {
 
 struct Unit {
     std::uint32_t stat = 0, err = 0, mark = 0, cycle = 0, mode = 0, num = 0, mask = 0, code = 0;
-    std::uint32_t itops = 0, base = 0, ofst = 0, tops = 0, itop = 0, top = 0;
+    std::uint32_t itops = 0, base = 0, ofst = 0, tops = 0, itop = 0, top = 0, vu_addr = 0;
     std::uint32_t row[4] = {}, col[4] = {};
-    bool dbf = false, stalled = false;
+    bool dbf = false, stalled = false, vu_pending = false;
     std::vector<std::uint32_t> pending;
 };
 
@@ -35,6 +37,19 @@ constexpr std::uint32_t kFifoWords[2] = {16u, 32u};
 
 Unit g_units[2];
 Unit g_vu_side;
+// How many programs VIF1 started on VU1, and how many of those it held back until the UNPACKs behind the MSCAL were done (run_vu).
+// Only the thread that really runs VU1 counts; the emulation thread's shadow copy does not.
+std::atomic<std::uint64_t> g_vu_starts{0}, g_vu_held{0};  // one writer (the thread that runs VU1), read at the end of a run and in a report
+void count_up(std::atomic<std::uint64_t> &n) { n.store(n.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+// PS2_VIF_DEFER=0 starts every program at its MSCAL, as before the deferral (public pull request 64) was added: a way to tell whether
+// a game's trouble comes from it.
+bool defer_enabled() {
+    static const bool on = [] {
+        const char *e = std::getenv("PS2_VIF_DEFER");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 std::uint64_t g_commands[2][128];
 std::uint8_t g_dry_run[16384];
 
@@ -163,13 +178,31 @@ struct Ctx {
     bool dry;
 };
 
+void flush_vu(int unit) {
+    if (unit != 1) return;
+    Unit &u = state(1);
+    if (!u.vu_pending) return;
+    u.vu_pending = false;
+    if (shadow(1)) return;
+    vu::set_tops(u.top, u.itop);
+    vu::run(1, u.vu_addr);
+}
+
 void run_vu(int unit, std::uint32_t address, const Ctx &c) {
     Unit &u = c.u;
     if (unit == 1) {
+        flush_vu(1);
         u.top = u.tops;
         u.itop = u.itops;
         u.dbf = !u.dbf;
         u.tops = u.base + (u.dbf ? u.ofst : 0);
+        if (!c.dry) count_up(g_vu_starts);
+        if (u.ofst != 0 && defer_enabled()) {
+            if (!c.dry) count_up(g_vu_held);
+            u.vu_pending = true;
+            u.vu_addr = address;
+            return;
+        }
         if (c.dry) return;
         vu::set_tops(u.top, u.itop);
     } else {
@@ -245,27 +278,44 @@ __attribute__((always_inline)) inline __m128i unpack_element(const std::uint8_t 
     }
 }
 
-template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
-void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
-    constexpr std::size_t stride = static_cast<std::size_t>(Components) * Bits / 8;
-    if (skip == 0) {
-        for (std::uint32_t n = 0; n < num; ++n)
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>((addr + n) & mask) * 16), unpack_element<Bits, Components, Usn>(bytes + n * stride));
-        return;
-    }
-    std::uint32_t cycle = 0;
-    for (std::uint32_t n = 0; n < num; ++n) {
-        _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>(addr & mask) * 16), unpack_element<Bits, Components, Usn>(bytes + n * stride));
-        ++addr;
-        if (++cycle >= wl) {
-            addr += skip;
-            cycle = 0;
-        }
+// STMOD applied to one unpacked element when no lane is masked: mode 1 adds the row registers, mode 2 adds them and keeps the sum
+// as the new row, mode 3 keeps the element as the new row (the generic loop below does the same lane by lane).
+template <std::uint32_t Mode>
+__attribute__((always_inline)) inline __m128i apply_mode(__m128i v, __m128i &row) {
+    if constexpr (Mode == 1) {
+        return _mm_add_epi32(v, row);
+    } else if constexpr (Mode == 2) {
+        row = _mm_add_epi32(v, row);
+        return row;
+    } else {
+        if constexpr (Mode == 3) row = v;
+        return v;
     }
 }
+
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn, std::uint32_t Mode>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num, std::uint32_t *row_regs) {
+    constexpr std::size_t stride = static_cast<std::size_t>(Components) * Bits / 8;
+    __m128i row = Mode ? _mm_loadu_si128(reinterpret_cast<const __m128i *>(row_regs)) : _mm_setzero_si128();
+    if (skip == 0) {
+        for (std::uint32_t n = 0; n < num; ++n)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>((addr + n) & mask) * 16), apply_mode<Mode>(unpack_element<Bits, Components, Usn>(bytes + n * stride), row));
+    } else {
+        std::uint32_t cycle = 0;
+        for (std::uint32_t n = 0; n < num; ++n) {
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(mem + static_cast<std::size_t>(addr & mask) * 16), apply_mode<Mode>(unpack_element<Bits, Components, Usn>(bytes + n * stride), row));
+            ++addr;
+            if (++cycle >= wl) {
+                addr += skip;
+                cycle = 0;
+            }
+        }
+    }
+    if constexpr (Mode >= 2) _mm_storeu_si128(reinterpret_cast<__m128i *>(row_regs), row);
+}
 #else
-template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
-void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn, std::uint32_t Mode>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num, std::uint32_t *row) {
     std::uint32_t cycle = 0;
     for (std::uint32_t n = 0; n < num; ++n) {
         std::uint32_t value[4];
@@ -289,6 +339,16 @@ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std:
         } else if constexpr (Components == 3) {
             value[3] = 0;
         }
+        for (std::uint32_t j = 0; j < 4; ++j) {
+            if constexpr (Mode == 1) {
+                value[j] += row[j];
+            } else if constexpr (Mode == 2) {
+                value[j] += row[j];
+                row[j] = value[j];
+            } else if constexpr (Mode == 3) {
+                row[j] = value[j];
+            }
+        }
         std::memcpy(mem + (addr & mask) * 16, value, 16);
         ++addr;
         if (++cycle >= wl) {
@@ -300,24 +360,28 @@ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std:
 
 #endif
 
-using FastUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t);
+using FastUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t, std::uint32_t *);
 
-template <std::uint32_t Bits>
+template <std::uint32_t Bits, std::uint32_t Mode>
 constexpr FastUnpack fast_pair(std::uint32_t components, bool usn) {
     switch (components) {
-    case 1: return usn ? unpack_fast<Bits, 1, true> : unpack_fast<Bits, 1, false>;
-    case 2: return usn ? unpack_fast<Bits, 2, true> : unpack_fast<Bits, 2, false>;
-    case 3: return usn ? unpack_fast<Bits, 3, true> : unpack_fast<Bits, 3, false>;
-    default: return usn ? unpack_fast<Bits, 4, true> : unpack_fast<Bits, 4, false>;
+    case 1: return usn ? unpack_fast<Bits, 1, true, Mode> : unpack_fast<Bits, 1, false, Mode>;
+    case 2: return usn ? unpack_fast<Bits, 2, true, Mode> : unpack_fast<Bits, 2, false, Mode>;
+    case 3: return usn ? unpack_fast<Bits, 3, true, Mode> : unpack_fast<Bits, 3, false, Mode>;
+    default: return usn ? unpack_fast<Bits, 4, true, Mode> : unpack_fast<Bits, 4, false, Mode>;
     }
 }
 
-constexpr FastUnpack kFastUnpack[4][4][2] = {
-    {{fast_pair<32>(1, false), fast_pair<32>(1, true)}, {fast_pair<32>(2, false), fast_pair<32>(2, true)}, {fast_pair<32>(3, false), fast_pair<32>(3, true)}, {fast_pair<32>(4, false), fast_pair<32>(4, true)}},
-    {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
-    {{fast_pair<8>(1, false), fast_pair<8>(1, true)}, {fast_pair<8>(2, false), fast_pair<8>(2, true)}, {fast_pair<8>(3, false), fast_pair<8>(3, true)}, {fast_pair<8>(4, false), fast_pair<8>(4, true)}},
-    {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
+// [STMOD][VL][VN][USN]; VL 3 (V4-5) is not a fast form, its row repeats the 16-bit one only to fill the table.
+template <std::uint32_t Mode>
+constexpr FastUnpack kFastMode[4][4][2] = {
+    {{fast_pair<32, Mode>(1, false), fast_pair<32, Mode>(1, true)}, {fast_pair<32, Mode>(2, false), fast_pair<32, Mode>(2, true)}, {fast_pair<32, Mode>(3, false), fast_pair<32, Mode>(3, true)}, {fast_pair<32, Mode>(4, false), fast_pair<32, Mode>(4, true)}},
+    {{fast_pair<16, Mode>(1, false), fast_pair<16, Mode>(1, true)}, {fast_pair<16, Mode>(2, false), fast_pair<16, Mode>(2, true)}, {fast_pair<16, Mode>(3, false), fast_pair<16, Mode>(3, true)}, {fast_pair<16, Mode>(4, false), fast_pair<16, Mode>(4, true)}},
+    {{fast_pair<8, Mode>(1, false), fast_pair<8, Mode>(1, true)}, {fast_pair<8, Mode>(2, false), fast_pair<8, Mode>(2, true)}, {fast_pair<8, Mode>(3, false), fast_pair<8, Mode>(3, true)}, {fast_pair<8, Mode>(4, false), fast_pair<8, Mode>(4, true)}},
+    {{fast_pair<16, Mode>(1, false), fast_pair<16, Mode>(1, true)}, {fast_pair<16, Mode>(2, false), fast_pair<16, Mode>(2, true)}, {fast_pair<16, Mode>(3, false), fast_pair<16, Mode>(3, true)}, {fast_pair<16, Mode>(4, false), fast_pair<16, Mode>(4, true)}},
 };
+
+constexpr const FastUnpack (*kFastUnpack[4])[4][2] = {kFastMode<0>, kFastMode<1>, kFastMode<2>, kFastMode<3>};
 
 void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c) {
     Unit &u = c.u;
@@ -349,8 +413,8 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c
     std::uint32_t cycle = 0;
     std::uint8_t *mem = dry ? g_dry_run : vu_data(unit);
     const std::uint32_t wrap = vu_qwords(unit);
-    if (!masked && u.mode == 0 && !(wl > cl) && !(vn == 3 && vl == 3)) {
-        kFastUnpack[vl][vn][usn ? 1 : 0](mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num);
+    if (!masked && !(wl > cl) && !(vn == 3 && vl == 3)) {
+        kFastUnpack[u.mode][vl][vn][usn ? 1 : 0](mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num, u.row);
         u.num = 0;
         return;
     }
@@ -416,11 +480,21 @@ std::uint32_t data_words(std::uint32_t cmd, const Unit &u) {
 void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c) {
     Unit &u = c.u;
     const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
+    if (unit == 1 && u.vu_pending) {
+        const bool skipping = (u.cycle & 0xFFu) > write_length(u);
+        const bool keep = op == 0x00 || op == 0x01 ||
+                          ((op == 0x05 || op == 0x20 || op == 0x30 || op == 0x31) && skipping) ||
+                          ((op & 0x60u) == 0x60u && skipping && ((cmd >> 15) & 1u) && u.ofst != 0);
+        if (!keep) flush_vu(1);
+    }
     u.code = cmd;
     if (!c.vu_thread) ++g_commands[unit][op];
     switch (op) {
     case 0x00: break;
-    case 0x01: u.cycle = imm; break;
+    case 0x01:
+        u.cycle = imm;
+        if (unit == 1 && u.vu_pending && (u.cycle & 0xFFu) <= write_length(u)) flush_vu(1);
+        break;
     case 0x02: u.ofst = imm & 0x3FFu; u.dbf = false; u.tops = u.base; break;
     case 0x03: u.base = imm & 0x3FFu; break;
     case 0x04: u.itops = imm & 0x3FFu; break;
@@ -458,6 +532,7 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &
         break;
     }
     if ((cmd & 0x80000000u) && !(u.err & 1u)) {
+        flush_vu(unit);
         // The interrupt bit raises INT and stalls the unit before the next command, except on MARK, which only raises INT.
         u.stat |= kStatInt;
         if (op != 0x07) {
@@ -528,8 +603,28 @@ void stats() {
             if (g_commands[u][op]) std::fprintf(stderr, " %02X:%llu", op, static_cast<unsigned long long>(g_commands[u][op]));
         std::fprintf(stderr, "\n");
     }
+    if (const std::uint64_t held = g_vu_held.load(std::memory_order_relaxed))
+        std::fprintf(stderr, "[vif1] %llu programs started on VU1, %llu held back until the UNPACKs behind their MSCAL were done\n", static_cast<unsigned long long>(g_vu_starts.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(held));
     for (int i = 0; i < 3; ++i)
         if (g_hist[i].unknown) std::fprintf(stderr, "[%s] %llu unknown commands in this run\n", kLabel[i], static_cast<unsigned long long>(g_hist[i].unknown));
+}
+
+// What VIF1 looks like at the moment VU1 kicks a packet that does not end (vu_micro.cpp, the first one of a run): the double buffer, the
+// unpack settings, how many programs it held back, and the last commands it ran. Called on the thread that runs VU1.
+void describe_vu1() {
+    const Unit &u = state(1);
+    const History &h = g_hist[hist_index(1)];
+    std::fprintf(stderr, "[vif1] now: BASE %u OFFSET %u TOPS %u (%s), the running program got TOP %u ITOP %u; CYCLE CL %u WL %u, STMOD %u, MASK 0x%08X\n", u.base, u.ofst, u.tops,
+                 u.ofst ? "double buffer" : "single buffer", u.top, u.itop, u.cycle & 0xFFu, write_length(u), u.mode, u.mask);
+    std::fprintf(stderr, "[vif1] %llu programs started so far, %llu of them held back until the UNPACKs behind their MSCAL were done (PS2_VIF_DEFER=0 starts them at the MSCAL)\n",
+                 static_cast<unsigned long long>(g_vu_starts.load(std::memory_order_relaxed)), static_cast<unsigned long long>(g_vu_held.load(std::memory_order_relaxed)));
+    const std::uint32_t before = std::min<std::uint32_t>(h.head, 8u);
+    std::fprintf(stderr, "[vif1] the last %u commands it ran, oldest first:\n", before);
+    for (std::uint32_t i = before; i >= 1; --i) {
+        const Seen &s = h.last[(h.head - i) & 7u];
+        std::fprintf(stderr, "[vif1]   word %llu: 0x%08X %s, %u data words\n", static_cast<unsigned long long>(s.at), s.cmd, command_name(s.cmd), s.words);
+    }
 }
 
 // `count` words, not quadwords: the 64 bits of a DMA tag that a chain with the tag transfer enabled sends ahead of its data are two
@@ -636,11 +731,14 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
     }
 }
 
+void flush(int unit) { flush_vu(unit); }
+
 }
 
 namespace ps2::vif {
 
 void state(ps2::state::Stream &s) {
+    if (!s.loading()) flush_vu(1);
     s.tag("vif");
     for (Unit *u : {&g_units[0], &g_units[1], &g_vu_side}) {
         s.pod(u->stat);

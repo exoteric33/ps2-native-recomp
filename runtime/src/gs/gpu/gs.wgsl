@@ -15,6 +15,10 @@ override SCALE: u32 = 1u;
 override TILE: u32 = 16u;
 
 override EXPLICIT_FMA: bool = false;
+// Mipmap levels (docs/mipmap.md). The program that reads them takes about twice as long to translate on FXC (Direct3D 12 without DXC), so
+// the host builds the draw program twice: HAS_MIP = false (plain, the one every draw without mipmap words uses, built at start) and
+// HAS_MIP = true (built in the background, used by the batches that carry a mipmap table). With false every use below folds away.
+override HAS_MIP: bool = false;
 
 // Where a*b+c is fused into one rounding differs between shader compilers: FXC and the graphics drivers fuse their own way and
 // Microsoft's DXC another, which moved a colour or a texel position by the last bit on a few pixels (docs/speed.md, section DXC).
@@ -311,7 +315,18 @@ fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         v = bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
     }
-    write_pixel(data[r + 2u], data[r], data[r + 1u], x, y, v);
+    let psm = data[r + 2u];
+    // A depth buffer that is put back as it was read (Digital Devil Saga reads its depth and writes it back in every frame)
+    // keeps its finer samples: a read gives the first sample of each pixel, and a write of that same value would otherwise
+    // replace the finer depth of a scaled picture with one value per pixel, and the shapes drawn against it afterwards (lights
+    // a hair in front of a slanted ceiling) would fail in stripes. A changed value is written to every sample as before.
+    if (SCALE > 1u && (psm == 0x30u || psm == 0x31u || psm == 0x32u || psm == 0x3Au)) {
+        let l = locate(psm, data[r], data[r + 1u], x, y);
+        if (((atomicLoad(&vram[l.word * SCALE * SCALE]) >> l.shift) & l.mask) == (v & l.mask)) {
+            return;
+        }
+    }
+    write_pixel(psm, data[r], data[r + 1u], x, y, v);
 }
 
 @compute @workgroup_size(64)
@@ -325,6 +340,11 @@ fn copy_read(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pixel = i / n;
     let x = (prm(3u) + pixel % w) & 0x7FFu;
     let y = (prm(4u) + pixel / w) & 0x7FFu;
+    // TRXREG allows up to 4095 x 4095 pixels, more than the copy area of `scratch` holds: such a copy keeps what fits (an explicit
+    // bound, so the draw program needs no run-time checks from wgpu, gpu.cpp PS2_GPU_TRUSTED)
+    if (i >= arrayLength(&scratch)) {
+        return;
+    }
     scratch[i] = read_sample(prm(2u), prm(0u), prm(1u), x, y, i % n);
 }
 
@@ -349,45 +369,115 @@ fn copy_write(@builtin(global_invocation_id) gid: vec3<u32>) {
     if ((dir & 2u) != 0u) {
         sy = h - 1u - y;
     }
-    write_sample(prm(2u), prm(0u), prm(1u), (prm(3u) + x) & 0x7FFu, (prm(4u) + y) & 0x7FFu, k, scratch[(sy * w + sx) * n + k]);
+    let src_at = (sy * w + sx) * n + k;
+    if (src_at >= arrayLength(&scratch)) {
+        return;
+    }
+    write_sample(prm(2u), prm(0u), prm(1u), (prm(3u) + x) & 0x7FFu, (prm(4u) + y) & 0x7FFu, k, scratch[src_at]);
 }
 
+// The colour palette load `k` of record `r` reads from graphics memory.
+fn clut_read(r: u32, k: u32) -> u32 {
+    let cbp = data[r + 2u];
+    let cpsm = data[r + 3u];
+    if (data[r + 4u] != 0u) {
+        return read_pixel(cpsm, cbp, data[r + 7u], data[r + 8u] * 16u + k, data[r + 9u]);
+    }
+    var x = k & 7u;
+    var y = k >> 3u;
+    if (data[r + 6u] != 0u) {
+        let j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
+        x = j & 15u;
+        y = j >> 4u;
+    }
+    return read_pixel(cpsm, cbp, 1u, x, y);
+}
+
+// Which of its own entries a palette load with the slot entries `d` writes into slot entry j: 0 .. d >> 16 - 1, else d >> 16 or more. `d` is
+// record word 10 (gpu.cpp, load_clut): the first slot entry it writes in the low half (CSA * 16 with CSM2, CSA's 16 of the low 256 with CSM1,
+// 0 for 8-bit indices with CSM1) and how many it writes in the high half (16 for 4-bit indices, 256 for 8-bit); the entries wrap at 512.
+fn clut_entry(d: u32, j: u32) -> u32 {
+    return (j - (d & 0xFFFFu)) & 511u;
+}
+
+const CLUT_CHUNK: u32 = 16u;
+const CLUT_NONE: u32 = 0xFFFFFFFFu;
+
+// The palette loads of one command, records prm(0) on, prm(1) of them. Load n fills slot data[r + 1] with the slot before it (data[r]) and
+// then its own 16 or 256 entries; the loads of a command use consecutive slots, each the one before's destination (gpu.cpp, load_clut), and
+// no slot twice. One after another in one workgroup with a barrier between them, a command of a few hundred loads kept one part of the chip
+// busy for most of a millisecond. Now every thread keeps two of the 512 entries in hand and writes them into each load's slot itself, so no
+// load waits for the slot before it to land in memory, and the loads are cut into chunks of CLUT_CHUNK, one chunk per workgroup: a chunk's
+// entries start from what the last earlier load that writes each entry read (looked for four loads at a time), else from the slot before the
+// first load, which is what they held one by one. Graphics memory does not change during the command, so every read gives what it gave then.
 @compute @workgroup_size(256)
-fn load_clut(@builtin(local_invocation_index) k: u32) {
+fn load_clut(@builtin(local_invocation_index) k: u32, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let first = prm(0u);
     let count = prm(1u);
-    for (var n = 0u; n < count; n = n + 1u) {
-        let r = prm(0u) + n * 12u;
-        let src = data[r] * CLUT_ENTRIES;
-        let dst = data[r + 1u] * CLUT_ENTRIES;
-        clut[dst + k] = clut[src + k];
-        clut[dst + k + 256u] = clut[src + k + 256u];
-        storageBarrier();
-        let cbp = data[r + 2u];
-        let cpsm = data[r + 3u];
-        let csm = data[r + 4u];
-        let csa = data[r + 5u];
-        let eight = data[r + 6u] != 0u;
-        var entries = 16u;
-        if (eight) {
-            entries = 256u;
-        }
-        if (k < entries) {
-            if (csm != 0u) {
-                clut[dst + ((csa * 16u + k) & 511u)] = read_pixel(cpsm, cbp, data[r + 7u], data[r + 8u] * 16u + k, data[r + 9u]);
-            } else {
-                var x = k & 7u;
-                var y = k >> 3u;
-                var slot = ((csa & 15u) * 16u + k) & 255u;
-                if (eight) {
-                    let j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
-                    x = j & 15u;
-                    y = j >> 4u;
-                    slot = k;
-                }
-                clut[dst + slot] = read_pixel(cpsm, cbp, 1u, x, y);
+    let before = data[first] * CLUT_ENTRIES;
+    let j0 = k;
+    let j1 = k + 256u;
+    for (var c = wid.x * CLUT_CHUNK; c < count; c = c + groups.x * CLUT_CHUNK) {
+        var m0 = CLUT_NONE;
+        var m1 = CLUT_NONE;
+        var e0 = 0u;
+        var e1 = 0u;
+        var m = c;
+        while (m > 0u && (m0 == CLUT_NONE || m1 == CLUT_NONE)) {
+            var d = vec4<u32>(0u);  // 0: writes no entry
+            d.x = data[first + (m - 1u) * 12u + 10u];
+            if (m > 1u) {
+                d.y = data[first + (m - 2u) * 12u + 10u];
             }
+            if (m > 2u) {
+                d.z = data[first + (m - 3u) * 12u + 10u];
+            }
+            if (m > 3u) {
+                d.w = data[first + (m - 4u) * 12u + 10u];
+            }
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                let di = d[i];
+                let a = clut_entry(di, j0);
+                let b = clut_entry(di, j1);
+                if (m0 == CLUT_NONE && a < (di >> 16u)) {
+                    m0 = m - 1u - i;
+                    e0 = a;
+                }
+                if (m1 == CLUT_NONE && b < (di >> 16u)) {
+                    m1 = m - 1u - i;
+                    e1 = b;
+                }
+            }
+            m = m - min(m, 4u);
         }
-        storageBarrier();
+        var v0 = 0u;
+        var v1 = 0u;
+        if (m0 != CLUT_NONE) {
+            v0 = clut_read(first + m0 * 12u, e0);
+        } else {
+            v0 = clut[before + j0];
+        }
+        if (m1 != CLUT_NONE) {
+            v1 = clut_read(first + m1 * 12u, e1);
+        } else {
+            v1 = clut[before + j1];
+        }
+        let end = min(c + CLUT_CHUNK, count);
+        for (var n = c; n < end; n = n + 1u) {
+            let r = first + n * 12u;
+            let d = data[r + 10u];
+            let a = clut_entry(d, j0);
+            let b = clut_entry(d, j1);
+            if (a < (d >> 16u)) {
+                v0 = clut_read(r, a);
+            }
+            if (b < (d >> 16u)) {
+                v1 = clut_read(r, b);
+            }
+            let dst = data[r + 1u] * CLUT_ENTRIES;
+            clut[dst + j0] = v0;
+            clut[dst + j1] = v1;
+        }
     }
 }
 
@@ -425,7 +515,11 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
             c = o | 0xFF000000u;
         }
     }
-    scratch[prm(8u) + gid.y * w + gid.x] = c;
+    // DISPLAY allows pictures up to 2048 x 2048, more than a field's area of `scratch` holds: never write past its end
+    let at = prm(8u) + gid.y * w + gid.x;
+    if (at < arrayLength(&scratch)) {
+        scratch[at] = c;
+    }
 }
 
 struct Setup {
@@ -463,6 +557,10 @@ struct Setup {
     tf: Fmt,
     ff: Fmt,
     zf: Fmt,
+    // Mipmapping (make_mip in gpu.cpp, docs/mipmap.md): 0 when the texture is sampled as before, else TEX1's fields; `mip_at` is where the
+    // setup's table entry starts (word 0 is `mip`, words 1 to 6 the base pointer and buffer width of levels 1 to 6).
+    mip: u32,
+    mip_at: u32,
 }
 
 const F_IIP: u32 = 1u;
@@ -518,6 +616,8 @@ fn load_setup(at: u32) -> Setup {
     s.tf = fmt_at(at + 25u);
     s.ff = fmt_at(at + 30u);
     s.zf = fmt_at(at + 35u);
+    s.mip = 0u;
+    s.mip_at = 0u;
     return s;
 }
 
@@ -573,6 +673,13 @@ fn texel_y(s: Setup, yi: i32) -> u32 {
 
 var<private> snapshot_lo: u32 = 0u;
 var<private> snapshot_hi: u32 = 0u;
+// A sprite that copies a rendered picture (a colour or depth format) at almost 1:1 but not exactly, with a slight zoom or a
+// fractional offset, reads it on the inner-resolution grid (rt_copy, set per pixel in shade_at): texel X / SCALE and sub-sample
+// X % SCALE on each axis. Read on the console's grid with the output pixel's own sub-sample, such a copy lands up to one console
+// pixel off at SCALE > 1, and the picture blended over the frame draws a blocky fringe around everything with contrast. Digital
+// Devil Saga blends the last frame, 0.2 % larger and half a pixel off, over each new one (an afterimage glow); exact 1:1 copies
+// are unchanged.
+var<private> rt_copy: bool = false;
 
 fn load_texel(l: Loc, k: u32) -> u32 {
     if (l.word >= snapshot_lo && l.word < snapshot_hi) {
@@ -581,13 +688,70 @@ fn load_texel(l: Loc, k: u32) -> u32 {
     return load_at(l, k);
 }
 
+fn fetch_sub(s: Setup, xs: i32, ys: i32) -> u32 {
+    let n = i32(SCALE);
+    let tx = select(xs / n, (xs - n + 1) / n, xs < 0);
+    let ty = select(ys / n, (ys - n + 1) / n, ys < 0);
+    return fetch(s, tx, ty, u32(ys - ty * n) * SCALE + u32(xs - tx * n));
+}
+
+fn unpack4(c: u32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(c & 0xFFu, (c >> 8u) & 0xFFu, (c >> 16u) & 0xFFu, c >> 24u));
+}
+
+// A bilinear read on the inner-resolution grid (u, v in inner texels, the half-texel shift already taken off).
+fn bilinear_sub(s: Setup, u: f32, v: f32) -> vec4<f32> {
+    let x0 = i32(floor(u));
+    let y0 = i32(floor(v));
+    let fx = u - f32(x0);
+    let fy = v - f32(y0);
+    let top = lerp4(unpack4(fetch_sub(s, x0, y0)), unpack4(fetch_sub(s, x0 + 1, y0)), fx);
+    let bottom = lerp4(unpack4(fetch_sub(s, x0, y0 + 1)), unpack4(fetch_sub(s, x0 + 1, y0 + 1)), fx);
+    return lerp4(top, bottom, fy);
+}
+
+// The console's bilinear filter spreads over one console texel each way (a tent of half-width 1); on the inner grid that tent is
+// exactly the sum of inner-grid bilinear reads at offsets m = -(SCALE-1)..SCALE-1 inner texels, weighted (SCALE - |m|) per axis
+// (the tent is linear between multiples of 1/SCALE). So the copy keeps the inner resolution and the blur the game asked for: a
+// narrower blur showed the previous frame's fine stripes crisp next to the current ones (flickering lines on striped lights).
+fn sample_scaled(s: Setup, uin: f32, vin: f32) -> u32 {
+    let nf = f32(SCALE);
+    if (!has(s, F_BILINEAR)) {
+        return fetch_sub(s, i32(floor(uin * nf)), i32(floor(vin * nf)));
+    }
+    let u = uin * nf - 0.5;
+    let v = vin * nf - 0.5;
+    let n = i32(SCALE);
+    var acc = vec4<f32>(0.0);
+    for (var my = 1 - n; my < n; my = my + 1) {
+        for (var mx = 1 - n; mx < n; mx = mx + 1) {
+            let w = f32((n - abs(mx)) * (n - abs(my)));
+            acc = acc + w * bilinear_sub(s, u + f32(mx), v + f32(my));
+        }
+    }
+    let o = vec4<u32>(clamp(acc / f32(n * n * n * n) + vec4<f32>(0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
+    return o.x | (o.y << 8u) | (o.z << 16u) | (o.w << 24u);
+}
+
+fn texel_x_hd(s: Setup, xi: i32, hd_shift: u32) -> u32 {
+    return u32(wrap_coord(xi, 1 << (s.tw + hd_shift), mode(s, 24u, 2u), s.minu << hd_shift, ((s.maxu + 1u) << hd_shift) - 1u));
+}
+
+fn texel_y_hd(s: Setup, yi: i32, hd_shift: u32) -> u32 {
+    return u32(wrap_coord(yi, 1 << (s.th + hd_shift), mode(s, 26u, 2u), s.minv << hd_shift, ((s.maxv + 1u) << hd_shift) - 1u));
+}
+
 fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
     return fetch_at(s, texel_x(s, xi), texel_y(s, yi), k);
 }
 
 fn fetch_at(s: Setup, x: u32, y: u32, k: u32) -> u32 {
     if (s.dec != 0xFFFFFFFFu) {
-        return decoded[s.dec + (y << s.tw) + x];
+        // plan_decodes (gpu.cpp) gives a decoded texture only to a setup whose clamp or repeat region lies inside it, so x and y stay inside the
+        // texture; the bound keeps the index inside the buffer in any case (in place of wgpu's run-time check, PS2_GPU_TRUSTED)
+        let hd_shift = (s.dec >> 28u) & 7u;
+        let dec_base = s.dec & 0x0FFFFFFFu;
+        return decoded[min(dec_base + (y << (s.tw + hd_shift)) + x, arrayLength(&decoded) - 1u)];
     }
     return convert(s, load_texel(addr(s.tf, x, y), k));
 }
@@ -646,14 +810,78 @@ fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
     return convert(s, raw & s.tf.mask);
 }
 
+// The 2D art of a game (text, icons, menus) is mostly sprites that map one texel to one pixel at the PS2's resolution. Upscaled,
+// bilinear filtering spreads every texel edge over SCALE pixels and the text looks soft. With SHARP set (PS2_SHARP_2D), such a
+// sprite narrows the blend between two texels to the middle of the step: 1 to two upscaled pixels, 2 to one. Inside a texel the
+// colour is the texel's own and the edges stay smooth. A sprite that copies an upscaled picture one to one gets closer to the
+// picture's own samples too (plain bilinear blends each with the same sample of the neighbouring pixel).
+override SHARP: u32 = 0u;
+var<private> sharp_sprite: bool = false;
+var<private> upscaled_source: bool = false;
+
+fn sharpen(f: f32) -> f32 {
+    return clamp((f - 0.5) * f32(SCALE) * 0.5 * f32(SHARP) + 0.5, 0.0, 1.0);
+}
+
+// One sample of an upscaled texture by its position in samples (SCALE per texel each way): the texel, then the sample in it.
+fn tap_upscaled(s: Setup, hx: i32, hy: i32) -> u32 {
+    let n = i32(SCALE);
+    let tx = select(hx / n, (hx - n + 1) / n, hx < 0);
+    let ty = select(hy / n, (hy - n + 1) / n, hy < 0);
+    return fetch(s, tx, ty, u32(hy - ty * n) * SCALE + u32(hx - tx * n));
+}
+
+// Bilinear filtering of a texture the GS drew at the upscaled size (upscaled_source): between its own samples. Filtering between whole
+// texels, each read at the sample the target pixel has, put the native pixel grid into copies that are not one to one (Urban
+// Reign's knockout trail, a slightly zoomed copy of the last picture laid over the next, showed a mesh of dots and lines).
+fn sample_upscaled(s: Setup, uin: f32, vin: f32) -> u32 {
+    let u = uin * f32(SCALE) - 0.5;
+    let v = vin * f32(SCALE) - 0.5;
+    let x0 = i32(floor(u));
+    let y0 = i32(floor(v));
+    return blend4(tap_upscaled(s, x0, y0), tap_upscaled(s, x0 + 1, y0), tap_upscaled(s, x0, y0 + 1), tap_upscaled(s, x0 + 1, y0 + 1), u - f32(x0), v - f32(y0));
+}
+
 fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
+    if (rt_copy) {
+        return sample_scaled(s, uin, vin);
+    }
+    if (s.dec != 0xFFFFFFFFu) {
+        let hd_shift = (s.dec >> 28u) & 7u;
+        if (hd_shift > 0u) {
+            let scale_f = f32(1u << hd_shift);
+            let uhd = uin * scale_f;
+            let vhd = vin * scale_f;
+            if (!has(s, F_BILINEAR)) {
+                return fetch_at(s, texel_x_hd(s, i32(floor(uhd)), hd_shift), texel_y_hd(s, i32(floor(vhd)), hd_shift), k);
+            }
+            let u = uhd - 0.5;
+            let v = vhd - 0.5;
+            let x0 = i32(floor(u));
+            let y0 = i32(floor(v));
+            let xa = texel_x_hd(s, x0, hd_shift);
+            let xb = texel_x_hd(s, x0 + 1, hd_shift);
+            let ya = texel_y_hd(s, y0, hd_shift);
+            let yb = texel_y_hd(s, y0 + 1, hd_shift);
+            return blend4(fetch_at(s, xa, ya, k), fetch_at(s, xb, ya, k), fetch_at(s, xa, yb, k), fetch_at(s, xb, yb, k), u - f32(x0), v - f32(y0));
+        }
+    }
     if (!has(s, F_BILINEAR)) {
         return fetch(s, i32(floor(uin)), i32(floor(vin)), k);
+    }
+    if (SCALE > 1u && upscaled_source) {
+        return sample_upscaled(s, uin, vin);
     }
     let u = uin - 0.5;
     let v = vin - 0.5;
     let x0 = i32(floor(u));
     let y0 = i32(floor(v));
+    var fx = u - f32(x0);
+    var fy = v - f32(y0);
+    if (sharp_sprite) {
+        fx = sharpen(fx);
+        fy = sharpen(fy);
+    }
     let xa = texel_x(s, x0);
     let xb = texel_x(s, x0 + 1);
     let ya = texel_y(s, y0);
@@ -668,9 +896,95 @@ fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
         let nxb = spread_x(xb);
         let nya = spread_y(ya);
         let nyb = spread_y(yb);
-        return blend4(tap32(s, pxa + pya, nxa | nya, k), tap32(s, pxb + pya, nxb | nya, k), tap32(s, pxa + pyb, nxa | nyb, k), tap32(s, pxb + pyb, nxb | nyb, k), u - f32(x0), v - f32(y0));
+        return blend4(tap32(s, pxa + pya, nxa | nya, k), tap32(s, pxb + pya, nxb | nya, k), tap32(s, pxa + pyb, nxa | nyb, k), tap32(s, pxb + pyb, nxb | nyb, k), fx, fy);
     }
-    return blend4(fetch_at(s, xa, ya, k), fetch_at(s, xb, ya, k), fetch_at(s, xa, yb, k), fetch_at(s, xb, yb, k), u - f32(x0), v - f32(y0));
+    return blend4(fetch_at(s, xa, ya, k), fetch_at(s, xb, ya, k), fetch_at(s, xa, yb, k), fetch_at(s, xb, yb, k), fx, fy);
+}
+
+// Mip level n of the texture as a setup of its own (raster.cpp, level_setup): its base pointer and buffer width from the table, its size
+// (TW and TH shifted by the level, at least one texel), the region of the clamp modes 2 and 3 shifted the same way, never the decoded copy.
+fn level_setup(s: Setup, n: u32) -> Setup {
+    var l = s;
+    let w = data[s.mip_at + n];
+    let bp = w & 0x3FFFu;
+    let bw = (w >> 14u) & 0x3Fu;
+    l.tbp = bp;
+    l.tbw = bw;
+    l.tf.base = bp * 256u;
+    l.tf.per_row = max(1u, (bw * 64u) >> (s.tf.bits & 15u));
+    l.tw = select(0u, s.tw - n, s.tw > n);
+    l.th = select(0u, s.th - n, s.th > n);
+    l.minu = s.minu >> n;
+    l.maxu = s.maxu >> n;
+    l.minv = s.minv >> n;
+    l.maxv = s.maxv >> n;
+    l.dec = 0xFFFFFFFFu;
+    return l;
+}
+
+fn blend_levels(a: u32, b: u32, f: f32) -> u32 {
+    let x = vec4<f32>(vec4<u32>(a & 0xFFu, (a >> 8u) & 0xFFu, (a >> 16u) & 0xFFu, a >> 24u));
+    let y = vec4<f32>(vec4<u32>(b & 0xFFu, (b >> 8u) & 0xFFu, (b >> 16u) & 0xFFu, b >> 24u));
+    let o = vec4<u32>(clamp(x + (y - x) * f + vec4<f32>(0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
+    return o.x | (o.y << 8u) | (o.z << 16u) | (o.w << 24u);
+}
+
+// Whether a setup's pixels can read a mip level above 0 (as mip_top_of in gpu.cpp): MXL > 0, a *_MIPMAP_* reduction filter, and with LCM = 1 a
+// K above 0. A setup whose mipmap words only give reduction a filter of its own (MMIN 0 or 1, or MXL 0) reads level 0 like any other, and
+// sprites keep the console-centre sampling of `point` (shade_at): Digital Devil Saga squeezes a 384-line picture into 160 lines with LCM = 1,
+// K = 0, MMAG bilinear, MMIN nearest (so always MMAG, level 0), and without that sampling the finer rows of the last line blended in texture
+// row 384, memory past the picture (a line along the bottom of its movies at 2x and 3x).
+fn mip_levels(s: Setup) -> bool {
+    if (!HAS_MIP || s.mip == 0u) {
+        return false;
+    }
+    let mxl = (s.mip >> 1u) & 7u;
+    let mmin = (s.mip >> 5u) & 7u;
+    if (mxl == 0u || mmin < 2u) {
+        return false;
+    }
+    if ((s.mip & 1u) != 0u) {
+        return bitcast<i32>(((s.mip >> 16u) & 0xFFFu) << 20u) > 0;
+    }
+    return true;
+}
+
+struct Pick {
+    level: u32,
+    frac: f32,
+    linear: u32,
+}
+
+// The GS's level of detail (GS User's Manual, TEX1; raster.cpp, pick_level): LOD = K with LCM = 1, else (log2(1/|Q|) << L) + K, K a signed
+// 7.4 number. LOD <= 0 magnifies (MMAG, level 0); LOD > 0 reduces (MMIN): *_MIPMAP_NEAREST take the level nearest to LOD, *_MIPMAP_LINEAR
+// blend the two levels around it by its fraction, never past MXL; NEAREST_* / LINEAR_* is the filter inside a level. Only the choice: the
+// sampling stays in one place in plot(), because every copy of sample() makes the program longer to translate (FXC took minutes with six).
+fn mip_pick(s: Setup, q: f32) -> Pick {
+    let lk = f32(bitcast<i32>(((s.mip >> 16u) & 0xFFFu) << 20u) >> 20u) / 16.0;
+    var lod = lk;
+    if ((s.mip & 1u) == 0u) {
+        lod = log2(1.0 / abs(q)) * f32(1u << ((s.mip >> 8u) & 3u)) + lk;
+    }
+    let mxl = (s.mip >> 1u) & 7u;
+    let mmin = (s.mip >> 5u) & 7u;
+    if (!(lod > 0.0)) {
+        return Pick(0u, 0.0, (s.mip >> 4u) & 1u);
+    }
+    if (mmin < 2u) {
+        return Pick(0u, 0.0, mmin & 1u);
+    }
+    let linear = select(0u, 1u, mmin >= 4u);
+    if (mxl == 0u) {
+        return Pick(0u, 0.0, linear);
+    }
+    if ((mmin & 1u) == 0u) {
+        return Pick(u32(min(floor(lod + 0.5), f32(mxl))), 0.0, linear);
+    }
+    let whole = floor(lod);
+    if (whole >= f32(mxl)) {
+        return Pick(mxl, 0.0, linear);
+    }
+    return Pick(u32(whole), lod - whole, linear);
 }
 
 fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
@@ -755,6 +1069,11 @@ struct Attr {
     z: u32,
 }
 
+// The frame and depth places of this thread's pixel for the current set-up (raster, worked out again only when the set-up changes): they
+// depend on nothing else, and working them out for every shape cost two table reads, each a trip to memory before the pixel's own.
+var<private> pix_fl: Loc;
+var<private> pix_zl: Loc;
+
 fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) {
         return;
@@ -769,7 +1088,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     let ux = u32(x);
     let uy = u32(y);
     let z = min(at.z, s.zmax);
-    let fl = addr(s.ff, ux, uy);
+    let fl = pix_fl;
     var zl = Loc(0u, 0u, 0u);
 
     var dst = 0u;
@@ -788,7 +1107,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         if (ztst == 0u) {
             return;
         }
-        zl = addr(s.zf, ux, uy);
+        zl = pix_zl;
         if (ztst != 1u) {
             let old = load_at(zl, k) & s.zmax;
             if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
@@ -804,18 +1123,57 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     if (has(s, F_TME)) {
         var u: f32;
         var v: f32;
+        var q = 1.0;
+        var nu = 0.0;
+        var nv = 0.0;
         if (has(s, F_FST)) {
             u = at.s / 16.0;
             v = at.t / 16.0;
         } else {
-            var q = at.q;
+            q = at.q;
             if (q == 0.0) {
                 q = 1.0;
             }
-            u = at.s / q * f32(1u << s.tw);
-            v = at.t / q * f32(1u << s.th);
+            nu = at.s / q;
+            nv = at.t / q;
+            u = nu * f32(1u << s.tw);
+            v = nv * f32(1u << s.th);
         }
-        let t = sample(s, u, v, k);
+        // One level (two when *_MIPMAP_LINEAR blends): without mipmap words that is level 0 with the setup as it is, as before.
+        var base = s;
+        var p = Pick(0u, 0.0, 0u);
+        if (HAS_MIP && s.mip != 0u) {
+            p = mip_pick(s, q);
+            if (p.linear != 0u) {
+                base.flags = base.flags | F_BILINEAR;
+            } else {
+                base.flags = base.flags & ~F_BILINEAR;
+            }
+        }
+        let levels = select(1u, 2u, p.frac > 0.0);
+        var t = 0u;
+        for (var i = 0u; i < levels; i = i + 1u) {
+            let n = p.level + i;
+            var l = base;
+            var lu = u;
+            var lv = v;
+            if (n != 0u) {
+                l = level_setup(base, n);
+                if (has(s, F_FST)) {
+                    lu = u / f32(1u << n);
+                    lv = v / f32(1u << n);
+                } else {
+                    lu = nu * f32(1u << l.tw);
+                    lv = nv * f32(1u << l.th);
+                }
+            }
+            let c = sample(l, lu, lv, k);
+            if (i == 0u) {
+                t = c;
+            } else {
+                t = blend_levels(t, c, p.frac);
+            }
+        }
         let tr = i32(t & 0xFFu);
         let tg = i32((t >> 8u) & 0xFFu);
         let tb = i32((t >> 16u) & 0xFFu);
@@ -985,6 +1343,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
 
 const PRIM_WORDS: u32 = 28u;
 const SETUP_WORDS: u32 = 40u;
+const MIP_WORDS: u32 = 8u;
 
 fn fat(i: u32) -> f32 {
     return bitcast<f32>(data[i]);
@@ -1013,8 +1372,12 @@ fn edge_in(w: f32, inclusive: u32) -> bool {
 }
 
 fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
-    let kind = data[p + 1u];
+    rt_copy = false;
+    // word 1: the kind of shape in the low byte, bit 8 when the texture is an upscaled picture the GS drew (gpu.cpp, kUpscaledSource)
+    let kind = data[p + 1u] & 0xFFu;
+    upscaled_source = (data[p + 1u] & 0x100u) != 0u;
     var at: Attr;
+    sharp_sprite = false;
     switch kind {
         case 0u {
             let x0 = fat(p + 4u);
@@ -1024,13 +1387,52 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let x2 = fat(p + 8u);
             let y2 = fat(p + 9u);
             let inv = fat(p + 10u);
-            let w0 = cross2(x1 - px, y2 - py, x2 - px, y1 - py) * inv;
-            let w1 = cross2(x2 - px, y0 - py, x0 - px, y2 - py) * inv;
+            let s0 = cross2(x1 - px, y2 - py, x2 - px, y1 - py) * inv;
+            let s1 = cross2(x2 - px, y0 - py, x0 - px, y2 - py) * inv;
             let c2 = cross2(x0 - px, y1 - py, x1 - px, y0 - py) * inv;
             let inclusive = data[p + 27u];
-            if (!edge_in(w0, inclusive & 1u) || !edge_in(w1, inclusive & 2u) || !edge_in(c2, inclusive & 4u)) {
+            // An edge that is exactly horizontal or vertical decides coverage at the console pixel's centre, as a sprite does
+            // below: 2D pieces laid side by side for the console's grid (Digital Devil Saga's solar-noise dial is two
+            // rectangles, x 27-56.5 and 57-86.5) leave a gap narrower than a pixel that covers no console pixel centre but
+            // does cover the finer samples of a scaled picture (a seam). Slanted edges keep the finer samples.
+            let cx = f32(x);
+            let cy = f32(y);
+            // Only for half of an upright rectangle (one horizontal and one vertical edge) at one depth, i.e. a 2D piece: its
+            // other half shares the slanted edge and tests it the same way. A triangle with a single straight edge next to other
+            // triangles' slanted edges would decide that line differently from its neighbours (specks along the dial's inner
+            // fan, drawn untextured), and small 3D triangles often have straight edges by chance on the 1/16-pixel grid (specks
+            // in hair). So: textured, one depth, one horizontal and one vertical edge.
+            let flat = y0 == y1 || y1 == y2 || y2 == y0;
+            let upright = x0 == x1 || x1 == x2 || x2 == x0;
+            let level = fat(p + 25u) == 0.0 && fat(p + 26u) == 0.0;
+            let rect = SCALE > 1u && flat && upright && level && has(s, F_TME);
+            let a0 = rect && (x1 == x2 || y1 == y2);
+            let a1 = rect && (x2 == x0 || y2 == y0);
+            let a2 = rect && (x0 == x1 || y0 == y1);
+            let ce0 = cross2(x1 - cx, y2 - cy, x2 - cx, y1 - cy) * inv;
+            let ce1 = cross2(x2 - cx, y0 - cy, x0 - cx, y2 - cy) * inv;
+            let ce2 = cross2(x0 - cx, y1 - cy, x1 - cx, y0 - cy) * inv;
+            let in0 = edge_in(select(s0, ce0, a0), inclusive & 1u);
+            let in1 = edge_in(select(s1, ce1, a1), inclusive & 2u);
+            let in2 = edge_in(select(c2, ce2, a2), inclusive & 4u);
+            if (!in0 || !in1 || !in2) {
                 return;
             }
+            // A sample outside such an edge is covered only when its console pixel is, i.e. when the pixel's centre is inside
+            // the whole triangle (as on the console); the slanted edges alone would let a sliver whose straight edge passes a
+            // pixel centre spread into the rows beyond it (lines along the rain ripples). Such a sample takes its colour,
+            // texture coordinates and depth from the pixel's centre, as the console's pixel does, not from beyond the shape.
+            let out0 = a0 && !edge_in(s0, inclusive & 1u);
+            let out1 = a1 && !edge_in(s1, inclusive & 2u);
+            let out2 = a2 && !edge_in(c2, inclusive & 4u);
+            if ((out0 || out1 || out2) && !(edge_in(ce0, inclusive & 1u) && edge_in(ce1, inclusive & 2u) && edge_in(ce2, inclusive & 4u))) {
+                return;
+            }
+            let extended = out0 || out1 || out2;
+            let qx = select(px, cx, extended);
+            let qy = select(py, cy, extended);
+            let w0 = cross2(x1 - qx, y2 - qy, x2 - qx, y1 - qy) * inv;
+            let w1 = cross2(x2 - qx, y0 - qy, x0 - qx, y2 - qy) * inv;
             let w2 = 1.0 - w0 - w1;
             // Colour and fog as the first vertex's value plus weighted differences, like the depth: a value that is the same
             // at all vertices (flat shading) comes out exactly instead of a hair below, which truncation would turn into one
@@ -1064,10 +1466,23 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
                 du = du / q * f32(1u << s.tw);
                 dv = dv / q * f32(1u << s.th);
             }
-            var ux = px;
-            var uy = py;
+            // one texel to one pixel at the PS2's resolution (within 2 %): 2D art drawn at its own size
+            sharp_sprite = SHARP != 0u && SCALE > 1u && abs(abs(du) - abs(dx)) <= abs(dx) * 0.02 && abs(abs(dv) - abs(dy)) <= abs(dy) * 0.02;
+            // The GS samples a pixel at its top left corner, and 2D art is laid out for that: a sprite from x.5 with texels from u.5
+            // puts every pixel on a texel centre. Upscaled, the samples x, x + 1/SCALE ... spread from that corner
+            // across the pixel, so half of them fell between two texels and blended them: text was soft and half a pixel off. Each
+            // sample stands for its own place in the pixel instead (its centre, less the half pixel the corner is from the middle).
+            let centre = select(0.0, 0.5 / f32(SCALE) - 0.5, SCALE > 1u);
+            var ux = px + centre;
+            var uy = py + centre;
+            let is_hd_override = s.dec != 0xFFFFFFFFu && ((s.dec >> 28u) & 7u) > 0u;
             let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
-            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct);
+            // (a bilinear read of an upscaled picture is exact one to one by itself: snapped, all its samples would read the same spot)
+            let point = has(s, F_TME) && !is_hd_override && (!has(s, F_BILINEAR) || (direct && !upscaled_source)) && !mip_levels(s);
+            let near_x = abs(abs(du) - abs(dx)) <= abs(dx) * 0.05;
+            let near_y = abs(abs(dv) - abs(dy)) <= abs(dy) * 0.05;
+            let exact = abs(du) >= abs(dx) * 0.999 && abs(dv) >= abs(dy) * 0.999;
+            rt_copy = SCALE > 1u && has(s, F_TME) && direct && s.dec == 0xFFFFFFFFu && near_x && near_y && !exact;
             if (point && abs(du) >= abs(dx) * 0.999) {
                 ux = f32(x);
             }
@@ -1078,6 +1493,17 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let cy = f32(y);
             if (SCALE > 1u && (cx < min(x0, x0 + dx) || cx >= max(x0, x0 + dx) || cy < min(y0, y0 + dy) || cy >= max(y0, y0 + dy))) {
                 return;
+            }
+            // Upscaled, the extra samples of the last native pixel row and column sit past it (x + 1/3, x + 2/3 ...), so a bilinear
+            // sprite reads up to most of a texel beyond the ones it covers at native size: the neighbour in the texture shows as a
+            // line along that edge (button icons cut from a sheet get a dark line under them). Keep the sample within the native
+            // pixels the sprite covers: inside it still blends smoothly, at its edges it ends on its own texels as at native size.
+            // (An upscaled picture read by its own samples needs no such clamp: they lie inside the native pixels the sprite covers.)
+            if (SCALE > 1u && !upscaled_source) {
+                let ax = ceil(min(x0, x0 + dx));
+                let ay = ceil(min(y0, y0 + dy));
+                ux = clamp(ux, ax, max(ax, ceil(max(x0, x0 + dx)) - 1.0));
+                uy = clamp(uy, ay, max(ay, ceil(max(y0, y0 + dy)) - 1.0));
             }
             var tx = 0.0;
             var ty = 0.0;
@@ -1197,6 +1623,7 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     let setups = prm(2u);
     snapshot_lo = prm(5u);
     snapshot_hi = prm(6u);
+    let mips = prm(9u);  // words 7 and 8 are not used here
     var last_setup = 0xFFFFFFFFu;
     var s: Setup;
     for (var i = 0u; i < count; i = i + 1u) {
@@ -1205,6 +1632,12 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
         let si = data[p];
         if (si != last_setup) {
             s = load_setup(setups + si * SETUP_WORDS);
+            if (HAS_MIP && mips != 0xFFFFFFFFu) {
+                s.mip_at = mips + si * MIP_WORDS;
+                s.mip = data[s.mip_at];
+            }
+            pix_fl = addr(s.ff, u32(x), u32(y));
+            pix_zl = addr(s.zf, u32(x), u32(y));
             last_setup = si;
         }
         let lo = data[p + 2u];

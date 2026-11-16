@@ -31,6 +31,10 @@ namespace ps2::vu {
 
 std::uint32_t g_trace_vu1_pc = 0;  // entry of the vector program run last (shown by the GS draw trace)
 
+// The vector program that runs now: its entry, its key and whether it is a compiled one. For the report of a packet that does not end;
+// defined below, where the table of entries is.
+static void current_program(std::uint32_t &entry, std::uint64_t &key, bool &compiled);
+
 namespace {
 
 struct Unit {
@@ -440,6 +444,58 @@ void store_vi(Vu0Regs &r, unsigned index, std::uint32_t value) {
     if (index) r.vi[index] = static_cast<std::uint16_t>(value);
 }
 
+// The last kicks, oldest overwritten first, for the report of the first packet that does not end.
+struct KickNote {
+    std::uint32_t address = 0, qwords = 0, entry = 0;
+    bool cut = false;
+};
+KickNote g_kicks[8];
+std::uint32_t g_kick_count = 0;
+
+// The distinct (program, kick address) pairs of packets that did not end, and how often each came: the end-of-run summary says whether
+// it is one program or all of them (public issue #69, Nickelodeon Barnyard).
+struct RunawayRow {
+    std::uint64_t key = 0, count = 0;
+    std::uint32_t entry = 0, address = 0;
+    bool compiled = false;
+};
+constexpr std::uint32_t kRunawayRows = 24;
+RunawayRow g_runaway_rows[kRunawayRows];
+std::uint32_t g_runaway_used = 0;
+std::uint64_t g_runaway_total = 0, g_runaway_other = 0;
+
+// The first packet that does not end prints what a log needs to find out why: the program that kicked it, the tags the GIF walks
+// through, the kicks before it and VIF1's state; the next three print one line, then only the counts of the end-of-run summary.
+void note_runaway(std::uint32_t first) {
+    std::uint32_t entry = 0;
+    std::uint64_t key = 0;
+    bool compiled = false;
+    current_program(entry, key, compiled);
+    const std::uint64_t n = ++g_runaway_total;
+    RunawayRow *row = nullptr;
+    for (std::uint32_t i = 0; i < g_runaway_used; ++i)
+        if (g_runaway_rows[i].key == key && g_runaway_rows[i].entry == entry && g_runaway_rows[i].address == first) row = &g_runaway_rows[i];
+    if (!row && g_runaway_used < kRunawayRows) {
+        row = &g_runaway_rows[g_runaway_used++];
+        *row = RunawayRow{key, 0, entry, first, compiled};
+    }
+    if (row) ++row->count;
+    else ++g_runaway_other;
+    if (n > 4) return;
+    std::fprintf(stderr, "[vu1] XGKICK packet without an end, number %llu: kicked at 0x%03X by the program at entry 0x%04X (key %016llX, %s), TOP %u ITOP %u\n",
+                 static_cast<unsigned long long>(n), first, entry, static_cast<unsigned long long>(key), compiled ? "compiled" : "interpreted", g_top, g_itop);
+    if (n > 1) return;
+    std::fprintf(stderr, "[vu1] the GIF reads from there, tag by tag (it would stop at a tag with EOP 1):\n%s", describe_packet(first).c_str());
+    const std::uint32_t shown = std::min<std::uint32_t>(g_kick_count, 8u);
+    std::fprintf(stderr, "[vu1] the kicks before it, oldest first (address, qwords, program entry):");
+    for (std::uint32_t i = shown; i >= 1; --i) {
+        const KickNote &k = g_kicks[(g_kick_count - i) & 7u];
+        std::fprintf(stderr, " 0x%03X/%u/0x%04X%s", k.address, k.qwords, k.entry, k.cut ? "(cut)" : "");
+    }
+    std::fprintf(stderr, "\n");
+    vif::describe_vu1();
+}
+
 // A packet that runs past the end of the data memory goes on at its start; the queue wants it in one piece.
 __attribute__((noinline)) void xgkick_wrapped(Unit &u, std::uint32_t first, std::uint32_t count) {
     std::uint8_t buffer[16 * 1024 + 16];
@@ -455,7 +511,7 @@ void xgkick(Unit &u, std::uint32_t address) {
     if (g_reference_dry) return;
     const std::uint32_t qwords = u.data_qwords, first = address & (qwords - 1);
     std::uint32_t q = first, count = 0;
-    bool done = false;
+    bool done = false, cut = false;
     while (!done && count < qwords) {
         std::uint64_t tag;
         std::memcpy(&tag, qword(u, q), 8);
@@ -467,13 +523,28 @@ void xgkick(Unit &u, std::uint32_t address) {
         std::uint32_t nreg = static_cast<std::uint32_t>(tag >> 60) & 0xFu;
         if (!nreg) nreg = 16;
         const std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
-        const std::uint32_t take = std::min(body, qwords - count);
-        q += take;
-        count += take;
+        if (body > qwords - count) {
+            // The data of this tag is more than the whole memory holds, so it is no tag but vertex data or other noise: the tag and what
+            // follows it are not sent (they only spray random GS registers); what came before it is a whole number of tags.
+            --count;
+            cut = true;
+            break;
+        }
+        q += body;
+        count += body;
         done = eop;
     }
-    if (first + count <= qwords) gif::transfer(1, u.data + first * 16, count);
-    else xgkick_wrapped(u, first, count);
+    g_kicks[g_kick_count++ & 7u] = KickNote{first, count, g_trace_vu1_pc & 16383u, cut || !done};
+    if (count) {
+        if (first + count <= qwords) gif::transfer(1, u.data + first * 16, count);
+        else xgkick_wrapped(u, first, count);
+    }
+    // More than the whole memory is never a real packet: the GIF met a "tag" that is not one. The packet ends with this kick, as the
+    // console's next XGKICK starts a packet of its own (gif::end_runaway_kick).
+    if (cut || !done) [[unlikely]] {
+        note_runaway(first);
+        gif::end_runaway_kick(first);
+    }
 }
 
 // A VU branch that reads an integer register the instruction right before it
@@ -483,16 +554,36 @@ void xgkick(Unit &u, std::uint32_t address) {
 // flag reading instruction (FMAND, FCAND...) writing the register does not
 // delay it. PCSX2 calls this the branch VI delay.
 struct BranchView {
-    std::uint16_t before[16] = {};
-    bool live = false;
+    struct Step {
+        std::uint16_t before[16] = {};
+        std::uint8_t def = 0;
+    };
+    Step hist[4] = {};
+    std::uint16_t view[16] = {};
 
     // Before an instruction runs: what its branch, if it is one, reads.
-    void arm(Unit &u) const { u.branch_vi = live ? before : nullptr; }
+    void arm(Unit &u, const Vu0Regs &r) {
+        const unsigned reg = hist[0].def;
+        if (reg == 0 || (reg & 0x80u)) {
+            u.branch_vi = nullptr;
+            return;
+        }
+        unsigned j = 0;
+        for (unsigned i = 0; i < 4; ++i) {
+            if (hist[i].def == reg) j = i;
+            else break;
+        }
+        std::memcpy(view, r.vi, sizeof view);
+        view[reg] = hist[j].before[reg];
+        u.branch_vi = view;
+    }
     // Keep the registers as they are before this instruction for the next one.
     void snapshot(const Vu0Regs &r, std::uint16_t (&now)[16]) const { std::memcpy(now, r.vi, sizeof now); }
-    void commit(const std::uint16_t (&was)[16], std::uint32_t lo, bool lower_ran) {
-        std::memcpy(before, was, sizeof before);
-        live = lower_ran && !branch_delay_exempt(lo);
+    void commit(const std::uint16_t (&was)[16], std::uint32_t lo, std::uint32_t hi) {
+        for (int i = 3; i > 0; --i) hist[i] = hist[i - 1];
+        std::memcpy(hist[0].before, was, sizeof hist[0].before);
+        const unsigned reg = vi_written_reg(lo, hi);
+        hist[0].def = static_cast<std::uint8_t>(reg == 0 ? 0 : branch_delay_exempt(lo) ? (0x80u | reg) : reg);
     }
 };
 
@@ -708,10 +799,45 @@ void run_fast(int n, std::uint32_t address);
 std::unordered_map<std::uint64_t, ProgramFn> g_programs;
 std::unordered_map<std::uint64_t, ProgramFn> g_vu0_programs;
 void run_reference(int n, std::uint32_t address);
+// A program seen at an entry before: the instruction pairs it can reach (as runs of addresses) and their code. When the code is
+// uploaded again and those pairs hold the same code, reachable() would find the same pairs and program_key() the same key.
+struct Candidate {
+    std::vector<std::uint32_t> runs;
+    std::vector<std::uint8_t> code;
+    std::uint64_t key = 0;
+    ProgramFn function = nullptr;
+    ProgramFn jit = nullptr;
+};
+
+bool candidate_matches(const Candidate &c, const std::uint8_t *unit_code) {
+    const std::uint8_t *code = c.code.data();
+    for (std::size_t i = 0; i < c.runs.size(); i += 2) {
+        if (std::memcmp(unit_code + c.runs[i], code, c.runs[i + 1]) != 0) return false;
+        code += c.runs[i + 1];
+    }
+    return true;
+}
+
+Candidate make_candidate(std::vector<std::uint32_t> pcs, const std::uint8_t *unit_code) {
+    std::sort(pcs.begin(), pcs.end());
+    Candidate c;
+    for (std::uint32_t pc : pcs) {
+        if (!c.runs.empty() && c.runs[c.runs.size() - 2] + c.runs.back() == pc) c.runs.back() += 8;
+        else {
+            c.runs.push_back(pc);
+            c.runs.push_back(8);
+        }
+        c.code.insert(c.code.end(), unit_code + pc, unit_code + pc + 8);
+    }
+    return c;
+}
+
 struct Vu0Entry {
     std::uint32_t generation = 0;
     std::uint64_t key = 0;
     ProgramFn function = nullptr;
+    std::vector<Candidate> candidates;  // the programs seen at this entry (only their keys are used: the function is looked up again)
+    std::uint32_t next = 0;
 };
 Vu0Entry g_vu0_entries[512];
 std::unordered_set<std::uint64_t> g_vu0_rejected;
@@ -722,20 +848,64 @@ ProgramFn lookup_vu0(std::uint32_t address) {
     Vu0Entry &e = g_vu0_entries[address >> 3];
     if (e.generation == g_generation[0]) return e.function;
     e.generation = g_generation[0];
-    e.key = program_key(g_vu0_code, reachable(g_vu0_code, 4095u, address), address);
+    // A game that uploads its VU0 code again and again (Silent Hill 2, several times a frame) finds the key of a program it ran before
+    // by comparing the code of that program's pairs instead of walking the code and hashing it again (with two allocations).
+    const Candidate *known = nullptr;
+    for (const Candidate &c : e.candidates)
+        if (candidate_matches(c, g_vu0_code)) {
+            known = &c;
+            break;
+        }
+    if (known) {
+        e.key = known->key;
+    } else {
+        std::vector<std::uint32_t> pcs = reachable(g_vu0_code, 4095u, address);
+        e.key = program_key(g_vu0_code, pcs, address);
+        Candidate c = make_candidate(std::move(pcs), g_vu0_code);
+        c.key = e.key;
+        if (e.candidates.size() < 4) e.candidates.push_back(std::move(c));
+        else e.candidates[e.next++ % 4] = std::move(c);
+    }
     const auto it = g_vu0_programs.find(e.key);
     e.function = it == g_vu0_programs.end() || g_vu0_rejected.count(e.key) ? nullptr : it->second;
     static const std::string record = ps2::os::env("PS2_VU0_RECORD");
-    if (!e.function && !record.empty()) {
+    // Each program is looked for on disk once per run: a window run records by default, and a game that uploads its VU0 code often
+    // (Silent Hill 2) asked the file system on every upload, about 14 % of the emulation thread on Windows. A known
+    // program (same key, same entry) was handled when it was first seen.
+    static std::unordered_set<std::string> recorded;
+    if (!known && !e.function && !record.empty()) {
         char name[64];
         std::snprintf(name, sizeof name, "%016llX_%04X.bin", static_cast<unsigned long long>(e.key), address);
-        const auto path = ps2::os::path(record) / name;
-        if (!std::filesystem::exists(path)) {
-            std::filesystem::create_directories(ps2::os::path(record));
-            std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu0_code), 4096);
+        if (recorded.insert(name).second) {
+            const auto path = ps2::os::path(record) / name;
+            if (!std::filesystem::exists(path)) {
+                std::filesystem::create_directories(ps2::os::path(record));
+                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu0_code), 4096);
+            }
         }
     }
     return e.function;
+}
+
+std::uint64_t vu0_key(std::uint32_t entry) {
+    lookup_vu0(entry);
+    return g_vu0_entries[(entry & 4095u) >> 3].key;
+}
+
+std::uint64_t g_vu0_restarts = 0;
+
+void vu0_restart(std::uint32_t entry) {
+    if (++g_vu0_restarts == 1 || g_vu0_restarts % 100000 == 0)
+        std::fprintf(stderr, "[vu0] a compiled program at %04X called code it does not know; ran it in the interpreter (%llu times)\n", entry & 4095u,
+                     static_cast<unsigned long long>(g_vu0_restarts));
+    run_reference(0, entry);
+}
+
+// The interpreter's VU0 calls (JALR): where they go is recorded as a program of its own (PS2_VU0_RECORD), so the next build compiles the
+// subroutine into the program that calls it (vurecomp_gen.cpp, vu0_calls).
+void note_vu0_call(std::uint32_t target) {
+    static const bool recording = !ps2::os::env("PS2_VU0_RECORD").empty();
+    if (recording) lookup_vu0(target);
 }
 
 bool same_vu0_regs(const Vu0Regs &a, const Vu0Regs &b) {
@@ -784,14 +954,6 @@ bool run_compiled_vu0(std::uint32_t address) {
 }
 
 
-struct Candidate {
-    std::vector<std::uint32_t> runs;
-    std::vector<std::uint8_t> code;
-    std::uint64_t key = 0;
-    ProgramFn function = nullptr;
-    ProgramFn jit = nullptr;
-};
-
 struct EntryCache {
     std::uint32_t generation = 0;
     std::uint64_t key = 0;
@@ -801,28 +963,6 @@ struct EntryCache {
     std::uint32_t next = 0;
 };
 
-bool candidate_matches(const Candidate &c) {
-    const std::uint8_t *code = c.code.data();
-    for (std::size_t i = 0; i < c.runs.size(); i += 2) {
-        if (std::memcmp(g_vu1_code + c.runs[i], code, c.runs[i + 1]) != 0) return false;
-        code += c.runs[i + 1];
-    }
-    return true;
-}
-
-Candidate make_candidate(std::vector<std::uint32_t> pcs) {
-    std::sort(pcs.begin(), pcs.end());
-    Candidate c;
-    for (std::uint32_t pc : pcs) {
-        if (!c.runs.empty() && c.runs[c.runs.size() - 2] + c.runs.back() == pc) c.runs.back() += 8;
-        else {
-            c.runs.push_back(pc);
-            c.runs.push_back(8);
-        }
-        c.code.insert(c.code.end(), g_vu1_code + pc, g_vu1_code + pc + 8);
-    }
-    return c;
-}
 std::unordered_map<std::uint64_t, ProgramFn> g_jit_programs;
 std::vector<std::uint32_t> *g_kick_log = nullptr;
 std::int64_t *g_capture = nullptr;
@@ -863,6 +1003,56 @@ void kick(int unit, std::uint32_t address) {
     if (g_kick_log && unit == 1) g_kick_log->push_back(address);
     Unit u = unit_of(unit);
     xgkick(u, address);
+}
+
+static void current_program(std::uint32_t &entry, std::uint64_t &key, bool &compiled) {
+    entry = g_trace_vu1_pc & 16383u;
+    const EntryCache &e = g_entries[entry >> 3];
+    key = e.key;
+    compiled = e.function != nullptr;
+}
+
+// The GIF tags a kick at `address` walks through, as the console's GIF reads them (the same walk as xgkick's), up to ten, one line each.
+std::string describe_packet(std::uint32_t address) {
+    constexpr std::uint32_t qwords = 1024;
+    std::string out;
+    std::uint32_t q = address & (qwords - 1), count = 0;
+    for (int i = 0; i < 10 && count < qwords; ++i) {
+        std::uint64_t lo, hi;
+        std::memcpy(&lo, g_vu1_mem + q * 16, 8);
+        std::memcpy(&hi, g_vu1_mem + q * 16 + 8, 8);
+        const std::uint32_t nloop = static_cast<std::uint32_t>(lo) & 0x7FFFu, flg = static_cast<std::uint32_t>(lo >> 58) & 3u;
+        const bool eop = (lo >> 15) & 1u;
+        std::uint32_t nreg = static_cast<std::uint32_t>(lo >> 60) & 0xFu;
+        if (!nreg) nreg = 16;
+        const std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+        const std::uint32_t at = q;
+        ++count;
+        const std::uint32_t take = std::min(body, qwords - count);
+        count += take;
+        q = (q + 1 + take) & (qwords - 1);
+        char line[220];
+        std::snprintf(line, sizeof line, "[vu1]   tag at 0x%03X: %016llX %016llX  NLOOP %u EOP %u FLG %u NREG %u, %u data qwords, next tag at 0x%03X%s\n", at,
+                      static_cast<unsigned long long>(hi), static_cast<unsigned long long>(lo), nloop, eop ? 1u : 0u, flg, nreg, body, q, take < body ? " (past the end of the memory)" : "");
+        out += line;
+        if (eop) return out;
+    }
+    out += "[vu1]   (no tag with EOP 1 in the first ten)\n";
+    return out;
+}
+
+std::uint64_t runaway_kicks() { return g_runaway_total; }
+
+void runaway_summary() {
+    if (!g_runaway_total) return;
+    RunawayRow sorted[kRunawayRows];
+    std::copy(g_runaway_rows, g_runaway_rows + g_runaway_used, sorted);
+    std::sort(sorted, sorted + g_runaway_used, [](const RunawayRow &a, const RunawayRow &b) { return a.count > b.count; });
+    std::fprintf(stderr, "[vu1] %llu XGKICK packets without an end, from %u different (program, address) pairs%s; the most frequent:\n", static_cast<unsigned long long>(g_runaway_total),
+                 g_runaway_used, g_runaway_other ? " and more" : "");
+    for (std::uint32_t i = 0; i < g_runaway_used && i < 6; ++i)
+        std::fprintf(stderr, "[vu1]   %llu times: program at entry 0x%04X (key %016llX, %s) kicked at 0x%03X\n", static_cast<unsigned long long>(sorted[i].count), sorted[i].entry,
+                     static_cast<unsigned long long>(sorted[i].key), sorted[i].compiled ? "compiled" : "interpreted", sorted[i].address);
 }
 
 std::uint32_t top() { return g_top; }
@@ -1117,7 +1307,7 @@ ProgramFn lookup(std::uint32_t address) {
     if (e.generation == g_generation[1]) return e.function;
     e.generation = g_generation[1];
     for (const Candidate &c : e.candidates)
-        if (candidate_matches(c)) {
+        if (candidate_matches(c, g_vu1_code)) {
             e.function = c.function;
             e.jit = c.jit;
             e.key = c.key;
@@ -1133,7 +1323,7 @@ ProgramFn lookup(std::uint32_t address) {
     const int jit_mode = jit::mode();
     if (jit_mode == 2 || (jit_mode >= 1 && !e.function)) e.function = jit_program(key, address);
     else if (jit_mode == 3) e.jit = jit_program(key, address);
-    Candidate c = make_candidate(pcs);
+    Candidate c = make_candidate(pcs, g_vu1_code);
     c.key = key;
     c.function = e.function;
     c.jit = e.jit;
@@ -1150,7 +1340,8 @@ ProgramFn lookup(std::uint32_t address) {
             return e.function;
         }
         const std::filesystem::path path = ps2::os::path(record) / name;
-        if (!std::filesystem::exists(path)) {
+        static std::unordered_set<std::string> recorded;  // once per program and run, as for VU0 (lookup_vu0)
+        if (recorded.insert(name).second && !std::filesystem::exists(path)) {
             std::filesystem::create_directories(ps2::os::path(record));
             std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu1_code), 16384);
         }
@@ -1199,7 +1390,7 @@ void run_fast(int n, std::uint32_t address) {
         fast_upper(r, d, out);
         std::uint16_t was[16];
         view.snapshot(r, was);
-        view.arm(u);
+        view.arm(u, r);
         if (hi & 0x80000000u) {
             r.i = lo;
         } else {
@@ -1210,7 +1401,7 @@ void run_fast(int n, std::uint32_t address) {
             if (branch && record_jumps && n == 1 && ((lo >> 25) == 0x24u || (lo >> 25) == 0x25u)) lookup(target);
         }
         u.branch_vi = nullptr;
-        view.commit(was, lo, !(hi & 0x80000000u));
+        view.commit(was, lo, hi);
         if (out.target > 0) {
             Reg128 &dst = out.target == kAcc ? r.acc : r.vf[out.target];
             for (int i = 0; i < 4; ++i)
@@ -1321,16 +1512,17 @@ void run_reference(int n, std::uint32_t address) {
         bool branch = false;
         std::uint16_t was[16];
         view.snapshot(r, was);
-        view.arm(u);
+        view.arm(u, r);
         if (hi & 0x80000000u) {
             r.i = lo;
         } else {
             std::uint32_t target = npc;
             lower(u, lo, current, target, branch);
             if (branch) npc = target;
+            if (branch && n == 0 && (lo >> 25) == 0x25u) note_vu0_call(target);
         }
         u.branch_vi = nullptr;
-        view.commit(was, lo, !(hi & 0x80000000u));
+        view.commit(was, lo, hi);
         commit(r, out);
         if (out.target >= 0 && out.flags) pipe.set_mac(r.mac, r.status);
         if (u.fsset >= 0) {

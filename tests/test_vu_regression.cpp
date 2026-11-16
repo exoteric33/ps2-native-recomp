@@ -205,6 +205,53 @@ int main() {
         if (!branch_taken) failures++;
     }
 
+    printf("\n=== Test 4: Champions of Norrath 4-SQI post-increment branch VI delay chain ===\n");
+    for (int unit = 0; unit < 2; ++unit) {
+        printf("--- Unit %d 4-SQI loop test ---\n", unit);
+        // Exact microprogram loop from Champions of Norrath (vu1_C4125B3E36875A2A, 0x12D8..0x1320):
+        // 0x00: IADDIU vi1, vi0, 0x0040
+        // 0x08: IADDIU vi2, vi0, 0x0000
+        // 0x10: IADDIU vi3, vi2, 0x00FB  (251 = 64 * 4 - 5)
+        // 0x18: SQI.xyzw vf1, (vi2++)
+        // 0x20: SQI.xyzw vf2, (vi2++)
+        // 0x28: SQI.xyzw vf3, (vi2++)
+        // 0x30: IBNE vi3, vi2, 0x18 (offset -4 = 0x7FC)
+        // 0x38: SQI.xyzw vf4, (vi2++)    (delay slot)
+        // 0x40: [E=1] NOP
+        // 0x48: NOP
+        const std::vector<std::array<std::uint32_t, 2>> sqi_pairs = {
+            {0x10010040u, 0x000002FFu}, // 0x00: IADDIU vi1, vi0, 0x40
+            {0x10020000u, 0x000002FFu}, // 0x08: IADDIU vi2, vi0, 0x00
+            {0x100310FBu, 0x000002FFu}, // 0x10: IADDIU vi3, vi2, 0xFB
+            {0x81E20B7Du, 0x000002FFu}, // 0x18: SQI.xyzw vf1, (vi2++)
+            {0x81E2137Du, 0x000002FFu}, // 0x20: SQI.xyzw vf2, (vi2++)
+            {0x81E21B7Du, 0x000002FFu}, // 0x28: SQI.xyzw vf3, (vi2++)
+            {0x52021FFCu, 0x000002FFu}, // 0x30: IBNE vi3, vi2, 0x18
+            {0x81E2237Du, 0x000002FFu}, // 0x38: SQI.xyzw vf4, (vi2++)
+            {0x8000033Cu, 0x400002FFu}, // 0x40: [E=1] NOP
+            {0x8000033Cu, 0x000002FFu}, // 0x48: NOP
+        };
+        std::uint8_t *code = unit ? g_vu1_code : g_vu0_code;
+        std::uint8_t *data = unit ? g_vu1_mem : g_vu0_mem;
+        std::memset(code, 0, unit ? 16384 : 4096);
+        for (std::size_t i = 0; i < sqi_pairs.size(); ++i) {
+            std::memcpy(code + i * 8, &sqi_pairs[i][0], 4);
+            std::memcpy(code + i * 8 + 4, &sqi_pairs[i][1], 4);
+        }
+        vu::code_changed(unit);
+        std::memset(data, 0, unit ? 16384 : 4096);
+        Vu0Regs &r = vu::regs(unit);
+        std::memset(&r, 0, sizeof(r));
+        r.vf[0].w[3] = 0x3F800000u;
+
+        vu::run(unit, 0);
+
+        const bool ok = (r.vi[2] == 256 && r.vi[3] == 251);
+        printf("  4-SQI loop result: vi2=%u (want 256), vi3=%u (want 251) -> %s\n",
+               r.vi[2], r.vi[3], ok ? "PASS" : "FAIL");
+        if (!ok) failures++;
+    }
+
     printf("\n==================================================\n");
     printf("Total test failures: %d\n", failures);
     return failures ? 1 : 0;

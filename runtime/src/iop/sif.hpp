@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace ps2::state {
 class Stream;
@@ -21,6 +22,14 @@ int dma_stat(std::uint32_t id);
 void packet_processed();
 void pump();
 void dump();
+// For the F9 report's thread list, all read-only: the RPC call (to which server, which function) an EE semaphore waits
+// for, empty when none; one line per call the EE has sent and the IOP has not answered; what an IOP thread in an RPC wait (queue 0: a bind or a
+// call it made) is waiting for.
+std::string rpc_call_of_ee_semaphore(int sema);
+std::string open_calls_text();
+std::string iop_thread_rpc_wait(int thread, int queue);
+// How many SIF commands with this id came from the EE with no IOP handler for them this run (dropped, as the console does).
+std::uint64_t unhandled_commands(std::uint32_t cid);
 
 void register_hle_server(std::uint32_t id, HleServer server);
 void complete_call(std::uint32_t id);

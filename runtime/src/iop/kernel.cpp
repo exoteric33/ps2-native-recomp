@@ -25,6 +25,10 @@ namespace kernel {
 
 bool g_trace_hle = false;
 bool g_trace_modules = false;
+// read by the interpreter's inline switch_pending() (kernel.hpp)
+bool g_switch = false;
+int g_nesting = 0;
+bool g_nested_done = false;
 
 namespace {
 
@@ -57,6 +61,7 @@ struct Interrupt {
 std::vector<HleEntry> g_hle;
 std::map<std::pair<std::string, std::uint32_t>, std::uint32_t> g_hle_ids;
 std::vector<std::pair<std::uint32_t, std::uint32_t>> g_hle_stubs;
+std::map<std::uint32_t, std::uint32_t> g_replaced;  // a loaded state's word at each stub place, before relink_hle_imports wrote the stub there
 std::map<std::string, std::uint32_t> g_hle_versions;
 std::map<std::string, std::uint32_t> g_libraries;
 std::map<std::string, HleModuleStart> g_hle_modules;
@@ -68,7 +73,6 @@ std::map<int, Thread> g_threads;
 int g_current = 0;
 int g_next_thread = 1;
 std::uint64_t g_order = 0;
-bool g_switch = false;
 std::uint64_t g_switch_count = 0;  // thread switches so far (statistics for ReferSystemStatus; not part of the save state)
 
 std::map<std::uint32_t, std::uint32_t> g_used;
@@ -82,8 +86,6 @@ std::uint64_t g_ee_remainder = 0;
 
 std::map<unsigned, Interrupt> g_interrupts;
 bool g_suspended = false;
-int g_nesting = 0;
-bool g_nested_done = false;
 std::uint32_t g_return_stub = 0;
 std::uint32_t g_exit_stub = 0;
 std::set<std::pair<std::string, std::uint32_t>> g_missing_reported;
@@ -168,7 +170,11 @@ void relink_hle_imports() {
             }
         }
     }
-    for (const auto &[at, id] : g_hle_stubs) set_ram32(at, (kHleOpcode << 26) | id);
+    g_replaced.clear();
+    for (const auto &[at, id] : g_hle_stubs) {
+        g_replaced[at] = ram32(at);
+        set_ram32(at, (kHleOpcode << 26) | id);
+    }
 }
 
 // A module comes from the disc or from the game's memory, so it is untrusted: every read is checked against the file, and a read
@@ -285,8 +291,6 @@ void syscall(Cpu &c, std::uint32_t pc) {
 }
 
 void set_status(Cpu &c, std::uint32_t value) { c.status = value; }
-
-bool switch_pending() { return g_switch || (g_nesting && g_nested_done); }
 
 std::uint64_t now() { return g_now; }
 std::uint64_t usec_to_cycles(std::uint64_t usec) { return usec * 36864u / 1000u; }
@@ -502,6 +506,25 @@ std::uint32_t hle_stub(const HleFunction &function) {
     return at;
 }
 
+// A loaded state whose memory holds the stubs at other places than the ones they have now: put each stub where the state has it, and give
+// the old places back the words the state had there (they are data of the state, not stubs). All the old places are given back first and
+// the new ones written after, so a place that one stub leaves and another one takes ends up with the stub, in whatever order the moves come.
+void move_hle_stubs(const std::vector<std::pair<std::uint32_t, std::uint32_t>> &moves) {
+    std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t> *, std::uint32_t>> found;
+    for (const auto &[from, to] : moves)
+        for (auto &stub : g_hle_stubs)
+            if (stub.first == from) {
+                found.emplace_back(&stub, to);
+                break;
+            }
+    for (const auto &[stub, to] : found)
+        if (const auto kept = g_replaced.find(stub->first); kept != g_replaced.end()) set_ram32(stub->first, kept->second);
+    for (const auto &[stub, to] : found) {
+        stub->first = to;
+        set_ram32(to, (kHleOpcode << 26) | stub->second);
+    }
+}
+
 void register_library(const std::string &name, std::uint32_t table) {
     g_libraries[name] = table;
     if (g_trace_modules) std::fprintf(stderr, "[iop] library %s at 0x%08X\n", name.c_str(), table);
@@ -583,6 +606,7 @@ void boot() {
     install_io();
     install_cdvd();
     install_sif();
+    install_io_stubs();
 }
 
 }
@@ -684,8 +708,52 @@ void dump() {
     using namespace kernel;
     for (const auto &[id, m] : g_modules) std::fprintf(stderr, "[iop] module %d %s at 0x%08X\n", id, m.name.c_str(), m.base);
     for (const auto &[id, t] : g_threads)
-        std::fprintf(stderr, "[iop] thread %d status %d prio %d wait %d/%d pc 0x%08X\n", id, t.status, t.priority, t.wait, t.wait_id,
-                     id == g_current ? g_cpu.pc : t.context.pc);
+        std::fprintf(stderr, "[iop] thread %d status %d prio %d wait %d/%d pc 0x%08X (%s)\n", id, t.status, t.priority, t.wait, t.wait_id,
+                     id == g_current ? g_cpu.pc : t.context.pc, wait_words(t).c_str());
+}
+
+// The name of the module whose code holds an address, for the thread list ("" when none does).
+static std::string module_of(std::uint32_t address) {
+    for (const auto &[id, m] : kernel::g_modules)
+        if (address >= m.base && address - m.base < m.size) return m.name;
+    return {};
+}
+
+std::string thread_summary() {
+    using namespace kernel;
+    int live = 0, waiting = 0, servers = 0;
+    for (const auto &[id, t] : g_threads) {
+        if (t.status == kDormant) continue;
+        ++live;
+        if (t.status == kWait || t.status == kWaitSuspend) {
+            ++waiting;
+            servers += t.wait == kWaitRpc && t.wait_id != 0;
+        }
+    }
+    if (!live) return "no IOP thread has started yet";
+    if (waiting == live) return "every IOP thread waits (" + std::to_string(live) + ", " + std::to_string(servers) + " of them idle RPC server loops)";
+    return std::to_string(live - waiting) + " of " + std::to_string(live) + " IOP threads run or are ready, " + std::to_string(waiting) + " wait";
+}
+
+std::string thread_report() {
+    using namespace kernel;
+    std::string out;
+    char b[200];
+    int dormant = 0;
+    for (const auto &[id, t] : g_threads) {
+        if (t.status == kDormant) {
+            ++dormant;
+            continue;
+        }
+        const std::string module = module_of(t.entry);
+        std::snprintf(b, sizeof b, "    IOP thread %d%s%s%s, priority %d: ", id, module.empty() ? "" : " (", module.c_str(), module.empty() ? "" : ")", t.priority);
+        out += b;
+        out += wait_words(t);
+        std::snprintf(b, sizeof b, "; at 0x%08X\n", id == g_current ? g_cpu.pc : t.context.pc);
+        out += b;
+    }
+    if (dormant) out += "    (IOP threads that exist but are not started: " + std::to_string(dormant) + ")\n";
+    return out;
 }
 
 void raise_interrupt(unsigned line) { hw::raise_interrupt(line); }

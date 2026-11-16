@@ -8,6 +8,7 @@
 
 #define SDL_MAIN_HANDLED
 #include "iop/sio2.hpp"
+#include "ps2/system.hpp"
 #include "window.hpp"
 
 #include <SDL.h>
@@ -25,6 +26,13 @@
 namespace {
 
 int g_checks = 0, g_failed = 0;
+
+// One pass of the window's input code, then the frame boundary the emulation would reach: the host's pad state only goes on to the
+// console's ports when the emulation takes it over once per frame (latch_pads in runtime/src/system.cpp, since 2026-10-25).
+void pump() {
+    poll_input();
+    ps2::latch_pads_now();
+}
 
 void check(bool ok, const char *format, ...) {
     ++g_checks;
@@ -121,12 +129,12 @@ void unplug(int n) {
 
 void button(int n, SDL_GameControllerButton b, bool down) {
     SDL_JoystickSetVirtualButton(g_virtual[n].joystick, b, down ? SDL_PRESSED : SDL_RELEASED);
-    poll_input();
+    pump();
 }
 
 void axis(int n, SDL_GameControllerAxis a, int value) {
     SDL_JoystickSetVirtualAxis(g_virtual[n].joystick, a, static_cast<Sint16>(value));
-    poll_input();
+    pump();
 }
 
 // a trigger value as the game controller layer gives it (0..32767) set on the virtual joystick's whole range
@@ -171,7 +179,7 @@ int main() {
     for (int i = 0; i < SDL_NumJoysticks(); ++i)
         std::printf("note: a real controller is connected (%s); the checks below assume it is idle\n", SDL_JoystickNameForIndex(i));
     ps2::iop::sio2::reset();
-    poll_input();
+    pump();
 
     std::printf("port 1 with no controller (the keyboard drives it)\n");
     {
@@ -182,7 +190,7 @@ int main() {
 
     std::printf("controller A plugged in\n");
     plug(0);
-    poll_input();
+    pump();
     check(SDL_NumJoysticks() >= 1 && SDL_IsGameController(SDL_NumJoysticks() - 1), "SDL sees it as a game controller");
     set_up_pad(0);
     {
@@ -195,6 +203,11 @@ int main() {
     std::printf("each button\n");
     for (const Expect &e : kButtons) {
         button(0, e.sdl, true);
+        // the window holds Select back for 300 ms (the quick menu is Select, then Start), then gives it to the game
+        if (e.sdl == SDL_CONTROLLER_BUTTON_BACK) {
+            SDL_Delay(320);
+            pump();
+        }
         const auto a = poll_state(0);
         const bool pressure_ok = e.pressure < 0 || a[9 + e.pressure] == 0xFF;
         int others = 0;
@@ -203,10 +216,22 @@ int main() {
         check(buttons(a) == (1u << e.bit) && pressure_ok && !others, "%-24s buttons %04X%s", e.name, buttons(a),
               e.pressure < 0 ? "" : (std::string(", pressure ") + std::to_string(a[9 + e.pressure])).c_str());
         button(0, e.sdl, false);
+        // a Select that was let go is still given to the game for 80 ms
+        if (e.sdl == SDL_CONTROLLER_BUTTON_BACK) {
+            SDL_Delay(120);
+            pump();
+        }
         check(buttons(poll_state(0)) == 0, "%-24s released", e.name);
     }
     button(0, SDL_CONTROLLER_BUTTON_GUIDE, true);
-    check(buttons(poll_state(0)) == 0, "Guide/Xbox/PS button: no PS2 button (it has none)");
+    // the Guide / Xbox / PS button has no PS2 button; it opens the quick menu (since 2026-10-26), which keeps every button from the game
+    // until it is closed, and pressing Guide again closes it
+    check(buttons(poll_state(0)) == 0, "Guide/Xbox/PS button: no PS2 button (it has none; it opens the quick menu)");
+    button(0, SDL_CONTROLLER_BUTTON_GUIDE, false);
+    button(0, SDL_CONTROLLER_BUTTON_A, true);
+    check(buttons(poll_state(0)) == 0, "quick menu open: the game gets no button");
+    button(0, SDL_CONTROLLER_BUTTON_A, false);
+    button(0, SDL_CONTROLLER_BUTTON_GUIDE, true);
     button(0, SDL_CONTROLLER_BUTTON_GUIDE, false);
 
     std::printf("triggers (L2, R2) with pressure\n");
@@ -251,19 +276,19 @@ int main() {
     std::printf("rumble\n");
     {
         poll_state(0, 1, 0xC0);
-        poll_input();
+        pump();
         check(g_virtual[0].rumbles > 0 && g_virtual[0].high == 0xFFFF && std::abs(g_virtual[0].low - static_cast<int>(std::sqrt(0xC0 / 255.0) * 65535.0)) < 64,
               "game asks for small motor on, large motor 0xC0: the controller gets low %u high %u", g_virtual[0].low, g_virtual[0].high);
         poll_state(0, 0, 0);
-        poll_input();
+        pump();
         check(g_virtual[0].low == 0 && g_virtual[0].high == 0, "game stops the motors: low %u high %u", g_virtual[0].low, g_virtual[0].high);
         poll_state(0, 1, 0xFF);
-        poll_input();
+        pump();
         unplug(0);
-        poll_input();
+        pump();
         const int before = g_virtual[0].rumbles;
         poll_state(0, 1, 0xFF);
-        poll_input();
+        pump();
         check(g_virtual[0].rumbles == before, "rumble request after the controller was pulled out: nothing sent, no crash");
         poll_state(0, 0, 0);
     }
@@ -271,15 +296,15 @@ int main() {
     std::printf("hot-plug\n");
     {
         plug(0);
-        poll_input();
+        pump();
         button(0, SDL_CONTROLLER_BUTTON_A, true);
         check(buttons(poll_state(0)) == (1u << 14), "plugged in again while running: A -> cross works");
         unplug(0);
-        poll_input();
+        pump();
         const auto a = poll_state(0);
         check(buttons(a) == 0 && a[7] == 0x80, "pulled out while A was held: no button stays stuck (%04X)", buttons(a));
         plug(0);
-        poll_input();
+        pump();
         axis(0, SDL_CONTROLLER_AXIS_LEFTX, -32768);
         check(poll_state(0)[7] == 0x00, "plugged in a third time: the left stick works");
         axis(0, SDL_CONTROLLER_AXIS_LEFTX, 0);
@@ -290,7 +315,7 @@ int main() {
         const auto before = exchange(1, {0x01, 0x42, 0x00, 0x00, 0x00});
         check(before[1] == 0xFF, "port 2 is empty before: %02X", before[1]);
         plug(1);
-        poll_input();
+        pump();
         const auto digital = exchange(1, {0x01, 0x42, 0x00, 0x00, 0x00});
         check(digital[1] == 0x41, "controller B plugged in: port 2 answers (%02X)", digital[1]);
         set_up_pad(1);
@@ -302,18 +327,18 @@ int main() {
         check(buttons(poll_state(0)) == (1u << 12) && buttons(poll_state(1)) == 0, "Y on controller A: port 1 triangle, port 2 nothing");
         button(0, SDL_CONTROLLER_BUTTON_Y, false);
         poll_state(1, 1, 0x80);
-        poll_input();
+        pump();
         check(g_virtual[1].rumbles > 0 && g_virtual[0].low == 0, "rumble for port 2 goes to controller B only: B low %u high %u, A low %u", g_virtual[1].low,
               g_virtual[1].high, g_virtual[0].low);
         poll_state(1, 0, 0);
         unplug(1);
-        poll_input();
+        pump();
         check(exchange(1, {0x01, 0x42, 0x00, 0x00, 0x00})[1] == 0xFF, "controller B pulled out: port 2 is empty again");
         check(buttons(poll_state(0)) == 0 && poll_state(0)[1] == 0x79, "port 1 is not disturbed");
     }
 
     unplug(0);
-    poll_input();
+    pump();
     std::printf("pad test: %d checks, %d failed\n", g_checks, g_failed);
     SDL_Quit();
     return g_failed ? 1 : 0;

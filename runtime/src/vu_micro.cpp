@@ -987,7 +987,17 @@ void register_programs(const Program *programs, std::uint32_t count) {
     for (std::uint32_t i = 0; i < count; ++i)
         if (programs[i].function) (programs[i].unit == 0 ? g_vu0_programs : g_programs)[programs[i].key] = programs[i].function;
     for (Vu0Entry &entry : g_vu0_entries) entry.generation = 0;
-    if (count > 0) std::fprintf(stderr, "[vu1] Statically registered %u compiled vector programs\n", count);
+    // The log head says how many programs of each vector unit the build holds (the old line "[vu1] Statically registered N compiled
+    // vector programs" counted both: N is the sum of the two numbers). Printed for 0 and 0 too: a first build with nothing compiled in.
+    std::uint32_t in_vu0 = 0;
+    for (std::uint32_t i = 0; i < count; ++i) in_vu0 += programs[i].unit == 0;
+    std::fprintf(stderr, "[vu] compiled in: %u VU1 programs, %u VU0 programs\n", count - in_vu0, in_vu0);
+    // The two switches that make a unit run every program in the interpreter, so the compiled-in ones above are not used. A log that
+    // does not say so cannot be told from a run that was slow for another reason. The tests below (run_entry, run_compiled_vu0) read them too.
+    const bool interpret_vu1 = std::getenv("PS2_VU_INTERPRET") != nullptr, interpret_vu0 = std::getenv("PS2_VU0_INTERPRET") != nullptr;
+    if (interpret_vu1 || interpret_vu0)
+        std::fprintf(stderr, "[vu] %s%s%s\n", interpret_vu1 ? "PS2_VU_INTERPRET is set: VU1 programs run in the interpreter" : "", interpret_vu1 && interpret_vu0 ? "; " : "",
+                     interpret_vu0 ? "PS2_VU0_INTERPRET is set: VU0 programs run in the interpreter" : "");
 }
 
 // Programs the background thread compiled and loaded (vu_live.cpp) join the table of built-in ones. A program the build knew keeps

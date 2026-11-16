@@ -16,17 +16,20 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cwchar>
 #include <filesystem>
 #include <string>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 #include <atomic>
 #include <chrono>
@@ -56,6 +59,10 @@
 #ifdef PS2_WINDOW
 #include <fcntl.h>
 #endif
+#endif
+
+#ifndef _WIN32
+extern char **environ;  // the process's environment, read once for the log head (log_start_lines)
 #endif
 
 void register_generated_code();
@@ -530,6 +537,79 @@ static void log_machine() {
     std::fprintf(stderr, "[cpu] %s: %s\n", name.c_str(), detail);
 }
 
+// The log head says how the runner was started (log_start_lines below): the arguments and the PS2_* switches. A log is posted in public
+// by testers, and a path in it holds their folder names (C:\Users\<name>\...), so a path, or a value that holds one, is shortened to its
+// last part: `C:\Users\bob\games\gow2\disc.iso` is `disc.iso`, `games/gow2/` is `gow2`. A leading frame number stays
+// (`--save-state 100:C:\x\a.state` is `100:a.state`), and a last part that is the user's own account name is shown as `<user>`.
+static std::string short_path(const std::string &text) {
+    const auto separator = [](char c) { return c == '/' || c == '\\'; };
+    const auto first_separator = std::find_if(text.begin(), text.end(), separator);
+    if (first_separator == text.end()) return text;  // not a path: --frames, --widescreen, a number
+    std::size_t keep = 0;  // "100:" before a path
+    while (keep < text.size() && text[keep] >= '0' && text[keep] <= '9') ++keep;
+    keep = keep && keep < text.size() && text[keep] == ':' ? keep + 1 : 0;
+    std::string rest = text.substr(keep);
+    while (rest.size() > 1 && separator(rest.back())) rest.pop_back();  // a folder written with a closing slash
+    const auto cut = std::find_if(rest.rbegin(), rest.rend(), separator);
+    std::string last = cut == rest.rend() ? rest : std::string(cut.base(), rest.end());
+    if (last.empty()) last = rest;  // "/" alone
+    std::string user = ps2::os::env("USERNAME");
+    if (user.empty()) user = ps2::os::env("USER");
+    if (!user.empty() && user.size() == last.size() &&
+        std::equal(user.begin(), user.end(), last.begin(), [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)); }))
+        last = "<user>";
+    return text.substr(0, keep) + last;
+}
+
+// Text for a log line: in quotes when it holds a blank or nothing at all, cut at 100 characters.
+static std::string for_log(std::string text) {
+    if (text.size() > 100) text = text.substr(0, 100) + "...";
+    return text.empty() || text.find_first_of(" \t") != std::string::npos ? "\"" + text + "\"" : text;
+}
+
+// The PS2_* variables that are set, by name, read from the environment in one pass (Windows: the block of the process, UTF-16 made UTF-8;
+// there the names are not case sensitive, so ps2_vu_check counts as it does for the code that reads it).
+static std::vector<std::pair<std::string, std::string>> ps2_environment() {
+    std::vector<std::pair<std::string, std::string>> found;
+    const auto add = [&found](const std::string &entry) {
+        const std::size_t equals = entry.find('=');
+        if (equals == std::string::npos || equals <= 4) return;
+        for (std::size_t i = 0; i < 4; ++i) {
+            const char c = entry[i];
+#ifdef _WIN32
+            if (std::toupper(static_cast<unsigned char>(c)) != "PS2_"[i]) return;
+#else
+            if (c != "PS2_"[i]) return;
+#endif
+        }
+        found.emplace_back(entry.substr(0, equals), entry.substr(equals + 1));
+    };
+#ifdef _WIN32
+    if (wchar_t *block = GetEnvironmentStringsW()) {
+        for (const wchar_t *at = block; *at; at += std::wcslen(at) + 1) add(ps2::os::utf8(at));
+        FreeEnvironmentStringsW(block);
+    }
+#else
+    for (char **at = environ; at && *at; ++at) add(*at);
+#endif
+    std::sort(found.begin(), found.end());
+    return found;
+}
+
+// The first lines of every log (window or headless) say how the runner was started: the arguments, which show the extras (--widescreen,
+// --patches <file>) and the disc, and the PS2_* switches that change what it does. Both are read once, here, before anything changes
+// the environment (the runner sets PS2_VU_RECORD and PS2_WINDOW_TITLE itself later; those are not the user's). Paths are shortened
+// (short_path) so the lines can be posted as they are. Nothing here runs per frame.
+static void log_start_lines(int argc, char **argv) {
+    std::string line;
+    for (int i = 0; i < argc; ++i) line += (i ? " " : "") + for_log(short_path(argv[i]));
+    std::fprintf(stderr, "[run] started with: %s\n", line.c_str());
+    line.clear();
+    for (const auto &[name, value] : ps2_environment()) line += (line.empty() ? "" : " ") + name + "=" + for_log(short_path(value));
+    if (line.empty()) std::fprintf(stderr, "[env] no PS2_ variable is set\n");
+    else std::fprintf(stderr, "[env] PS2_ variables set: %s\n", line.c_str());
+}
+
 // The window run's threads without a window (PS2_THREADS=1): this thread draws, one runs the vector units, one is the emulation.
 // The emulation waits for the drawing as in a window (post_present lets it run two pictures ahead), nothing is shown.
 // --frames-dir works too: the pictures are read back here, on the drawing side, at the same frames as in a run with one thread, under the
@@ -652,6 +732,7 @@ int main(int argc, char **argv) {
         }
     }
 #endif
+    log_start_lines(argc, argv);  // the first lines of the log: the arguments and the PS2_* switches
     ps2::crash::test_here("main");
 #ifdef _WIN32
     SetConsoleCtrlHandler(on_console_event, TRUE);

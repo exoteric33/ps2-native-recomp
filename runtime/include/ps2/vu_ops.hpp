@@ -455,7 +455,9 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
         for (unsigned i = 0; i < kPipeQ; ++i)
             if (!near2[pc >> 3].test(i)) s[i] = 0;
         if (q_distance[pc >> 3] > 11) s[kPipeQ] = 0;
-        if (p_distance[pc >> 3] > 52) s[kPipeP] = 0;
+        // P loses at least one per instruction, so a count no larger than the distance to the next WAITP or EFU instruction plus one
+        // cannot make anything wait: dropping it keeps paths that differ only there in one state.
+        if (p_distance[pc >> 3] > 52 || s[kPipeP] <= p_distance[pc >> 3] + 1u) s[kPipeP] = 0;
         return s;
     };
     std::vector<std::vector<PipeState>> states(slots);

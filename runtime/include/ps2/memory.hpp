@@ -8,6 +8,9 @@
 namespace ps2 {
 
 inline constexpr std::uint32_t kRamSize = 32u << 20;
+inline constexpr std::uint32_t kHighRamBase = kRamSize;
+inline constexpr std::uint32_t kHighRamSize = 96u << 20;
+inline constexpr std::uint32_t kTotalRamSize = kRamSize + kHighRamSize; // 128 MB (0x00000000..0x07FFFFFF)
 inline constexpr std::uint32_t kScratchpadBase = 0x70000000u;
 inline constexpr std::uint32_t kScratchpadSize = 16u << 10;
 
@@ -21,6 +24,9 @@ extern std::uint8_t *g_live_spr;
 #else
 extern std::uint8_t g_ram[];
 extern std::uint8_t g_spr[];
+extern bool g_high_ram_enabled;
+inline std::uint32_t ee_ram_size() { return g_high_ram_enabled ? kTotalRamSize : kRamSize; }
+inline std::uint32_t ee_ram_mask() { return g_high_ram_enabled ? (kTotalRamSize - 1u) : (kRamSize - 1u); }
 #define PS2_RAM g_ram
 #define PS2_SPR g_spr
 #endif
@@ -50,7 +56,11 @@ void slow_st128(std::uint32_t a, const Reg128 &v);
 
 template <typename T>
 inline T *fast(std::uint32_t a) {
+#ifdef PS2_LIVE_EE
     if (a < kRamSize) [[likely]] return reinterpret_cast<T *>(PS2_RAM + a);
+#else
+    if (a < ee_ram_size()) [[likely]] return reinterpret_cast<T *>(PS2_RAM + a);
+#endif
     if ((a >> 14) == (kScratchpadBase >> 14)) return reinterpret_cast<T *>(PS2_SPR + (a & (kScratchpadSize - 1)));
     return nullptr;
 }

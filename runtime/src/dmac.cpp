@@ -71,23 +71,26 @@ std::uint8_t *vu_window(std::uint32_t address, bool write) {
     }
 }
 
+inline std::uint32_t dma_ram_size() { return g_high_ram_enabled ? kTotalRamSize : kRamSize; }
+inline std::uint32_t dma_ram_mask() { return dma_ram_size() - 16u; }
+
 const std::uint8_t *source(std::uint32_t address) {
     if (address & 0x80000000u) return g_spr + (address & (kScratchpadSize - 1));
     if (const std::uint8_t *vu = vu_window(address, false)) [[unlikely]] return vu;
-    return g_ram + (address & (kRamSize - 16));
+    return g_ram + (address & dma_ram_mask());
 }
 
 std::uint8_t *target(std::uint32_t address) {
     if (address & 0x80000000u) return g_spr + (address & (kScratchpadSize - 1));
     if (std::uint8_t *vu = vu_window(address, true)) [[unlikely]] return vu;
-    return g_ram + (address & (kRamSize - 16));
+    return g_ram + (address & dma_ram_mask());
 }
 
 void deliver(int ch, std::uint32_t address, std::uint32_t qwc) {
     if (!qwc) return;
     static std::vector<std::uint8_t> buffer;
     const std::size_t bytes = static_cast<std::size_t>(qwc) * 16;
-    const std::size_t room = (address & 0x80000000u) ? kScratchpadSize - (address & (kScratchpadSize - 1)) : kRamSize - (address & (kRamSize - 16));
+    const std::size_t room = (address & 0x80000000u) ? kScratchpadSize - (address & (kScratchpadSize - 1)) : dma_ram_size() - (address & dma_ram_mask());
     const std::uint8_t *data = source(address);
     if (bytes > room || ch == 9 || ((address & 0x80000000u) == 0 && (address & 0x7FFF0000u) == 0x11000000u)) {  // a VU memory is small: copy by quadword
         buffer.resize(bytes);
@@ -448,8 +451,8 @@ std::size_t ipu_push_many(const std::uint8_t *qwords, std::size_t count) {
     while (done < count) {
         if (!(c.chcr & 0x100u) || !c.qwc) break;
         const std::size_t n = std::min<std::size_t>(count - done, c.qwc);
-        if (!g_watch_on && static_cast<std::uint64_t>(c.madr) + n * 16 <= kRamSize) {
-            std::memcpy(g_ram + (c.madr & (kRamSize - 16)), qwords + done * 16, n * 16);
+        if (!g_watch_on && static_cast<std::uint64_t>(c.madr) + n * 16 <= dma_ram_size()) {
+            std::memcpy(g_ram + (c.madr & dma_ram_mask()), qwords + done * 16, n * 16);
             c.madr += static_cast<std::uint32_t>(n * 16);
             c.qwc -= static_cast<std::uint32_t>(n);
             done += n;

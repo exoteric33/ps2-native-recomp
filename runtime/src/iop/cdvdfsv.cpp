@@ -23,7 +23,7 @@ namespace {
 // A read the EE asks for is cut to the sectors that reach the end of the memory it goes to (the last one may be partial, as before),
 // so a bad count does not ask the host for a buffer of up to 8 TB: up to the end of EE memory, or 2 MiB for the IOP (mirrored).
 std::uint32_t ee_sectors(std::uint32_t dst, std::uint32_t count) {
-    const std::uint32_t most = (ps2::kRamSize - (dst & (ps2::kRamSize - 1)) + disc::kSector - 1) / disc::kSector;
+    const std::uint32_t most = (ps2::ee_ram_size() - (dst & ps2::ee_ram_mask()) + disc::kSector - 1) / disc::kSector;
     if (count <= most) return count;
     bad_span("cdvdfsv read to EE", dst, std::uint64_t{count} * disc::kSector, "cut at the end of EE memory");
     return most;
@@ -40,15 +40,15 @@ std::uint32_t iop_sectors(std::uint32_t dst, std::uint32_t count) {
 std::string ee_text(std::uint32_t a, std::size_t limit) {
     std::string s;
     for (std::size_t i = 0; i < limit; ++i) {
-        const char ch = static_cast<char>(ps2::g_ram[(a + i) & (ps2::kRamSize - 1)]);
+        const char ch = static_cast<char>(ps2::g_ram[(a + i) & ps2::ee_ram_mask()]);
         if (!ch) break;
         s += ch;
     }
     return s;
 }
 
-std::uint32_t ee32(std::uint32_t a) { return load<std::uint32_t>(ps2::g_ram + (a & (ps2::kRamSize - 1))); }
-void set_ee32(std::uint32_t a, std::uint32_t v) { store<std::uint32_t>(ps2::g_ram + (a & (ps2::kRamSize - 1)), v); }
+std::uint32_t ee32(std::uint32_t a) { return load<std::uint32_t>(ps2::g_ram + (a & ps2::ee_ram_mask())); }
+void set_ee32(std::uint32_t a, std::uint32_t v) { store<std::uint32_t>(ps2::g_ram + (a & ps2::ee_ram_mask()), v); }
 
 std::uint8_t bcd(int v) { return static_cast<std::uint8_t>(((v / 10) << 4) | (v % 10)); }
 
@@ -73,9 +73,9 @@ std::uint64_t delay(std::uint32_t sectors) { return usec_to_cycles(400) + static
 void read_to_ee(std::uint32_t sector, std::uint32_t count, std::uint32_t dst) {
     std::vector<std::uint8_t> data(static_cast<std::size_t>(count) * disc::kSector);
     disc::read(sector, count, data.data());
-    const std::uint32_t at = dst & (ps2::kRamSize - 1);
-    std::memcpy(ps2::g_ram + at, data.data(), std::min<std::size_t>(data.size(), ps2::kRamSize - at));
-    ps2::watch_span(at, static_cast<std::uint32_t>(std::min<std::size_t>(data.size(), ps2::kRamSize - at)), "cdvd:read");
+    const std::uint32_t at = dst & ps2::ee_ram_mask();
+    std::memcpy(ps2::g_ram + at, data.data(), std::min<std::size_t>(data.size(), ps2::ee_ram_size() - at));
+    ps2::watch_span(at, static_cast<std::uint32_t>(std::min<std::size_t>(data.size(), ps2::ee_ram_size() - at)), "cdvd:read");
 }
 
 }

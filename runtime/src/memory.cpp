@@ -10,14 +10,18 @@
 
 namespace ps2 {
 
-alignas(64) std::uint8_t g_ram[kRamSize + 64];
+alignas(64) std::uint8_t g_ram[kTotalRamSize + 64];
 alignas(64) std::uint8_t g_spr[kScratchpadSize];
 alignas(64) std::uint8_t g_vu0_code[4096];
 alignas(64) std::uint8_t g_vu0_mem[4096];
 alignas(64) std::uint8_t g_vu1_code[16384];
 alignas(64) std::uint8_t g_vu1_mem[16384];
+bool g_high_ram_enabled = std::getenv("PS2_HIGH_RAM") != nullptr && std::atoi(std::getenv("PS2_HIGH_RAM")) != 0;
 
 namespace {
+
+inline std::uint32_t active_ram_size() { return g_high_ram_enabled ? kTotalRamSize : kRamSize; }
+inline std::uint32_t active_ram_mask() { return active_ram_size() - 1u; }
 
 enum class Region { Ram, Scratchpad, Io, Vu, Rom, None };
 
@@ -30,10 +34,11 @@ bool g_watch_on = false;
 std::uint32_t g_watch_base = 0, g_watch_end = 0;
 
 void init_watch() {
+    g_store_ram_end = ee_ram_size();
     if (const char *spec = std::getenv("PS2_WATCH")) {
         std::uint32_t base = 0, len = 0;
         if (std::sscanf(spec, "%x,%x", &base, &len) == 2 && len) {
-            g_watch_base = base & (kRamSize - 1);
+            g_watch_base = base & active_ram_mask();
             g_watch_end = g_watch_base + len;
             g_watch_on = true;
             g_store_ram_end = 0;  // every guest store takes st*_other, which checks the watch
@@ -43,7 +48,7 @@ void init_watch() {
 }
 
 void watch_hit(std::uint32_t a, std::uint32_t v, const char *via) {
-    const std::uint8_t *at = (a < kRamSize) ? g_ram + a : ((a >> 14) == (kScratchpadBase >> 14) ? g_spr + (a & (kScratchpadSize - 1)) : nullptr);
+    const std::uint8_t *at = (a < active_ram_size()) ? g_ram + a : ((a >> 14) == (kScratchpadBase >> 14) ? g_spr + (a & (kScratchpadSize - 1)) : nullptr);
     std::uint32_t was = 0;
     if (at) std::memcpy(&was, at, 4);
     std::fprintf(stderr, "[watch] frame %llu: write %08X = %08X (was %08X) via %s, pc 0x%08X ra 0x%08X\n",
@@ -130,7 +135,7 @@ void st128_other(std::uint32_t a, const Reg128 &v) {
 
 void watch_span(std::uint32_t a, std::uint32_t n, const char *via) {
     if (!g_watch_on) return;
-    const std::uint32_t s = a & (kRamSize - 1), e = s + n;
+    const std::uint32_t s = a & active_ram_mask(), e = s + n;
     if (e <= g_watch_base || s >= g_watch_end) return;
     for (std::uint32_t k = s & ~3u; k < e; k += 4) {
         if (k < g_watch_base || k + 4 > g_watch_end) continue;
@@ -163,7 +168,7 @@ Target resolve(std::uint32_t a) {
     ++hw::g_slow_seq;
     if ((a >> 14) == (kScratchpadBase >> 14)) return {Region::Scratchpad, g_spr + (a & (kScratchpadSize - 1)), a};
     const std::uint32_t p = physical(a);
-    if (p < 0x10000000u) return {Region::Ram, g_ram + (p & (kRamSize - 1)), p};
+    if (p < 0x10000000u) return {Region::Ram, g_ram + (p & active_ram_mask()), p};
     if (p >= 0x11000000u && p < 0x11010000u) {
         if (std::uint8_t *host = vu_memory(p)) {
             // VU1 runs on its own thread beside the emulation: what the game wrote to it with the VIF1 must have landed before it
@@ -195,9 +200,9 @@ void trap_unmapped(const char *what, std::uint32_t a) {
     for (int i = 1; i < 32; ++i) std::fprintf(stderr, "%s=%08X%s", names[i], g_cpu.r[i].w[0], (i % 8 == 7) ? "\n" : " ");
     std::fprintf(stderr, "\n[trap] return addresses on the stack:");
     const std::uint32_t sp = g_cpu.r[29].w[0];
-    for (std::uint32_t off = 0; off < 0x800 && (sp & (kRamSize - 1)) + off + 4 <= kRamSize; off += 4) {
+    for (std::uint32_t off = 0; off < 0x800 && (sp & ee_ram_mask()) + off + 4 <= ee_ram_size(); off += 4) {
         std::uint32_t v, before;
-        std::memcpy(&v, g_ram + ((sp + off) & (kRamSize - 1)), 4);
+        std::memcpy(&v, g_ram + ((sp + off) & ee_ram_mask()), 4);
         if (v < 0x100000u || v >= 0x800000u || (v & 3u)) continue;
         std::memcpy(&before, g_ram + (v - 8), 4);
         const bool jal = (before >> 26) == 3u, jalr = (before >> 26) == 0u && (before & 0x3Fu) == 9u;
@@ -235,7 +240,7 @@ void write_slow(std::uint32_t a, T v) {
     const Target t = resolve(a);
     if (t.host) {
         if (g_watch_on && t.region == Region::Ram) {
-            const std::uint32_t base = t.address & (kRamSize - 1);
+            const std::uint32_t base = t.address & active_ram_mask();
             if (base >= g_watch_base && base < g_watch_end) watch_hit(base, static_cast<std::uint32_t>(v), "store-slow");
         }
         std::memcpy(t.host, &v, sizeof v);
@@ -269,7 +274,7 @@ constexpr std::uint32_t kIpuBase = 0x10002000u;  // the IPU registers, 0x1000200
 //  - RAM through a mirror: the inline path in memory.hpp only takes the first 32 MB at their own address; the same memory seen at
 //    0x20000000 / 0x30000000 (uncached), 0x80000000 / 0xA0000000 and so on comes here.
 //  - IPU registers, 32 and 64 bits: hw.cpp hands them to ipu::read32 / ipu::write32 after checks that no IPU address passes.
-inline std::uint8_t *ram_mirror(std::uint32_t p) { return p < 0x10000000u ? g_ram + (p & (kRamSize - 1)) : nullptr; }
+inline std::uint8_t *ram_mirror(std::uint32_t p) { return p < 0x10000000u ? g_ram + (p & active_ram_mask()) : nullptr; }
 
 // The IPU registers, the same calls on both ways in: the first test in slow_ld32 / slow_ld64 / slow_st32 / slow_st64 below (the
 // address exactly as the game's code passes it, 0x10002000..0x1000203F: physical() leaves it as it is, it is no RAM mirror and not
@@ -315,7 +320,7 @@ inline void store_fast(std::uint32_t a, T v) {
     if (std::uint8_t *host = ram_mirror(p)) {
         ++hw::g_slow_seq;
         if (g_watch_on) {
-            const std::uint32_t base = p & (kRamSize - 1);
+            const std::uint32_t base = p & active_ram_mask();
             if (base >= g_watch_base && base < g_watch_end) watch_hit(base, static_cast<std::uint32_t>(v), "store-slow");
         }
         store(host, v);

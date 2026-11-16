@@ -149,12 +149,35 @@ inline bool waits_q(std::uint32_t lo, std::uint32_t hi) {
     return !(hi & 0x80000000u) && lower_major(lo) == 0x40 && (lo & 0x3Fu) == 0x3Fu && ((lo >> 6) & 31u) == 0x0Eu;
 }
 
+// The elementary function unit (VU1's EFU) is a pipeline like the divider: its result reaches P that many cycles after
+// the instruction, and a WAITP or the next EFU instruction waits for it (PCSX2's microVU: the latency less one cycle).
+// The instructions that read Q next to such a wait therefore issue late enough to see a divide that was started just
+// before (Digital Devil Saga: ADDq | WAITP right after SQRT and ESQRT sizes the status icons above the enemies).
+inline std::uint32_t p_unit_latency(std::uint32_t lo, std::uint32_t hi) {
+    if ((hi & 0x80000000u) || lower_major(lo) != 0x40 || (lo & 0x3Cu) != 0x3Cu) return 0;
+    switch (((lo >> 6) & 31u) * 4u + (lo & 3u)) {
+    case 0x70: return 11;                        // ESADD
+    case 0x71: case 0x72: case 0x79: return 18;  // ERSADD, ELENG, ERSQRT
+    case 0x73: return 24;                        // ERLENG
+    case 0x74: case 0x75: case 0x7D: return 54;  // EATANxy, EATANxz, EATAN
+    case 0x76: case 0x78: case 0x7A: return 12;  // ESUM, ESQRT, ERCPR
+    case 0x7C: return 29;                        // ESIN
+    case 0x7E: return 44;                        // EEXP
+    default: return 0;
+    }
+}
+
+inline bool waits_p(std::uint32_t lo, std::uint32_t hi) {
+    return !(hi & 0x80000000u) && lower_major(lo) == 0x40 && (lo & 0x3Fu) == 0x3Fu && ((lo >> 6) & 31u) == 0x1Eu;
+}
+
 // What an instruction pair reads and writes that the pipeline can still be busy with: the vector lanes it needs and the ones
 // it writes (register * 4 + lane), the integer registers it reads and the one an ILW loads, and the divide unit (a WAITQ or
-// a new divide waits for the quotient of the last one, q_set is the latency of the divide it starts).
+// a new divide waits for the quotient of the last one, q_set is the latency of the divide it starts), and the same for
+// the EFU (a WAITP or a new EFU instruction waits for P, p_set: the cycles until it may, see p_unit_latency).
 struct VfUse {
     std::uint8_t lanes_read[16] = {}, lanes_written[8] = {};
-    std::uint8_t nr = 0, nw = 0, vi_load = 0, q_wait = 0, q_set = 0;
+    std::uint8_t nr = 0, nw = 0, vi_load = 0, q_wait = 0, q_set = 0, p_wait = 0, p_set = 0;
     std::uint16_t vi_reads = 0;
     void read_vi(unsigned r) { vi_reads = static_cast<std::uint16_t>(vi_reads | ((1u << (r & 15u)) & ~1u)); }
     void read(unsigned r, unsigned m) {
@@ -243,6 +266,8 @@ inline VfUse vf_use(std::uint32_t lo, std::uint32_t hi) {
     }
     u.q_set = static_cast<std::uint8_t>(q_unit_latency(lo, hi));
     u.q_wait = u.q_set || waits_q(lo, hi);
+    if (const std::uint32_t p = p_unit_latency(lo, hi)) u.p_set = static_cast<std::uint8_t>(p - 1u);
+    u.p_wait = u.p_set || waits_p(lo, hi);
     return u;
 }
 
@@ -260,10 +285,13 @@ inline void retire(const VfUse &u, std::uint32_t cycle, std::uint32_t (&ready)[3
 }
 
 // The cycle an instruction pair issues at when it may not before `cycle`. The interpreters count these cycles in
-// FlagPipe::t: the pair waits for the registers it reads (and a WAITQ or divide for the last quotient, q_ready), so a
-// result that was four cycles away when it was written can be read by the third instruction after it, or by the first.
-inline std::uint32_t issue_cycle(const VfUse &u, std::uint32_t cycle, const std::uint32_t (&ready)[32][4], const std::uint32_t (&vi_ready)[16], std::uint32_t q_ready) {
+// FlagPipe::t: the pair waits for the registers it reads (and a WAITQ or divide for the last quotient, q_ready, a WAITP or
+// EFU instruction for the last EFU result, p_ready), so a result that was four cycles away when it was written can be read
+// by the third instruction after it, or by the first.
+inline std::uint32_t issue_cycle(const VfUse &u, std::uint32_t cycle, const std::uint32_t (&ready)[32][4], const std::uint32_t (&vi_ready)[16], std::uint32_t q_ready,
+                                 std::uint32_t p_ready = 0) {
     cycle = issue(u, cycle, ready, vi_ready);
+    if (u.p_wait) cycle = std::max(cycle, p_ready);
     return u.q_wait ? std::max(cycle, q_ready) : cycle;
 }
 
@@ -272,7 +300,7 @@ inline std::uint32_t issue_cycle(const VfUse &u, std::uint32_t cycle, const std:
 // integer registers 128 to 143, the quotient 144); the stall is the longest of those minus the cycle the instruction gets
 // anyway. Where two paths reach an instruction with different states and the stalls differ, the compiled program keeps the
 // index of the state it is in (`tracked`).
-constexpr unsigned kPipeVi = 128, kPipeQ = 144, kPipeSize = 145;
+constexpr unsigned kPipeVi = 128, kPipeQ = 144, kPipeP = 145, kPipeSize = 146;
 using PipeState = std::array<std::uint8_t, kPipeSize>;
 
 inline unsigned pipe_stall(const PipeState &s, const VfUse &u) {
@@ -280,6 +308,7 @@ inline unsigned pipe_stall(const PipeState &s, const VfUse &u) {
     for (unsigned i = 0; i < u.nr; ++i) wait = std::max<unsigned>(wait, s[u.lanes_read[i]]);
     for (unsigned m = u.vi_reads; m; m &= m - 1u) wait = std::max<unsigned>(wait, s[kPipeVi + static_cast<unsigned>(__builtin_ctz(m))]);
     if (u.q_wait) wait = std::max<unsigned>(wait, s[kPipeQ]);
+    if (u.p_wait) wait = std::max<unsigned>(wait, s[kPipeP]);
     return wait ? wait - 1u : 0u;
 }
 
@@ -289,6 +318,7 @@ inline PipeState pipe_step(const PipeState &s, const VfUse &u, unsigned stall) {
     for (unsigned i = 0; i < u.nw; ++i) o[u.lanes_written[i]] = 4;
     if (u.vi_load) o[kPipeVi + u.vi_load] = 4;
     if (u.q_set) o[kPipeQ] = u.q_set;
+    if (u.p_set) o[kPipeP] = u.p_set;
     return o;
 }
 
@@ -388,13 +418,14 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
         }
     };
     std::vector<Need> reads(slots), near1(slots), near2(slots);
-    std::vector<std::uint8_t> q_distance(slots, 255);
+    std::vector<std::uint8_t> q_distance(slots, 255), p_distance(slots, 255);
     for (std::uint32_t pc : pcs) {
         const std::size_t at = pc >> 3;
         const VfUse &u = use[at];
         for (unsigned i = 0; i < u.nr; ++i) reads[at].set(u.lanes_read[i]);
         for (unsigned m = u.vi_reads; m; m &= m - 1u) reads[at].set(kPipeVi + static_cast<unsigned>(__builtin_ctz(m)));
         if (u.q_wait) q_distance[at] = 0;
+        if (u.p_wait) p_distance[at] = 0;
     }
     for (int round = 0; round < 2; ++round) {
         std::vector<Need> &from = round ? near1 : reads, &to = round ? near2 : near1;
@@ -410,10 +441,16 @@ inline StallPlan stall_plan(const std::uint8_t *code, std::uint32_t mask, const 
             const Next s = successors(pc);
             for (unsigned k = 0; k < s.size(); ++k) q_distance[pc >> 3] = static_cast<std::uint8_t>(std::min<unsigned>(q_distance[pc >> 3], q_distance[s.at(k) >> 3] + 1u));
         }
+    for (int round = 0; round < 54; ++round)
+        for (std::uint32_t pc : pcs) {
+            const Next s = successors(pc);
+            for (unsigned k = 0; k < s.size(); ++k) p_distance[pc >> 3] = static_cast<std::uint8_t>(std::min<unsigned>(p_distance[pc >> 3], p_distance[s.at(k) >> 3] + 1u));
+        }
     const auto canonical = [&](PipeState s, std::uint32_t pc) {
         for (unsigned i = 0; i < kPipeQ; ++i)
             if (!near2[pc >> 3].test(i)) s[i] = 0;
         if (q_distance[pc >> 3] > 11) s[kPipeQ] = 0;
+        if (p_distance[pc >> 3] > 52) s[kPipeP] = 0;
         return s;
     };
     std::vector<std::vector<PipeState>> states(slots);
@@ -519,12 +556,14 @@ inline QRead q_read_kind(const std::uint8_t *code, std::uint32_t mask, std::uint
         for (std::uint32_t k = 3; k > 0; --k) order.push_back((div - 8u * k) & mask);
         order.insert(order.end(), back.rbegin(), back.rend());
         std::uint32_t ready[32][4] = {}, vi_ready[16] = {};
-        std::uint32_t cycle = 0, issued = 0;
+        std::uint32_t cycle = 0, issued = 0, p_ready = 0;
         for (std::size_t i = 0; i < order.size(); ++i) {
             std::uint32_t lo, hi;
             load(order[i], lo, hi);
             const VfUse u = vf_use(lo, hi);
             cycle = issue(u, cycle + 1u, ready, vi_ready);
+            if (u.p_wait) cycle = std::max(cycle, p_ready);
+            if (u.p_set) p_ready = cycle + u.p_set;
             if (i == 3) issued = cycle;
             retire(u, cycle, ready, vi_ready);
         }
@@ -804,6 +843,7 @@ struct FlagPipe {
     unsigned mh = 0, ch = 0;
     std::uint32_t q_value = 0, q_ready = 0;
     bool q_pending = false;
+    std::uint32_t p_ready = 0;  // the cycle a WAITP or the next EFU instruction may issue at (issue_cycle)
 
     PS2_VU_INLINE std::uint32_t begin_q(Vu0Regs &r) {
         flush_q(r);

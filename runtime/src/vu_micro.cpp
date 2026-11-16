@@ -417,7 +417,7 @@ void scan_flags(int unit, const std::uint8_t *code, std::uint32_t size) {
         switch (lo >> 25) {
         case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1B: used = clock = true; break;
         case 0x10: case 0x11: case 0x12: case 0x13: case 0x1C: clock = true; break;
-        case 0x40: clock = clock || waits_q(lo, hi) || q_unit_latency(lo, hi); break;
+        case 0x40: clock = clock || waits_q(lo, hi) || q_unit_latency(lo, hi) || waits_p(lo, hi) || p_unit_latency(lo, hi); break;
         default: break;
         }
     }
@@ -1381,7 +1381,8 @@ void run_fast(int n, std::uint32_t address) {
         pc = npc;
         npc = (npc + 8u) & u.code_mask;
         if (clock) {
-            pipe.t = issue_cycle(d.use, pipe.t + 1u, vf_ready, vi_ready, pipe.q_ready);
+            pipe.t = issue_cycle(d.use, pipe.t + 1u, vf_ready, vi_ready, pipe.q_ready, pipe.p_ready);
+            if (d.use.p_set) pipe.p_ready = pipe.t + d.use.p_set;
             retire(d.use, pipe.t, vf_ready, vi_ready);
         } else {
             ++pipe.t;
@@ -1502,7 +1503,8 @@ void run_reference(int n, std::uint32_t address) {
         if (clock) {
             Decoded &d = cache[current >> 3];
             if (!d.valid || d.lo != lo || d.hi != hi) d = decode_upper(lo, hi);
-            pipe.t = issue_cycle(d.use, pipe.t + 1u, vf_ready, vi_ready, pipe.q_ready);
+            pipe.t = issue_cycle(d.use, pipe.t + 1u, vf_ready, vi_ready, pipe.q_ready, pipe.p_ready);
+            if (d.use.p_set) pipe.p_ready = pipe.t + d.use.p_set;
             retire(d.use, pipe.t, vf_ready, vi_ready);
         } else {
             ++pipe.t;

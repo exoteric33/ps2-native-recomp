@@ -562,6 +562,7 @@ namespace Ps2Ui
         readonly Control content;
         readonly DarkScroll bar;
         public int Step = 36;   // pixels for one notch of the wheel
+        bool needed;            // the rows are taller than the window, so there is something to scroll
         public ListScroller(Control viewport, Control content, DarkScroll bar)
         {
             this.viewport = viewport;
@@ -577,13 +578,13 @@ namespace Ps2Ui
             viewport.Invalidate(true);
             viewport.Update();
         }
-        public bool Scrolls { get { return bar.Visible; } }
+        public bool Scrolls { get { return needed; } }
         public int Value { get { return bar.Value; } }
         // Called when the rows are rebuilt: the new total height and the position to keep (it is clamped to what exists).
         public void Reset(int contentHeight, int keep)
         {
             content.Height = Math.Max(contentHeight, viewport.Height);
-            bool needed = contentHeight > viewport.Height;
+            needed = contentHeight > viewport.Height;
             bar.Visible = needed;
             if (needed)
             {
@@ -598,14 +599,14 @@ namespace Ps2Ui
         }
         public void ScrollBy(int pixels)
         {
-            if (!bar.Visible) return;
+            if (!needed) return;
             int top = Math.Max(0, bar.Maximum - bar.LargeChange + 1);
             bar.Value = Math.Max(0, Math.Min(top, bar.Value + pixels));
         }
         // Brings a row (a child of content) fully into view, for example when Tab reaches a button of a row below the fold.
         public void ScrollIntoView(Control row)
         {
-            if (!bar.Visible || row == null) return;
+            if (!needed || row == null) return;
             int top = row.Top;
             int bottom = row.Top + row.Height;
             if (top < bar.Value) ScrollBy(top - bar.Value);
@@ -614,7 +615,7 @@ namespace Ps2Ui
         public void Detach() { Application.RemoveMessageFilter(this); }
         public bool PreFilterMessage(ref Message m)
         {
-            if (m.Msg != WM_MOUSEWHEEL || !bar.Visible || !viewport.Visible) return false;
+            if (m.Msg != WM_MOUSEWHEEL || !needed || !viewport.Visible) return false;
             Form form = viewport.FindForm();
             // only a wheel turn that is meant for this window (not for a message box on top of it, nor another program's window)
             if (form == null || !form.Enabled) return false;

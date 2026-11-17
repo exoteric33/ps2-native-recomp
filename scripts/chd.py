@@ -1109,6 +1109,18 @@ class Chd:
         return bytes(sectors)
 
     def _raw_hunk(self, h):
+        try:
+            return self._raw_hunk2(h)
+        except ChdError:
+            raise
+        except (zlib.error, ValueError, IndexError, struct.error, OverflowError, KeyError, MemoryError) as e:
+            raise ChdError('hunk %d is damaged (%s)' % (h, e))
+        except Exception as e:  # lzma.LZMAError and the like
+            if lzma is not None and isinstance(e, lzma.LZMAError):
+                raise ChdError('hunk %d is damaged (%s)' % (h, e))
+            raise
+
+    def _raw_hunk2(self, h):
         """The hunk's bytes as stored: a DVD hunk, or for a CD frames * 2352 sector bytes (sub-channel left out)."""
         t = self.types[h]
         if t == T_SELF:

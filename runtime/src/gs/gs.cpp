@@ -1078,7 +1078,7 @@ std::atomic<std::uint32_t> g_downloads{0};
 //    sent as a ticket; the drawing thread puts the saved depth back when that upload is the download's rectangle and format and has
 //    had no data yet, and otherwise uploads the real bytes, read from the copy.
 // Only rectangles that are whole pages of PSMZ32, PSMZ16 or PSMZ16S, downloaded in one piece into main memory, on the compute path,
-// where page guards exist (Windows). PS2_DEPTH_TRIP=0 turns it off (every depth download waits, as before); PS2_DEPTH_TRIP_LOG=1
+// where page guards exist (Windows). Off by default until a game that does depth round trips confirms it: PS2_DEPTH_TRIP=1 turns it on (otherwise every depth download waits, as before); PS2_DEPTH_TRIP_LOG=1
 // prints what it did once in a while.
 namespace {
 namespace trip {
@@ -1088,7 +1088,7 @@ constexpr std::uint32_t kSlots = gpu::kTripSlots;
 bool enabled() {
     static const bool on = [] {
         const char *v = std::getenv("PS2_DEPTH_TRIP");
-        return !v || std::atoi(v) != 0;
+        return v && std::atoi(v) != 0;
     }();
     return on;
 }

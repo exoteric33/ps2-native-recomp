@@ -10,6 +10,10 @@ Each must unpack to exactly the bytes it was made from. Also checked: a few rand
     python tests/chd_check.py                       prints "chd: 0 failed"
     python tests/chd_check.py --chdman PATH         also makes fresh .chd files with a chdman you have (bigger data, more hunks)
     python tests/chd_check.py --make-fixtures PATH  rewrites tests/chd_fixtures.py with that chdman (the data is the same every time)
+
+The native unpacker (recomp/chdunpack, built into build/tools by scripts/setup.sh and port.sh) must give the same bytes and the same
+refusals as scripts/chd.py for every file: it is found in build/tools, or named with --chdunpack PATH. Without it those checks are
+skipped and the output says so.
 """
 import base64
 import hashlib
@@ -30,6 +34,7 @@ MKISO = os.path.join(HERE, '..', 'scripts', 'mkiso.py')
 EXTRACT = os.path.join(HERE, '..', 'scripts', 'extract_disc.py')
 failed = 0
 checks = 0
+NATIVE = None  # the path of chdunpack, when there is one
 
 
 def check(ok, message):
@@ -264,6 +269,28 @@ def check_image(label, chd_path, expect=None, sha1=None):
         img.close()
 
 
+def native_run(tool, src, dst, jobs=None):
+    cmd = [tool] + (['--jobs', str(jobs)] if jobs else []) + [src, dst]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def check_native(label, tool, chd_path, expect, sha1=None):
+    """The native unpacker gives the same bytes as the Python code (expect), with one thread and with several."""
+    for jobs in (1, 3):
+        out = chd_path + '.native%d.iso' % jobs
+        done = native_run(tool, chd_path, out, jobs)
+        check(done.returncode == 0, '%s: chdunpack --jobs %d failed: %s' % (label, jobs, done.stderr[-200:]))
+        if done.returncode:
+            continue
+        got = open(out, 'rb').read()
+        check(got == expect, '%s: chdunpack --jobs %d gives other bytes than chd.py (%d against %d)' % (label, jobs, len(got), len(expect)))
+        if sha1:
+            check(hashlib.sha1(got).hexdigest() == sha1, '%s: chdunpack --jobs %d: sha1 differs' % (label, jobs))
+        check('%d %%' % 100 in done.stdout, '%s: chdunpack prints no progress line' % label)
+        check(not os.path.exists(out + '.part'), '%s: chdunpack left a .part file behind' % label)
+        os.remove(out)
+
+
 def damaged_cases(tmp, name, raw):
     """Files that must be refused with a clear message and leave nothing behind."""
     cases = {
@@ -278,10 +305,15 @@ def damaged_cases(tmp, name, raw):
         with open(path, 'wb') as f:
             f.write(data)
         out = os.path.join(tmp, 'bad.iso')
-        done = subprocess.run([sys.executable, '-I', os.path.join(HERE, '..', 'scripts', 'chd.py'), 'iso', path, out], capture_output=True, text=True)
-        check(done.returncode != 0, '%s (%s): was accepted' % (name, label))
-        check('Traceback' not in done.stderr, '%s (%s): crashed instead of saying what is wrong: %s' % (name, label, done.stderr[-200:]))
-        check(not os.path.exists(out) and not os.path.exists(out + '.part'), '%s (%s): left an image behind' % (name, label))
+        runs = [('chd.py', subprocess.run([sys.executable, '-I', os.path.join(HERE, '..', 'scripts', 'chd.py'), 'iso', path, out], capture_output=True, text=True,
+                                          env=dict(os.environ, PS2_CHD_NATIVE='0')))]
+        if NATIVE:
+            runs.append(('chdunpack', native_run(NATIVE, path, out)))
+        for who, done in runs:
+            check(done.returncode != 0, '%s (%s): %s accepted it' % (name, label, who))
+            check('Traceback' not in done.stderr, '%s (%s): %s crashed instead of saying what is wrong: %s' % (name, label, who, done.stderr[-200:]))
+            check(done.returncode == 0 or done.stderr.startswith('chd.py: '), '%s (%s): %s gave no sentence of its own: %s' % (name, label, who, done.stderr[-200:]))
+            check(not os.path.exists(out) and not os.path.exists(out + '.part'), '%s (%s): %s left an image behind' % (name, label, who))
 
 
 def main():
@@ -289,6 +321,10 @@ def main():
     if args[:1] == ['--make-fixtures']:
         make_fixtures(args[1], os.path.join(HERE, 'chd_fixtures.py'))
         return 0
+    global NATIVE
+    NATIVE = args[args.index('--chdunpack') + 1] if '--chdunpack' in args else chd.native_unpacker()
+    if not NATIVE:
+        print('chd: the native unpacker is not built (build/tools/chdunpack): its checks are skipped')
     with tempfile.TemporaryDirectory() as tmp:
         from chd_fixtures import FIXTURES
         for name in sorted(FIXTURES):
@@ -297,6 +333,8 @@ def main():
             with open(path, 'wb') as f:
                 f.write(base64.b64decode(''.join(text)))
             check_image(name, path, sha1=sha1)
+            if NATIVE:
+                check_native(name, NATIVE, path, open(path + '.iso', 'rb').read(), sha1)
         check(len(FIXTURES) >= 11, 'fixtures are missing')
         # the codecs really are in the files (a fixture that fell back to "none" would test nothing)
         want = {'dvd-zlib': b'zlib', 'dvd-lzma': b'lzma', 'dvd-huff': b'huff', 'dvd-flac': b'flac', 'dvd-zstd': b'zstd', 'cd1-cdzl': b'cdzl', 'cd1-cdlz': b'cdlz', 'cd2-cdzs': b'cdzs', 'cd2-cdfl': b'cdfl'}
@@ -354,6 +392,10 @@ def main():
         except chd.ChdError as e:
             check('checksum' in str(e), 'a damaged DVD: wrong message: %s' % e)
         check(not os.path.exists(os.path.join(tmp, 'flipped.iso')), 'a damaged DVD left an image behind')
+        if NATIVE:
+            done = native_run(NATIVE, flipped, os.path.join(tmp, 'flipped.iso'))
+            check(done.returncode == 1 and 'checksum' in done.stderr, 'a damaged DVD: chdunpack: wrong answer: %s' % done.stderr[-200:])
+            check(not os.path.exists(os.path.join(tmp, 'flipped.iso')) and not os.path.exists(os.path.join(tmp, 'flipped.iso.part')), 'a damaged DVD left an image behind (chdunpack)')
 
         # several worker processes give the same bytes as one
         out = os.path.join(tmp, 'many.iso')
@@ -387,6 +429,8 @@ def live(chdman, tmp, iso, dvd):
     for name, (path, expect) in made.items():
         check_image(name, path, expect)
         check(hashlib.sha1(open(path + '.iso', 'rb').read()).digest() == hashlib.sha1(expect).digest(), '%s: sha1 differs' % name)
+        if NATIVE:
+            check_native(name, NATIVE, path, expect)
 
 
 if __name__ == '__main__':

@@ -4,6 +4,8 @@ Reads CHD v5 disc images (MAME's "Compressed Hunks of Data") and writes the plai
 
     python chd.py info  game.chd              what is inside (codecs, size, tracks)
     python chd.py iso   game.chd game.iso     convert; a DVD comes out byte for byte, a CD gives its data track as 2048-byte sectors
+                                              (uses build/tools/chdunpack when it is built: same result, on all cores, about ten times
+                                              faster; PS2_CHD_NATIVE=0 makes it use only this file)
     python chd.py selftest                    check the decoders on built-in data
 
 Every hunk codec chdman writes is decoded here with the standard library or our own code, so a player needs nothing else:
@@ -1362,6 +1364,29 @@ def selftest():
     print('selftest ok')
 
 
+def native_unpacker():
+    """The path of build/tools/chdunpack (recomp/chdunpack, the same rules on every core, about ten times faster) when it has been
+    built; None otherwise, and the Python code below does the work. PS2_CHD_NATIVE=0 turns it off."""
+    if os.environ.get('PS2_CHD_NATIVE', '') == '0':
+        return None
+    tools = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'build', 'tools')
+    for name in ('chdunpack.exe', 'chdunpack'):
+        path = os.path.join(tools, name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def run_native(tool, src, dst):
+    """Runs chdunpack with the same progress lines and the same error sentences (on stdout and stderr as they come). Returns its status."""
+    import subprocess
+    try:
+        return subprocess.call([tool, src, dst])
+    except OSError as e:
+        print('chd.py: the native unpacker could not be started (%s)' % e, flush=True)
+        return -1
+
+
 def main(argv):
     if len(argv) >= 3 and argv[1] == 'info':
         c = Chd(argv[2])
@@ -1369,6 +1394,12 @@ def main(argv):
         c.close()
         return 0
     if len(argv) >= 4 and argv[1] == 'iso':
+        native = native_unpacker()
+        if native:
+            rc = run_native(native, argv[2], argv[3])
+            if rc in (0, 1, 2):  # done, or stopped with a sentence of its own (a damaged file and the like): same words as below
+                return rc
+            print('chd.py: the native unpacker stopped unexpectedly (status %d); unpacking with the slower Python code' % rc, flush=True)
         try:
             n = convert(argv[2], argv[3], _progress_printer('Unpacking the .chd disc image'))
         except ChdError as e:

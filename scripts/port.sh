@@ -101,7 +101,17 @@ else
     # a CHD (MAME's compressed disc image): chd.py unpacks it to a plain .iso, a DVD byte for byte, a CD as its data track. It
     # writes the .iso under another name and renames it when done, so a stopped unpack never leaves a half image that looks finished.
     *.chd)
-      echo "Unpacking the .chd disc image into a normal disc image (the game keeps it): this takes a few minutes"
+      # chdunpack (recomp/chdunpack, built with the translator tools) unpacks on all cores in a couple of minutes; chd.py runs it when it
+      # is there and does the same alone, about ten times slower, when it is not (a build that failed, a tools folder from before it existed)
+      if [ -f "$tools/build.ninja" ] && [ ! -x "$tools/chdunpack" ]; then
+        echo "Building the disc image unpacker"
+        ninja -C "$tools" chdunpack > "$tools/ninja-chdunpack.log" 2>&1 || echo "the unpacker could not be built (see $tools/ninja-chdunpack.log): using the slower Python code"
+      fi
+      if [ -x "$tools/chdunpack" ]; then
+        echo "Unpacking the .chd disc image into a normal disc image (the game keeps it): this takes a few minutes"
+      else
+        echo "Unpacking the .chd disc image into a normal disc image (the game keeps it): this takes a long time without the native unpacker"
+      fi
       "${py[@]}" -I "$here/chd.py" iso "$source_path" "$iso" || { rm -f "$iso" "$iso.part"; exit 1; } ;;
     *.7z)
       sevenzip=7z

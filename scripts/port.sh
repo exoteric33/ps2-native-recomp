@@ -9,7 +9,7 @@ here="$ROOT/scripts"
 
 usage() {
   cat <<'EOF'
-usage: scripts/port.sh <name> <game.iso | game.bin | game.cue | game.zip | game.7z> [options]
+usage: scripts/port.sh <name> <game.iso | game.bin | game.cue | game.zip | game.7z | game.chd> [options]
 
 Turns a PS2 disc image you own into a browser build in build/web-<name> and a
 native one in build/native-<name>. It reads the boot program named in
@@ -98,6 +98,11 @@ else
     # an archive with an image in it, or a CD dumped as BIN (with a CUE sheet): disc.py writes the .iso, cutting the 2048-byte
     # sectors out of a 2352-byte-sector dump (follows upstream 0d72093)
     *.zip|*.bin|*.cue|*.img) "${py[@]}" -I "$here/disc.py" iso "$source_path" "$iso" ;;
+    # a CHD (MAME's compressed disc image): chd.py unpacks it to a plain .iso, a DVD byte for byte, a CD as its data track. It
+    # writes the .iso under another name and renames it when done, so a stopped unpack never leaves a half image that looks finished.
+    *.chd)
+      echo "Unpacking the .chd disc image into a normal disc image (the game keeps it): this takes a few minutes"
+      "${py[@]}" -I "$here/chd.py" iso "$source_path" "$iso" || { rm -f "$iso" "$iso.part"; exit 1; } ;;
     *.7z)
       sevenzip=7z
       [ "$windows" = 0 ] || command -v 7z > /dev/null || sevenzip="${PROGRAMFILES:-/c/Program Files}/7-Zip/7z.exe"

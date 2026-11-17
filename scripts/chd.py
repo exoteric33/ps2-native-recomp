@@ -841,6 +841,41 @@ def zstd_decompress(raw, size, pure_only=False):
     return _zstd_pure(raw)
 
 
+def _huff_bytes(hf, raw, bitpos, size):
+    """Decodes size symbols of a "huff" hunk from bit position bitpos (the tree has been read already)."""
+    data = raw + bytes(16)
+    table, look, mb = hf.table, hf.look, hf.maxbits
+    need = max(look, mb)
+    mask = (1 << look) - 1
+    bi = bitpos >> 3
+    off = bitpos & 7
+    cnt = 8 - off
+    acc = data[bi] & ((1 << cnt) - 1)
+    bi += 1
+    out = bytearray(size)
+    for i in range(size):
+        if cnt < need:
+            acc = ((acc & ((1 << cnt) - 1)) << 32) | int.from_bytes(data[bi:bi + 4], 'big')
+            bi += 4
+            cnt += 32
+        e = table[(acc >> (cnt - look)) & mask]
+        if e:
+            cnt -= e & 31
+            out[i] = e >> 5
+        else:
+            w = (acc >> (cnt - mb)) & ((1 << mb) - 1)
+            for n, code, sym in hf.slow:
+                if (w >> (mb - n)) == code:
+                    cnt -= n
+                    out[i] = sym
+                    break
+            else:
+                raise ChdError('bad Huffman code')
+    if bi - 4 > len(raw) + 4 or (bi * 8 - cnt) > len(raw) * 8:
+        raise ChdError('Huffman data ends too early')
+    return bytes(out)
+
+
 # --------------------------------------------------------------------------------------------------------------------
 # The CHD file
 # --------------------------------------------------------------------------------------------------------------------
@@ -1037,13 +1072,7 @@ class Chd:
             bits = _Bits(raw + bytes(8))
             hf = _Huffman(256, 16)
             hf.import_huffman(bits)
-            out = bytearray(size)
-            dec = hf.decode
-            for i in range(size):
-                out[i] = dec(bits)
-            if bits.pos > len(raw) * 8:
-                raise ChdError('Huffman data ends too early')
-            return bytes(out)
+            return _huff_bytes(hf, raw, bits.pos, size)
         if tag == b'flac':
             if not raw or raw[:1] not in (b'L', b'B'):
                 raise ChdError('bad FLAC hunk')
@@ -1134,7 +1163,110 @@ def _user_data(sector, kind):
     return sector[16:16 + SECTOR] if mode == 1 else sector[24:24 + SECTOR]
 
 
-def convert(path, out_path, progress=None, verify=True):
+class ChdImage:
+    """Random access to the disc inside a CHD as 2048-byte sectors (a DVD as it is, a CD as its first data track)."""
+
+    def __init__(self, path):
+        self.chd = Chd(path)
+        c = self.chd
+        if c.cd:
+            tracks = [t for t in c.tracks if t.is_data]
+            if not tracks:
+                c.close()
+                raise ChdError('this CHD file holds an audio CD, no game disc')
+            self.track = tracks[0]
+            if self.track.pregap and self.track.pgtype.startswith('V'):
+                c.close()
+                raise ChdError('this CD image keeps its pregap in the file, which is not supported')
+            self.total_sectors = self.track.frames
+        else:
+            self.track = None
+            self.total_sectors = c.logical // SECTOR
+
+    def read_sectors(self, sector, count):
+        c = self.chd
+        count = min(count, self.total_sectors - sector)
+        if count <= 0:
+            return b''
+        out = bytearray()
+        if self.track is None:
+            pos, end = sector * SECTOR, (sector + count) * SECTOR
+            while pos < end:
+                h = pos // c.hunk_bytes
+                data = c.hunk(h)
+                a = pos - h * c.hunk_bytes
+                piece = data[a:a + (end - pos)]
+                out += piece
+                pos += len(piece)
+            return bytes(out)
+        base = self.track.start
+        for frame in range(base + sector, base + sector + count):
+            h, k = divmod(frame, c.frames_per_hunk)
+            out += _user_data(c.hunk(h)[k * CD_RAW:(k + 1) * CD_RAW], self.track.kind)
+        return bytes(out)
+
+    def close(self):
+        self.chd.close()
+
+
+_WORKER = None
+
+
+def _worker_open(path):
+    global _WORKER
+    _WORKER = Chd(path)
+
+
+def _worker_range(span):
+    first, last = span
+    return b''.join(_WORKER.hunk(h) for h in range(first, last))
+
+
+def _job_count():
+    for name in ('PS2_CHD_JOBS', 'PS2_JOBS'):
+        try:
+            n = int(os.environ.get(name, ''))
+            if n >= 1:
+                return n
+        except ValueError:
+            pass
+    return max(1, min(os.cpu_count() or 1, 8))
+
+
+def iter_hunks(chd, first, last, jobs=None):
+    """Yields the decoded hunks first..last-1 in order. Several processes decode when the file is big enough to need it."""
+    jobs = _job_count() if jobs is None else jobs
+    size = chd.hunk_bytes if not chd.cd else chd.frames_per_hunk * CD_RAW
+    if jobs <= 1 or last - first < 64:
+        for h in range(first, last):
+            yield chd.hunk(h)
+        return
+    import multiprocessing
+    per = max(1, (1 << 21) // size)
+    spans = [(a, min(a + per, last)) for a in range(first, last, per)]
+    try:
+        pool = multiprocessing.Pool(jobs, _worker_open, (chd.path,))
+    except (OSError, ImportError):
+        for h in range(first, last):
+            yield chd.hunk(h)
+        return
+    try:
+        pending = []
+        nxt = 0
+        while nxt < len(spans) or pending:
+            while nxt < len(spans) and len(pending) < jobs * 3:
+                pending.append((spans[nxt], pool.apply_async(_worker_range, (spans[nxt],))))
+                nxt += 1
+            (a, b), res = pending.pop(0)
+            blob = res.get()
+            for i in range(b - a):
+                yield blob[i * size:(i + 1) * size]
+    finally:
+        pool.terminate()
+        pool.join()
+
+
+def convert(path, out_path, progress=None, verify=True, jobs=None):
     """Writes the image inside the CHD to out_path (through out_path + '.part'). Returns the number of bytes written."""
     chd = Chd(path)
     try:
@@ -1148,27 +1280,23 @@ def convert(path, out_path, progress=None, verify=True):
             if tr.pregap and tr.pgtype.startswith('V'):
                 raise ChdError('this CD image keeps its pregap in the file, which is not supported')
             first_frame, nframes = tr.start, tr.frames
-            hunks = range(first_frame // chd.frames_per_hunk, (first_frame + nframes - 1) // chd.frames_per_hunk + 1)
+            fph = chd.frames_per_hunk
+            first_h, last_h = first_frame // fph, (first_frame + nframes - 1) // fph + 1
             total = nframes * SECTOR
-            done_frames = 0
             with open(part, 'wb') as f:
-                for h in hunks:
-                    data = chd.hunk(h)
-                    for k in range(chd.frames_per_hunk):
-                        frame = h * chd.frames_per_hunk + k
-                        if frame < first_frame or frame >= first_frame + nframes:
-                            continue
-                        f.write(_user_data(data[k * CD_RAW:(k + 1) * CD_RAW], tr.kind))
-                        written += SECTOR
+                for h, data in zip(range(first_h, last_h), iter_hunks(chd, first_h, last_h, jobs)):
+                    for k in range(fph):
+                        frame = h * fph + k
+                        if first_frame <= frame < first_frame + nframes:
+                            f.write(_user_data(data[k * CD_RAW:(k + 1) * CD_RAW], tr.kind))
+                            written += SECTOR
                     if progress:
                         progress(written, total)
-            verify = False  # the stored checksum covers the audio and sub-channel parts too
         else:
             sha = hashlib.sha1() if verify else None
             total = chd.logical
             with open(part, 'wb') as f:
-                for h in range(chd.hunks):
-                    data = chd.hunk(h)
+                for h, data in zip(range(chd.hunks), iter_hunks(chd, 0, chd.hunks, jobs)):
                     if (h + 1) * chd.hunk_bytes > chd.logical:
                         data = data[:chd.logical - h * chd.hunk_bytes]
                     f.write(data)
@@ -1178,7 +1306,6 @@ def convert(path, out_path, progress=None, verify=True):
                     if progress:
                         progress(written, total)
             if sha and sha.digest() != chd.raw_sha1 and chd.raw_sha1 != bytes(20):
-                os.remove(part)
                 raise ChdError('the data of this CHD file does not match its checksum (damaged file)')
         os.replace(part, out_path)
         return written

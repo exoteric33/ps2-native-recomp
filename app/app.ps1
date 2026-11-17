@@ -276,6 +276,28 @@ function Get-CueTarget([string]$cue) {
     $null
 }
 
+# What a .chd file says about itself, read from its 124-byte header (nothing is unpacked here): @{ Error = <plain sentence> } or
+# @{ Size = <bytes of the plain image it unpacks to> }. scripts\chd.py reads version 5 files with these compressions.
+$ChdCodecs = @('zlib', 'lzma', 'huff', 'flac', 'zstd', 'cdzl', 'cdlz', 'cdfl', 'cdzs')
+function Get-ChdInfo([string]$path) {
+    $buf = New-Object byte[] 124
+    try {
+        $fs = [IO.File]::OpenRead($path)
+        try { $n = $fs.Read($buf, 0, 124) } finally { $fs.Dispose() }
+    } catch { return @{ Size = 0; Error = 'This file cannot be read.' } }
+    if ($n -lt 124 -or [Text.Encoding]::ASCII.GetString($buf, 0, 8) -ne 'MComprHD') { return @{ Size = 0; Error = 'This does not look like a .chd disc image.' } }
+    $version = ([int]$buf[12] -shl 24) + ([int]$buf[13] -shl 16) + ([int]$buf[14] -shl 8) + [int]$buf[15]
+    if ($version -ne 5) { return @{ Size = 0; Error = "This .chd file is an old version ($version). Only version 5 files work: make a new one with a current chdman, or choose an .iso." } }
+    for ($i = 104; $i -lt 124; $i++) { if ($buf[$i] -ne 0) { return @{ Size = 0; Error = 'This .chd file needs a second (parent) .chd file, which the app cannot use. Choose an .iso instead.' } } }
+    for ($c = 0; $c -lt 4; $c++) {
+        $tag = [Text.Encoding]::ASCII.GetString($buf, 16 + 4 * $c, 4)
+        if ($tag -ne ([string][char]0 * 4) -and $ChdCodecs -notcontains $tag) { return @{ Size = 0; Error = "This .chd file uses a compression ($tag) that the app cannot read. Make a new one with chdman createdvd or createcd, or choose an .iso." } }
+    }
+    $size = [uint64]0
+    for ($i = 32; $i -lt 40; $i++) { $size = $size * 256 + $buf[$i] }
+    @{ Size = [int64]$size; Error = '' }
+}
+
 function Test-DiscImage([string]$path) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return 'That file does not exist.' }
     switch ([IO.Path]::GetExtension($path).ToLower()) {
@@ -305,7 +327,11 @@ function Test-DiscImage([string]$path) {
                 return 'A .7z file needs the free program 7-Zip (7-zip.org). Install it, or unpack the .iso yourself and choose that.'
             }
         }
-        default { return 'Please choose an .iso file (or a .bin with its .cue file), or a .zip or .7z file with one inside.' }
+        '.chd' {
+            $info = Get-ChdInfo $path
+            if ($info.Error) { return $info.Error }
+        }
+        default { return 'Please choose an .iso file (or a .bin with its .cue file), or a .zip, .7z or .chd file.' }
     }
     $null
 }
@@ -945,7 +971,7 @@ $w = $P['welcome']
 [void](Add-Label $w 'title' $AppTitle 38 16 720 54 (New-Font 28 $false $TitleFont) $C.Ink)
 [void](Add-Label $w 'subtitle' 'Turn your own PlayStation 2 game into a program for this PC.' 41 70 720 26 (New-Font 12) $C.Muted)
 $steps = @(
-    @('1', 'Choose your disc', 'An .iso file ripped from a PS2 disc you own (or a .bin with its .cue file, or a .zip or .7z with one inside).'),
+    @('1', 'Choose your disc', 'An .iso file ripped from a PS2 disc you own (or a .bin with its .cue file, a .chd file, or a .zip or .7z with one inside).'),
     @('2', 'Press Build', "Free build tools are downloaded once (about $ToolsDownloadMb MB). Then the game becomes a PC program: 5 to 30 minutes."),
     @('3', 'Press Play', 'Start the game from here, or make a desktop shortcut and start it from there next time.')
 )
@@ -1015,7 +1041,7 @@ $card = New-Glass $w 'DiscCard' 40 108 720 238
 [void](Add-Label $card 'cardTitle1' 'Your disc image' 56 16 400 26 (New-Font 13 $true) $C.Ink)
 $U.choose = Add-Button $card 'ChooseImage' 'Choose disc image...' 16 54 250 50 'primary' 14
 $U.fileName = Add-Label $card 'fileName' 'No disc image chosen yet.' 284 52 420 26 (New-Font 12.5 $true) $C.Muted
-$U.filePath = Add-Label $card 'filePath' 'An .iso made from a PS2 disc you own (or a .bin with its .cue file), or a .zip or .7z file that holds one.' 284 80 420 24 (New-Font 9.5) $C.Muted
+$U.filePath = Add-Label $card 'filePath' 'An .iso from a PS2 disc you own (or .bin + .cue, or .chd), or a .zip or .7z file that holds one.' 284 80 420 24 (New-Font 9.5) $C.Muted
 $U.filePath.AutoEllipsis = $true
 $U.imageError = Add-Label $card 'imageError' '' 16 110 688 38 (New-Font 11 $true) $C.Danger
 [void](Add-Label $card 'nameLabel' 'Name of the game' 16 150 300 22 (New-Font 11 $true) $C.Ink)
@@ -1447,6 +1473,11 @@ function Set-Image([string]$path) {
         $U.filePath.Text = $path
         $U.name.Text = Get-FreeName (Get-SafeName $path) $path
         Restore-Patches $U.name.Text $path
+        if ($path -match '\.chd$') {
+            # the build turns it into a normal disc image that stays with the game: say what that costs
+            $unpacked = (Get-ChdInfo $path).Size
+            $U.chooseSub.Text = ('It is unpacked while building: about {0} stay with the game, so {1} of free disk space is needed.' -f (Format-Size $unpacked), (Format-Size ($unpacked + 3GB)))
+        }
     }
     Update-ChooseState
 }
@@ -1456,7 +1487,7 @@ $U.chooseBack.Add_Click({ Show-Screen 'welcome' })
 $U.choose.Add_Click({
     $dialog = New-Object Windows.Forms.OpenFileDialog
     $dialog.Title = 'Choose your PS2 disc image'
-    $dialog.Filter = 'PS2 disc images (*.iso, *.cue, *.bin, *.zip, *.7z)|*.iso;*.cue;*.bin;*.zip;*.7z'
+    $dialog.Filter = 'PS2 disc images (*.iso, *.cue, *.bin, *.chd, *.zip, *.7z)|*.iso;*.cue;*.bin;*.chd;*.zip;*.7z'
     $dialog.CheckFileExists = $true
     if (Test-Path -LiteralPath (Join-Path $Root 'isos')) { $dialog.InitialDirectory = Join-Path $Root 'isos' }
     if ($dialog.ShowDialog($form) -eq 'OK') { Set-Image $dialog.FileName }
@@ -1988,6 +2019,8 @@ $StepText = @{
 }
 # Where each port.sh step sits on the bar (percent of the port stage) and how fast it creeps toward its end (seconds).
 $StepRange = @{ 1 = @(0, 2, 5); 2 = @(2, 4, 5); 3 = @(4, 18, 60); 4 = @(18, 76, 240); 5 = @(76, 78, 5); 6 = @(78, 100, 60) }
+# The same when the disc came from a .chd file: step 1 is the unpack and gets a share of the bar that follows its percent.
+$ChdStepRange = @{ 1 = @(0, 20, 5); 2 = @(20, 21, 5); 3 = @(21, 31, 60); 4 = @(31, 79, 240); 5 = @(79, 81, 5); 6 = @(81, 100, 60) }
 # Make it faster runs port.sh with --no-explore: no testing round, so the bar and the words are different.
 $FasterText = @{
     1 = @('Getting ready', 'Checking the disc image.')
@@ -2052,8 +2085,15 @@ function Start-Build([string]$name, [string]$image, [bool]$faster = $false, $pat
     $drive = [IO.Path]::GetPathRoot($Root)
     if (-not $faster -and $drive -and -not $drive.StartsWith('\\')) {
         $free = (New-Object IO.DriveInfo($drive)).AvailableFreeSpace
-        if ($free -lt 3GB) {
-            Set-BuildFailed $b "There is not enough free disk space on drive $drive ($(Format-Size $free) free, about 3 GB needed). Free some space and try again."
+        $need = 3GB
+        $unpackNote = ''
+        # a .chd is unpacked into games\<name>\disc.iso, the full size of the disc, and that file stays
+        if ($image -match '\.chd$' -and -not (Test-Path -LiteralPath (Get-GameFile $name 'disc.iso'))) {
+            $ci = Get-ChdInfo $image
+            if (-not $ci.Error) { $need += $ci.Size; $unpackNote = " (the build tools, and the unpacked disc image of $(Format-Size $ci.Size))" }
+        }
+        if ($free -lt $need) {
+            Set-BuildFailed $b "There is not enough free disk space on drive $drive ($(Format-Size $free) free, about $(Format-Size $need) needed$unpackNote). Free some space and try again."
             return
         }
     }
@@ -2079,7 +2119,7 @@ function Start-Stage([int]$index) {
     $stage = $b.Plan[$index]
     $b.Stage = $stage
     $b.StageClock = [Diagnostics.Stopwatch]::StartNew()
-    $b.Step = 0; $b.Round = 0; $b.Testing = 0; $b.TestMax = 8; $b.TestSeen = $false; $b.TestClock = [Diagnostics.Stopwatch]::StartNew(); $b.LastLine = [DateTime]::Now; $b.F = 0.0; $b.ExitSeen = $null; $b.Error = ''; $b.Phase = 0; $b.Ninja = $null; $b.NinjaAt = [DateTime]::MinValue
+    $b.Chd = $false; $b.ChdPct = 0; $b.Step = 0; $b.Round = 0; $b.Testing = 0; $b.TestMax = 8; $b.TestSeen = $false; $b.TestClock = [Diagnostics.Stopwatch]::StartNew(); $b.LastLine = [DateTime]::Now; $b.F = 0.0; $b.ExitSeen = $null; $b.Error = ''; $b.Phase = 0; $b.Ninja = $null; $b.NinjaAt = [DateTime]::MinValue
     $bash = Join-Path $ToolsDir 'mingit\usr\bin\bash.exe'
     switch ($stage.Id) {
         'tools' {
@@ -2173,6 +2213,12 @@ function Read-BuildLine($b, [string]$raw) {
                 $text = Get-StepText $b $b.Step
                 Set-Status $text[0] $text[1]
             }
+            elseif ($line -match '^Unpacking the \.chd disc image: (\d+) %') {
+                # the unpack of a .chd file: its own stretch of the bar (step 1 is longer then), in plain words
+                $b.Chd = $true; $b.ChdPct = [int]$Matches[1]
+                Set-Status 'Unpacking the disc image' ('The .chd file is turned into a normal disc image: {0} % done. A big disc takes several minutes.' -f $b.ChdPct)
+            }
+            elseif ($line -match '^Unpacking the \.chd disc image') { $b.Chd = $true; Set-Status 'Unpacking the disc image' 'The .chd file is turned into a normal disc image. A big disc takes several minutes.' }
             elseif ($line -match '^round (\d+):') { $b.Round = [int]$Matches[1]; $b.Testing = 0 }
             elseif ($line -match '^\[port\] testing round (\d+) of at most (\d+)') {
                 $b.Testing = [int]$Matches[1]; $b.TestMax = [Math]::Max(1, [int]$Matches[2]); $b.TestSeen = $true; $b.TestClock = [Diagnostics.Stopwatch]::StartNew()
@@ -2255,9 +2301,10 @@ function Update-Progress($b) {
         }
         'port' {
             if ($b.Step -ge 1) {
-                $r = if ($b.Faster) { $FasterRange[$b.Step] } else { $StepRange[$b.Step] }
+                $r = if ($b.Faster) { $FasterRange[$b.Step] } elseif ($b.Chd) { $ChdStepRange[$b.Step] } else { $StepRange[$b.Step] }
                 $stepSeconds = $b.StepClock.Elapsed.TotalSeconds
                 $g = 1 - [Math]::Exp(-$stepSeconds / $r[2])
+                if ($b.Chd -and $b.Step -eq 1) { $g = [Math]::Min(0.97, $b.ChdPct / 100.0) }
                 if ($b.Step -eq 4) { $g = Get-ExploreFraction $b $g }
                 if ($b.Step -eq 4 -or $b.Step -eq 6) {
                     if (([DateTime]::Now - $b.NinjaAt).TotalSeconds -ge 1) {
@@ -2348,6 +2395,8 @@ function Get-FailureMessage($b) {
         }
         'setup' { return 'The libraries or translator tools could not be prepared. If your internet connection was down, try again.' }
     }
+    if ($tail -match 'No space left|Errno 28|WinError 112') { return 'There is not enough free disk space to unpack the .chd file. Free some space and try again.' }
+    if ($tail -match 'chd\.py: ([^\r\n]+)') { return 'The .chd file could not be unpacked: ' + $Matches[1].Trim().TrimEnd('.') + '.' }
     if ($tail -match 'not an ISO 9660 image') { return 'This file is not a PS2 disc image. It has to be an .iso made from the DVD.' }
     if ($tail -match 'no \.iso, \.bin or \.img inside the archive') { return 'There is no disc image (.iso or .bin) inside that archive.' }
     if ($tail -match 'cue sheet names') { return 'The .cue file names a .bin file that is not in the same folder.' }
@@ -3071,7 +3120,7 @@ $U.shortcut.Add_Click({
 $U.another.Add_Click({
     Reset-Patches; $State.Image = ''
     $U.fileName.Text = 'No disc image chosen yet.'; $U.fileName.ForeColor = $C.Muted
-    $U.filePath.Text = 'An .iso made from a PS2 DVD you own, or a .zip or .7z file that holds one.'
+    $U.filePath.Text = 'An .iso from a PS2 disc you own (or .bin + .cue, or .chd), or a .zip or .7z file that holds one.'
     $U.imageError.Text = ''; $U.name.Text = ''
     $U.chooseSub.Text = 'Pick your disc, choose extras if you like, then press Build.'
     Show-Screen 'choose'

@@ -974,7 +974,7 @@ $U.privacy = Add-Label $w 'privacy' 'Nothing is uploaded. Everything stays in th
 # The games built before: one row each (Play, Extras, and Make it faster while vector programs wait to be compiled). Every built
 # game gets a row. Three rows fit; with more, the rows (gamesContent) move behind the clipping panel (again) when the mouse wheel
 # turns over the list or the scroll bar at its right edge is used, and a row that gets keyboard focus scrolls into view.
-$U.again = New-Object Ps2Ui.Clear
+$U.again = New-Object Ps2Ui.ScrollView
 $U.again.Name = 'again'
 $U.again.Location = New-Point 40 284
 $U.again.Size = New-Size 720 212

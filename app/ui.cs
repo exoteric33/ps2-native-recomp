@@ -448,6 +448,22 @@ namespace Ps2Ui
         }
     }
 
+    // The clipping panel of the games list: transparent like Clear, but every child is painted in one double-buffered pass
+    // (WS_EX_COMPOSITED). Without it, moving the rows shifts the old pixels and repaints only the revealed strip, which
+    // left streaks behind the see-through rows while the list scrolled.
+    public class ScrollView : Panel
+    {
+        public ScrollView()
+        {
+            SetStyle(ControlStyles.SupportsTransparentBackColor | ControlStyles.OptimizedDoubleBuffer, true);
+            BackColor = Color.Transparent;
+        }
+        protected override CreateParams CreateParams
+        {
+            get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x02000000; return cp; }
+        }
+    }
+
     // A slim dark scroll bar (a rounded track and a blue thumb) for the games list: drag the thumb, or click the track to move
     // one page. It has the few properties of a Windows scroll bar that the list needs. Never takes keyboard focus.
     public class DarkScroll : Control
@@ -551,8 +567,15 @@ namespace Ps2Ui
             this.viewport = viewport;
             this.content = content;
             this.bar = bar;
-            bar.ValueChanged += delegate { content.Top = -bar.Value; };
+            bar.ValueChanged += delegate { Move(); };
             Application.AddMessageFilter(this);
+        }
+        // Puts the rows at the scroll position and has the whole list painted again, so no old pixels are left behind.
+        void Move()
+        {
+            content.Top = -bar.Value;
+            viewport.Invalidate(true);
+            viewport.Update();
         }
         public bool Scrolls { get { return bar.Visible; } }
         public int Value { get { return bar.Value; } }
@@ -571,7 +594,7 @@ namespace Ps2Ui
                 bar.Value = Math.Max(0, Math.Min(keep, contentHeight - viewport.Height));
             }
             else if (bar.Value != 0) { bar.Value = 0; }
-            content.Top = -(needed ? bar.Value : 0);
+            Move();
         }
         public void ScrollBy(int pixels)
         {
@@ -593,7 +616,10 @@ namespace Ps2Ui
         {
             if (m.Msg != WM_MOUSEWHEEL || !bar.Visible || !viewport.Visible) return false;
             Form form = viewport.FindForm();
-            if (form == null || !object.ReferenceEquals(Form.ActiveForm, form)) return false;
+            // only a wheel turn that is meant for this window (not for a message box on top of it, nor another program's window)
+            if (form == null || !form.Enabled) return false;
+            Control target = Control.FromChildHandle(m.HWnd);
+            if (target == null || !object.ReferenceEquals(target.FindForm(), form)) return false;
             Point at = Cursor.Position;
             Rectangle area = Rectangle.Union(viewport.RectangleToScreen(viewport.ClientRectangle), bar.RectangleToScreen(bar.ClientRectangle));
             if (!area.Contains(at)) return false;

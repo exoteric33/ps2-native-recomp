@@ -1165,11 +1165,19 @@ struct Counts {
     std::atomic<std::uint32_t> kept{0}, restored{0}, uploaded{0}, resolved{0}, touches{0};
 } g_counts;
 
+bool log_every() {  // PS2_DEPTH_TRIP_LOG=2: after every event (tests/depth_trip.py)
+    static const bool on = [] {
+        const char *v = std::getenv("PS2_DEPTH_TRIP_LOG");
+        return v && std::atoi(v) >= 2;
+    }();
+    return on;
+}
+
 void report() {
     if (!log_on()) return;
     static std::atomic<std::uint32_t> last{0};
     const std::uint32_t kept = g_counts.kept.load();
-    if (kept - last.load() < 300 && kept != 1) return;
+    if (kept - last.load() < 300 && kept != 1 && !log_every()) return;
     last = kept;
     std::fprintf(stderr, "[depth-trip] frame %llu: %u depth downloads not waited for, %u uploads put back from the copy, %u uploads from its bytes, %u times the game touched them first (%u guard stops)\n",
                  static_cast<unsigned long long>(frame_count()), kept, g_counts.restored.load(), g_counts.uploaded.load(), g_counts.resolved.load(), g_counts.touches.load());
@@ -1371,6 +1379,7 @@ bool trip_restore(const TripTicket &ticket, std::uint32_t qwc) {
     if (!same || !gpu::trip_restore(ticket.slot % trip::kSlots, s.first, s.bytes)) return false;
     g_transfer.active = false;
     trip::g_counts.restored.fetch_add(1);
+    trip::report();
     return true;
 #else
     (void)ticket, (void)qwc;
@@ -1388,6 +1397,7 @@ const std::vector<std::uint8_t> &trip_bytes(const TripTicket &ticket) {
     }
     if (!s.have_real) trip::decode(ticket.slot % trip::kSlots);
     trip::g_counts.uploaded.fetch_add(1);
+    trip::report();
     return s.real;
 #else
     (void)ticket;

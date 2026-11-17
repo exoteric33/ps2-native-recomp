@@ -987,11 +987,11 @@ private:
         case Vmsub: vec("msub", i); break;
         case Vmini: vec("mini", i); break;
         case Vopmsub: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("opmsub"), i.fd(), i.fs(), i.ft())); break;
-        case Viadd: line(std::format("vu::set_vi(c.vu0, {}u, {} + {});", i.fd(), vi(i.fs()), vi(i.ft()))); break;
-        case Visub: line(std::format("vu::set_vi(c.vu0, {}u, {} - {});", i.fd(), vi(i.fs()), vi(i.ft()))); break;
-        case Viaddi: line(std::format("vu::set_vi(c.vu0, {}u, {} + {});", i.ft(), vi(i.fs()), i.imm5())); break;
-        case Viand: line(std::format("vu::set_vi(c.vu0, {}u, {} & {});", i.fd(), vi(i.fs()), vi(i.ft()))); break;
-        case Vior: line(std::format("vu::set_vi(c.vu0, {}u, {} | {});", i.fd(), vi(i.fs()), vi(i.ft()))); break;
+        case Viadd: line(std::format("vu::set_vi(c.vu0, {}u, {} + {});", i.id(), vi(i.is()), vi(i.it()))); break;
+        case Visub: line(std::format("vu::set_vi(c.vu0, {}u, {} - {});", i.id(), vi(i.is()), vi(i.it()))); break;
+        case Viaddi: line(std::format("vu::set_vi(c.vu0, {}u, {} + {});", i.it(), vi(i.is()), i.imm5())); break;
+        case Viand: line(std::format("vu::set_vi(c.vu0, {}u, {} & {});", i.id(), vi(i.is()), vi(i.it()))); break;
+        case Vior: line(std::format("vu::set_vi(c.vu0, {}u, {} | {});", i.id(), vi(i.is()), vi(i.it()))); break;
         case Vcallms: line(std::format("vcallms(c, {}u);", i.imm15() * 8u)); break;
         case Vcallmsr: line("vcallms(c, c.vu0.cmsar0 * 8u);"); break;
         case Vaddabc: vaccbc("addabc", i, bcv(i)); break;
@@ -1030,22 +1030,22 @@ private:
         case Vmr32: line(std::format("vu::{}(c.vu0, {}u, {}u, {}u);", vu_name("mr32", false), i.dest(), i.ft(), i.fs())); break;
         case Vclip: line(std::format("vu::clip(c.vu0, {}u, {}u);", i.fs(), i.ft())); break;
         case Vnop: case Vwaitq: break;
-        case Vlqi: line(std::format("lqc2_vu(c, {}u, {}u, {}); vu::set_vi(c.vu0, {}u, {} + 1u);", i.dest(), i.ft(), vi(i.fs()), i.fs(), vi(i.fs()))); break;
-        case Vsqi: line(std::format("sqc2_vu(c, {}u, {}u, {}); vu::set_vi(c.vu0, {}u, {} + 1u);", i.dest(), i.fs(), vi(i.ft()), i.ft(), vi(i.ft()))); break;
-        case Vlqd: line(std::format("vu::set_vi(c.vu0, {}u, {} - 1u); lqc2_vu(c, {}u, {}u, {});", i.fs(), vi(i.fs()), i.dest(), i.ft(), vi(i.fs()))); break;
-        case Vsqd: line(std::format("vu::set_vi(c.vu0, {}u, {} - 1u); sqc2_vu(c, {}u, {}u, {});", i.ft(), vi(i.ft()), i.dest(), i.fs(), vi(i.ft()))); break;
+        case Vlqi: line(std::format("lqc2_vu(c, {}u, {}u, {}); vu::set_vi(c.vu0, {}u, {} + 1u);", i.dest(), i.ft(), vi(i.is()), i.is(), vi(i.is()))); break;
+        case Vsqi: line(std::format("sqc2_vu(c, {}u, {}u, {}); vu::set_vi(c.vu0, {}u, {} + 1u);", i.dest(), i.fs(), vi(i.it()), i.it(), vi(i.it()))); break;
+        case Vlqd: line(std::format("vu::set_vi(c.vu0, {}u, {} - 1u); lqc2_vu(c, {}u, {}u, {});", i.is(), vi(i.is()), i.dest(), i.ft(), vi(i.is()))); break;
+        case Vsqd: line(std::format("vu::set_vi(c.vu0, {}u, {} - 1u); sqc2_vu(c, {}u, {}u, {});", i.it(), vi(i.it()), i.dest(), i.fs(), vi(i.it()))); break;
         case Vdiv: line(std::format("vu::div(c.vu0, {}.w[{}], {}.w[{}]);", vf(i.fs()), fsf, vf(i.ft()), ftf)); break;
         case Vsqrt: line(std::format("vu::sqrt(c.vu0, {}.w[{}]);", vf(i.ft()), ftf)); break;
         case Vrsqrt: line(std::format("vu::rsqrt(c.vu0, {}.w[{}], {}.w[{}]);", vf(i.fs()), fsf, vf(i.ft()), ftf)); break;
-        case Vmtir: line(std::format("vu::set_vi(c.vu0, {}u, {}.w[{}]);", i.ft(), vf(i.fs()), fsf)); break;
-        case Vmfir: line(std::format("vu::mfir(c.vu0, {}u, {}u, {}u);", i.dest(), i.ft(), i.fs())); break;
+        case Vmtir: line(std::format("vu::set_vi(c.vu0, {}u, {}.w[{}]);", i.it(), vf(i.fs()), fsf)); break;
+        case Vmfir: line(std::format("vu::mfir(c.vu0, {}u, {}u, {}u);", i.dest(), i.ft(), i.is())); break;
         case Vilwr:
             line(std::format("{{ std::uint16_t v; __builtin_memcpy(&v, vu0_data() + vu0_addr({}) + 4u * {}u, 2); vu::set_vi(c.vu0, {}u, v); }}",
-                             vi(i.fs()), std::countl_zero(i.dest() << 28), i.ft()));
+                             vi(i.is()), std::countl_zero(i.dest() << 28), i.it()));
             break;
         case Viswr:
             line(std::format("for (int k = 0; k < 4; ++k) if (vu::lane({}u, k)) {{ const std::uint32_t v = {}; __builtin_memcpy(vu0_data() + vu0_addr({}) + 4u * k, &v, 4); }}",
-                             i.dest(), vi(i.ft()), vi(i.fs())));
+                             i.dest(), vi(i.it()), vi(i.is())));
             break;
         case Vrnext:
             line(std::format("c.vu0.r = vu::rand_next(c.vu0.r); vu::apply(c.vu0, {}u, {}u, [&](int) {{ return c.vu0.r | fp::kOne; }});", i.dest(), i.ft()));

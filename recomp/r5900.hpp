@@ -64,6 +64,10 @@ struct Insn {
     std::uint32_t fs() const { return rd(); }
     std::uint32_t ft() const { return rt(); }
     std::uint32_t fd() const { return sa(); }
+    // VU integer operands use the low four bits of the encoded register field.
+    std::uint32_t is() const { return (word >> 11) & 15u; }
+    std::uint32_t it() const { return (word >> 16) & 15u; }
+    std::uint32_t id() const { return (word >> 6) & 15u; }
     std::int32_t simm() const { return static_cast<std::int16_t>(word & 0xFFFFu); }
     std::uint32_t uimm() const { return word & 0xFFFFu; }
     std::uint32_t jump_target() const { return ((pc + 4u) & 0xF0000000u) | ((word & 0x03FFFFFFu) << 2); }

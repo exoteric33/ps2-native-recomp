@@ -4557,6 +4557,70 @@ void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
     read_back(g_scratch, bytes, memory + offset, offset);
 }
 
+// The depth round trip: a copy of graphics memory taken where a depth download stands in the drawing order,
+// every sample of every pixel, put back when the same bytes come back by an upload, so the game need not wait for the download.
+namespace {
+struct TripCopy {
+    WGPUBuffer buffer = nullptr;
+    std::uint64_t capacity = 0;
+} g_trip[kTripSlots];
+
+void copy_buffer(WGPUBuffer from, std::uint64_t from_offset, WGPUBuffer to, std::uint64_t to_offset, std::uint64_t bytes) {
+    flush_all();
+    submit();
+    post::drain();
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, from, from_offset, to, to_offset, bytes);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+    wgpuQueueSubmit(g_queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(enc);
+}
+}
+
+bool trip_supported() { return g_mode == Mode::primary && g_device && !g_live && !hwcache::g_on; }
+
+void trip_save(std::uint32_t slot, std::uint32_t offset, std::uint32_t bytes) {
+    TripCopy &t = g_trip[slot % kTripSlots];
+    const std::uint64_t size = static_cast<std::uint64_t>(bytes) * g_scale * g_scale;
+    if (t.capacity < size) {
+        if (t.buffer) wgpuBufferRelease(t.buffer);
+        t.buffer = make_buffer(size, WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
+        t.capacity = size;
+    }
+    copy_buffer(g_vram, static_cast<std::uint64_t>(offset) * g_scale * g_scale, t.buffer, 0, size);
+}
+
+bool trip_restore(std::uint32_t slot, std::uint32_t offset, std::uint32_t bytes) {
+    TripCopy &t = g_trip[slot % kTripSlots];
+    Image &im = g_image;
+    const std::uint64_t size = static_cast<std::uint64_t>(bytes) * g_scale * g_scale;
+    if (!t.buffer || t.capacity < size || !im.active || im.done || im.lead_bits || !im.pending.empty()) return false;
+    im.active = false;  // the upload this stands for is done, all of it
+    copy_buffer(t.buffer, 0, g_vram, static_cast<std::uint64_t>(offset) * g_scale * g_scale, size);
+    // the caches as after a write: at 1x as after the upload (its samples are all one), scaled as after a local copy (they may differ)
+    const Range r{offset, static_cast<std::uint64_t>(offset) + bytes};
+    if (g_scale == 1)
+        for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = false;
+    else mark_rendered(r);
+    if (g_dec_on) stamp_pages(r, g_scale != 1);
+    return true;
+}
+
+void trip_read(std::uint32_t slot, std::uint32_t bytes, std::uint8_t *out) {
+    TripCopy &t = g_trip[slot % kTripSlots];
+    const std::uint32_t samples = g_scale * g_scale;
+    std::vector<std::uint32_t> all(static_cast<std::size_t>(bytes / 4) * samples);
+    if (!t.buffer || t.capacity < all.size() * 4) {
+        std::memset(out, 0, bytes);
+        return;
+    }
+    flush_all();
+    submit();
+    read_back(t.buffer, all.size() * 4, all.data());
+    for (std::size_t w = 0; w < bytes / 4; ++w) std::memcpy(out + w * 4, &all[w * samples], 4);  // sample 0, as kResolve gives a download
+}
+
 void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut) {
     flush_all();
     if (g_live) hw::live_position(static_cast<std::uint32_t>(g_commands.size())), hw::live_reader(0, kMemorySize);  // states are the judge: everything the card holds goes back first

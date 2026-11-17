@@ -318,6 +318,37 @@ void Ring::wait_for_work(int timeout_ms) {
     consumer_waiting_.store(0, std::memory_order_relaxed);   // awake (woken, timed out or never asleep): no wake needed until the next sleep
 }
 
+// Page guards for the depth round trip: memory the game must not see before the drawing thread has caught up
+// is made inaccessible, and the first touch of it, by any thread and any code, lands in the handler, which makes it right and lets
+// the access go on. Windows only for now (a vectored handler runs before the crash filter of host/crash.cpp); elsewhere guard()
+// says no and the caller takes the waiting path.
+namespace {
+bool (*g_guard_handler)(std::uintptr_t) = nullptr;
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+LONG CALLBACK guard_fault(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->ExceptionRecord->NumberParameters < 2 || !g_guard_handler) return EXCEPTION_CONTINUE_SEARCH;
+    return g_guard_handler(static_cast<std::uintptr_t>(e->ExceptionRecord->ExceptionInformation[1])) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+}
+
+bool guard(void *at, std::size_t bytes, bool on) {
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    if (on && !g_guard_handler) return false;
+    static const bool installed = AddVectoredExceptionHandler(1, guard_fault) != nullptr;
+    if (!installed) return false;
+    DWORD old = 0;
+    return VirtualProtect(at, bytes, on ? PAGE_NOACCESS : PAGE_READWRITE, &old) != 0;
+#else
+    (void)at, (void)bytes, (void)on;
+    return false;
+#endif
+}
+
+void on_guard_fault(bool (*handler)(std::uintptr_t address)) { g_guard_handler = handler; }
+
+std::size_t guard_page() { return 4096; }
+
 }
 
 #include "ps2/hitch.hpp"

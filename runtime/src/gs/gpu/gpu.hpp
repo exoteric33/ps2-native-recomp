@@ -38,6 +38,14 @@ void wait_idle();
 void download(std::uint8_t *memory, std::uint32_t offset = 0, std::uint32_t bytes = kMemorySize);
 bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes, std::uint32_t serial);
 bool finish_download(std::uint32_t serial);
+// The depth round trip: trip_save copies graphics memory offset..offset+bytes (every sample) into one of
+// kTripSlots copies, trip_restore puts it back in place of the upload under way (false, and nothing done, unless that upload has had
+// no data yet), trip_read gives the copy's bytes as a download would have. trip_supported: the compute path only, not PS2_GPU_HW.
+inline constexpr std::uint32_t kTripSlots = 4;
+bool trip_supported();
+void trip_save(std::uint32_t slot, std::uint32_t offset, std::uint32_t bytes);
+bool trip_restore(std::uint32_t slot, std::uint32_t offset, std::uint32_t bytes);
+void trip_read(std::uint32_t slot, std::uint32_t bytes, std::uint8_t *out);
 void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut);
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut);
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);

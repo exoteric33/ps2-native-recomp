@@ -7,7 +7,7 @@
 
 namespace ps2::gs::queue {
 
-enum Type : std::uint32_t { kWrap, kGif, kGifReset, kReset, kSoftReset, kVblank, kPresent, kDownload, kVif1, kVif1Write, kVuReset, kState, kVuFence, kDownloadAsync, kPath3Idle };
+enum Type : std::uint32_t { kWrap, kGif, kGifReset, kReset, kSoftReset, kVblank, kPresent, kDownload, kVif1, kVif1Write, kVuReset, kState, kVuFence, kDownloadAsync, kPath3Idle, kDownloadTrip };
 
 enum class Role { Emulation, Vu, Render };
 
@@ -68,6 +68,12 @@ private:
     alignas(64) std::atomic<std::uint32_t> freed_{0}, producer_waiting_{0};
 };
 
+// Page guards (queue.cpp): guard() makes whole pages of guard_page() bytes inaccessible (on) or readable and
+// writable again (off); a touch of a guarded page calls the handler with the address, which returns true when it has made the access
+// possible. False where the system has no guards (then nothing was changed).
+bool guard(void *at, std::size_t bytes, bool on);
+void on_guard_fault(bool (*handler)(std::uintptr_t address));
+std::size_t guard_page();
 Ring &render();
 Ring &vu();
 Role &role();

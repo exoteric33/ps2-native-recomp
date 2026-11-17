@@ -106,6 +106,9 @@ void walk(Path &p, const std::uint8_t *data, std::uint32_t qwc, Sink &sink) {
 
 // In the path argument of a GIF message: end that path's packet there (end_runaway_kick).
 constexpr int kEndPacket = 0x100;
+// The data of this message are a gs::TripTicket standing for qwc quadwords of image data: a depth download's bytes, sent back
+// unchanged (gs.cpp).
+constexpr int kTripFlag = 0x200;
 
 // Signs that the GIF is reading something that is not a packet (vertex data taken for a tag, which then sprays the rest over random
 // registers): writes to GS registers that do not exist, and XGKICK packets without an end. A game does neither on purpose. Counted
@@ -259,6 +262,16 @@ void out(int path, const std::uint8_t *data, std::uint32_t qwc) {
         render(path, data, qwc);
         return;
     }
+    if (path & kTripFlag) {  // a ticket the vector thread passes on
+        gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, sizeof(gs::TripTicket));
+        return;
+    }
+    if (gs::TripTicket ticket; gs::trip_match(data, qwc, ticket)) {
+        // a depth download's bytes going back untouched: the ticket goes instead (the scan reads image data only if it is not)
+        if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
+        gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path | kTripFlag), qwc, &ticket, sizeof ticket);
+        return;
+    }
     if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
     gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
 }
@@ -331,6 +344,22 @@ void render_reset() {
 }
 
 void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (path & kTripFlag) [[unlikely]] {
+        path &= 3;
+        gs::TripTicket ticket;
+        std::memcpy(&ticket, data, sizeof ticket);
+        Path &p = g_paths[path];
+        if (p.active && p.flg >= 2 && p.nloop - p.loop >= qwc && gs::trip_restore(ticket, qwc)) {  // as walk() takes image data
+            p.loop += qwc;
+            if (p.loop >= p.nloop) p.active = false;
+            return;
+        }
+        const std::vector<std::uint8_t> &bytes = gs::trip_bytes(ticket);
+        const std::vector<std::uint8_t> none(bytes.size() >= static_cast<std::size_t>(qwc) * 16 ? 0 : static_cast<std::size_t>(qwc) * 16);
+        GsSink sink{path};
+        walk(p, none.empty() ? bytes.data() : none.data(), qwc, sink);
+        return;
+    }
     if (path & kEndPacket) [[unlikely]] {
         path &= 3;
         note(g_runaway[path], path, 0, 0, qwc);  // qwc carries the kick address here
@@ -361,6 +390,26 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
         return;
     }
     Held &h = g_held;
+    if (path & kTripFlag) [[unlikely]] {  // a depth trip's ticket (out() above), here on the vector thread
+        if ((path & 3) == 3) {
+            if (h.flowing && !h.masked) {
+                h.flowing = false;
+                release(false);
+            }
+            if (!h.data.empty() || (h.masked && !h.mid_packet) || h.left < qwc) {  // it would be held or cut: as bytes, then
+                gs::TripTicket ticket;
+                std::memcpy(&ticket, data, sizeof ticket);
+                std::vector<std::uint8_t> bytes = gs::trip_fetch(ticket);
+                bytes.resize(static_cast<std::size_t>(qwc) * 16);
+                transfer(3, bytes.data(), qwc);
+                return;
+            }
+            h.left -= qwc;  // what packet_length does with data inside a tag
+            if (!h.left && h.eop) h.mid_packet = false;
+        }
+        out(path, data, qwc);
+        return;
+    }
     if (!hold_here()) {
         out(path, data, qwc);
         return;

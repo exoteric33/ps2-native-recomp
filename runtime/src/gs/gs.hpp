@@ -59,6 +59,18 @@ void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64
 void write_image(const std::uint8_t *data, std::uint32_t qwords);
 void read_image(std::uint8_t *data, std::uint32_t qwords);
 void render_read_image(std::uint8_t *data, std::uint32_t qwords);
+// The depth round trip (gs.cpp). A depth download the emulation thread does not wait for leaves its bytes
+// out of main memory, under a page guard, until something touches them; an upload of exactly those bytes reaches the GIF as a
+// ticket instead of the bytes. trip_match (emulation side): these qwords are such a download's bytes, untouched. trip_fetch (any
+// thread but the drawing one): the bytes, waiting for the drawing thread if need be. trip_restore and trip_bytes (drawing thread):
+// put the saved memory back in place of the upload under way (false if it is not that upload), or give the bytes for a normal one.
+struct TripTicket {
+    std::uint32_t slot = 0, id = 0;
+};
+bool trip_match(const std::uint8_t *data, std::uint32_t qwc, TripTicket &ticket);
+std::vector<std::uint8_t> trip_fetch(const TripTicket &ticket);
+bool trip_restore(const TripTicket &ticket, std::uint32_t qwc);
+const std::vector<std::uint8_t> &trip_bytes(const TripTicket &ticket);
 void render_reset();
 
 std::uint64_t read_privileged(std::uint32_t address);

@@ -10,6 +10,7 @@
 #endif
 
 #include "ps2/hitch.hpp"
+#include "ps2/memory.hpp"
 #include "ps2/os.hpp"
 #include "ps2/state.hpp"
 #include "ps2/system.hpp"
@@ -1067,6 +1068,333 @@ void write_image(const std::uint8_t *data, std::uint32_t qwords) { feed_image(da
 
 std::atomic<std::uint32_t> g_downloads{0};
 
+// The depth round trip (issue #122). Digital Devil Saga reads its whole depth buffer back every frame and later
+// writes the same bytes back, never looking at them on the EE; waiting for the drawing thread for that was half of its emulation
+// thread's time. Here such a download does not wait: the drawing thread copies the depth (every sample) where the download stands in
+// the drawing order, and main memory is left as it was under a page guard. Exact for every game, because no one sees the missing bytes:
+//  - any touch of the guarded pages (a load or store of the game, a DMA, the IOP, a save state; any thread, any code) stops in the
+//    guard handler, which waits for the real bytes, writes them and drops the guard, before the access goes on;
+//  - a GIF upload whose data are exactly those bytes (same address, same length, still guarded, so unchanged since the download) is
+//    sent as a ticket; the drawing thread puts the saved depth back when that upload is the download's rectangle and format and has
+//    had no data yet, and otherwise uploads the real bytes, read from the copy.
+// Only rectangles that are whole pages of PSMZ32, PSMZ16 or PSMZ16S, downloaded in one piece into main memory, on the compute path,
+// where page guards exist (Windows). PS2_DEPTH_TRIP=0 turns it off (every depth download waits, as before); PS2_DEPTH_TRIP_LOG=1
+// prints what it did once in a while.
+namespace {
+namespace trip {
+#ifdef PS2_GPU
+constexpr std::uint32_t kSlots = gpu::kTripSlots;
+
+bool enabled() {
+    static const bool on = [] {
+        const char *v = std::getenv("PS2_DEPTH_TRIP");
+        return !v || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+bool log_on() {
+    static const bool on = [] {
+        const char *v = std::getenv("PS2_DEPTH_TRIP_LOG");
+        return v && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// The download's rectangle as whole pages: first byte and length in graphics memory (equal to the bytes the download gives).
+bool shape(std::uint64_t buf, std::uint64_t pos, std::uint64_t reg, std::uint32_t &first, std::uint32_t &bytes) {
+    const std::uint32_t sbp = static_cast<std::uint32_t>(buf) & 0x3FFFu, sbw = static_cast<std::uint32_t>(buf >> 16) & 0x3Fu;
+    const std::uint32_t spsm = static_cast<std::uint32_t>(buf >> 24) & 0x3Fu;
+    const std::uint32_t ssax = static_cast<std::uint32_t>(pos) & 0x7FFu, ssay = static_cast<std::uint32_t>(pos >> 16) & 0x7FFu;
+    const std::uint32_t rrw = static_cast<std::uint32_t>(reg) & 0xFFFu, rrh = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
+    if (spsm != PSMZ32 && spsm != PSMZ16 && spsm != PSMZ16S) return false;
+    const std::uint32_t ph = spsm == PSMZ32 ? 32u : 64u;  // a page is 64 pixels wide in all three
+    if (!sbw || sbp % 32u || ssax || rrw != sbw * 64u || rrw > 2048 || !rrh || ssay % ph || rrh % ph || ssay + rrh > 2048) return false;
+    const std::uint64_t at = static_cast<std::uint64_t>(sbp) * 256 + static_cast<std::uint64_t>(ssay / ph) * sbw * 8192;
+    const std::uint64_t size = static_cast<std::uint64_t>(rrh / ph) * sbw * 8192;
+    if (at + size > kMemorySize) return false;
+    first = static_cast<std::uint32_t>(at);
+    bytes = static_cast<std::uint32_t>(size);
+    return true;
+}
+
+// What a download of this rectangle gives, read from g_memory (16- and 32-bit formats: the pixels one after another).
+void decode_rect(std::uint64_t buf, std::uint64_t pos, std::uint64_t reg, std::uint8_t *out, std::uint32_t bytes) {
+    const std::uint32_t sbp = static_cast<std::uint32_t>(buf) & 0x3FFFu, sbw = static_cast<std::uint32_t>(buf >> 16) & 0x3Fu;
+    const std::uint32_t spsm = static_cast<std::uint32_t>(buf >> 24) & 0x3Fu;
+    const std::uint32_t ssax = static_cast<std::uint32_t>(pos) & 0x7FFu, ssay = static_cast<std::uint32_t>(pos >> 16) & 0x7FFu;
+    const std::uint32_t rrw = static_cast<std::uint32_t>(reg) & 0xFFFu;
+    const std::uint32_t step = bits_per_pixel(spsm) / 8;
+    for (std::uint32_t i = 0; (i + 1) * step <= bytes; ++i) {
+        const std::uint32_t v = read_pixel(spsm, sbp, sbw, (ssax + i % rrw) & 0x7FFu, (ssay + i / rrw) & 0x7FFu);
+        std::memcpy(out + static_cast<std::size_t>(i) * step, &v, step);
+    }
+}
+
+struct Payload {
+    std::uint64_t buf, pos, reg;
+    std::uint32_t slot, id;
+};
+
+// The drawing thread's side, one per slot.
+struct Slot {
+    std::uint32_t id = 0;
+    bool saved = false, have_real = false;
+    std::uint64_t buf = 0, pos = 0, reg = 0;
+    std::uint32_t first = 0, bytes = 0;
+    std::vector<std::uint8_t> real;
+    std::atomic<std::uint32_t> wanted{0}, ready{0};
+};
+Slot g_slots[kSlots];
+std::atomic<std::uint32_t> g_wants{0};
+std::uint32_t g_served = 0;
+
+// The emulation side: downloads whose bytes are not in main memory yet.
+struct Armed {
+    bool on = false;
+    std::uint32_t id = 0;
+    std::uint8_t *lo = nullptr, *hi = nullptr;            // the bytes the download wrote
+    std::uint8_t *page_lo = nullptr, *page_hi = nullptr;  // the guarded pages around them
+};
+std::recursive_mutex g_mutex;
+Armed g_armed[kSlots];
+std::atomic<std::uint32_t> g_armed_count{0};
+std::uint32_t g_next_id = 0;
+
+struct Counts {
+    std::atomic<std::uint32_t> kept{0}, restored{0}, uploaded{0}, resolved{0}, touches{0};
+} g_counts;
+
+void report() {
+    if (!log_on()) return;
+    static std::atomic<std::uint32_t> last{0};
+    const std::uint32_t kept = g_counts.kept.load();
+    if (kept - last.load() < 300 && kept != 1) return;
+    last = kept;
+    std::fprintf(stderr, "[depth-trip] frame %llu: %u depth downloads not waited for, %u uploads put back from the copy, %u uploads from its bytes, %u times the game touched them first (%u guard stops)\n",
+                 static_cast<unsigned long long>(frame_count()), kept, g_counts.restored.load(), g_counts.uploaded.load(), g_counts.resolved.load(), g_counts.touches.load());
+}
+
+// Drawing thread: the real bytes of slot k, from its copy.
+void decode(std::uint32_t k) {
+    Slot &s = g_slots[k];
+    std::vector<std::uint8_t> pages(s.bytes), keep(g_memory + s.first, g_memory + s.first + s.bytes);
+    gpu::trip_read(k, s.bytes, pages.data());
+    std::memcpy(g_memory + s.first, pages.data(), s.bytes);
+    s.real.assign(s.bytes, 0);
+    decode_rect(s.buf, s.pos, s.reg, s.real.data(), s.bytes);
+    std::memcpy(g_memory + s.first, keep.data(), s.bytes);
+    s.have_real = true;
+}
+
+void serve(std::uint32_t k) {
+    Slot &s = g_slots[k];
+    const std::uint32_t want = s.wanted.load(std::memory_order_acquire);
+    if (!want || want != s.id || s.ready.load(std::memory_order_acquire) == want || !(s.saved || s.have_real)) return;
+    if (!s.have_real) decode(k);
+    s.ready.store(want, std::memory_order_release);
+    queue::notify(s.ready);
+}
+
+void serve_all() {
+    const std::uint32_t w = g_wants.load(std::memory_order_acquire);
+    if (w == g_served) return;
+    g_served = w;
+    for (std::uint32_t k = 0; k < kSlots; ++k) serve(k);
+}
+
+// Drawing thread, at the download's place in the drawing order.
+void on_download(const Payload &p, std::uint32_t qwords) {
+    Slot &s = g_slots[p.slot % kSlots];
+    s.id = p.id;
+    s.saved = s.have_real = false;
+    s.buf = p.buf, s.pos = p.pos, s.reg = p.reg;
+    if (!shape(p.buf, p.pos, p.reg, s.first, s.bytes)) s.bytes = qwords * 16;
+    const bool same = g_transfer.active && (g_state.trxdir & 3u) == 1 && g_state.bitbltbuf == p.buf && g_state.trxpos == p.pos && g_state.trxreg == p.reg &&
+                      g_transfer.x == 0 && g_transfer.y == 0 && s.bytes == qwords * 16;
+    if (same && gpu_on() && !cpu_raster() && gpu::trip_supported()) {
+        g_transfer_stale = false;  // the download started by download_source is not needed
+        gpu::trip_save(p.slot % kSlots, s.first, s.bytes);
+        s.saved = true;
+        g_transfer.active = false;
+    } else {  // not the transfer the emulation side saw (never expected): read it as kDownload does, and keep that
+        exact_download();
+        s.real.assign(static_cast<std::size_t>(qwords) * 16, 0);
+        render_read_image(s.real.data(), qwords);
+        s.have_real = true;
+    }
+    serve(p.slot % kSlots);
+}
+
+// Any thread but the drawing one: the real bytes of the trip in slot k, id; waits for the drawing thread to reach the download.
+std::vector<std::uint8_t> fetch(std::uint32_t k, std::uint32_t id) {
+    Slot &s = g_slots[k];
+    if (queue::role() == queue::Role::Render) {  // the drawing thread touched the memory itself: it cannot wait for itself
+        if (s.id == id && (s.saved || s.have_real)) {
+            if (!s.have_real) decode(k);
+            return s.real;
+        }
+        std::fprintf(stderr, "[depth-trip] the drawing thread touched a download it has not reached yet\n");
+        return {};
+    }
+    if (queue::role() == queue::Role::Vu) queue::outbox().flush();  // its held batch may hold the download
+    s.wanted.store(id, std::memory_order_release);
+    g_wants.fetch_add(1, std::memory_order_acq_rel);
+    queue::render().wake();
+    for (std::uint32_t r = s.ready.load(std::memory_order_acquire); r != id; r = s.ready.load(std::memory_order_acquire)) queue::wait(s.ready, r);
+    return s.real;
+}
+
+// Puts the real bytes of every armed trip into main memory and drops the guards. g_mutex held.
+void resolve_all() {
+    for (std::uint32_t k = 0; k < kSlots; ++k) {
+        Armed &a = g_armed[k];
+        if (!a.on) continue;
+        const std::vector<std::uint8_t> real = fetch(k, a.id);
+        queue::guard(a.page_lo, static_cast<std::size_t>(a.page_hi - a.page_lo), false);
+        if (real.size() == static_cast<std::size_t>(a.hi - a.lo)) std::memcpy(a.lo, real.data(), real.size());
+        a.on = false;
+        g_armed_count.fetch_sub(1);
+        g_counts.resolved.fetch_add(1);
+    }
+    report();
+}
+
+std::uint8_t *page_down(std::uint8_t *p) { return reinterpret_cast<std::uint8_t *>(reinterpret_cast<std::uintptr_t>(p) & ~(queue::guard_page() - 1)); }
+std::uint8_t *page_up(std::uint8_t *p) { return page_down(p + queue::guard_page() - 1); }
+
+bool on_fault(std::uintptr_t address) {
+    const std::uintptr_t ram = reinterpret_cast<std::uintptr_t>(g_ram);
+    if (address < ram || address >= ram + kRamSize) return false;
+    std::lock_guard lock(g_mutex);
+    g_counts.touches.fetch_add(1);
+    for (const Armed &a : g_armed)
+        if (a.on && address >= reinterpret_cast<std::uintptr_t>(a.page_lo) && address < reinterpret_cast<std::uintptr_t>(a.page_hi)) {
+            resolve_all();
+            return true;
+        }
+    // Nothing armed there (any more): another thread made it right meanwhile. Nothing else guards main memory, so open the page.
+    queue::guard(page_down(reinterpret_cast<std::uint8_t *>(address)), queue::guard_page(), false);
+    return true;
+}
+
+// Emulation side: any armed trip whose pages meet these bytes is made right first (a download into that memory).
+void touch(const std::uint8_t *data, std::size_t bytes) {
+    if (!g_armed_count.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(g_mutex);
+    for (const Armed &a : g_armed)
+        if (a.on && a.page_lo < data + bytes && data < a.page_hi) {
+            resolve_all();
+            return;
+        }
+}
+
+// Emulation side, for a depth download: true when it was left to the drawing thread.
+bool arm(const DownloadKey &key, std::uint8_t *data, std::uint32_t qwords) {
+    const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
+    std::uint32_t first = 0, size = 0;
+    if (!enabled() || key.offset || !shape(key.buf, key.pos, key.reg, first, size) || size != bytes || !gpu::trip_supported()) return false;
+    std::uint8_t *lo = data, *hi = data + bytes, *page_lo = page_down(lo), *page_hi = page_up(hi);
+    if (page_lo < g_ram || page_hi > g_ram + kRamSize) return false;
+    static const bool handler = (queue::on_guard_fault(on_fault), true);
+    (void)handler;
+    std::lock_guard lock(g_mutex);
+    for (Armed &a : g_armed) {
+        if (!a.on || a.page_hi <= page_lo || page_hi <= a.page_lo) continue;
+        if (a.lo == lo && a.hi == hi) {  // the same bytes again: the new download overwrites all of them, so the old ones are never seen
+            a.on = false;
+            g_armed_count.fetch_sub(1);
+            continue;
+        }
+        resolve_all();
+        break;
+    }
+    std::uint32_t slot = kSlots;
+    for (std::uint32_t k = 0; k < kSlots && slot == kSlots; ++k)
+        if (!g_armed[k].on) slot = k;
+    if (slot == kSlots) {
+        resolve_all();
+        slot = 0;
+    }
+    if (!queue::guard(page_lo, static_cast<std::size_t>(page_hi - page_lo), true)) return false;
+    if (!++g_next_id) ++g_next_id;
+    g_armed[slot] = Armed{true, g_next_id, lo, hi, page_lo, page_hi};
+    g_armed_count.fetch_add(1);
+    const Payload p{key.buf, key.pos, key.reg, slot, g_next_id};
+    queue::post(queue::kDownloadTrip, qwords, 0, &p, sizeof p);
+    g_counts.kept.fetch_add(1);
+    report();
+    return true;
+}
+#else
+void serve_all() {}
+void touch(const std::uint8_t *, std::size_t) {}
+bool arm(const DownloadKey &, std::uint8_t *, std::uint32_t) { return false; }
+#endif
+}  // namespace trip
+}  // namespace
+
+bool trip_match(const std::uint8_t *data, std::uint32_t qwc, TripTicket &ticket) {
+#ifdef PS2_GPU
+    if (!trip::g_armed_count.load(std::memory_order_acquire)) return false;
+    std::lock_guard lock(trip::g_mutex);
+    for (std::uint32_t k = 0; k < trip::kSlots; ++k) {
+        const trip::Armed &a = trip::g_armed[k];
+        if (a.on && a.lo == data && a.hi == data + static_cast<std::size_t>(qwc) * 16) {
+            ticket = TripTicket{k, a.id};
+            return true;
+        }
+    }
+#else
+    (void)data, (void)qwc, (void)ticket;
+#endif
+    return false;
+}
+
+std::vector<std::uint8_t> trip_fetch(const TripTicket &ticket) {
+#ifdef PS2_GPU
+    return trip::fetch(ticket.slot % trip::kSlots, ticket.id);
+#else
+    (void)ticket;
+    return {};
+#endif
+}
+
+bool trip_restore(const TripTicket &ticket, std::uint32_t qwc) {
+#ifdef PS2_GPU
+    trip::Slot &s = trip::g_slots[ticket.slot % trip::kSlots];
+    if (s.id != ticket.id || !s.saved || static_cast<std::size_t>(qwc) * 16 != s.bytes) return false;
+    const std::uint64_t buf = g_state.bitbltbuf, pos = g_state.trxpos, reg = g_state.trxreg;
+    const bool same = g_transfer.active && (g_state.trxdir & 3u) == 0 && ((buf >> 32) & 0x3FFFu) == (s.buf & 0x3FFFu) && ((buf >> 48) & 0x3Fu) == ((s.buf >> 16) & 0x3Fu) &&
+                      ((buf >> 56) & 0x3Fu) == ((s.buf >> 24) & 0x3Fu) && ((pos >> 32) & 0x7FFu) == (s.pos & 0x7FFu) && ((pos >> 48) & 0x7FFu) == ((s.pos >> 16) & 0x7FFu) &&
+                      (reg & 0xFFFu) == (s.reg & 0xFFFu) && ((reg >> 32) & 0xFFFu) == ((s.reg >> 32) & 0xFFFu);
+    if (!same || !gpu::trip_restore(ticket.slot % trip::kSlots, s.first, s.bytes)) return false;
+    g_transfer.active = false;
+    trip::g_counts.restored.fetch_add(1);
+    return true;
+#else
+    (void)ticket, (void)qwc;
+    return false;
+#endif
+}
+
+const std::vector<std::uint8_t> &trip_bytes(const TripTicket &ticket) {
+    static const std::vector<std::uint8_t> none;
+#ifdef PS2_GPU
+    trip::Slot &s = trip::g_slots[ticket.slot % trip::kSlots];
+    if (s.id != ticket.id || !(s.saved || s.have_real)) {
+        std::fprintf(stderr, "[depth-trip] an upload ticket for a download the drawing thread does not have\n");
+        return none;
+    }
+    if (!s.have_real) trip::decode(ticket.slot % trip::kSlots);
+    trip::g_counts.uploaded.fetch_add(1);
+    return s.real;
+#else
+    (void)ticket;
+    return none;
+#endif
+}
+
 void read_image(std::uint8_t *data, std::uint32_t qwords) {
     if (!queue::active()) {
         render_read_image(data, qwords);
@@ -1076,6 +1404,9 @@ void read_image(std::uint8_t *data, std::uint32_t qwords) {
     key.qwords = qwords;
     g_shadow.offset += qwords * 16;
     const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
+    const std::uint32_t kind = static_cast<std::uint32_t>(key.buf >> 24) & 0x3Fu;
+    if ((kind == PSMZ32 || kind == PSMZ16 || kind == PSMZ16S) && trip::arm(key, data, qwords)) return;
+    trip::touch(data, bytes);  // a download into memory a depth trip still holds: that one is made right first
     // A depth buffer is always read as it is now: a game that reads its depth and writes it back (Digital Devil Saga does it in
     // every frame) would otherwise put the depth of the frame before back and draw against it (lights that are tested against
     // the ceiling go missing while the camera moves).
@@ -1424,7 +1755,9 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
     static std::uint32_t messages[16] = {}, last_frame = 0;
     static double cpu_at_start = 0;
     const bool hitch_on = hitch::on();
+    trip::serve_all();
     for (std::uint32_t n = 1; queue::render().peek(h, payload); ++n) {
+        trip::serve_all();  // a thread that touched a depth download's memory waits for its bytes
         if (!(n & 7u) && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget_ms) return Rendered::busy;
         bool presented = false;
         hitch::Clock::time_point step_start{};
@@ -1461,6 +1794,14 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
             render_read_image(reinterpret_cast<std::uint8_t *>(target), h.arg0);
             g_downloads.fetch_add(1);
             queue::notify(g_downloads);
+            break;
+        }
+        case queue::kDownloadTrip: {
+#ifdef PS2_GPU
+            trip::Payload p;
+            std::memcpy(&p, payload, sizeof p);
+            trip::on_download(p, h.arg0);
+#endif
             break;
         }
         case queue::kDownloadAsync: {

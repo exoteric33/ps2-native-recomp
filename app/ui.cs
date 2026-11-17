@@ -447,4 +447,159 @@ namespace Ps2Ui
             BackColor = Color.Transparent;
         }
     }
+
+    // A slim dark scroll bar (a rounded track and a blue thumb) for the games list: drag the thumb, or click the track to move
+    // one page. It has the few properties of a Windows scroll bar that the list needs. Never takes keyboard focus.
+    public class DarkScroll : Control
+    {
+        int min = 0, max = 100, large = 10, small = 1, val = 0, dragOffset = 0;
+        bool hot, dragging;
+        public event EventHandler ValueChanged;
+        public DarkScroll()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
+            SetStyle(ControlStyles.Selectable, false);
+            TabStop = false;
+            BackColor = Color.Transparent;
+        }
+        public int Minimum { get { return min; } set { min = value; Invalidate(); } }
+        public int Maximum { get { return max; } set { max = value; Invalidate(); } }
+        public int LargeChange { get { return large; } set { large = Math.Max(1, value); Invalidate(); } }
+        public int SmallChange { get { return small; } set { small = Math.Max(1, value); } }
+        int Top0() { return Math.Max(min, max - large + 1); }   // the highest value the thumb can reach
+        public int Value
+        {
+            get { return val; }
+            set
+            {
+                int v = Math.Max(min, Math.Min(Top0(), value));
+                if (v == val) return;
+                val = v;
+                Invalidate();
+                if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+            }
+        }
+        RectangleF Track() { return new RectangleF(1, 1, Width - 3, Height - 3); }
+        RectangleF Thumb()
+        {
+            RectangleF t = Track();
+            float whole = Math.Max(1, max - min + 1);
+            float h = Math.Min(t.Height, Math.Max(Pal.U(28), t.Height * Math.Min(1f, large / whole)));
+            int range = Top0() - min;
+            float y = t.Y + (range > 0 ? (t.Height - h) * (val - min) / range : 0);
+            return new RectangleF(t.X, y, t.Width, h);
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            if (Width < 6 || Height < 8) return;
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            RectangleF t = Track();
+            float rad = t.Width / 2f;
+            using (GraphicsPath p = Pal.Round(t, rad))
+            {
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(120, 3, 8, 22))) g.FillPath(b, p);
+                using (Pen pen = new Pen(Color.FromArgb(70, 150, 190, 250), 1f)) g.DrawPath(pen, p);
+            }
+            RectangleF th = RectangleF.Inflate(Thumb(), -1.5f, -1.5f);
+            using (GraphicsPath tp = Pal.Round(th, rad))
+            {
+                int a = (hot || dragging) ? 255 : 200;
+                using (LinearGradientBrush b = new LinearGradientBrush(new RectangleF(th.X, th.Y, th.Width + 1, th.Height), Color.FromArgb(a, 40, 120, 235), Color.FromArgb(a, 110, 190, 255), 0f)) g.FillPath(b, tp);
+            }
+        }
+        protected override void OnMouseEnter(EventArgs e) { hot = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hot = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            RectangleF th = Thumb();
+            if (e.Y >= th.Top && e.Y <= th.Bottom) { dragging = true; dragOffset = (int)(e.Y - th.Top); Capture = true; Invalidate(); }
+            else Value += (e.Y < th.Top) ? -large : large;
+        }
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (!dragging) return;
+            RectangleF t = Track();
+            float room = t.Height - Thumb().Height;
+            if (room <= 0) return;
+            float f = (e.Y - dragOffset - t.Y) / room;
+            Value = min + (int)Math.Round(f * (Top0() - min));
+        }
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (dragging) { dragging = false; Capture = false; Invalidate(); }
+        }
+    }
+
+    // Scrolls a tall column of rows (the games list of the welcome screen) inside a window that shows only part of it. The rows
+    // live in one invisible panel (content) that is moved up and down behind a clipping panel (viewport); a scroll bar next to it
+    // and the mouse wheel over the list move it, and a row that gets keyboard focus is scrolled into view. The page behind is a
+    // gradient, so this is not a Windows AutoScroll panel (those cannot be see-through).
+    public class ListScroller : IMessageFilter
+    {
+        const int WM_MOUSEWHEEL = 0x020A;
+        readonly Control viewport;
+        readonly Control content;
+        readonly DarkScroll bar;
+        public int Step = 36;   // pixels for one notch of the wheel
+        public ListScroller(Control viewport, Control content, DarkScroll bar)
+        {
+            this.viewport = viewport;
+            this.content = content;
+            this.bar = bar;
+            bar.ValueChanged += delegate { content.Top = -bar.Value; };
+            Application.AddMessageFilter(this);
+        }
+        public bool Scrolls { get { return bar.Visible; } }
+        public int Value { get { return bar.Value; } }
+        // Called when the rows are rebuilt: the new total height and the position to keep (it is clamped to what exists).
+        public void Reset(int contentHeight, int keep)
+        {
+            content.Height = Math.Max(contentHeight, viewport.Height);
+            bool needed = contentHeight > viewport.Height;
+            bar.Visible = needed;
+            if (needed)
+            {
+                bar.Minimum = 0;
+                bar.LargeChange = viewport.Height;
+                bar.SmallChange = Step;
+                bar.Maximum = contentHeight - 1;
+                bar.Value = Math.Max(0, Math.Min(keep, contentHeight - viewport.Height));
+            }
+            else if (bar.Value != 0) { bar.Value = 0; }
+            content.Top = -(needed ? bar.Value : 0);
+        }
+        public void ScrollBy(int pixels)
+        {
+            if (!bar.Visible) return;
+            int top = Math.Max(0, bar.Maximum - bar.LargeChange + 1);
+            bar.Value = Math.Max(0, Math.Min(top, bar.Value + pixels));
+        }
+        // Brings a row (a child of content) fully into view, for example when Tab reaches a button of a row below the fold.
+        public void ScrollIntoView(Control row)
+        {
+            if (!bar.Visible || row == null) return;
+            int top = row.Top;
+            int bottom = row.Top + row.Height;
+            if (top < bar.Value) ScrollBy(top - bar.Value);
+            else if (bottom > bar.Value + viewport.Height) ScrollBy(bottom - bar.Value - viewport.Height);
+        }
+        public void Detach() { Application.RemoveMessageFilter(this); }
+        public bool PreFilterMessage(ref Message m)
+        {
+            if (m.Msg != WM_MOUSEWHEEL || !bar.Visible || !viewport.Visible) return false;
+            Form form = viewport.FindForm();
+            if (form == null || !object.ReferenceEquals(Form.ActiveForm, form)) return false;
+            Point at = Cursor.Position;
+            Rectangle area = Rectangle.Union(viewport.RectangleToScreen(viewport.ClientRectangle), bar.RectangleToScreen(bar.ClientRectangle));
+            if (!area.Contains(at)) return false;
+            int delta = unchecked((short)(((long)m.WParam >> 16) & 0xFFFF));
+            ScrollBy(-delta * Step / 120);
+            return true;
+        }
+    }
 }

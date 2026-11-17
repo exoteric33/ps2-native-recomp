@@ -121,7 +121,7 @@ function Get-FreeName([string]$name, [string]$image) {
     $candidate
 }
 
-# Built games, newest first (at most three): the ones with an app.json that says built and a runner that exists.
+# Built games, newest first (all of them; the welcome screen scrolls): the ones with an app.json that says built and a runner that exists.
 function Get-BuiltGames {
     $found = @()
     if (Test-Path -LiteralPath $GamesDir) {
@@ -130,7 +130,7 @@ function Get-BuiltGames {
             if ($game -and $game.built -and (Test-Path -LiteralPath (Join-Path $Root "build\native-$($dir.Name)\ps2run.exe"))) { $found += $game }
         }
     }
-    @($found | Sort-Object { $_.built } -Descending | Select-Object -First 3)
+    @($found | Sort-Object { $_.built } -Descending)
 }
 
 function Resolve-AppPath([string]$path) {
@@ -971,12 +971,28 @@ $U.gamesEmpty = Add-Label $w 'gamesEmpty' 'Nothing built yet. A game you build s
 $U.installProblem = Add-Label $w 'installProblem' '' 40 288 720 150 (New-Font 11.5 $true) $C.Danger
 $U.start = Add-Button $w 'Start' 'Add a game' 240 502 320 58 'primary' 17
 $U.privacy = Add-Label $w 'privacy' 'Nothing is uploaded. Everything stays in this app''s folder (about 2 GB of disk space is needed).' 40 568 720 22 (New-Font 9.5) $C.Muted 'TopCenter'
-# The games built before: one row each (Play, Extras, and Make it faster while vector programs wait to be compiled).
+# The games built before: one row each (Play, Extras, and Make it faster while vector programs wait to be compiled). Every built
+# game gets a row. Three rows fit; with more, the rows (gamesContent) move behind the clipping panel (again) when the mouse wheel
+# turns over the list or the scroll bar at its right edge is used, and a row that gets keyboard focus scrolls into view.
 $U.again = New-Object Ps2Ui.Clear
 $U.again.Name = 'again'
 $U.again.Location = New-Point 40 284
 $U.again.Size = New-Size 720 212
 $w.Controls.Add($U.again)
+$U.gamesContent = New-Object Ps2Ui.Clear
+$U.gamesContent.Name = 'gamesContent'
+$U.gamesContent.Location = New-Point 0 0
+$U.gamesContent.Size = New-Size 720 212
+$U.again.Controls.Add($U.gamesContent)
+$U.gamesBar = New-Object Ps2Ui.DarkScroll
+$U.gamesBar.Name = 'gamesBar'
+$U.gamesBar.AccessibleName = 'Your games, scroll bar'
+$U.gamesBar.Location = New-Point 764 284
+$U.gamesBar.Size = New-Size 16 212
+$U.gamesBar.Visible = $false
+$w.Controls.Add($U.gamesBar)
+$U.gamesScroll = New-Object Ps2Ui.ListScroller($U.again, $U.gamesContent, $U.gamesBar)
+$U.gamesScroll.Step = S 36
 $U.fasterButtons = @{}
 $U.patchMode = ''
 # The notice in the place of the three cards: a newer version is out (Update), or the app was updated and the games should be built
@@ -1325,18 +1341,19 @@ function Update-Welcome {
     $U.privacy.Visible = -not $InstallProblem
     Set-ButtonEnabled $U.start (-not $InstallProblem)
     $U.start.Visible = -not $InstallProblem
-    foreach ($old in @($U.again.Controls)) { $U.again.Controls.Remove($old); $old.Dispose() }
+    foreach ($old in @($U.gamesContent.Controls)) { $U.gamesContent.Controls.Remove($old); $old.Dispose() }
     $U.fasterButtons = @{}
     $games = @(Get-BuiltGames)
+    $keepScroll = $U.gamesScroll.Value
     $show = ($games.Count -gt 0 -and -not $InstallProblem)
     $U.gamesEmpty.Visible = (-not $show) -and (-not $InstallProblem)
     $U.gamesHeader.Visible = -not $InstallProblem
     $U.gamesRule.Visible = -not $InstallProblem
-    if (-not $show) { return }
+    if (-not $show) { $U.gamesScroll.Reset(0, 0); return }
     $y = 0
     foreach ($g in $games) {
         $gameName = $g.name
-        $row = New-Glass $U.again "Game-$gameName" 0 $y 720 66 1
+        $row = New-Glass $U.gamesContent "Game-$gameName" 0 $y 720 66 1
         $row.Strong = $false
         $title = Add-Label $row "GameTitle-$gameName" $gameName 64 6 180 26 (New-Font 13 $true) $C.Ink
         $title.AutoEllipsis = $true
@@ -1362,8 +1379,13 @@ function Update-Welcome {
         $f.Visible = $false
         $f.Add_Click({ Start-Faster $gameName }.GetNewClosure())
         $U.fasterButtons[$gameName] = $f
+        # Tab (or any keyboard focus) on a button of a row that is cut off scrolls the row into view; a mouse click does not move the list.
+        foreach ($focusable in @($b, $e, $o, $f)) {
+            $focusable.Add_Enter({ param($sender, $args2) if ([Windows.Forms.Control]::MouseButtons -eq 'None') { $U.gamesScroll.ScrollIntoView($sender.Parent) } })
+        }
         $y += 72
     }
+    $U.gamesScroll.Reset((S ($y - 6)), $keepScroll)
     Update-FasterOffers
 }
 

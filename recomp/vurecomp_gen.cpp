@@ -982,6 +982,12 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
     }
     for (int reg : shadowed) o += std::format("    v4u {} = vshadow({});\n", shadow(reg), raw(reg));
     o += std::format("    goto {};\n", label(p.entry & kMask));
+    std::set<std::uint32_t> split_slot;
+    for (std::uint32_t pc : pcs) {
+        if (!lowers[pc].branch) continue;
+        const std::uint32_t slot = (pc + 8u) & kMask;
+        if (targets.count(slot) && in.count(slot)) split_slot.insert(slot);
+    }
     for (std::uint32_t pc : pcs) {
         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
         bool out_live = false;
@@ -1020,10 +1026,32 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
             stop = std::format("if (steps >= 1000000u) {{ std::fprintf(stderr, \"[vu0] program at 0x{:04X} did not end\\n\"); return; }} ", p.entry);
             stop += "if (!(steps & 255u) && vu::stopped()) return; ++steps; ";
         }
+        const auto edge = [&](std::uint32_t to) -> std::string {
+            const auto *e = plan.edge(pc, to);
+            if (!e) return {};
+            if (plan.tracked[pc >> 3]) return std::format("st = ke_{:04X}_{:04X}[st]; ", pc, to);
+            return std::format("st = {}u; ", e->next[0]);
+        };
         const unsigned stall = plan.stall[pc >> 3];
-        if (plan.tracked[pc >> 3]) o += std::format("{}: {{ {}fl.t += 1u + ks_{:04X}[st]; ", label(pc), stop, pc);
-        else if (stall) o += std::format("{}: {{ {}fl.t += {}u; ", label(pc), stop, 1 + stall);
-        else o += std::format("{}: {{ {}++fl.t; ", label(pc), stop);
+        const std::string pro = plan.tracked[pc >> 3] ? std::format("fl.t += 1u + ks_{:04X}[st]; ", pc)
+                                : stall              ? std::format("fl.t += {}u; ", 1 + stall)
+                                                     : std::string("++fl.t; ");
+        const std::uint32_t next_pc = (pc + 8u) & kMask;
+        if (split_slot.count(pc)) {
+            o += std::format("{}: {{ {}{}{}", label(pc), stop, pro, body);
+            const int lw = (hi & 0x80000000u) || !l.supported ? -1 : l.writes;
+            if (lw >= 0 && shadowed.count(lw)) o += std::format("{} = vshadow({}); ", shadow(lw), raw(lw));
+            if (u.target >= 0 && u.target != lw && shadowed.count(u.target)) {
+                if (!u.normalized) o += std::format("{} = vshadow({}); ", shadow(u.target), raw(u.target));
+                else if (u.mask == 0xF) o += std::format("{} = uv; ", shadow(u.target));
+                else o += std::format("{0} = vsel({0}, uv, {1}); ", shadow(u.target), lane_mask(u.mask));
+            }
+            if (hi & 0x40000000u) o += "ending = true; ";
+            const std::uint32_t resume = (lowers[pc].branch || lowers[pc].jump) ? pc : next_pc;
+            if (!in.count(next_pc)) o += std::format("}}{}vu::interpret(1, {}u);\n    return;\n", meet(pc, next_pc), resume);
+            else o += std::format("}}{}{}goto {};\n", meet(pc, next_pc), edge(next_pc), label(next_pc));
+        }
+        o += std::format("{}: {{ {}{}", split_slot.count(pc) ? std::format("LF_{:04X}", pc) : label(pc), stop, pro);
         if (any_q && ps2::vu::reads_q(hi)) {
             const ps2::vu::QRead kind = ps2::vu::q_read_kind(p.code.data(), kMask, pc);
             if (kind == ps2::vu::kQNew) o += "fl.flush_q(r); ";
@@ -1039,12 +1067,6 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         }
         if (hi & 0x40000000u) o += "ending = true; ";
         o += "}\n";
-        const auto edge = [&](std::uint32_t to) -> std::string {
-            const auto *e = plan.edge(pc, to);
-            if (!e) return {};
-            if (plan.tracked[pc >> 3]) return std::format("st = ke_{:04X}_{:04X}[st]; ", pc, to);
-            return std::format("st = {}u; ", e->next[0]);
-        };
         const std::uint32_t prev = (pc - 8u) & kMask;
         if (in.count(prev)) {
             const Lower &pl = lowers[prev];
@@ -1068,6 +1090,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         }
         const std::uint32_t next = (pc + 8u) & kMask;
         if (!in.count(next)) o += std::format("    {}vu::interpret(1, {}u);\n    return;\n", leave(pc), next);
+        else if (split_slot.count(next)) o += std::format("    {}{}goto LF_{:04X};\n", meet(pc, next), edge(next), next);
         else if (const std::string e = meet(pc, next) + edge(next); !e.empty()) o += "    " + e + "\n";
     }
     if (dyn) o += std::format("bail:\n    r = saved;\n    std::memcpy(mem, saved_mem, sizeof saved_mem);\n    vu::vu0_restart({}u);\n    return;\n", p.entry & kMask);

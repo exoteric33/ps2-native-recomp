@@ -49,6 +49,16 @@ if(NOT EMSCRIPTEN)
     add_executable(vurecomp recomp/vurecomp.cpp recomp/vurecomp_gen.cpp)
     target_include_directories(vurecomp PRIVATE runtime/include)
     target_compile_options(vurecomp PRIVATE -Wall -Wextra)
+
+    # chdunpack: unpacks a .chd disc image on all cores (recomp/chdunpack/, docs/chd.md). scripts/port.sh uses it when it is built and
+    # falls back to scripts/chd.py when it is not. Plain C++20, no libraries; on Windows linked static so it needs no DLL of the compiler.
+    find_package(Threads REQUIRED)
+    add_executable(chdunpack recomp/chdunpack/chdunpack.cpp recomp/chdunpack/codecs.cpp recomp/chdunpack/flac.cpp recomp/chdunpack/zstd.cpp)
+    target_compile_options(chdunpack PRIVATE -Wall -Wextra)
+    target_link_libraries(chdunpack PRIVATE Threads::Threads)
+    if(WIN32)
+        target_link_options(chdunpack PRIVATE -static)
+    endif()
 endif()
 
 if(PS2_RUNTIME_LIB AND NOT EMSCRIPTEN)

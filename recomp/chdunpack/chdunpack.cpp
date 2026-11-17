@@ -139,6 +139,8 @@ struct Chd {
         for (int i = 0; i < 4; ++i) {
             if (!all_zero(codecs[i], 4) && !known_codec(codecs[i])) {
                 std::string name(reinterpret_cast<const char *>(codecs[i]), 4);
+                for (char &ch : name)
+                    if (ch < 32 || ch > 126) ch = '?';
                 throw ChdError("this CHD file uses the codec \"" + name + "\", which is not supported");
             }
         }

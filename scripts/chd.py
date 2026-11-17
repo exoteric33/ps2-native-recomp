@@ -845,33 +845,40 @@ def _huff_bytes(hf, raw, bitpos, size):
     """Decodes size symbols of a "huff" hunk from bit position bitpos (the tree has been read already)."""
     data = raw + bytes(16)
     table, look, mb = hf.table, hf.look, hf.maxbits
-    need = max(look, mb)
+    slow = hf.slow
     mask = (1 << look) - 1
     bi = bitpos >> 3
-    off = bitpos & 7
-    cnt = 8 - off
+    cnt = 8 - (bitpos & 7)
     acc = data[bi] & ((1 << cnt) - 1)
     bi += 1
     out = bytearray(size)
-    for i in range(size):
-        if cnt < need:
-            acc = ((acc & ((1 << cnt) - 1)) << 32) | int.from_bytes(data[bi:bi + 4], 'big')
-            bi += 4
-            cnt += 32
-        e = table[(acc >> (cnt - look)) & mask]
-        if e:
-            cnt -= e & 31
-            out[i] = e >> 5
-        else:
-            w = (acc >> (cnt - mb)) & ((1 << mb) - 1)
-            for n, code, sym in hf.slow:
-                if (w >> (mb - n)) == code:
-                    cnt -= n
-                    out[i] = sym
-                    break
+    from_bytes = int.from_bytes
+    i = 0
+    while i < size:
+        # a code has at most 16 bits: with 64 bits in hand four codes are decoded without looking again
+        if cnt < 64:
+            acc = ((acc & ((1 << cnt) - 1)) << 64) | from_bytes(data[bi:bi + 8], 'big')
+            bi += 8
+            cnt += 64
+        n = size - i
+        for _ in range(4 if n > 4 else n):
+            e = table[(acc >> (cnt - look)) & mask]
+            if e:
+                cnt -= e & 31
+                out[i] = e >> 5
             else:
-                raise ChdError('bad Huffman code')
-    if bi - 4 > len(raw) + 4 or (bi * 8 - cnt) > len(raw) * 8:
+                w = (acc >> (cnt - mb)) & ((1 << mb) - 1)
+                for nb, code, sym in slow:
+                    if (w >> (mb - nb)) == code:
+                        cnt -= nb
+                        out[i] = sym
+                        break
+                else:
+                    raise ChdError('bad Huffman code')
+            i += 1
+        if bi > len(raw) + 24:  # ran far off the end of a damaged hunk
+            break
+    if bi * 8 - cnt > len(raw) * 8:
         raise ChdError('Huffman data ends too early')
     return bytes(out)
 

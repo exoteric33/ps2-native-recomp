@@ -144,7 +144,7 @@ def compute_ee_live_stamp(
     Compute the 64-bit FNV-1a `ee-live` stamp matching `runtime/src/ee_live.cpp`.
     """
     h = 0xCBF29CE484222325
-    h = _fnv1a64(h, b"ee-live 3")
+    h = _fnv1a64(h, b"ee-live 4")
     for hdr_name in ("cpu", "fpu", "vu", "memory", "mmi", "generated", "ee_live_abi"):
         hdr_path = os.path.join(repo_root, "runtime", "include", "ps2", f"{hdr_name}.hpp")
         with open(hdr_path, "rb") as hf:

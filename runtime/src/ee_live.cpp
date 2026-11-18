@@ -55,7 +55,7 @@ namespace {
 
 // Bump when recomp/codegen.cpp or recomp/analysis.cpp change what they write for the same code in a way the headers do not show: an
 // old library would otherwise still be loaded (the cache also drops libraries of another runner version by the stamp).
-constexpr const char *kGeneratorVersion = "ee-live 3";
+constexpr const char *kGeneratorVersion = "ee-live 4";
 
 using Clock = lb::Clock;
 

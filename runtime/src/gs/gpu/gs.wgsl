@@ -1412,23 +1412,33 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let ce0 = cross2(x1 - cx, y2 - cy, x2 - cx, y1 - cy) * inv;
             let ce1 = cross2(x2 - cx, y0 - cy, x0 - cx, y2 - cy) * inv;
             let ce2 = cross2(x0 - cx, y1 - cy, x1 - cx, y0 - cy) * inv;
-            let in0 = edge_in(select(s0, ce0, a0), inclusive & 1u);
-            let in1 = edge_in(select(s1, ce1, a1), inclusive & 2u);
-            let in2 = edge_in(select(c2, ce2, a2), inclusive & 4u);
+            // Such a half covers a sample only when the console pixel's centre lies in the whole rectangle, i.e. the triangle's
+            // bounding box (left and top inclusive, as the edge rule): the half's own two straight edges are only two of the
+            // rectangle's four. Tested on those two alone, the half below a diagonal took the samples next to its far corner whose
+            // pixel centre is in the rectangle to its left or above, while that rectangle took them too (its pixel), and the
+            // samples there that neither half wanted stayed empty: every shared edge of a mesh of 2D pieces drew a line, bright
+            // where an added glow was drawn twice (Medal of Honor: Vanguard's muzzle flash at 4x, public #114).
+            let rx0 = min(x0, min(x1, x2));
+            let rx1 = max(x0, max(x1, x2));
+            let ry0 = min(y0, min(y1, y2));
+            let ry1 = max(y0, max(y1, y2));
+            if (rect && (cx < rx0 || cx >= rx1 || cy < ry0 || cy >= ry1)) {
+                return;
+            }
+            // Inside the rectangle the diagonal decides at the sample (the two halves meet there at the finer resolution); a sample
+            // outside the rectangle (past its right or bottom edge, in a pixel whose centre is inside) belongs to the half that holds
+            // the pixel's centre, as on the console, and takes its colour, texture coordinates and depth from that centre, not from
+            // beyond the shape. Both halves see the same rectangle, so each such sample is taken by exactly one of them; a sliver
+            // whose straight edge passes a pixel centre does not spread into the rows beyond it (lines along the rain ripples).
+            let inside = px >= rx0 && px < rx1 && py >= ry0 && py < ry1;
+            let at_s = !rect || inside;
+            let in0 = a0 || edge_in(select(ce0, s0, at_s), inclusive & 1u);
+            let in1 = a1 || edge_in(select(ce1, s1, at_s), inclusive & 2u);
+            let in2 = a2 || edge_in(select(ce2, c2, at_s), inclusive & 4u);
             if (!in0 || !in1 || !in2) {
                 return;
             }
-            // A sample outside such an edge is covered only when its console pixel is, i.e. when the pixel's centre is inside
-            // the whole triangle (as on the console); the slanted edges alone would let a sliver whose straight edge passes a
-            // pixel centre spread into the rows beyond it (lines along the rain ripples). Such a sample takes its colour,
-            // texture coordinates and depth from the pixel's centre, as the console's pixel does, not from beyond the shape.
-            let out0 = a0 && !edge_in(s0, inclusive & 1u);
-            let out1 = a1 && !edge_in(s1, inclusive & 2u);
-            let out2 = a2 && !edge_in(c2, inclusive & 4u);
-            if ((out0 || out1 || out2) && !(edge_in(ce0, inclusive & 1u) && edge_in(ce1, inclusive & 2u) && edge_in(ce2, inclusive & 4u))) {
-                return;
-            }
-            let extended = out0 || out1 || out2;
+            let extended = !at_s;
             let qx = select(px, cx, extended);
             let qy = select(py, cy, extended);
             let w0 = cross2(x1 - qx, y2 - qy, x2 - qx, y1 - qy) * inv;

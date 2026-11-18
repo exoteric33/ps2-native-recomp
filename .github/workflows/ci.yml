@@ -77,7 +77,7 @@ jobs:
           ROOT="$PWD"
           . scripts/cxx.sh
           cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release "${cxx_flags[@]}"
-          ninja -C build/ci ps2runtime vujit_dump ps2thbasetest ps2sifcmdtest ps2savetest ps2discinputtest ps2iopboundstest
+          ninja -C build/ci ps2runtime vujit_dump ps2thbasetest ps2sifcmdtest ps2savetest ps2discinputtest ps2iopboundstest chdunpack
           ccache -s | head -n 5 || true
           echo "CXX_BIN=$cxx_bin" >> "$GITHUB_ENV"
 
@@ -98,6 +98,7 @@ jobs:
           python3 scripts/test_vu_codegen.py "$CXX_BIN"
           CXX="$CXX_BIN" python3 scripts/test_vu0_codegen.py
           python3 tests/vurecomp_incremental.py --vurecomp build/tools/vurecomp
+          python3 tests/chd_check.py --chdunpack build/ci/chdunpack
 
       - name: Free test programs (ps2autotests), one on macOS
         if: runner.os == 'macOS'

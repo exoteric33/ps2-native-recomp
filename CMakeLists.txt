@@ -50,7 +50,7 @@ if(NOT EMSCRIPTEN)
     target_include_directories(vurecomp PRIVATE runtime/include)
     target_compile_options(vurecomp PRIVATE -Wall -Wextra)
 
-    # chdunpack: unpacks a .chd disc image on all cores (recomp/chdunpack/, docs/chd.md). scripts/port.sh uses it when it is built and
+    # chdunpack: unpacks a .chd disc image on all cores (recomp/chdunpack/). scripts/port.sh uses it when it is built and
     # falls back to scripts/chd.py when it is not. Plain C++20, no libraries; on Windows linked static so it needs no DLL of the compiler.
     find_package(Threads REQUIRED)
     add_executable(chdunpack recomp/chdunpack/chdunpack.cpp recomp/chdunpack/codecs.cpp recomp/chdunpack/flac.cpp recomp/chdunpack/zstd.cpp)

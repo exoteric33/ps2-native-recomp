@@ -76,7 +76,9 @@ struct BgJob {
     bool upgrade = false;                 // the window has a quick library already: this one is the same code with the normal flags
     bool sparse = false;                  // a loaded program (not a window): checked by the first words of its functions
     std::vector<std::uint32_t> candidates;   // pointers into the image that were found in memory when the quick library was made
-    std::vector<std::uint32_t> entries;      // the entry points the quick library was made from
+    std::vector<std::uint32_t> entries;      // the entry points the quick library was made from (the worker adds the ones it found itself)
+    std::set<std::uint32_t> accepted;        // the entries that turned out to be code (filled in by the worker)
+    std::set<std::uint32_t> quick_accepted;  // an upgrade: what the quick library of this image serves, which this library must cover too
     // Filled in by the worker before the state turns kBuilt or kFailed.
     fs::path library;
     std::string error;
@@ -536,6 +538,10 @@ void worker_main() {
         job->files = built.files;
         job->code = built.generated.code;
         job->entry_points = built.generated.accepted.size();
+        job->accepted = built.generated.accepted;
+        // What this build was made from, whole: the upgrade of a quick library is made from the same entries and pointers
+        job->entries = request.entries;
+        job->candidates = request.candidates;
         job->library = built.library;
         job->error = built.why;
         job->no_code = !built.ok && built.generated.error.rfind("none of the entry points is code", 0) == 0;
@@ -590,7 +596,11 @@ void enqueue(const std::shared_ptr<BgJob> &job) {
 
 // A window with a quick library: the same code again with the normal flags, in the background. The game goes on meanwhile; at a frame
 // boundary the better library is switched in, and it runs from then on (dispatch.cpp, ranks).
-void queue_upgrade(std::uint32_t base, const std::string &name, std::vector<std::uint8_t> image, bool sparse = false, std::vector<std::uint32_t> candidates = {}, std::vector<std::uint32_t> entries = {}) {
+//
+// `candidates` and `entries` are what the quick library was made from, and `quick_accepted` the entries it serves: the better library is
+// made from the same, and it only replaces the quick one (the marker is cleared) when it serves all of them (finish_background).
+void queue_upgrade(std::uint32_t base, const std::string &name, std::vector<std::uint8_t> image, bool sparse = false, std::vector<std::uint32_t> candidates = {}, std::vector<std::uint32_t> entries = {},
+                   std::set<std::uint32_t> quick_accepted = {}) {
     if (!g->two_step || !g->background || !g->fast.count(name) || g->bg_failures >= 2) return;
     for (const std::shared_ptr<BgJob> &j : g->active)
         if (j->upgrade && j->name == name) return;
@@ -603,6 +613,7 @@ void queue_upgrade(std::uint32_t base, const std::string &name, std::vector<std:
     job->sparse = sparse;
     job->candidates = std::move(candidates);
     job->entries = std::move(entries);
+    job->quick_accepted = std::move(quick_accepted);
     if (g->verbose) say("window 0x%08X (image %s): the quick library is in use, making it again with the normal flags in the background", base, name.c_str());
     enqueue(job);
 }
@@ -634,6 +645,14 @@ void finish_background(const std::shared_ptr<BgJob> &job) {
         if (!load_library(job->library, modules, 1)) {
             say("the library made in the background does not load (%s)", ps2::os::utf8(job->library.filename()).c_str());
             if (++g->bg_failures >= 2) g->background = false;
+            return;
+        }
+        // The quick library stays in use for what this one does not serve, so the image counts as upgraded only when this one serves every
+        // entry the quick one did; otherwise the marker stays and a later look at the window makes it again.
+        std::size_t missing = 0;
+        for (const std::uint32_t entry : job->quick_accepted) missing += job->accepted.count(entry) == 0;
+        if (missing) {
+            say("the library of window 0x%08X (image %s) made with the normal flags lacks %zu of the %zu entries of the quick one: the quick library stays in use for them and the image still counts as quick", job->base, job->name.c_str(), missing, job->quick_accepted.size());
             return;
         }
         g->fast.erase(job->name);
@@ -668,7 +687,7 @@ void finish_background(const std::shared_ptr<BgJob> &job) {
     say("switched in the background translation of window 0x%08X (image %s, %u KiB%s): settled at frame %llu, ready %.1f s later (translate %.1f, compile %.1f, link %.1f), %zu entry points%s%s, %zu instructions, %zu files",
         job->base, job->name.c_str(), size / 1024, job->quick ? ", quick" : "", static_cast<unsigned long long>(job->frame), lb::seconds_since(job->queued), job->timing.generate, job->timing.compile, job->timing.link, job->entry_points,
         job->static_calls ? " (calls of the program included)" : "", job->known_entries ? " (entries.txt included)" : "", job->code, job->files);
-    if (job->quick) queue_upgrade(job->base, job->name, job->image);
+    if (job->quick) queue_upgrade(job->base, job->name, job->image, false, job->candidates, job->entries, job->accepted);
 }
 
 // The emulation thread: every finished background build, in the order they finished.
@@ -1319,7 +1338,7 @@ bool translate_missing(std::uint32_t pc) {
         write_marker(name, quick);
     }
     if (!flat) remember(name, base, image, {pc}, region);   // a loaded program is not an overlay of the build: eerecomp checks those word for word
-    if (quick) queue_upgrade(base, name, std::move(image), flat, std::move(request.candidates), std::move(request.entries));
+    if (quick) queue_upgrade(base, name, std::move(image), flat, std::move(request.candidates), std::move(request.entries), std::move(built.generated.accepted));
     return true;
 }
 

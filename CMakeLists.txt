@@ -148,6 +148,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2dispatchmoduletest PRIVATE synchronization)
     endif()
+    # The optimised library after a quick one serves what the quick one did, a made-up program and code image, needs a C++ compiler on
+    # the PATH and takes a minute or two: ninja ps2eeliveupgradetest
+    add_executable(ps2eeliveupgradetest EXCLUDE_FROM_ALL tests/ee_live_upgrade.cpp)
+    target_link_libraries(ps2eeliveupgradetest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2eeliveupgradetest PRIVATE synchronization)
+    endif()
 endif()
 # the IOP thread manager tested through a synthetic module, no game needed: ninja ps2thbasetest
 if(NOT EMSCRIPTEN)

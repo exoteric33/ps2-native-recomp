@@ -62,4 +62,7 @@ struct SoftChecks {
 };
 void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank, const SoftChecks *soft = nullptr);
 
+// The rank of the module that serves pc as an entry (the one dispatch() would run), or -1 when none does. For tests and the log.
+int serving_rank(std::uint32_t pc);
+
 }  // namespace ps2

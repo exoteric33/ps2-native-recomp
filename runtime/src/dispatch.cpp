@@ -219,6 +219,11 @@ void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank
 
 bool window_module_in_place(std::uint32_t pc) { return instance_for(pc) != nullptr; }
 
+int serving_rank(std::uint32_t pc) {
+    if (const Instance *i = instance_for(pc, true)) return i->rank;
+    return -1;
+}
+
 bool window_covered(std::uint32_t base, std::uint32_t size) {
     // A module that holds the range, whatever base it begins at (windows are steps of 16 KiB in one area, and a window inside a
     // translated one holds the same code).

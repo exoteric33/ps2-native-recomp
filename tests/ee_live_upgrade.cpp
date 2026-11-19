@@ -1,4 +1,4 @@
-// The optimised library that follows a quick one must serve everything the quick one did (review of 2026-11-18, section 3).
+// The optimised library that follows a quick one must serve everything the quick one did.
 //
 // No game and no disc. A made-up program and a made-up block of loaded code with three functions: A is found by the search of the
 // image itself (it follows a return), B only by the entry the game missed, C only by a pointer to it that sits in memory. The game

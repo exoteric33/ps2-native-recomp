@@ -1,5 +1,5 @@
 // A relocatable module (SNR2 or xff2 header) found by the backwards header scan must answer for a missing entry the same way on the
-// first lookup as on every later one (review of 2026-11-18, section 5). No game needed: ninja ps2dispatchmoduletest.
+// first lookup as on every later one. No game needed: ninja ps2dispatchmoduletest.
 #include "ps2/generated.hpp"
 #include "ps2/system.hpp"
 

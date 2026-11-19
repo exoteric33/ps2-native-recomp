@@ -534,7 +534,7 @@ enum QRead : std::uint8_t { kQDynamic, kQNew, kQOld };
 // Whether the instruction at `pc` that reads Q sees the quotient of the divide before it (kQNew), the one from before that divide (kQOld), or
 // it depends on the path (kQDynamic: the cycle counter decides). It looks only at the pairs of the program, `pcs` (reachable from `entry`):
 // a compiled VU1 program is found by its key over those pairs (program_key_moved), so code it never runs must not change what it computes
-// (private #30: an EFU instruction just before the entry made a later WAITP look long enough for the new quotient). It walks the paths back
+// (an EFU instruction just before the entry made a later WAITP look long enough for the new quotient). It walks the paths back
 // from the read to the divide, takes up to three pairs before the divide as the pipeline it starts in (along the same paths; the program
 // starts with every unit idle), and works out on each whether the divide is done when the read issues. A path that reaches the entry
 // without a divide has none in flight (each run starts with no quotient pending) and counts for neither side.

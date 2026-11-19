@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One VU1 key, one result: the Q decision looks only at code the program can reach (private #30, outside review 2026-11-18).
+"""One VU1 key, one result: the Q decision looks only at code the program can reach.
 
 A compiled VU1 program is found by a key over the instruction pairs its entry can reach (ps2::vu::program_key_moved). Whether an
 instruction that reads Q sees a divide's new quotient (ps2::vu::q_read_kind) must then depend on those pairs only. It used to walk back
@@ -8,7 +8,7 @@ runs them. An EFU instruction there (one the program never executes) made the ge
 enough to see the new quotient. Two programs with the same key then compiled into different results, and whichever was compiled first
 was used for both.
 
-The fixture (from the review): the 16 KiB code memory is filled with NOP pairs; at the entry 0x40 SQRT Q, vf1.x; at 0x48 ADDq.x vf6, vf0, Q
+The fixture: the 16 KiB code memory is filled with NOP pairs; at the entry 0x40 SQRT Q, vf1.x; at 0x48 ADDq.x vf6, vf0, Q
 | WAITP with the E bit. vf1.x = 4.0, the old Q = 0, the EFU is idle (no EFU instruction runs), so the console's WAITP does not wait and ADDq
 reads the old quotient: vf6.x = 0.0 (tests/vu_waitp.py, case 4). Program B differs only in the lower word at 0x38 = ESIN P, vf0.x, which
 neither program executes. A relocated copy of each sits at 0x2040.

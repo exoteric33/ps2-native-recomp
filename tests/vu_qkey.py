@@ -179,7 +179,7 @@ def compile_(*args):
 
 
 # VU_KEEP=<folder>: build in that folder and keep it
-with (contextlib.nullcontext(os.environ['VU_KEEP']) if os.environ.get('VU_KEEP') else tempfile.TemporaryDirectory(prefix='vu-qkey-')) as tmp:
+with (contextlib.nullcontext(os.environ['VU_KEEP']) if os.environ.get('VU_KEEP') else tempfile.TemporaryDirectory(prefix='vu-q-')) as tmp:
     tmp = pathlib.Path(tmp)
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / 'cases.h').write_text(CASES_H)

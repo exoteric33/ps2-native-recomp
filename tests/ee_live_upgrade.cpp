@@ -2,7 +2,7 @@
 //
 // No game and no disc. A made-up program and a made-up block of loaded code with three functions: A is found by the search of the
 // image itself (it follows a return), B only by the entry the game missed, C only by a pointer to it that sits in memory. The game
-// misses B through the asynchronous path (PS2_EE_INTERP): the quick library is built, then the same code again with the normal flags
+// misses B: the quick library is built, then the same code again with the normal flags
 // in the background. Both libraries must then serve A, B and C, the better one first, and the "quick only" marker of the image must
 // be gone. It needs a C++ compiler the live translator can find (clang++ on the PATH) and takes a minute or two.
 //
@@ -97,7 +97,7 @@ int main() {
         std::printf("ee live upgrade: FAIL, code is there before anything was translated\n");
         return 1;
     }
-    ps2::ee::live::translate_missing_async(kB);
+    ps2::ee::live::translate_missing(kB);
 
     using Clock = std::chrono::steady_clock;
     const auto began = Clock::now();

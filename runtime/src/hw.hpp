@@ -45,6 +45,10 @@ std::uint32_t dmac_pending();
 void dmac_ack(unsigned channel);
 void dmac_raise(unsigned channel);
 bool dmac_set_mask(unsigned channel, bool enabled);
+// The raw INTC_STAT / INTC_MASK / D_STAT words (no side effects), for the interrupt trace and the F9 report (PS2_TRACE_INTC).
+std::uint32_t intc_stat_raw();
+std::uint32_t intc_mask_raw();
+std::uint32_t dmac_stat_raw();
 std::uint64_t gs_imr();
 std::uint64_t gs_csr();
 void gs_set_imr(std::uint64_t value);

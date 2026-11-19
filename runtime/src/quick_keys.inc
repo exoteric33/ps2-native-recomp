@@ -847,6 +847,8 @@ std::string report_info(bool emergency, const fs::path &dir, bool has_state, boo
         t += kernel::thread_report() + iop::thread_report();
         const std::string calls = sif::open_calls_text();
         t += calls.empty() ? std::string("    no RPC call the EE sent is waiting for a reply\n") : calls;
+        // Interrupts on or off, the INTC/DMAC mask and status and the handlers the game installed. Read on this thread too.
+        t += "\nEE interrupts (are they on, and which handlers could run):\n" + kernel::interrupt_report("    ");
     }
     const std::string first = g_options.first_log ? g_options.first_log(80) : std::string();
     const std::string startup = pick_lines(first, {"[gpu]", "[window]", "[audio] sound device", "[pad]"});

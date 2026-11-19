@@ -138,11 +138,15 @@ void vblank_start() {
 }
 
 std::uint32_t intc_pending() { return g_intc_stat & g_intc_mask; }
+std::uint32_t intc_stat_raw() { return g_intc_stat; }
+std::uint32_t intc_mask_raw() { return g_intc_mask; }
+std::uint32_t dmac_stat_raw() { return g_dmac_stat; }
 
 void intc_raise(unsigned cause) {
     g_intc_stat |= 1u << cause;
     g_intc_latched |= 1u << cause;
     if (g_intc_mask & (1u << cause)) kernel::wake_idle();
+    if (kernel::g_trace_irq) [[unlikely]] kernel::trace_raise(false, cause);
 }
 
 void intc_ack(unsigned cause) { g_intc_stat &= ~(1u << cause); }
@@ -192,6 +196,7 @@ void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field
 void dmac_raise(unsigned channel) {
     g_dmac_stat |= 1u << channel;
     if (g_dmac_stat & (0x10000u << channel)) kernel::wake_idle();
+    if (kernel::g_trace_irq) [[unlikely]] kernel::trace_raise(true, channel);
 }
 
 std::uint64_t g_slow_seq = 0;
@@ -311,11 +316,24 @@ std::uint32_t read32(std::uint32_t a) {
 }
 
 void write32(std::uint32_t a, std::uint32_t v) {
-    if (a == kIntcStat) { g_intc_stat &= ~v; g_intc_latched &= ~v; return; }
-    if (a == kIntcMask) { g_intc_mask ^= v; return; }
+    if (a == kIntcStat) {
+        const std::uint32_t before = g_intc_stat;
+        g_intc_stat &= ~v;
+        g_intc_latched &= ~v;
+        if (kernel::g_trace_irq) [[unlikely]] kernel::trace_register_write(0, v, before, g_intc_stat);
+        return;
+    }
+    if (a == kIntcMask) {
+        const std::uint32_t before = g_intc_mask;
+        g_intc_mask ^= v;
+        if (kernel::g_trace_irq) [[unlikely]] kernel::trace_register_write(1, v, before, g_intc_mask);
+        return;
+    }
     if (a == kDmacStat) {
+        const std::uint32_t before = g_dmac_stat;
         g_dmac_stat &= ~(v & 0xFFFFu);
         g_dmac_stat ^= v & 0xFFFF0000u;
+        if (kernel::g_trace_irq) [[unlikely]] kernel::trace_register_write(2, v, before, g_dmac_stat);
         return;
     }
     if (a >= 0x12000000u && a < 0x12002000u) {

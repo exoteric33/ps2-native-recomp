@@ -32,6 +32,14 @@ void dump();
 std::string thread_summary();  // one plain line, e.g. "every EE thread waits: main thread on semaphore 49 (count 0, 1 waiting), ..."
 std::string thread_report();   // one line per started thread
 
+// The interrupt trace (PS2_TRACE_INTC=1), off by default: g_trace_irq is the one flag the hot paths test.
+extern bool g_trace_irq;
+void trace_raise(bool dmac, unsigned cause);  // a cause or channel fired (hw.cpp), and what becomes of it
+void trace_register_write(int reg, std::uint32_t value, std::uint32_t before, std::uint32_t after);  // a direct write: 0 INTC_STAT, 1 INTC_MASK, 2 D_STAT
+// What the interrupt side looks like now, one line each, every line starting with `prefix`: the Status register's IE/EIE bits, the INTC
+// and DMAC mask and status, the installed handlers (and, with the trace on, how often each ran). The F9 report and the end-of-run list use it.
+std::string interrupt_report(const char *prefix);
+
 // The picture pace (ps2/pace.hpp). pace_setup sets the refreshes per picture (1 = off) and says where it came from
 // in the log; pace_picture is called when the game changes the buffer the TV shows (DISPFB1/2); pace_report prints the end-of-run line.
 void pace_setup(int every, const char *source);

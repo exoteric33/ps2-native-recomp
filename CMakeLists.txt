@@ -393,6 +393,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2eipendingtest PRIVATE synchronization)
     endif()
+    # the interrupt trace (PS2_TRACE_INTC): handler calls, a chain that stops, why a cause does not run, the report; no game needed: ninja ps2irqtracetest
+    add_executable(ps2irqtracetest EXCLUDE_FROM_ALL tests/irq_trace.cpp)
+    target_include_directories(ps2irqtracetest PRIVATE runtime/src)
+    target_link_libraries(ps2irqtracetest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2irqtracetest PRIVATE synchronization)
+    endif()
     # the IPU's inverse transform (BDEC) gives the same pixels bit for bit as the one it replaced, on millions of random blocks (no game needed): ninja ps2idctexacttest
     add_executable(ps2idctexacttest EXCLUDE_FROM_ALL tests/idct_exact.cpp)
     target_include_directories(ps2idctexacttest PRIVATE runtime/src)

@@ -531,6 +531,134 @@ inline bool reads_q(std::uint32_t hi) {
 
 enum QRead : std::uint8_t { kQDynamic, kQNew, kQOld };
 
+// Whether the instruction at `pc` that reads Q sees the quotient of the divide before it (kQNew), the one from before that divide (kQOld), or
+// it depends on the path (kQDynamic: the cycle counter decides). It looks only at the pairs of the program, `pcs` (reachable from `entry`):
+// a compiled VU1 program is found by its key over those pairs (program_key_moved), so code it never runs must not change what it computes
+// (private #30: an EFU instruction just before the entry made a later WAITP look long enough for the new quotient). It walks the paths back
+// from the read to the divide, takes up to three pairs before the divide as the pipeline it starts in (along the same paths; the program
+// starts with every unit idle), and works out on each whether the divide is done when the read issues. A path that reaches the entry
+// without a divide has none in flight (each run starts with no quotient pending) and counts for neither side.
+inline QRead q_read_kind(const std::uint8_t *code, std::uint32_t mask, const std::vector<std::uint32_t> &pcs, std::uint32_t entry, std::uint32_t pc) {
+    const auto load = [&](std::uint32_t a, std::uint32_t &lo, std::uint32_t &hi) {
+        std::memcpy(&lo, code + (a & mask), 4);
+        std::memcpy(&hi, code + (a & mask) + 4, 4);
+    };
+    pc &= mask;
+    entry &= mask;
+    std::vector<std::uint8_t> in((mask + 1u) / 8u, 0), direct((mask + 1u) / 8u, 0);
+    for (std::uint32_t a : pcs) in[(a & mask) >> 3] = 1;
+    if (!in[pc >> 3]) return kQDynamic;
+    {
+        std::uint32_t lo, hi;
+        load(pc, lo, hi);
+        if (waits_q(lo, hi) || q_unit_latency(lo, hi)) return kQNew;
+    }
+    // the branches of the program: target -> its delay slot, which goes on there
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> jumps;
+    direct[entry >> 3] = 1;
+    for (std::uint32_t a : pcs) {
+        std::uint32_t lo, hi;
+        load(a, lo, hi);
+        if (!(hi & 0x80000000u) && is_branch(lo) && !is_jump_register(lo)) {
+            const std::uint32_t target = branch_target(lo, a, mask);
+            direct[target >> 3] = 1;
+            if (in[((a + 8u) & mask) >> 3] && in[target >> 3]) jumps.emplace_back(target, (a + 8u) & mask);
+        }
+    }
+    // What runs just before `y` (the inverse of stall_plan's successors): the pair before it, unless that one is the delay slot of a jump or
+    // of the end and not itself a place the program can come to directly; and the delay slot of every branch to `y`.
+    const auto preds = [&](std::uint32_t y) {
+        std::vector<std::uint32_t> out;
+        const std::uint32_t x = (y - 8u) & mask, b = (y - 16u) & mask;
+        if (in[x >> 3]) {
+            bool continues = true;
+            if (in[b >> 3]) {
+                std::uint32_t lo, hi;
+                load(b, lo, hi);
+                const bool lower_op = !(hi & 0x80000000u);
+                if ((hi & 0x40000000u) || (lower_op && is_jump_register(lo))) continues = false;
+                else if (lower_op && is_branch(lo)) continues = !is_unconditional(lo);
+            }
+            if (continues || direct[x >> 3]) out.push_back(x);
+        }
+        for (const auto &[target, slot] : jumps)
+            if (target == y && std::find(out.begin(), out.end(), slot) == out.end()) out.push_back(slot);
+        return out;
+    };
+    // the pairs that may run in the three cycles before the divide at `div`, oldest first; shorter where the program starts
+    const auto contexts = [&](std::uint32_t div) {
+        std::vector<std::vector<std::uint32_t>> out;
+        std::vector<std::vector<std::uint32_t>> stack{{div}};
+        while (!stack.empty() && out.size() < 64) {
+            const std::vector<std::uint32_t> chain = std::move(stack.back());
+            stack.pop_back();
+            const std::vector<std::uint32_t> from = preds(chain.back());
+            if (chain.size() == 4 || from.empty() || chain.back() == entry) {
+                std::vector<std::uint32_t> c(chain.rbegin(), chain.rend() - 1);
+                out.push_back(std::move(c));
+                if (chain.size() == 4 || from.empty()) continue;
+            }
+            for (std::uint32_t p : from) {
+                std::vector<std::uint32_t> next = chain;
+                next.push_back(p);
+                stack.push_back(std::move(next));
+            }
+        }
+        return out;
+    };
+    // on one path (read ... divide, backwards) and one start: is the divide done when the read issues?
+    const auto complete = [&](const std::vector<std::uint32_t> &context, const std::vector<std::uint32_t> &back, std::uint32_t latency) {
+        std::vector<std::uint32_t> order = context;
+        order.insert(order.end(), back.rbegin(), back.rend());
+        std::uint32_t ready[32][4] = {}, vi_ready[16] = {};
+        std::uint32_t cycle = 0, issued = 0, p_ready = 0;
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            std::uint32_t lo, hi;
+            load(order[i], lo, hi);
+            const VfUse u = vf_use(lo, hi);
+            cycle = issue(u, cycle + 1u, ready, vi_ready);
+            if (u.p_wait) cycle = std::max(cycle, p_ready);
+            if (u.p_set) p_ready = cycle + u.p_set;
+            if (i == context.size()) issued = cycle;
+            retire(u, cycle, ready, vi_ready);
+        }
+        return cycle >= issued + latency;
+    };
+    bool any_new = false, any_old = false;
+    unsigned budget = 4096;
+    std::vector<std::vector<std::uint32_t>> stack{{pc}};
+    while (!stack.empty()) {
+        if (!--budget) return kQDynamic;
+        const std::vector<std::uint32_t> path = std::move(stack.back());
+        stack.pop_back();
+        const std::uint32_t at = path.back();
+        if (path.size() > 1) {
+            std::uint32_t lo, hi;
+            load(at, lo, hi);
+            if (const std::uint32_t latency = q_unit_latency(lo, hi)) {
+                for (const std::vector<std::uint32_t> &context : contexts(at)) (complete(context, path, latency) ? any_new : any_old) = true;
+                if (any_new && any_old) return kQDynamic;
+                continue;
+            }
+            if (waits_q(lo, hi) || path.size() > 15) {
+                any_new = true;
+                continue;
+            }
+        }
+        const std::vector<std::uint32_t> from = preds(at);
+        if (from.empty() && at != entry) any_new = true;
+        for (std::uint32_t p : from) {
+            std::vector<std::uint32_t> next = path;
+            next.push_back(p);
+            stack.push_back(std::move(next));
+        }
+        if (any_new && any_old) return kQDynamic;
+    }
+    return any_old ? kQOld : kQNew;
+}
+
+// The same without the program's extent: walks back through whatever lies before the read, also code the program never runs. Only the
+// browser's Wasm translation (vu_jit.cpp) still calls it; it knows its entry and pairs and should move to the form above.
 inline QRead q_read_kind(const std::uint8_t *code, std::uint32_t mask, std::uint32_t pc) {
     const auto load = [&](std::uint32_t a, std::uint32_t &lo, std::uint32_t &hi) {
         std::memcpy(&lo, code + (a & mask), 4);

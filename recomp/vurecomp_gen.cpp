@@ -1051,7 +1051,7 @@ std::string generate(const Program &p0, std::string &name, const std::vector<Pro
         // an instruction that reads Q brings the quotient up to date first, on both ways into a split slot
         std::string qread;
         if (any_q && ps2::vu::reads_q(hi)) {
-            const ps2::vu::QRead kind = ps2::vu::q_read_kind(p.code.data(), kMask, pc);
+            const ps2::vu::QRead kind = ps2::vu::q_read_kind(p.code.data(), kMask, pcs, p.entry, pc);
             if (kind == ps2::vu::kQNew) qread = "fl.flush_q(r); ";
             else if (kind == ps2::vu::kQDynamic) qread = "fl.sync_q(r); ";
         }
@@ -1168,7 +1168,8 @@ namespace ps2::vurecomp {
 
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp). 16: VU1 programs keyed by program_key_moved, with the shift `sh` in them.
-const char *const kGeneratorVersion = "vurecomp 16";
+// 17: a read of Q decided from the program's own pairs only (q_read_kind with the entry), so one key always means one result.
+const char *const kGeneratorVersion = "vurecomp 17";
 
 // The key a program is built and found under, worked out from its code: VU0 keeps program_key (the address counts), VU1 has program_key_moved
 // (the same code at any address is one program). A recording of the old kind (VU1, its name holds a key that counted the address) is a

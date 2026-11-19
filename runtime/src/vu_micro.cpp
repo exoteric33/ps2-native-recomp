@@ -53,6 +53,8 @@ struct Unit {
     // Solid 3 clears them next to an OPMSUB before testing its collision
     // triangles). Follows upstream b7371e8.
     std::int32_t fsset = -1;
+    // where this run of the interpreter started: a read of Q is decided from the pairs it can reach (q_read_kind)
+    std::uint32_t start = 0;
 };
 
 Vu0Regs g_vu1;
@@ -61,18 +63,33 @@ std::uint32_t g_top = 0, g_itop = 0;
 std::uint32_t g_vu1_entry = 0;  // where the VU1 program that runs was started (entry())
 
 struct QDelay {
-    std::uint32_t generation = 0, value = 0;
+    std::uint32_t generation = 0, start = 0, value = 0;
 };
 
 QDelay g_q_kind[2][2048];
+
+// The pairs reachable from where the interpreter started, kept for the last start of each unit (the code memory as it is now).
+struct QReach {
+    std::uint32_t generation = 0, start = ~0u;
+    std::vector<std::uint32_t> pcs;
+};
+QReach g_q_reach[2];
 
 void read_q(const Unit &u, vuops::FlagPipe &pipe, Vu0Regs &r, std::uint32_t pc, std::uint32_t hi) {
     if (!pipe.q_pending || !reads_q(hi)) return;
     const int n = u.code == g_vu1_code ? 1 : 0;
     QDelay &d = g_q_kind[n][(pc & u.code_mask) >> 3];
-    if (d.generation != g_generation[n]) {
+    if (d.generation != g_generation[n] || d.start != u.start) {
+        QReach &reach = g_q_reach[n];
+        if (reach.generation != g_generation[n] || reach.start != u.start) {
+            reach.generation = g_generation[n];
+            reach.start = u.start;
+            reach.pcs = reachable(u.code, u.code_mask, u.start);
+        }
         d.generation = g_generation[n];
-        d.value = q_read_kind(u.code, u.code_mask, pc);
+        d.start = u.start;
+        // a pair the start cannot reach (after a jump through a register) is left to the cycle counter
+        d.value = q_read_kind(u.code, u.code_mask, reach.pcs, u.start, pc);
     }
     if (d.value == kQNew) pipe.flush_q(r);
     else if (d.value == kQDynamic) pipe.sync_q(r);
@@ -1386,6 +1403,7 @@ void run_fast(int n, std::uint32_t address) {
     vuops::FlagPipe pipe;
     pipe.start(r);
     u.pipe = &pipe;
+    u.start = address & u.code_mask;
     std::uint32_t vf_ready[32][4] = {}, vi_ready[16] = {};
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
     bool ending = false;
@@ -1515,6 +1533,7 @@ void run_reference(int n, std::uint32_t address) {
     vuops::FlagPipe pipe;
     pipe.start(r);
     u.pipe = &pipe;
+    u.start = address & u.code_mask;
     std::uint32_t vf_ready[32][4] = {}, vi_ready[16] = {};
     Decoded *cache = g_decoded[n];
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;

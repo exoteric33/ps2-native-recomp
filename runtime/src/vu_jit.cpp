@@ -1727,7 +1727,7 @@ void Translator::instruction(std::uint32_t pc, std::uint32_t following) {
     c_.op(kOpAdd);
     c_.set(kT);
     if (reads_q(hi)) {
-        const QRead kind = q_read_kind(code_, kMask, pc);
+        const QRead kind = q_read_kind(code_, kMask, pcs_, entry_, pc);
         if (kind == kQNew) flush_q();
         else if (kind == kQDynamic) sync_q();
     }

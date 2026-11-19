@@ -165,6 +165,18 @@ int main() {
     syscall_with(0x11, 0, 99);
     check(has(since(), "RemoveIntcHandler: id 99 not found"), "removing a handler that is not there is said");
 
+    // 10b. bounded: a game that switches a channel on and off 600 times makes a few lines, not 1200
+    since();
+    for (int i = 0; i < 600; ++i) {
+        syscall_with(0x16, 8);
+        syscall_with(0x17, 8);
+    }
+    out = since();
+    std::size_t lines = 0;
+    for (char ch : out) lines += ch == '\n';
+    check(lines > 0 && lines < 40, "1200 Enable/Disable calls on one channel make fewer than 40 lines");
+    check(has(ps2::kernel::interrupt_report(""), "Enable/DisableDmac 1201"), "the report counts the calls that were not printed");
+
     // 11. off by default: nothing is written with the switch off
     ps2::kernel::g_trace_irq = false;
     hw::intc_raise(2);

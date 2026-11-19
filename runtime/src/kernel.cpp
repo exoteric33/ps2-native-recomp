@@ -306,6 +306,9 @@ struct HandlerStat {
     bool any = false;
 };
 IrqCount g_irq_count[2][16];
+// How often the program called Add (index 0/1: INTC/DMAC), Remove (2) and Enable/Disable (3..6) per cause: these lines are bounded like the
+// rest (a game that switches a channel on and off for every transfer made 5400 lines in 25 seconds of God of War II).
+std::uint64_t g_irq_calls[7][16];
 std::map<int, HandlerStat> g_irq_handler;  // by handler id (one numbering for both lists)
 
 unsigned long long irq_frame() { return static_cast<unsigned long long>(frame_count()); }
@@ -365,6 +368,7 @@ void trace_add(const std::vector<Handler> &list, const Handler &h, std::int32_t 
         ++total;
         if (x.id == h.id) pos = total;
     }
+    if (!irq_say(++g_irq_calls[dmac][h.cause & 15u])) return;
     const char *where = next == 0 ? "in front of the others" : next == -1 ? "at the end" : "before another handler";
     std::fprintf(stderr, "[irq] f%llu Add%sHandler: %s %u (%s) handler id %d at 0x%08X arg 0x%08X, %s (next=%d): place %d of %d; chain now: %s\n", irq_frame(),
                  dmac ? "Dmac" : "Intc", dmac ? "DMAC" : "INTC", h.cause, irq_name(dmac, h.cause), h.id, h.address, h.arg, where, next, pos, total,
@@ -372,6 +376,7 @@ void trace_add(const std::vector<Handler> &list, const Handler &h, std::int32_t 
 }
 
 void trace_remove(const std::vector<Handler> &list, int id, bool found, bool dmac) {
+    if (!irq_say(++g_irq_calls[2][dmac])) return;
     std::fprintf(stderr, "[irq] f%llu Remove%sHandler: id %d %s\n", irq_frame(), dmac ? "Dmac" : "Intc", id, found ? "removed" : "not found (returns -1)");
     if (found) std::fprintf(stderr, "[irq]   %s handlers now: %s\n", dmac ? "DMAC" : "INTC", chain_text(list, 0, true).c_str());
 }
@@ -380,6 +385,7 @@ void trace_remove(const std::vector<Handler> &list, int id, bool found, bool dma
 bool mask_call(bool dmac, unsigned n, bool enable) {
     const bool changed = dmac ? hw::dmac_set_mask(n, enable) : hw::intc_set_mask(n, enable);
     if (g_trace_irq) [[unlikely]] {
+        if (!irq_say(++g_irq_calls[3 + dmac * 2 + !enable][n & 15u])) return changed;
         const auto &list = dmac ? g_dmac_handlers : g_intc_handlers;
         int have = 0;
         for (const Handler &h : list) have += h.cause == n;
@@ -569,6 +575,7 @@ void reset() {
     g_intc_handlers.clear();
     g_dmac_handlers.clear();
     g_irq_handler.clear();
+    std::memset(g_irq_calls, 0, sizeof g_irq_calls);
     for (auto &row : g_irq_count)
         for (IrqCount &n : row) n = IrqCount{};
     g_alarms.clear();
@@ -935,6 +942,13 @@ std::string interrupt_report(const char *prefix) {
         out += std::string(prefix) + "(how often each fired, why it did not run, every handler call: start the runner with PS2_TRACE_INTC=1)\n";
         return out;
     }
+    std::uint64_t sums[7] = {};
+    for (int k = 0; k < 7; ++k)
+        for (std::uint64_t v : g_irq_calls[k]) sums[k] += v;
+    std::snprintf(b, sizeof b, "%scalls the program made: AddIntcHandler %llu, AddDmacHandler %llu, Remove...Handler %llu, Enable/DisableIntc %llu, Enable/DisableDmac %llu\n", prefix,
+                  static_cast<unsigned long long>(sums[0]), static_cast<unsigned long long>(sums[1]), static_cast<unsigned long long>(sums[2]),
+                  static_cast<unsigned long long>(sums[3] + sums[4]), static_cast<unsigned long long>(sums[5] + sums[6]));
+    out += b;
     for (int d = 0; d < 2; ++d)
         for (unsigned i = 0; i < 16; ++i) {
             const IrqCount &n = g_irq_count[d][i];

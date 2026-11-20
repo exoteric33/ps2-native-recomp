@@ -316,6 +316,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2tilelisttest PRIVATE synchronization)
     endif()
+    # the tile lists kept per strip of two rows (PS2_GPU_STRIPS) against the lists per tile, filtered by the shapes' boxes: ninja ps2striplisttest
+    add_executable(ps2striplisttest EXCLUDE_FROM_ALL tests/strip_lists.cpp)
+    target_include_directories(ps2striplisttest PRIVATE runtime/include runtime/src)
+    target_link_libraries(ps2striplisttest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2striplisttest PRIVATE synchronization)
+    endif()
     # damaged disc images, IOP modules and boot ELFs refused cleanly, no game needed: ninja ps2discinputtest
     add_executable(ps2discinputtest EXCLUDE_FROM_ALL tests/disc_input.cpp)
     target_include_directories(ps2discinputtest PRIVATE runtime/src recomp)

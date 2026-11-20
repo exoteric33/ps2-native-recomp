@@ -125,6 +125,9 @@ WGPUComputePipeline g_pipelines[kPipelines] = {};
 // The draw program with mipmap levels (HAS_MIP = true in gs.wgsl) takes as long to translate as all the others together on FXC, so it is built
 // in the background after the plain programs; a batch that needs it waits for it (pipeline_of), every other batch never does.
 WGPUComputePipeline g_raster_mip = nullptr;
+// The draw program for batches whose tile lists are kept per strip (PS2_GPU_STRIPS, STRIPS in gs.wgsl), plain and with mipmap levels (built with
+// g_raster_mip); nullptr without strips.
+WGPUComputePipeline g_raster_strips = nullptr, g_raster_strips_mip = nullptr;
 std::thread *g_raster_mip_thread = nullptr;  // never destroyed: a running thread's destructor at exit would end the program
 std::atomic<bool> g_raster_mip_ready{false};
 std::mutex g_raster_mip_lock;
@@ -134,11 +137,13 @@ struct Command {
     std::uint32_t x, y;
     std::uint32_t param;
     bool mip = false;  // kRaster only: the batch carries a mipmap table, so it needs the draw program built with HAS_MIP (g_raster_mip)
+    bool strips = false;  // kRaster only: the batch's tile lists are kept per strip (g_raster_strips)
 };
 
 // The program a draw command runs. A batch with a mipmap table runs the HAS_MIP program, and waits here, once, until it is built.
 WGPUComputePipeline pipeline_of(const Command &c) {
-    if (!c.mip || c.pipeline != kRaster) return g_pipelines[c.pipeline];
+    if (c.pipeline != kRaster) return g_pipelines[c.pipeline];
+    if (!c.mip) return c.strips ? g_raster_strips : g_pipelines[kRaster];
     if (!g_raster_mip_ready.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(g_raster_mip_lock);
         if (!g_raster_mip_ready.load(std::memory_order_acquire)) {
@@ -148,6 +153,7 @@ WGPUComputePipeline pipeline_of(const Command &c) {
             std::fprintf(stderr, "[gpu] waited %.0f ms for the mipmap draw program\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         }
     }
+    if (c.strips) return g_raster_strips_mip ? g_raster_strips_mip : g_raster_strips;
     return g_raster_mip ? g_raster_mip : g_pipelines[kRaster];
 }
 
@@ -764,6 +770,15 @@ bool exact_clear(const std::uint32_t *rec, const std::uint32_t *setup, int minx,
 }
 
 int g_tile = 8;  // pixels along one side of a screen tile (one workgroup of the raster program): 8 was the cheaper of 16, 8 and 4 on the arena and hall test frames; PS2_TILE=4, 8 or 16 to try others
+// PS2_GPU_STRIPS=1: the tile lists are kept per two pixel rows of a tile (tiles.hpp, configure), so each group of 16 threads of the raster program walks only
+// the shapes whose box reaches its rows (STRIPS in gs.wgsl). Off by default; =0 turns it off.
+bool g_strips = false;
+// PS2_GPU_STRIPS=2: split tiles (SPLIT in gs.wgsl): the lists stay per tile, but every strip of two rows is drawn by a workgroup of its own that walks
+// its tile's whole list. The processor's work is that of strips off; the batches run the strip programs (g_raster_strips, built with SPLIT), so
+// Command::strips is set for every batch. Off by default; tiles of 4 or 8 pixels, not with the card path.
+bool g_split = false;
+const char *g_split_why = "";
+double g_strip_ratio = 4.0;  // see PS2_GPU_STRIPS_RATIO in init
 
 WGPUStringView view(const char *s) { return WGPUStringView{s, WGPU_STRLEN}; }
 
@@ -2116,6 +2131,11 @@ void reset_batch() {
     b.maxx = b.maxy = -1;
 }
 
+// Workgroups of the raster program for a batch's lists: one per tile, or one per strip (PS2_GPU_STRIPS, STRIPS in gs.wgsl).
+std::uint32_t raster_groups(const tiles::Lists &lists) {
+    return lists.strips ? lists.tiles * static_cast<std::uint32_t>(tiles::strips()) : g_split ? lists.tiles * (g_tile / 2) : lists.tiles;
+}
+
 // Puts the lists of a job the helper has finished into the arena and fills in the parameter record and the command that flush_batch left open for them.
 void place_tiles(tiles::Job *job) {
     const tiles::Lists &lists = job->result;
@@ -2129,10 +2149,12 @@ void place_tiles(tiles::Job *job) {
     std::array<std::uint32_t, kParamStride / 4> &record = g_param_records[job->param];
     record[0] = tile_offset;
     record[3] = lists.tiles;
-    record[4] = tile_offset + lists.tiles * 2 + 2;
+    record[4] = tile_offset + lists.table;
     Command &c = g_commands[job->command];
-    c.x = std::min(lists.tiles, 1024u);
-    c.y = (lists.tiles + 1023) / 1024;
+    const std::uint32_t groups = raster_groups(lists);
+    c.x = std::min(groups, 1024u);
+    c.y = (groups + 1023) / 1024;
+    c.strips = lists.strips || g_split;
     tiles::release(job);
 }
 
@@ -2193,7 +2215,7 @@ void flush_batch() {
         lists = tiles::build_now(b.prims.data(), prims, [](void *, std::size_t words) { return g_arena.grow(words); }, nullptr);
         if (tiles::logging()) tiles::note_lists(g_arena.data() + tile_offset, lists);
     }
-    const std::uint32_t list_offset = tile_offset + lists.tiles * 2 + 2;
+    const std::uint32_t list_offset = tile_offset + lists.table;
     std::uint32_t snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run;
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run);
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, lists.tiles, list_offset, snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run, mip_offset});
@@ -2209,7 +2231,8 @@ void flush_batch() {
         g_why = kWhyFlush;
     }
     if (g_bench.capturing && hw::enabled()) hw::capture_batch(static_cast<std::uint32_t>(g_bench.subs.size()), static_cast<std::uint32_t>(g_commands.size()), b.prims.data(), prims, b.setups.data(), static_cast<std::uint32_t>(b.setups.size() / kSetupWords));
-    g_commands.push_back({kRaster, std::min(lists.tiles, 1024u), (lists.tiles + 1023) / 1024, param, mip_offset != 0xFFFFFFFFu});
+    const std::uint32_t groups = raster_groups(lists);
+    g_commands.push_back({kRaster, std::min(groups, 1024u), (groups + 1023) / 1024, param, mip_offset != 0xFFFFFFFFu, lists.strips || g_split});
     g_shape_params.push_back(param);
     if (job) {  // the helper has the records; the slots wait for its numbers
         job->param = param;
@@ -2756,7 +2779,7 @@ void submit(WGPUTextureView present_view = nullptr) {
         pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
     }
     Pipeline current = kPipelines;
-    bool current_mip = false;
+    bool current_mip = false, current_strips = false;  // a batch kept per strip runs another program (g_raster_strips)
     ++g_submits;
     ++g_total_passes;
     static const unsigned skip = [] {  // PS2_GPU_SKIP=raster,snapshot: leave these kinds of work out (the picture is wrong; only to see what they cost)
@@ -2776,11 +2799,12 @@ void submit(WGPUTextureView present_view = nullptr) {
         ++command_index;
         ++g_dispatches[c.pipeline];
         if (skip & (1u << c.pipeline)) continue;
-        if (c.pipeline != current || c.mip != current_mip) {
+        if (c.pipeline != current || c.mip != current_mip || c.strips != current_strips) {
             wt::Scope s(wt::kSetPipeline);
             wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
             current = c.pipeline;
             current_mip = c.mip;
+            current_strips = c.strips;
         }
         const std::uint32_t offset = c.param * kParamStride;
         {
@@ -2997,16 +3021,17 @@ double bench_time(const std::vector<BenchBuffers> &bufs, unsigned skip, unsigned
         for (std::size_t i = 0; i < g_bench.subs.size(); ++i) {
             WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
             Pipeline current = kPipelines;
-            bool current_mip = false;
+            bool current_mip = false, current_strips = false;
             for (std::size_t n = 0; n < g_bench.subs[i].commands.size(); ++n) {
                 const Command &c = g_bench.subs[i].commands[n];
                 if (skip & (1u << c.pipeline)) continue;
                 if (size_filter && size_filter <= 2 && c.pipeline == kRaster && ((c.x * c.y <= 8u) == (size_filter == 1))) continue;  // 1: leave out the small runs (8 tiles or fewer), 2: leave out the big ones
                 if (size_filter >= 3 && c.pipeline == kRaster && (g_bench_glow[i][n] != 0) == (size_filter == 3)) continue;  // 3: leave out the full-screen sprite passes (lane glow), 4: leave out all the others
-                if (c.pipeline != current || c.mip != current_mip) {
+                if (c.pipeline != current || c.mip != current_mip || c.strips != current_strips) {
                     wgpuComputePassEncoderSetPipeline(pass, pipeline_of(c));
                     current = c.pipeline;
                     current_mip = c.mip;
+                    current_strips = c.strips;
                 }
                 const std::uint32_t offset = c.param * kParamStride;
                 wgpuComputePassEncoderSetBindGroup(pass, 0, bufs[i].group, 1, &offset);
@@ -3951,7 +3976,18 @@ bool init(Mode m) {
     if (const char *sharp = std::getenv("PS2_SHARP_2D")) g_sharp_2d = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(sharp)), 0u, 2u);
     g_copy_words = (1u << 20) * g_scale * g_scale;
     if (const int tile = std::atoi(os::env("PS2_TILE").c_str()); tile == 4 || tile == 8 || tile == 16) g_tile = tile;
-    tiles::configure(static_cast<int>(g_scale), g_tile);
+    g_strips = os::env("PS2_GPU_STRIPS") == "1";
+    // PS2_GPU_STRIPS_RATIO: a batch gets lists per strip when they hold at most this many times the entries of its lists per tile (4 or more: always)
+    const std::string strip_ratio = os::env("PS2_GPU_STRIPS_RATIO");
+    g_strip_ratio = strip_ratio.empty() ? g_strip_ratio : std::atof(strip_ratio.c_str());
+    tiles::configure(static_cast<int>(g_scale), g_tile, g_strips, g_strip_ratio);
+    g_strips = tiles::strips() != 0;  // not with 16-pixel tiles
+    if (g_strips) std::fprintf(stderr, "[gpu] tile lists per strip of two rows (PS2_GPU_STRIPS=1)\n");
+    // Split tiles: forced by PS2_GPU_STRIPS=2, off with 0 or 1, and on by default on Intel graphics (measured faster there, not slower elsewhere in the tests)
+    const std::string strips_env = os::env("PS2_GPU_STRIPS");
+    const bool split_intel_default = strips_env.empty() && g_vendor_id == 0x8086;
+    g_split = (strips_env == "2" || split_intel_default) && (g_tile == 4 || g_tile == 8) && !hw::enabled();
+    g_split_why = split_intel_default ? "Intel default; PS2_GPU_STRIPS=0 turns it off" : "PS2_GPU_STRIPS=2";
     g_field_words = (1u << 19) * g_scale * g_scale;
     g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     std::vector<std::uint32_t> tables;
@@ -4053,16 +4089,29 @@ bool init(Mode m) {
     const bool has_fma = shader_text.empty() || shader_text.find("override EXPLICIT_FMA") != std::string::npos;
     const bool has_mip = shader_text.empty() || shader_text.find("override HAS_MIP") != std::string::npos;
     const bool has_sharp = shader_text.empty() || shader_text.find("override SHARP") != std::string::npos;
+    const bool has_strips = shader_text.empty() || shader_text.find("override STRIPS") != std::string::npos;
+    const bool has_split = shader_text.empty() || shader_text.find("override SPLIT") != std::string::npos;
+    if (g_split && !has_split) {  // a shader from a file without SPLIT: whole tiles
+        std::fprintf(stderr, "[gpu] the shader has no SPLIT, so every tile is drawn by one workgroup\n");
+        g_split = false;
+    }
+    if (g_split) std::fprintf(stderr, "[gpu] split tiles: a workgroup per two rows, lists per tile (%s)\n", g_split_why);
+    if (g_strips && !has_strips) {  // a shader from a file that cannot read lists per strip: back to lists per tile (no list is built yet)
+        std::fprintf(stderr, "[gpu] the shader has no STRIPS, so the tile lists are kept per tile\n");
+        g_strips = false;
+        tiles::configure(static_cast<int>(g_scale), g_tile, false);
+    }
     const int scale = static_cast<int>(g_scale), tile = g_tile;
     const std::uint32_t sharp = g_sharp_2d;
-    // `mip`: the draw program that reads mipmap levels (HAS_MIP in gs.wgsl); without it the program is the plain one
-    auto make_pipeline = [=](int entry, bool mip) {
+    // `mip`: the draw program that reads mipmap levels (HAS_MIP in gs.wgsl); without it the program is the plain one. `strips`: the draw program for
+    // lists per strip (STRIPS in gs.wgsl, PS2_GPU_STRIPS)
+    auto make_pipeline = [=](int entry, bool mip, bool strips = false) {
         WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
         cd.layout = g_pipeline_layout;
         cd.compute.module = module;
         cd.compute.entryPoint = view(kEntryPoints[entry]);
         // a shader loaded with PS2_GS_SHADER may lack the later constants; each is listed only when the shader declares it
-        WGPUConstantEntry constants[5];
+        WGPUConstantEntry constants[8];
         std::size_t count = 0;
         const auto set = [&](bool declared, const char *key, double value) {
             if (!declared) return;
@@ -4076,6 +4125,9 @@ bool init(Mode m) {
         set(has_fma, "EXPLICIT_FMA", explicit_fma ? 1.0 : 0.0);
         set(has_sharp, "SHARP", static_cast<double>(sharp));
         set(has_mip, "HAS_MIP", mip ? 1.0 : 0.0);
+        set(has_strips, "STRIPS", strips && !g_split ? 1.0 : 0.0);  // (the plain programs get false and TILE rows)
+        set(has_split, "SPLIT", strips && g_split ? 1.0 : 0.0);       // the strip programs of split tiles (PS2_GPU_STRIPS=2)
+        set(has_strips, "ROWS", strips ? 2.0 : static_cast<double>(tile));
         cd.compute.constantCount = count;
         cd.compute.constants = constants;
         return wgpuDeviceCreateComputePipeline(g_device, &cd);
@@ -4089,15 +4141,18 @@ bool init(Mode m) {
         g_raster_mip_thread = nullptr;
     }
     g_raster_mip = nullptr;
+    g_raster_strips = g_raster_strips_mip = nullptr;
     g_raster_mip_ready.store(true, std::memory_order_release);  // nothing to wait for unless the thread below starts
     // the module is released by whoever finishes last: this function after the plain programs, the thread after its one
     auto users = std::make_shared<std::atomic<int>>(has_mip ? 2 : 1);
     const auto release_module = [users, module]() {
         if (users->fetch_sub(1) == 1) wgpuShaderModuleRelease(module);
     };
-    const auto build_mip = [make_pipeline, release_module]() {
+    const bool strips = g_strips || g_split;
+    const auto build_mip = [make_pipeline, release_module, strips]() {
         const auto start = std::chrono::steady_clock::now();
         g_raster_mip = make_pipeline(kRaster, true);
+        if (strips) g_raster_strips_mip = make_pipeline(kRaster, true, true);
         std::fprintf(stderr, "[gpu] mipmap draw program %s in %.0f ms\n", g_raster_mip ? "compiled" : "FAILED (levels are ignored)", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         release_module();
     };
@@ -4111,6 +4166,7 @@ bool init(Mode m) {
         g_pipelines[i] = make_pipeline(i, false);
         if (!g_pipelines[i]) return false;
     }
+    if (strips && !(g_raster_strips = make_pipeline(kRaster, false, true))) return false;
     std::fprintf(stderr, "[gpu] %d shaders compiled in %.0f ms\n", kPipelines, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compile_start).count());
 #ifdef __EMSCRIPTEN__
     if (has_mip) build_mip();  // the browser build has no threads

@@ -40,14 +40,30 @@ float u2f(std::uint32_t u) {
 
 struct Geometry {
     int scale = 1, tile = 8, per_row = 128;  // resolution scale, tile size in pixels, tiles along one row of the screen
+    int strips = 0;                           // strips per tile (tile / 2) when the lists are kept per strip, else 0
+    double strip_ratio = 4.0;                 // a batch gets lists per strip when they hold at most this many times the entries of its lists per tile
 };
 Geometry g_geo;
 bool g_configured = false;
+
+constexpr int kStripSlots = 4;           // counts kept per tile with strips (the most strips a tile has: 8 pixels / 2)
+constexpr std::uint16_t kRowBits = 0x0FFFu;  // with strips the span's `ty` carries the tile row in its low 12 bits (at most 2048 * 3 / 4 = 1536 rows) and the
+                                             // strips the shape's box reaches in that row in its top 4 bits; without strips the top bits are 0
 
 struct Span {
     std::int16_t ty, tx0, tx1;
     std::uint16_t prim;  // index of the shape in the batch (a batch has at most 65536 shapes)
 };
+
+// With strips: which strips of tile row `ty` the box rows [y0, y1] (in pixels, unscaled) reach, in the top 4 bits of a span's `ty` (see kRowBits).
+// A strip is two rows of upscaled pixels; the raster program's box test compares the unscaled row of each of them.
+inline std::int16_t row_with_strips(int ty, int y0, int y1) {
+    if (!g_geo.strips) return static_cast<std::int16_t>(ty);
+    const int sc = g_geo.scale, top = ty * g_geo.tile;
+    const int first = std::max(0, (y0 * sc - top) / 2), last = std::min(g_geo.strips - 1, (y1 * sc + sc - 1 - top) / 2);
+    const unsigned mask = ((2u << last) - 1u) & ~((1u << first) - 1u);
+    return static_cast<std::int16_t>(static_cast<std::uint16_t>(ty | (mask << 12)));
+}
 
 // The spans of a batch's shapes, in order (add_spans). Filled by hand: the capacity is made sure of once per shape, not checked at every push.
 struct SpanBuf {
@@ -72,17 +88,22 @@ struct SpanBuf {
 // and the spans. Every thread that builds has its own.
 struct Builder {
     std::vector<std::uint32_t> count, fill, touched;
+    std::vector<std::uint32_t> strip_count, strip_fill;  // with strips: kStripSlots counts and places per tile
     SpanBuf spans;
     std::uint32_t touched_n = 0;  // tiles in `touched`
     std::size_t counted = 0;      // spans already counted
 
     void prepare() {
         const std::size_t tiles = static_cast<std::size_t>(g_geo.per_row) * static_cast<std::size_t>(g_geo.per_row) + 8;
-        if (count.size() == tiles) return;
+        const std::size_t slots = g_geo.strips ? tiles * kStripSlots : 0;
+        if (count.size() == tiles && strip_count.size() == slots) return;
         count.assign(tiles, 0);  // 8 words to spare, as when the counting rounds of build were unrolled four wide (they wrote past a span's last tile)
         fill.assign(tiles, 0);
         touched.assign(tiles + 8, 0);
+        strip_count.assign(slots, 0);
+        strip_fill.assign(slots, 0);
     }
+    Lists finish_strips(Room room, void *context);
     void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi, std::uint16_t prim);
     // A batch in steps: begin, add its shapes in order (all at once, or a part whenever more are drawn: the spans and counts come out the same,
     // since they are made shape by shape and span by span in the same order either way), finish for the table and the lists.
@@ -95,7 +116,10 @@ struct Builder {
     void add(const std::uint32_t *prims, std::uint32_t from, std::uint32_t to);
     Lists finish(Room room, void *context);
     void abandon() {  // a batch given up half way: the counts back to zero for the next one
-        for (std::uint32_t n = 0; n < touched_n; ++n) count[touched[n]] = 0;
+        for (std::uint32_t n = 0; n < touched_n; ++n) {
+            count[touched[n]] = 0;
+            if (g_geo.strips) std::memset(&strip_count[static_cast<std::size_t>(touched[n]) * kStripSlots], 0, kStripSlots * 4);
+        }
         begin();
     }
     Lists build(const std::uint32_t *prims, std::uint32_t shapes, Room room, void *context) {
@@ -110,8 +134,9 @@ void Builder::add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_
     const int tx0 = static_cast<int>(lo & 0xFFFFu) * sc / tile, ty0 = static_cast<int>(lo >> 16) * sc / tile;
     const int tx1 = (static_cast<int>(hi & 0xFFFFu) * sc + sc - 1) / tile, ty1 = (static_cast<int>(hi >> 16) * sc + sc - 1) / tile;
     spans.ensure(static_cast<std::size_t>(std::max(ty1 - ty0 + 1, 0)));  // at most one span per tile row
+    const int by0 = static_cast<int>(lo >> 16), by1 = static_cast<int>(hi >> 16);  // the box's rows (for the strips, row_with_strips)
     const auto whole = [&] {
-        for (int ty = ty0; ty <= ty1; ++ty) spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(tx0), static_cast<std::int16_t>(tx1), prim});
+        for (int ty = ty0; ty <= ty1; ++ty) spans.push_back({row_with_strips(ty, by0, by1), static_cast<std::int16_t>(tx0), static_cast<std::int16_t>(tx1), prim});
     };
     if ((rec[1] & kKindMask) != 0 || tx1 - tx0 < 2) {
         whole();
@@ -160,7 +185,7 @@ void Builder::add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_
         const double lo_x = std::max(left, -1.0), hi_x = std::min(right, 4096.0);
         const int rx0 = std::max(tx0, static_cast<int>(std::floor(span_pow2 ? lo_x * span_inverse : lo_x / span)));
         const int rx1 = std::min(tx1, static_cast<int>(std::floor(span_pow2 ? hi_x * span_inverse : hi_x / span)));
-        if (rx0 <= rx1) spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(rx0), static_cast<std::int16_t>(rx1), prim});
+        if (rx0 <= rx1) spans.push_back({row_with_strips(ty, by0, by1), static_cast<std::int16_t>(rx0), static_cast<std::int16_t>(rx1), prim});
     }
 }
 
@@ -177,6 +202,29 @@ void Builder::add(const std::uint32_t *prims, std::uint32_t from, std::uint32_t 
     // One loop over all the new spans (not one per shape): its exits are easy to predict.
     const Span *const span_list = spans.spans.get();
     const std::size_t span_count = spans.size();
+    if (g_geo.strips) {
+        // The same, and per strip: one count for each strip the span's row reaches (its bits in the top of `ty`), without a branch per strip.
+        std::uint32_t *const strip_count = this->strip_count.data();
+        for (std::size_t k = counted; k < span_count; ++k) {
+            const Span sp = span_list[k];
+            const std::uint32_t row = static_cast<std::uint16_t>(sp.ty) & kRowBits, mask = static_cast<std::uint16_t>(sp.ty) >> 12;
+            const std::uint32_t t = row * static_cast<std::uint32_t>(tiles_per_row) + static_cast<std::uint32_t>(sp.tx0);
+            const std::int32_t len = sp.tx1 - sp.tx0 + 1;
+            for (std::int32_t j = 0; j < len; ++j) {
+                const std::uint32_t c = count[t + j];
+                if (c == 0) touched[touched_n++] = t + j;
+                count[t + j] = c + 1;
+                std::uint32_t *const s = strip_count + static_cast<std::size_t>(t + j) * kStripSlots;
+                s[0] += mask & 1u;
+                s[1] += (mask >> 1) & 1u;
+                s[2] += (mask >> 2) & 1u;
+                s[3] += mask >> 3;
+            }
+        }
+        counted = span_count;
+        this->touched_n = touched_n;
+        return;
+    }
     for (std::size_t k = counted; k < span_count; ++k) {
         const Span sp = span_list[k];
         const std::uint32_t t = static_cast<std::uint32_t>(sp.ty * tiles_per_row + sp.tx0);
@@ -194,11 +242,23 @@ void Builder::add(const std::uint32_t *prims, std::uint32_t from, std::uint32_t 
 Lists Builder::finish(Room room, void *context) {
     std::uint32_t *const count = this->count.data();
     const std::uint32_t *const touched = this->touched.data();
+    std::uint32_t total = 0;
+    for (std::uint32_t n = 0; n < touched_n; ++n) total += count[touched[n]];
+    if (g_geo.strips) {
+        // Lists per strip only when the shapes are small next to a tile: the strips' entries are then well under `strips` times the tile's. A batch
+        // of big shapes (full-screen passes, a film's pictures) would walk nearly the same lists in `strips` times as many workgroups.
+        std::uint64_t strip_total = 0;
+        for (std::uint32_t n = 0; n < touched_n; ++n) {
+            const std::uint32_t *const s = strip_count.data() + static_cast<std::size_t>(touched[n]) * kStripSlots;
+            strip_total += s[0] + s[1] + s[2] + s[3];
+        }
+        // (ratio 0 keeps every batch per tile, an empty one too)
+        if (g_geo.strip_ratio > 0.0 && static_cast<double>(strip_total) <= g_geo.strip_ratio * static_cast<double>(total)) return finish_strips(room, context);
+        for (std::uint32_t n = 0; n < touched_n; ++n) std::memset(strip_count.data() + static_cast<std::size_t>(touched[n]) * kStripSlots, 0, kStripSlots * 4);
+    }
     const std::int32_t tiles_per_row = g_geo.per_row;
     const Span *const span_list = spans.spans.get();
     const std::size_t span_count = spans.size();
-    std::uint32_t total = 0;
-    for (std::uint32_t n = 0; n < touched_n; ++n) total += count[touched[n]];
     const std::uint32_t tiles = touched_n;
     const std::uint32_t list_words = (total + 1) / 2;
     const std::uint32_t words = tiles * 2 + 2 + list_words;
@@ -223,7 +283,7 @@ Lists Builder::finish(Room room, void *context) {
     for (std::size_t k = 0; k < span_count; ++k) {
         const Span sp = span_list[k];
         const std::uint16_t index = sp.prim;
-        const std::uint32_t t = static_cast<std::uint32_t>(sp.ty * tiles_per_row + sp.tx0);
+        const std::uint32_t t = (static_cast<std::uint32_t>(static_cast<std::uint16_t>(sp.ty)) & kRowBits) * row_width + static_cast<std::uint32_t>(sp.tx0);  // (the strip bits off)
         const std::int32_t len = sp.tx1 - sp.tx0 + 1;
         for (std::int32_t j = 0; j < len; ++j) {
             const std::uint32_t f = fill[t + j]++;
@@ -238,6 +298,77 @@ Lists Builder::finish(Room room, void *context) {
     lists.tiles = tiles;
     lists.total = total;
     lists.words = words;
+    lists.table = tiles * 2 + 2;
+    return lists;
+}
+
+// finish with strips: the tiles in the same order, each with one list per strip (configure in tiles.hpp). A strip's list is its tile's list without the
+// shapes whose box misses the strip's rows, in the same order.
+Lists Builder::finish_strips(Room room, void *context) {
+    std::uint32_t *const count = this->count.data();
+    std::uint32_t *const strip_count = this->strip_count.data();
+    std::uint32_t *const strip_fill = this->strip_fill.data();
+    const std::uint32_t *const touched = this->touched.data();
+    const std::int32_t tiles_per_row = g_geo.per_row;
+    const std::uint32_t strips = static_cast<std::uint32_t>(g_geo.strips), entry = strips + 2;
+    const Span *const span_list = spans.spans.get();
+    const std::size_t span_count = spans.size();
+    std::uint32_t total = 0;
+    for (std::uint32_t n = 0; n < touched_n; ++n) {
+        const std::uint32_t *const s = strip_count + static_cast<std::size_t>(touched[n]) * kStripSlots;
+        total += s[0] + s[1] + s[2] + s[3];
+    }
+    const std::uint32_t tiles = touched_n;
+    const std::uint32_t table = tiles * entry + 2;
+    const std::uint32_t list_words = (total + 1) / 2;
+    const std::uint32_t words = table + list_words;
+    std::uint32_t *const grown = room(context, words);
+    if (list_words) grown[words - 1] = 0;
+    std::uint32_t cursor = 0;
+    const std::uint32_t row_width = static_cast<std::uint32_t>(tiles_per_row);
+    for (std::uint32_t i = 0; i < tiles; ++i) {
+        const std::uint32_t t = touched[i];
+        std::uint32_t *const out = grown + static_cast<std::size_t>(i) * entry;
+        out[0] = (t % row_width) | ((t / row_width) << 16);
+        const std::uint32_t *const s = strip_count + static_cast<std::size_t>(t) * kStripSlots;
+        std::uint32_t *const f = strip_fill + static_cast<std::size_t>(t) * kStripSlots;
+        for (std::uint32_t g = 0; g < strips; ++g) {
+            out[1 + g] = cursor;
+            f[g] = cursor;
+            cursor += s[g];
+        }
+        out[1 + strips] = cursor;
+    }
+    grown[tiles * entry] = 0;
+    grown[tiles * entry + 1] = cursor;
+    auto *halves = reinterpret_cast<unsigned char *>(grown + table);
+    for (std::size_t k = 0; k < span_count; ++k) {
+        const Span sp = span_list[k];
+        const std::uint16_t index = sp.prim;
+        const std::uint32_t row = static_cast<std::uint16_t>(sp.ty) & kRowBits, mask = static_cast<std::uint16_t>(sp.ty) >> 12;
+        const std::uint32_t t = row * row_width + static_cast<std::uint32_t>(sp.tx0);
+        const std::int32_t len = sp.tx1 - sp.tx0 + 1;
+        for (std::int32_t j = 0; j < len; ++j) {
+            std::uint32_t *const f = strip_fill + static_cast<std::size_t>(t + j) * kStripSlots;
+            for (std::uint32_t m = mask; m; m &= m - 1) {
+                const std::uint32_t at = f[__builtin_ctz(m)]++;
+                std::memcpy(halves + 2u * at, &index, 2);
+            }
+        }
+    }
+    for (std::uint32_t n = 0; n < touched_n; ++n) {
+        count[touched[n]] = 0;
+        std::memset(strip_count + static_cast<std::size_t>(touched[n]) * kStripSlots, 0, kStripSlots * 4);
+    }
+    spans.clear();
+    this->touched_n = 0;
+    counted = 0;
+    Lists lists;
+    lists.tiles = tiles;
+    lists.total = total;
+    lists.words = words;
+    lists.table = table;
+    lists.strips = true;
     return lists;
 }
 
@@ -490,13 +621,17 @@ void memory_note(const char *) {}
 
 }  // namespace
 
-void configure(int scale, int tile) {
+void configure(int scale, int tile, bool strips, double strip_ratio) {
     g_geo.scale = scale;
     g_geo.tile = tile;
     g_geo.per_row = (2048 * scale + tile - 1) / tile;
+    g_geo.strips = strips && (tile == 4 || tile == 8) ? tile / 2 : 0;
+    g_geo.strip_ratio = strip_ratio;
     g_own = Builder();
     g_configured = true;
 }
+
+int strips() { return g_geo.strips; }
 
 Lists build_now(const std::uint32_t *prims, std::uint32_t count, Room room, void *context) { return g_own.build(prims, count, room, context); }
 

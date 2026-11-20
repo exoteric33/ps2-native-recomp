@@ -13,6 +13,16 @@ struct Params {
 
 override SCALE: u32 = 1u;
 override TILE: u32 = 16u;
+// The tile lists are kept per strip of two pixel rows (gpu.cpp PS2_GPU_STRIPS, tiles.hpp): a tile's table entry holds one list per strip, and each
+// strip is drawn by a workgroup of its own (TILE x 2 threads: ROWS = 2), which walks only the strip's list. One workgroup per strip, not four strips in
+// one TILE x TILE workgroup: the list's start and length must be the same for the whole workgroup, or the compiler reads every shape per thread
+// (a first try that took the strip from the thread's row ran the raster program 2.8 times as long on Intel graphics, with the same pictures).
+override STRIPS: bool = false;
+override ROWS: u32 = 16u;  // rows of a raster workgroup: TILE, or 2 with STRIPS or SPLIT (set by gpu.cpp)
+// Split tiles (gpu.cpp PS2_GPU_STRIPS=2): the lists stay per tile, as without strips, but each strip of two pixel rows of a tile is drawn by a
+// workgroup of its own (TILE x 2 threads, ROWS = 2), which walks the tile's whole list. On the laptop's Intel graphics this alone gave most of what
+// the lists per strip saved in the God of War fights, with no extra work for the processor.
+override SPLIT: bool = false;
 
 override EXPLICIT_FMA: bool = false;
 // Mipmap levels (docs/mipmap.md). The program that reads them takes about twice as long to translate on FXC (Direct3D 12 without DXC), so
@@ -1638,23 +1648,29 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     scratch[i] = atomicLoad(&vram[i * SCALE * SCALE]);
 }
 
-@compute @workgroup_size(TILE, TILE)
+@compute @workgroup_size(TILE, ROWS)
 fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let index = wid.x + wid.y * 1024u;
+    let group = wid.x + wid.y * 1024u;
+    // with STRIPS or SPLIT the workgroups are the strips, TILE / 2 per tile
+    let split = STRIPS || SPLIT;
+    let index = select(group, group / (TILE / 2u), split);
+    let strip = select(0u, group % (TILE / 2u), split);
     if (index >= prm(3u)) {
         return;
     }
-    let tile = prm(0u) + index * 2u;
+    // per tile: (x | y << 16, start of its list), the next entry's start ends it; with STRIPS: (x | y << 16, start of each strip's list, end of the last)
+    let tile = prm(0u) + index * select(2u, TILE / 2u + 2u, STRIPS);
     let origin = data[tile];
+    let at = tile + 1u + select(0u, strip, STRIPS);  // SPLIT: every strip walks its tile's one list
     let sx = (origin & 0xFFFFu) * TILE + lid.x;
-    let sy = (origin >> 16u) * TILE + lid.y;
+    let sy = (origin >> 16u) * TILE + strip * 2u + lid.y;
     let x = i32(sx / SCALE);
     let y = i32(sy / SCALE);
     let k = (sy % SCALE) * SCALE + sx % SCALE;
     let px = f32(x) + f32(sx % SCALE) / f32(SCALE);
     let py = f32(y) + f32(sy % SCALE) / f32(SCALE);
-    let first = data[tile + 1u];
-    let count = data[tile + 3u] - first;
+    let first = data[at];
+    let count = data[at + select(2u, 1u, STRIPS)] - first;
     let lists = prm(4u);
     let prims = prm(1u);
     let setups = prm(2u);

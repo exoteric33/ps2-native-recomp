@@ -8,6 +8,8 @@
 // PS2_ONE_THREAD=1, in the browser build, without a render ring, or unless PS2_TILE_THREAD=1 is set (it is off by default for now) the lists are built
 // in place by the caller, as they always were.
 //
+// With strips (configure) the lists are kept per two rows of pixels inside each tile, see there.
+//
 // What the shape record holds that the lists need: word 1 (kind in the low byte: 0 triangle, 1 sprite, 2 line, 3 point), words 2 and 3 (the box,
 // x | y << 16, first and last pixel), words 4 to 9 (the three corners) and word 10 (the reciprocal of twice the triangle's area), see draw() in gpu.cpp.
 
@@ -79,13 +81,27 @@ struct Words {
     const std::uint32_t &operator[](std::size_t i) const { return words[i]; }
 };
 
-// Called once from init(): the resolution scale and the tile size in pixels (8: one workgroup of the raster program).
-void configure(int scale, int tile);
+// Called once from init(): the resolution scale, the tile size in pixels (8: one workgroup of the raster program) and whether the lists are kept
+// per strip (`strips`, PS2_GPU_STRIPS in gpu.cpp; only for tiles of 4 or 8 pixels, else it is ignored).
+//
+// Strips: the raster program's threads run in groups of 16, two pixel rows of a tile each (Intel graphics), and every group walks its tile's whole
+// list, throwing out by the shape's box the shapes that miss its two rows. With strips every tile has one list per two rows of pixels (a strip),
+// holding only the shapes whose box reaches those rows, in the same order as the tile's list; a group walks its strip's list. A shape left out of a
+// strip's list would have been thrown out by the box test for every pixel of the strip, so the pictures are the same. Each batch gets lists per strip
+// only when they hold at most `strip_ratio` times the entries of its lists per tile (small shapes); else it keeps lists per tile (Lists::strips says
+// which), since a batch of big shapes would walk nearly the same lists in tile / 2 times as many workgroups.
+void configure(int scale, int tile, bool strips = false, double strip_ratio = 4.0);
+// The number of strips per tile when the lists are kept per strip (tile / 2), 0 when they are not.
+int strips();
 
-// The lists of one batch: a table of `tiles` entries (tile x | y << 16, then the offset of its list), a closing entry, then the lists, all in one
-// array of `words` words. The table's offsets count from the start of the lists, so the whole array can sit anywhere in the arena.
+// The lists of one batch, all in one array of `words` words. Without strips: a table of `tiles` entries (tile x | y << 16, then the offset of its
+// list), a closing entry (0, the end of the last list), then the lists. With strips (S per tile): a table of `tiles` entries of S + 2 words
+// (tile x | y << 16, the offset of each strip's list, then the end of the last one), the same closing entry, then the lists. The offsets count in
+// entries from the start of the lists (`table` words into the array), so the whole array can sit anywhere in the arena.
 struct Lists {
     std::uint32_t tiles = 0, total = 0, words = 0;  // total: entries in all the lists
+    std::uint32_t table = 2;                        // words before the lists (the table and the closing entry)
+    bool strips = false;                            // the lists are per strip (the raster program's STRIPS variant draws them)
 };
 
 // Where build_now writes: the callback returns room for that many words (the arena, in gpu.cpp).

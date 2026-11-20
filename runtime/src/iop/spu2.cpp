@@ -370,16 +370,18 @@ void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (
     const std::int32_t fixed_l = static_cast<std::int16_t>(v.voll << 1), fixed_r = static_cast<std::int16_t>(v.volr << 1);
     std::uint32_t position = v.position;
     for (unsigned n = 0; n < kBatch; ++n) {
-        if (v.phase == kOff) break;
+        const bool stopped = v.phase == kOff;
+        if (stopped && step == 0) break;
         const std::uint32_t index = position >> 12, frac = position & 0xFFFu;
-        const std::int32_t sample = noise ? noise[n] : (v.buffer[index] * static_cast<std::int32_t>(0x1000 - frac) + v.buffer[index + 1] * static_cast<std::int32_t>(frac)) >> 12;
+        const std::int32_t sample = stopped ? 0 : noise ? noise[n] :
+            (v.buffer[index] * static_cast<std::int32_t>(0x1000 - frac) + v.buffer[index + 1] * static_cast<std::int32_t>(frac)) >> 12;
         position += step;
         while ((position >> 12) >= 28) {
             position -= 28u << 12;
             std::memmove(v.buffer, v.buffer + 28, 28 * sizeof(std::int16_t));
             if (block_end(v)[0]) {
                 v.end = true;
-                if (!((g_ram[v.block[0] & kRamMask] >> 8) & 2u)) {
+                if (!stopped && !((g_ram[v.block[0] & kRamMask] >> 8) & 2u)) {
                     v.phase = kRelease;
                     v.env.level = 0;
                 }
@@ -390,6 +392,9 @@ void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (
             check_irq(v.block[0], 8);
             decode_block(v, v.buffer + 28);
         }
+        // The sample reader can update NAX, ENDX and IRQA after the envelope
+        // stops. The stopped voice still contributes no samples to the mix.
+        if (stopped) continue;
         update_envelope(v);
         const std::int32_t out = sample * v.env.level >> 15;
         if (raw) raw[n] = clamp16(out);
@@ -624,8 +629,9 @@ void tick() {
         const std::uint32_t non = g_cores[c].regs[0x184 >> 1] | static_cast<std::uint32_t>(g_cores[c].regs[0x186 >> 1] & 0xFFu) << 16;
         for (int i = 0; i < 24; ++i) {
             Voice &v = g_cores[c].voices[i];
-            if (!v.key_on && v.phase == kOff) continue;
-            if (count) {
+            const bool active_voice = v.key_on || v.phase != kOff;
+            if (!active_voice && v.pitch == 0) continue;
+            if (count && active_voice) {
                 ++active;
                 ++phases[v.phase];
             }

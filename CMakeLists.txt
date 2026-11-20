@@ -351,6 +351,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2spu2summarytest PRIVATE synchronization)
     endif()
+    # Sample-reader progress and silent output after ADSR stops, no game needed.
+    add_executable(ps2spustoppedtest EXCLUDE_FROM_ALL tests/spu2_stopped_voice.cpp)
+    target_include_directories(ps2spustoppedtest PRIVATE runtime/src)
+    target_link_libraries(ps2spustoppedtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2spustoppedtest PRIVATE synchronization)
+    endif()
     # the thread lists of the F9 problem report, no game needed: ninja ps2threadreporttest
     add_executable(ps2threadreporttest EXCLUDE_FROM_ALL tests/thread_report.cpp)
     target_include_directories(ps2threadreporttest PRIVATE runtime/src)

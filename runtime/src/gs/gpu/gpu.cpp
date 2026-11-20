@@ -98,6 +98,7 @@ struct Overlay {
     bool on = false;
 } g_overlay;
 std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
+std::uint32_t g_picture_epoch = 0;  // counts what changes the picture without the game drawing: the quick menu's panel, a loaded state, a new swap chain
 bool g_have_previous = false;
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 std::uint32_t g_sharp_2d = 1;
@@ -4705,6 +4706,7 @@ void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vec
 
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut) {
     wait_idle();
+    ++g_picture_epoch;
     if (stat::g_on) stat::state_loaded();
     if (hwcache::g_on) hwcache::state_loaded();
     dec_reset();  // memory and palette are new: nothing kept is valid
@@ -4761,6 +4763,7 @@ void stats() {
 
 void configure_surface() {
     post::drain();  // no present of the old swap chain may be in flight
+    ++g_picture_epoch;
     WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
     config.device = g_device;
     config.format = g_surface_format;
@@ -4842,6 +4845,14 @@ bool attach_surface(const SurfaceTarget &target) {
     for (const WGPUPresentMode wanted : {WGPUPresentMode_Immediate, WGPUPresentMode_Mailbox})
         for (std::size_t i = 0; i < caps.presentModeCount; ++i)
             if (caps.presentModes[i] == wanted) g_present_mode = wanted;
+    // With the speed limit off (PS2_NO_LIMIT, a measuring run) on Direct3D 12, Mailbox makes the window thread wait for the screen's refresh
+    // when our window is in front; Immediate does not. Normal play keeps Mailbox. PS2_PRESENT_MODE below still wins.
+    if (g_dx12_compiler) {
+        const std::string no_limit = os::env("PS2_NO_LIMIT");
+        if (!no_limit.empty() && no_limit != "0")
+            for (std::size_t i = 0; i < caps.presentModeCount; ++i)
+                if (caps.presentModes[i] == WGPUPresentMode_Immediate) g_present_mode = WGPUPresentMode_Immediate;
+    }
     // PS2_PRESENT_MODE=fifo, relaxed, mailbox or immediate asks for one mode (when the surface offers it); PS2_FRAME_LATENCY=1..8 sets how many
     // pictures the swap chain keeps in flight. Both are for experiments (docs/speed.md); the log line below says what is used.
     if (std::string want = os::env("PS2_PRESENT_MODE"); !want.empty()) {
@@ -4933,7 +4944,13 @@ struct PresentLog {
     bool on = report || ps2::hitch::on();  // PS2_HITCH_LOG times the steps of every picture too
     Clock::time_point since = Clock::now(), mark = since;
     double flush = 0, acquire = 0, submit = 0, present = 0;
-    std::uint32_t pictures = 0;
+    std::uint32_t pictures = 0, same = 0;  // `same`: pictures not presented because nothing changed (SamePicture)
+    void skipped(bool yes) {
+        if (yes) {
+            ++same;
+            picture();
+        }
+    }
     void lap(double &into) {
         const auto now = Clock::now();
         into += std::chrono::duration<double, std::milli>(now - mark).count();
@@ -4945,11 +4962,12 @@ struct PresentLog {
         const auto now = Clock::now();
         const double seconds = std::chrono::duration<double>(now - since).count();
         if (seconds < 1.0) return;
-        std::fprintf(stderr, "[present] %u pictures in %.2f s; per picture: flush %.2f ms, acquire %.2f ms, submit %.2f ms, present %.2f ms (%s)\n", pictures, seconds,
-                     flush / pictures, acquire / pictures, submit / pictures, present / pictures, present_mode_name(g_present_mode));
+        const double n = std::max<double>(pictures - same, 1.0);  // pictures that went to the screen
+        std::fprintf(stderr, "[present] %u pictures in %.2f s (%u not presented, nothing had changed); per picture presented: flush %.2f ms, acquire %.2f ms, submit %.2f ms, present %.2f ms (%s)\n", pictures, seconds, same,
+                     flush / n, acquire / n, submit / n, present / n, present_mode_name(g_present_mode));
         since = now;
         flush = acquire = submit = present = 0;
-        pictures = 0;
+        pictures = same = 0;
     }
 };
 
@@ -5042,6 +5060,35 @@ std::uint32_t display_params(const DisplaySource &src, std::uint32_t scratch_at)
                         o.active ? 1u : 0u, o.fbp, o.fbw, o.psm, o.dbx, o.dby, static_cast<std::uint32_t>(o.x), static_cast<std::uint32_t>(o.y), o.width, o.height});
 }
 
+// A picture the game has not changed since the last present (nothing drawn, uploaded or copied, the same read circuits, the same
+// window and picture look) is not handed to the screen again: the screen already shows it. PS2_PRESENT_SKIP=1 turns this on, 0 off.
+// At most kMaxSkipped in a row, so a window that lost its picture (a resize, a cover) gets one soon anyway.
+struct SamePicture {
+    bool valid = false;
+    std::uint32_t key[29] = {};
+    std::uint64_t work = 0;
+    unsigned skipped_in_row = 0;
+    std::uint64_t skipped = 0, shown = 0, checked = 0, mismatched = 0, looked = 0, hash = 0;
+};
+SamePicture g_same;
+constexpr unsigned kMaxSkipped = 30;
+constexpr bool kSkipSamePictures = true;  // on: charger runs in Best performance, 3 pairs each, were faster in front and never slower elsewhere; PS2_PRESENT_SKIP=0 turns it off
+
+std::uint64_t picture_work() {  // everything given to the chip that is not the display step itself
+    std::uint64_t total = g_commands.size();
+    for (int k = 0; k < kPipelines; ++k)
+        if (k != kDisplay) total += g_dispatches[k];
+    return total;
+}
+
+void picture_key(const DisplaySource &src, std::uint32_t (&key)[29]) {
+    const DisplayOverlay &o = src.overlay;
+    const std::uint32_t words[29] = {src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, o.active ? 1u : 0u, o.fbp, o.fbw, o.psm, o.dbx, o.dby,
+                                     static_cast<std::uint32_t>(o.x), static_cast<std::uint32_t>(o.y), o.width, o.height, g_surface_width, g_surface_height,
+                                     g_options.widescreen ? 1u : 0u, ps2::video_options(), g_scale, g_overlay.on ? 1u : 0u, g_overlay.x, g_overlay.y, g_overlay.width, g_overlay.height, g_picture_epoch};
+    std::memcpy(key, words, sizeof words);
+}
+
 bool present(const DisplaySource &src) {
     if (!g_surface) return false;
     static PresentLog log;
@@ -5049,6 +5096,42 @@ bool present(const DisplaySource &src) {
     if (log.on) log.mark = PresentLog::Clock::now();
     flush_all();
     if (log.on) log.lap(log.flush);
+    static const std::string skip_asked = os::env("PS2_PRESENT_SKIP");
+    static const bool check_same = skip_asked == "check";  // PS2_PRESENT_SKIP=check: present every picture, but prove each "unchanged" call by reading the picture back
+    static const bool skip_same = check_same || (skip_asked.empty() ? kSkipSamePictures : skip_asked != "0");
+    if (skip_same && !g_live) {
+        std::uint32_t key[29];
+        picture_key(src, key);
+        const std::uint64_t work = picture_work();
+        const bool same = g_same.valid && g_same.work == work && g_same.skipped_in_row < kMaxSkipped && std::memcmp(key, g_same.key, sizeof key) == 0;
+        if (check_same) {
+            std::vector<std::uint32_t> pixels;
+            std::uint32_t w = 0, h = 0;
+            display(src, pixels, w, h);
+            std::uint64_t hash = 1469598103934665603ull;
+            for (const std::uint32_t px : pixels) hash = (hash ^ px) * 1099511628211ull;
+            if (same) {
+                ++g_same.checked;
+                if (hash != g_same.hash) {
+                    if (g_same.mismatched++ < 20) std::fprintf(stderr, "[present-check] picture %llu was called unchanged but its pixels differ\n", static_cast<unsigned long long>(g_same.looked));
+                }
+            }
+            g_same.hash = hash;
+            if (++g_same.looked % 600 == 0)
+                std::fprintf(stderr, "[present-check] %llu pictures, %llu called unchanged, %llu of those differ\n", static_cast<unsigned long long>(g_same.looked), static_cast<unsigned long long>(g_same.checked), static_cast<unsigned long long>(g_same.mismatched));
+        } else if (same) {
+            ++g_same.skipped_in_row;
+            ++g_same.skipped;
+            log.skipped(true);
+            return true;
+        }
+        std::memcpy(g_same.key, key, sizeof key);
+        g_same.work = work;
+        g_same.valid = true;
+        g_same.skipped_in_row = 0;
+        ++g_same.shown;
+    }
+    log.skipped(false);
     const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
@@ -5084,6 +5167,7 @@ bool present(const DisplaySource &src) {
     if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
         if (st.texture) wgpuTextureRelease(st.texture);
         submit();  // the chip still gets the work; only the screen misses this picture
+        g_same.valid = false;  // the screen does not show this picture: the next one is presented even if it looks the same
         if (reconfigure) configure_surface();
         return true;
     }
@@ -5212,6 +5296,7 @@ void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t h
     post::drain();
     if (!rgba || !width || !height || !g_surface) {
         g_overlay.on = false;
+        ++g_picture_epoch;
         return;
     }
     if (!g_overlay.pipeline && !make_overlay_pipeline()) return;
@@ -5234,6 +5319,7 @@ void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t h
         bd.entries = be;
         g_overlay.group = wgpuDeviceCreateBindGroup(g_device, &bd);
     }
+    ++g_picture_epoch;
     wgpuQueueWriteBuffer(g_queue, g_overlay.pixels, 0, rgba, bytes);
     const std::uint32_t rect[4] = {x, y, width, height};
     wgpuQueueWriteBuffer(g_queue, g_overlay.rect, 0, rect, sizeof rect);

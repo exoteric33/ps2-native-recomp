@@ -673,6 +673,9 @@ fn texel_y(s: Setup, yi: i32) -> u32 {
 
 var<private> snapshot_lo: u32 = 0u;
 var<private> snapshot_hi: u32 = 0u;
+// The copy keeps `snapshot_run` words of every `snapshot_stride` (whole pages of a rectangle of the frame); between the runs it holds old data, never read.
+var<private> snapshot_stride: u32 = 1u;
+var<private> snapshot_run: u32 = 1u;
 // A sprite that copies a rendered picture (a colour or depth format) at almost 1:1 but not exactly, with a slight zoom or a
 // fractional offset, reads it on the inner-resolution grid (rt_copy, set per pixel in shade_at): texel X / SCALE and sub-sample
 // X % SCALE on each axis. Read on the console's grid with the output pixel's own sub-sample, such a copy lands up to one console
@@ -680,9 +683,31 @@ var<private> snapshot_hi: u32 = 0u;
 // Devil Saga blends the last frame, 0.2 % larger and half a pixel off, over each new one (an afterimage glow); exact 1:1 copies
 // are unchanged.
 var<private> rt_copy: bool = false;
+// 1 / snapshot_stride, so that in_snapshot finds the place in a run without an integer division (the chip has none: it costs a long sequence)
+var<private> snapshot_inv: f32 = 1.0;
+
+// Whether graphics memory word `word` is in the batch's snapshot: inside its range and within one of its runs. The remainder by the stride
+// comes from a float quotient that is at most one off for these numbers (word counts below 2^24), then put right: exactly what % gives.
+fn in_snapshot(word: u32) -> bool {
+    if (word < snapshot_lo || word >= snapshot_hi) {
+        return false;
+    }
+    if (snapshot_run >= snapshot_stride) {
+        return true;
+    }
+    let d = word - snapshot_lo;
+    var r = i32(d) - i32(u32(f32(d) * snapshot_inv) * snapshot_stride);
+    if (r < 0) {
+        r = r + i32(snapshot_stride);
+    }
+    if (r >= i32(snapshot_stride)) {
+        r = r - i32(snapshot_stride);
+    }
+    return u32(r) < snapshot_run;
+}
 
 fn load_texel(l: Loc, k: u32) -> u32 {
-    if (l.word >= snapshot_lo && l.word < snapshot_hi) {
+    if (in_snapshot(l.word)) {
         return (scratch[(l.word - snapshot_lo) * SCALE * SCALE + k] >> l.shift) & l.mask;
     }
     return load_at(l, k);
@@ -802,7 +827,7 @@ fn spread_y(y: u32) -> u32 {
 fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
     let word = ((page + (n << 2u)) & 0x3FFFFFu) >> 2u;
     var raw = 0u;
-    if (word >= snapshot_lo && word < snapshot_hi) {
+    if (in_snapshot(word)) {
         raw = scratch[(word - snapshot_lo) * SCALE * SCALE + k];
     } else {
         raw = atomicLoad(&vram[word * SCALE * SCALE + k]);
@@ -1599,7 +1624,9 @@ fn snapshot(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= prm(1u)) {
         return;
     }
-    scratch[i] = atomicLoad(&vram[prm(0u) * SCALE * SCALE + i]);
+    let run = prm(3u) * SCALE * SCALE;
+    let at = (i / run) * prm(2u) * SCALE * SCALE + i % run;
+    scratch[at] = atomicLoad(&vram[prm(0u) * SCALE * SCALE + at]);
 }
 
 @compute @workgroup_size(64)
@@ -1633,7 +1660,10 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     let setups = prm(2u);
     snapshot_lo = prm(5u);
     snapshot_hi = prm(6u);
-    let mips = prm(9u);  // words 7 and 8 are not used here
+    snapshot_stride = max(prm(7u), 1u);
+    snapshot_run = prm(8u);
+    snapshot_inv = 1.0 / f32(snapshot_stride);
+    let mips = prm(9u);
     var last_setup = 0xFFFFFFFFu;
     var s: Setup;
     for (var i = 0u; i < count; i = i + 1u) {

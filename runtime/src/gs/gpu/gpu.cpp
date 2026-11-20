@@ -945,25 +945,46 @@ bool reads_own_word(const std::uint32_t *rec, const std::uint32_t *setup) {
     const int ox = texel(uv[0], uv[3], f[0], f[2], x0) - x0;
     if (texel(uv[0], uv[3], f[0], f[2], x1) - x1 != ox) return false;
     const auto wide = [](std::uint32_t psm) { return psm == PSMCT32 || psm == PSMCT24 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; };
-    if (ox == 0) return tpsm == fpsm || (wide(fpsm) && wide(tpsm));
-    const bool half = fpsm == PSMCT16 || fpsm == PSMCT16S;
-    return half && tpsm == fpsm && (ox == 8 || ox == -8) && x1 - x0 < 8 && (x0 & 8) == (x1 & 8) && ((x0 ^ 8) == x0 + ox);
+    // A 16-bit sprite that reads the other half of its word (x ^ 8, a channel shuffle) reads the batch copy like any other: the pixel at x ^ 8
+    // may write that half in the same batch (a second sprite over the other 8 pixels), and nothing orders its write after this read. The pair
+    // sits in two different tiles, so no barrier could (follows upstream 7812d21).
+    return ox == 0 && (tpsm == fpsm || (wide(fpsm) && wide(tpsm)));
 }
 
-Range read_range(const std::uint32_t *rec, const std::uint32_t *setup, const Range &whole) {
-    if ((rec[1] & kKindMask) != 1 || !(setup[0] & 16u)) return whole;
-    // Wrap mode 3 (region repeat) reads (u & MINU) | MAXU, which need not lie between the corners of the sprite: the range is that of the words it can touch, else the whole texture.
-    if (region_repeat(setup)) {
-        Range r;
-        return sprite_read_range(rec, setup, static_cast<int>(rec[2] & 0xFFFFu), static_cast<int>(rec[2] >> 16), static_cast<int>(rec[3] & 0xFFFFu), static_cast<int>(rec[3] >> 16), r) ? r : whole;
-    }
+// The rectangle of texels (u0..u1, v0..v1, inclusive) that a sprite can read, with a texel to spare on each side for the filter. Whole texture when it
+// cannot be said: not a sprite, no texture, or a rectangle that leaves the texture where the wrap mode would bring it round to the other side.
+// Clamp (mode 1) may leave it by the spare texel: those reads land on the edge, so the rectangle is cut back to the texture.
+bool read_rect(const std::uint32_t *rec, const std::uint32_t *setup, int &u0, int &v0, int &u1, int &v1) {
+    const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
+    u0 = v0 = 0;
+    u1 = tw - 1;
+    v1 = th - 1;
+    if ((rec[1] & kKindMask) != 1 || !(setup[0] & 16u)) return false;
+    // Wrap mode 3 (region repeat) reads (u & MINU) | MAXU, which need not lie between the corners of the sprite: no rectangle (repeat_range works out its words instead).
+    if (region_repeat(setup)) return false;
     float uv[6];
     std::memcpy(uv, rec + 15, sizeof uv);
-    const int u0 = static_cast<int>(std::floor(std::min(uv[0], uv[3]) / 16.0f)) - 1, u1 = static_cast<int>(std::ceil(std::max(uv[0], uv[3]) / 16.0f)) + 1;
-    const int v0 = static_cast<int>(std::floor(std::min(uv[1], uv[4]) / 16.0f)) - 1, v1 = static_cast<int>(std::ceil(std::max(uv[1], uv[4]) / 16.0f)) + 1;
-    const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
-    if (u0 < 0 || v0 < 0 || u1 >= tw || v1 >= th) return whole;
-    return region(setup[12], setup[13], setup[14], u0, v0, u1, v1);
+    int a0 = static_cast<int>(std::floor(std::min(uv[0], uv[3]) / 16.0f)) - 1, a1 = static_cast<int>(std::ceil(std::max(uv[0], uv[3]) / 16.0f)) + 1;
+    int b0 = static_cast<int>(std::floor(std::min(uv[1], uv[4]) / 16.0f)) - 1, b1 = static_cast<int>(std::ceil(std::max(uv[1], uv[4]) / 16.0f)) + 1;
+    const auto clamped = [](std::uint32_t mode, int &lo, int &hi, int size) {
+        if (lo >= 0 && hi < size) return true;
+        if (mode != 1 || lo + 1 < 0 || hi - 1 >= size) return false;
+        lo = std::max(lo, 0);
+        hi = std::min(hi, size - 1);
+        return true;
+    };
+    if (!clamped((setup[7] >> 24) & 3u, a0, a1, tw) || !clamped((setup[7] >> 26) & 3u, b0, b1, th)) return false;
+    u0 = a0;
+    v0 = b0;
+    u1 = a1;
+    v1 = b1;
+    return true;
+}
+
+// The words from the first to the last that a region-repeat sprite can touch (the rectangle of read_rect does not hold its reads), else the whole texture.
+Range repeat_range(const std::uint32_t *rec, const std::uint32_t *setup, const Range &whole) {
+    Range r;
+    return sprite_read_range(rec, setup, static_cast<int>(rec[2] & 0xFFFFu), static_cast<int>(rec[2] >> 16), static_cast<int>(rec[3] & 0xFFFFu), static_cast<int>(rec[3] >> 16), r) ? r : whole;
 }
 
 Range pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y0, int x1, int y1) {
@@ -1941,12 +1962,16 @@ void plan_decodes(std::uint32_t prims) {
     }
 }
 
+// Copies the words of graphics memory that the batch's textures read and its pixels write, so that the textures read them as they were before the batch.
+// When every such texture lies over the frame in the same page layout (same base, width and page size, the way a draw that reads the picture it is
+// drawing over does), only the rectangle of pages those textures cover is copied, row by row (`run` words of every `stride`); else the one range
+// from the first to the last word that both touch (follows upstream 883d903).
 std::uint32_t mip_top_of(const std::uint32_t *mip);
 Range mip_range(const std::uint32_t *setup, const std::uint32_t *mip, std::uint32_t top);
 
-std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi) {
+std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi, std::uint32_t &stride, std::uint32_t &run) {
     Batch &b = g_batch;
-    lo = hi = 0;
+    lo = hi = stride = run = 0;
     if (g_batch_reads.empty()) return 0;
     const Range fb = pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
     const Range z = pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
@@ -1954,6 +1979,13 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
     bool any = false;
     for (const Range &t : g_batch_reads) any = any || written(t);
     if (!any) return 0;
+    std::uint32_t pw, ph;
+    page_size(b.fpsm, pw, ph);
+    const int per_row = static_cast<int>(std::max<std::uint32_t>(1, b.fbw * 64 / pw));
+    const int fx0 = std::max(b.minx, 0) / static_cast<int>(pw), fy0 = std::max(b.miny, 0) / static_cast<int>(ph);
+    const int fx1 = std::max(b.maxx, 0) / static_cast<int>(pw), fy1 = std::max(b.maxy, 0) / static_cast<int>(ph);
+    int px0 = 1 << 30, py0 = 1 << 30, px1 = -1, py1 = -1;
+    bool rect = fx1 < per_row;
     Range shared;
     for (std::uint32_t i = 0; i < prims; ++i) {
         const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
@@ -1961,23 +1993,62 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
         const std::uint32_t *mip = b.any_mip && (rec[0] + 1) * kMipWords <= b.mips.size() ? b.mips.data() + rec[0] * kMipWords : nullptr;
         const std::uint32_t top = mip ? mip_top_of(mip) : 0u;
         if (!(setup[0] & 2u) || (!top && reads_own_word(rec, setup))) continue;
-        const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
-        const Range whole = region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1);
-        const bool listed = !top && (rec[1] & kKindMask) == 1 && region_repeat(setup) && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
-        Range t = top ? whole : listed ? g_exact.reads : read_range(rec, setup, whole);
-        if (top) {  // a shape that reads mip levels: the whole of every level it can reach (mip_range)
+        int u0, v0, u1, v1;
+        if (top) {  // a shape that reads mip levels: the whole of every level it can reach (mip_range), never a rectangle of pages
+            u0 = v0 = 0;
+            u1 = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1) - 1;
+            v1 = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1) - 1;
+        } else {
+            read_rect(rec, setup, u0, v0, u1, v1);
+        }
+        const Range rectangle = region(setup[12], setup[13], setup[14], u0, v0, u1, v1);  // the whole texture when read_rect cannot say
+        const bool repeat = (rec[1] & kKindMask) == 1 && region_repeat(setup);
+        const bool listed = repeat && g_exact.state == 1 && g_exact.reads_ok;  // the word sets know what such sprites read (exact_reads)
+        Range t = top ? rectangle : listed ? g_exact.reads : repeat ? repeat_range(rec, setup, rectangle) : rectangle;
+        if (top) {
             const Range levels = mip_range(setup, mip, top);
             t.add(levels.lo, levels.hi);
         }
-        for (const Range *w : {&fb, b.zwrite ? &z : nullptr})
-            if (w && t.overlaps(w->lo, w->hi)) shared.add(std::max(t.lo, w->lo), std::min(t.hi, w->hi));
+        if (b.zwrite && t.overlaps(z.lo, z.hi)) {
+            shared.add(std::max(t.lo, z.lo), std::min(t.hi, z.hi));
+            rect = false;
+        }
+        if (!t.overlaps(fb.lo, fb.hi)) continue;
+        shared.add(std::max(t.lo, fb.lo), std::min(t.hi, fb.hi));
+        std::uint32_t tpw, tph;
+        page_size(setup[14], tpw, tph);
+        if (top || setup[12] != b.fbp || setup[13] != b.fbw || tpw != pw || tph != ph || repeat || u1 / static_cast<int>(pw) >= per_row) {
+            rect = false;
+            continue;
+        }
+        const int x0 = std::max(u0 / static_cast<int>(pw), fx0), y0 = std::max(v0 / static_cast<int>(ph), fy0);
+        const int x1 = std::min(u1 / static_cast<int>(pw), fx1), y1 = std::min(v1 / static_cast<int>(ph), fy1);
+        if (x0 > x1 || y0 > y1) continue;
+        px0 = std::min(px0, x0);
+        py0 = std::min(py0, y0);
+        px1 = std::max(px1, x1);
+        py1 = std::max(py1, y1);
     }
     if (shared.lo >= shared.hi) return 0;
+    if (rect && px1 >= 0) {
+        const std::uint64_t base = static_cast<std::uint64_t>(b.fbp) * 256 + (static_cast<std::uint64_t>(px0) + static_cast<std::uint64_t>(py0) * per_row) * 8192;
+        if (base + static_cast<std::uint64_t>(py1 - py0 + 1) * per_row * 8192 <= kMemorySize) {
+            lo = static_cast<std::uint32_t>(base / 4);
+            run = static_cast<std::uint32_t>(px1 - px0 + 1) * 2048u;
+            stride = static_cast<std::uint32_t>(per_row) * 2048u;
+            const std::uint32_t rows = static_cast<std::uint32_t>(py1 - py0 + 1);
+            hi = lo + (rows - 1) * stride + run;
+            const std::uint32_t words = rows * run * g_scale * g_scale;
+            dispatch_linear(kSnapshot, words, push_params({lo, words, stride, run}));
+            return words;
+        }
+    }
     lo = static_cast<std::uint32_t>(std::min<std::uint64_t>(shared.lo, kMemorySize) / 4);
     hi = static_cast<std::uint32_t>(std::min<std::uint64_t>(shared.hi, kMemorySize) / 4);
     if (hi <= lo) return 0;
+    stride = run = hi - lo;
     const std::uint32_t words = (hi - lo) * g_scale * g_scale;
-    dispatch_linear(kSnapshot, words, push_params({lo, words}));
+    dispatch_linear(kSnapshot, words, push_params({lo, words, stride, run}));
     return words;
 }
 
@@ -2122,9 +2193,9 @@ void flush_batch() {
         if (tiles::logging()) tiles::note_lists(g_arena.data() + tile_offset, lists);
     }
     const std::uint32_t list_offset = tile_offset + lists.tiles * 2 + 2;
-    std::uint32_t snapshot_lo, snapshot_hi;
-    const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi);
-    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, lists.tiles, list_offset, snapshot_lo, snapshot_hi, 1u, 0u, mip_offset});
+    std::uint32_t snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run;
+    const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run);
+    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, lists.tiles, list_offset, snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run, mip_offset});
     note_raster(prims, lists.tiles, lists.total, snapshot);
     if (stat::g_on) {
         stat::batch(prims, kWhyName[g_why]);

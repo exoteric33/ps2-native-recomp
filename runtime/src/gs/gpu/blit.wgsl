@@ -95,7 +95,9 @@ fn row4(a: vec3<f32>, b: vec3<f32>, c: vec3<f32>, d: vec3<f32>, w: vec4<f32>) ->
 // (the amount follows how much room there is to the nearest of 0 and 1), not from any source code.
 // The 4x4 source pixels around the position are read once (16 reads; the soft look reads 4) into named variables (an array that is
 // indexed while running was slower on the Intel chip), and the cubic and the four neighbour blends are all taken from them.
-fn sharp_scene(uv: vec2<f32>) -> vec3<f32> {
+// With `edges` the edge smoothing follows (edge_aa), and the five source pixels its test reads, which always lie in this 4x4 block,
+// are taken from these reads: the same values, without reading them again.
+fn sharp_scene(uv: vec2<f32>, edges: bool) -> vec3<f32> {
     let size = vec2<f32>(f32(blit.width), f32(blit.height));
     let p = uv * size - 0.5;
     let origin = floor(p);
@@ -137,7 +139,24 @@ fn sharp_scene(uv: vec2<f32>) -> vec3<f32> {
     let mx = max(max(max(n, s), max(w, e)), c);
     let amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3<f32>(0.0001)), vec3<f32>(0.0), vec3<f32>(1.0)));
     let k = -amp * SHARPNESS;
-    return (c + (n + s + w + e) * k) / (1.0 + 4.0 * k);
+    let sharp = (c + (n + s + w + e) * k) / (1.0 + 4.0 * k);
+    if (!edges) { return sharp; }
+    // edge_aa's source pixel (the one uv falls in) is the block's (1, 1) or (2, 2) or a mix of the two per axis
+    let at = vec2<i32>(floor(uv * size));
+    let dx = at.x - x;
+    let dy = at.y - y;
+    if (dx < 0 || dx > 1 || dy < 0 || dy > 1) { return edge_aa(uv, sharp); }
+    let xl = dx == 1;
+    let yl = dy == 1;
+    // the corners of the 3x3 around it and its middle: block columns dx, dx + 1, dx + 2 and rows dy, dy + 1, dy + 2
+    let nw = luma(select(select(t00, t01, xl), select(t10, t11, xl), yl));
+    let ne = luma(select(select(t02, t03, xl), select(t12, t13, xl), yl));
+    let sw = luma(select(select(t20, t21, xl), select(t30, t31, xl), yl));
+    let se = luma(select(select(t22, t23, xl), select(t32, t33, xl), yl));
+    let m = luma(select(select(t11, t12, xl), select(t21, t22, xl), yl));
+    // (edge_tail reads the plain blend scene(uv) again: the same blend from the block's middle four gave a few window pixels one step
+    // apart, PS2_BLIT_CHECK, since the compiler rounds the position's arithmetic differently there)
+    return edge_tail(uv, sharp, nw, ne, sw, se, m);
 }
 
 fn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }
@@ -154,13 +173,18 @@ fn edge_aa(uv: vec2<f32>, center: vec3<f32>) -> vec3<f32> {
     // unchanged, while edge direction controls subpixel reconstruction.
     // The edge test reads the five source pixels around this one (one read each, instead of a smooth
     // blend per neighbour): most of the picture is flat and stops here, so this is what the picture costs.
-    let texel_step = 1.0 / vec2<f32>(f32(blit.width), f32(blit.height));
     let c = vec2<i32>(floor(uv * vec2<f32>(f32(blit.width), f32(blit.height))));
     let nw = luma(scene_texel(c.x - 1, c.y - 1));
     let ne = luma(scene_texel(c.x + 1, c.y - 1));
     let sw = luma(scene_texel(c.x - 1, c.y + 1));
     let se = luma(scene_texel(c.x + 1, c.y + 1));
     let m = luma(scene_texel(c.x, c.y));
+    return edge_tail(uv, center, nw, ne, sw, se, m);
+}
+
+// The rest of edge_aa from the brightness of the five source pixels.
+fn edge_tail(uv: vec2<f32>, center: vec3<f32>, nw: f32, ne: f32, sw: f32, se: f32, m: f32) -> vec3<f32> {
+    let texel_step = 1.0 / vec2<f32>(f32(blit.width), f32(blit.height));
     let low = min(m, min(min(nw, ne), min(sw, se)));
     let high = max(m, max(max(nw, ne), max(sw, se)));
     if (high - low < max(0.0312, high * 0.125)) { return center; }
@@ -220,10 +244,10 @@ fn fs(in: VertexOut) -> @location(0) vec4<f32> {
         return vec4<f32>(clamp(reduced_scene(in.uv), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     }
     if ((blit.options & 4u) != 0u) {
-        c = sharp_scene(in.uv);
+        c = sharp_scene(in.uv, (blit.options & 1u) != 0u);
     } else {
         c = scene(in.uv);
+        if ((blit.options & 1u) != 0u) { c = edge_aa(in.uv, c); }
     }
-    if ((blit.options & 1u) != 0u) { c = edge_aa(in.uv, c); }
     return vec4<f32>(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

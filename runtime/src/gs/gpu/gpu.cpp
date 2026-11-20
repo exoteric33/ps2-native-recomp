@@ -84,6 +84,10 @@ WGPUPresentMode g_present_mode = WGPUPresentMode_Fifo;
 std::uint32_t g_frame_latency = 0;  // pictures the swap chain may keep in flight; 0 = the library's default (2)
 std::uint32_t g_surface_width = 0, g_surface_height = 0;
 WGPURenderPipeline g_blit = nullptr;
+// PS2_BLIT_CHECK=<file>: a second present pass from that WGSL file (the blit to compare with, e.g. blit.wgsl before a change), drawn
+// with g_blit into two textures of the window's size after every timed present of a PS2_GPU_PROFILE window run; the bytes are compared
+// and a line "[blit-check]" says how many window pixels differ (a measuring aid for changes to blit.wgsl: they must give the same pixels)
+WGPURenderPipeline g_blit_ref = nullptr;
 WGPUBindGroup g_blit_group = nullptr;
 WGPUBuffer g_blit_params = nullptr;
 // The overlay (overlay.hpp): the quick menu's panel, drawn over the game's picture in the present pass with alpha blending. Its pixels
@@ -2289,6 +2293,24 @@ bool batch_conflict(const Range &r, bool clut) {
     return false;
 }
 
+// Uploads in squares (on by default; PS2_GPU_UPLOAD_BLOCKS=0 turns it off): an upload command whose records allow it runs in 8 x 8 squares of the rectangle (upload in gs.wgsl). A record allows it when no two
+// of its pixels can land on the same place of graphics memory, so that the order in which they are written cannot matter: its rows stay inside the
+// 2048-pixel space without wrapping, it is no wider than its buffer (else a row runs into the next row of pages), and its pages are fewer than the 512
+// of the whole memory. The others keep one thread per pixel in arrival order.
+bool g_upload_blocks = false;
+bool upload_in_squares(const std::uint32_t *q) {
+    const std::uint32_t bw = q[1], psm = q[2], sax = q[3], say = q[4], rrw = q[5], done = q[6], pixels = q[7];
+    if (!rrw || !pixels || hw::enabled()) return false;
+    const std::uint32_t first = done / rrw, last = (done + pixels - 1) / rrw;
+    if (sax + rrw > 2048 || say + last > 2047) return false;
+    std::uint32_t pw, ph;
+    page_size(psm, pw, ph);
+    const std::uint32_t per_row = std::max<std::uint32_t>(1, bw * 64 / pw);
+    if ((sax + rrw - 1) / pw >= per_row) return false;
+    const std::uint32_t lo = sax / pw + (say + first) / ph * per_row, hi = (sax + rrw - 1) / pw + (say + last) / ph * per_row;
+    return hi - lo < 512;
+}
+
 void emit_pre() {
     std::size_t i = 0;
     while (i < g_pre.size()) {
@@ -2302,6 +2324,35 @@ void emit_pre() {
             ++j;
         }
         const std::uint32_t count = static_cast<std::uint32_t>(j - i);
+        if (!clut && g_upload_blocks) {  // the uploads in 8 x 8 squares (upload in gs.wgsl, prm(3) = 1), when every record allows it
+            bool fits = true;
+            for (std::size_t k = i; k < j && fits; ++k) fits = upload_in_squares(g_pre[k].rec);
+            if (fits) {
+                std::uint32_t *records = g_arena.grow(count * 16u);
+                const std::uint32_t offset = static_cast<std::uint32_t>(records - g_arena.data());
+                std::uint32_t squares = 0;
+                for (std::size_t k = i; k < j; ++k) {
+                    const std::uint32_t *q = g_pre[k].rec;
+                    std::uint32_t *r = records + (k - i) * 16;
+                    std::memcpy(r, q, 11 * 4);
+                    const std::uint32_t first = q[6] / q[5], last = (q[6] + q[7] - 1) / q[5];
+                    const std::uint32_t bx0 = q[3] / 8, bx1 = (q[3] + q[5] - 1) / 8, by0 = (q[4] + first) / 8, by1 = (q[4] + last) / 8;
+                    r[11] = squares;
+                    r[12] = bx0;
+                    r[13] = by0;
+                    r[14] = bx1 - bx0 + 1;
+                    r[15] = 0;
+                    squares += (bx1 - bx0 + 1) * (by1 - by0 + 1);
+                }
+                if (g_live) {
+                    hw::live_position(static_cast<std::uint32_t>(g_commands.size()));
+                    for (std::size_t k = i; k < j; ++k) hw::live_writer(g_pre[k].range.lo, g_pre[k].range.hi);
+                }
+                if (squares) g_commands.push_back({kUpload, std::min(squares, 1024u), (squares + 1023) / 1024, push_params({offset, count, squares, 1})});
+                i = j;
+                continue;
+            }
+        }
         std::uint32_t *records = g_arena.grow(count * 12u);
         const std::uint32_t offset = static_cast<std::uint32_t>(records - g_arena.data());
         std::uint32_t total = 0;
@@ -2619,7 +2670,105 @@ void ensure_capacity() {
     if (changed || !g_group) rebuild_group();
 }
 
-void profile_submit() {
+// The picture onto the window's texture: the blit (blit.wgsl) and the overlay panel, one render pass. With `pipeline` (PS2_BLIT_CHECK)
+// that present pass instead of g_blit, and no overlay.
+void encode_present(WGPUCommandEncoder enc, WGPUTextureView view, const WGPUPassTimestampWrites *timestamps, WGPURenderPipeline pipeline = nullptr) {
+    WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+    color.view = view;
+    color.loadOp = WGPULoadOp_Clear;
+    color.storeOp = WGPUStoreOp_Store;
+    color.clearValue = WGPUColor{0.0, 0.0, 0.0, 1.0};
+    WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+    rd.colorAttachmentCount = 1;
+    rd.colorAttachments = &color;
+    rd.timestampWrites = timestamps;
+    WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+    const float w = static_cast<float>(g_surface_width), h = static_cast<float>(g_surface_height);
+    const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
+    const float vw = std::min(w, h * aspect), vh = vw / aspect;
+    wgpuRenderPassEncoderSetViewport(rp, (w - vw) * 0.5f, (h - vh) * 0.5f, vw, vh, 0.0f, 1.0f);
+    wgpuRenderPassEncoderSetPipeline(rp, pipeline ? pipeline : g_blit);
+    wgpuRenderPassEncoderSetBindGroup(rp, 0, g_blit_group, 0, nullptr);
+    wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+    if (!pipeline && g_overlay.on && g_overlay.group && g_surface_width && g_surface_height) {
+        // the panel's own rectangle, cut to the window (a window made smaller than the panel shows its top left part)
+        const std::uint32_t ox = std::min(g_overlay.x, g_surface_width - 1), oy = std::min(g_overlay.y, g_surface_height - 1);
+        const std::uint32_t ow = std::min(g_overlay.width, g_surface_width - ox), oh = std::min(g_overlay.height, g_surface_height - oy);
+        wgpuRenderPassEncoderSetViewport(rp, static_cast<float>(ox), static_cast<float>(oy), static_cast<float>(ow), static_cast<float>(oh), 0.0f, 1.0f);
+        wgpuRenderPassEncoderSetPipeline(rp, g_overlay.pipeline);
+        wgpuRenderPassEncoderSetBindGroup(rp, 0, g_overlay.group, 0, nullptr);
+        wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+    }
+    wgpuRenderPassEncoderEnd(rp);
+    wgpuRenderPassEncoderRelease(rp);
+}
+
+// PS2_BLIT_CHECK: the present pass of g_blit and of g_blit_ref into two textures of the window's size, read back and compared byte by byte.
+// Runs after a profiled submit has finished, so the picture and present()'s parameters are the ones the window just got.
+void blit_check() {
+    const std::uint32_t w = g_surface_width, h = g_surface_height;
+    if (!g_blit_ref || !w || !h) return;
+    const std::uint32_t row = (w * 4 + 255) / 256 * 256;
+    WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    td.size = {w, h, 1};
+    td.format = g_surface_format;
+    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
+    WGPUTexture tex[2] = {wgpuDeviceCreateTexture(g_device, &td), wgpuDeviceCreateTexture(g_device, &td)};
+    WGPUBuffer read = make_buffer(static_cast<std::uint64_t>(row) * h * 2, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+    for (int i = 0; i < 2; ++i) {
+        WGPUTextureView v = wgpuTextureCreateView(tex[i], nullptr);
+        encode_present(enc, v, nullptr, i ? g_blit_ref : g_blit);
+        wgpuTextureViewRelease(v);
+        WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+        src.texture = tex[i];
+        WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+        dst.buffer = read;
+        dst.layout.offset = static_cast<std::uint64_t>(row) * h * i;
+        dst.layout.bytesPerRow = row;
+        dst.layout.rowsPerImage = h;
+        const WGPUExtent3D size = {w, h, 1};
+        wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &size);
+    }
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+    wgpuQueueSubmit(g_queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(enc);
+    bool done = false;
+    WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+    cb.mode = WGPUCallbackMode_AllowProcessEvents;
+    cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
+    cb.userdata1 = &done;
+    wgpuBufferMapAsync(read, WGPUMapMode_Read, 0, static_cast<std::uint64_t>(row) * h * 2, cb);
+    wait_until(done);
+    if (const auto *b = static_cast<const std::uint8_t *>(wgpuBufferGetConstMappedRange(read, 0, static_cast<std::size_t>(row) * h * 2))) {
+        std::uint64_t differ = 0, hash = 1469598103934665603ull;
+        int most = 0;
+        std::uint32_t fx = 0, fy = 0;
+        for (std::uint32_t y = 0; y < h; ++y) {
+            const std::uint8_t *a = b + static_cast<std::size_t>(row) * y, *r = a + static_cast<std::size_t>(row) * h;
+            for (std::uint32_t x = 0; x < w; ++x) {
+                bool d = false;
+                for (int k = 0; k < 4; ++k) {
+                    const int diff = std::abs(int(a[x * 4 + k]) - int(r[x * 4 + k]));
+                    if (diff) d = true, most = std::max(most, diff);
+                    hash = (hash ^ a[x * 4 + k]) * 1099511628211ull;
+                }
+                if (d && !differ++) fx = x, fy = y;
+            }
+        }
+        std::fprintf(stderr, "[blit-check] frame %llu: %llu of %u window pixels differ (largest %d, first at %u %u), picture hash %016llx, look %u\n",
+                     static_cast<unsigned long long>(frame_count()), static_cast<unsigned long long>(differ), w * h, most, fx, fy,
+                     static_cast<unsigned long long>(hash), post::g_blit[7]);
+    }
+    wgpuBufferUnmap(read);
+    wgpuBufferRelease(read);
+    wgpuTextureRelease(tex[0]);
+    wgpuTextureRelease(tex[1]);
+}
+
+// PS2_GPU_PROFILE in a window also times the picture's render pass (blit and overlay), as a line "present" after the frame's commands.
+void profile_submit(WGPUTextureView present_view) {
     constexpr std::uint32_t kMax = 2048;
     if (!g_profile_queries) {
         WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
@@ -2636,6 +2785,7 @@ void profile_submit() {
     const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
     for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
         const Command &c = g_commands[i];
+        ++g_dispatches[c.pipeline];  // as submit() counts them: present() skips an unchanged picture by these counts
         WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
         writes.querySet = g_profile_queries;
         writes.beginningOfPassWriteIndex = i * 2;
@@ -2650,23 +2800,33 @@ void profile_submit() {
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
-    if (n) {
-        wgpuCommandEncoderResolveQuerySet(enc, g_profile_queries, 0, n * 2, g_profile_resolve, 0);
-        wgpuCommandEncoderCopyBufferToBuffer(enc, g_profile_resolve, 0, g_profile_read, 0, n * 16);
+    const std::uint32_t timed = n + (present_view && n < kMax ? 1u : 0u);
+    if (timed > n) {
+        WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+        writes.querySet = g_profile_queries;
+        writes.beginningOfPassWriteIndex = n * 2;
+        writes.endOfPassWriteIndex = n * 2 + 1;
+        encode_present(enc, present_view, &writes);
+    } else if (present_view) {
+        encode_present(enc, present_view, nullptr);
+    }
+    if (timed) {
+        wgpuCommandEncoderResolveQuerySet(enc, g_profile_queries, 0, timed * 2, g_profile_resolve, 0);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, g_profile_resolve, 0, g_profile_read, 0, timed * 16);
     }
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
-    if (n) {
+    if (timed) {
         bool done = false;
         WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
         cb.mode = WGPUCallbackMode_AllowProcessEvents;
         cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
         cb.userdata1 = &done;
-        wgpuBufferMapAsync(g_profile_read, WGPUMapMode_Read, 0, n * 16, cb);
+        wgpuBufferMapAsync(g_profile_read, WGPUMapMode_Read, 0, timed * 16, cb);
         wait_until(done);
-        const auto *t = static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_profile_read, 0, n * 16));
+        const auto *t = static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_profile_read, 0, timed * 16));
         std::size_t info = 0;
         for (std::uint32_t i = 0; t && i < n; ++i) {
             while (info < g_command_info.size() && g_command_info[info].index < i) ++info;
@@ -2676,8 +2836,13 @@ void profile_submit() {
                 for (std::uint32_t v : g_command_info[info].values) std::fprintf(g_profile_out, " %u", v);
             std::fprintf(g_profile_out, "\n");
         }
+        if (t && timed > n)
+            std::fprintf(g_profile_out, "%llu %u present %llu %u %u %u %u %u %u\n", static_cast<unsigned long long>(frame_count()), n,
+                         static_cast<unsigned long long>(t[n * 2 + 1] > t[n * 2] ? t[n * 2 + 1] - t[n * 2] : 0), g_surface_width, g_surface_height, post::g_blit[0],
+                         post::g_blit[1], post::g_blit[4], post::g_blit[7]);  // window size, picture size, blend of two fields, look
         wgpuBufferUnmap(g_profile_read);
     }
+    if (present_view) blit_check();
     g_commands.clear();
     g_command_info.clear();
     ++g_serial;
@@ -2717,9 +2882,10 @@ void submit(WGPUTextureView present_view = nullptr) {
     finish_tiles(true);  // the helper's lists go into the arena before it is measured, copied or uploaded
     place_shapes();
     if (g_bench.capturing) bench_capture();
-    if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
+    if (g_profile_out && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
         write_blit();
-        profile_submit();
+        post::g_presented_async = false;
+        profile_submit(present_view);
         return;
     }
     ensure_capacity();
@@ -2826,33 +2992,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     }
     if (present_view) {
         wt::Scope s(wt::kRenderPass);
-        WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
-        color.view = present_view;
-        color.loadOp = WGPULoadOp_Clear;
-        color.storeOp = WGPUStoreOp_Store;
-        color.clearValue = WGPUColor{0.0, 0.0, 0.0, 1.0};
-        WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-        rd.colorAttachmentCount = 1;
-        rd.colorAttachments = &color;
-        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
-        const float w = static_cast<float>(g_surface_width), h = static_cast<float>(g_surface_height);
-        const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
-        const float vw = std::min(w, h * aspect), vh = vw / aspect;
-        wgpuRenderPassEncoderSetViewport(rp, (w - vw) * 0.5f, (h - vh) * 0.5f, vw, vh, 0.0f, 1.0f);
-        wgpuRenderPassEncoderSetPipeline(rp, g_blit);
-        wgpuRenderPassEncoderSetBindGroup(rp, 0, g_blit_group, 0, nullptr);
-        wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
-        if (g_overlay.on && g_overlay.group && g_surface_width && g_surface_height) {
-            // the panel's own rectangle, cut to the window (a window made smaller than the panel shows its top left part)
-            const std::uint32_t ox = std::min(g_overlay.x, g_surface_width - 1), oy = std::min(g_overlay.y, g_surface_height - 1);
-            const std::uint32_t ow = std::min(g_overlay.width, g_surface_width - ox), oh = std::min(g_overlay.height, g_surface_height - oy);
-            wgpuRenderPassEncoderSetViewport(rp, static_cast<float>(ox), static_cast<float>(oy), static_cast<float>(ow), static_cast<float>(oh), 0.0f, 1.0f);
-            wgpuRenderPassEncoderSetPipeline(rp, g_overlay.pipeline);
-            wgpuRenderPassEncoderSetBindGroup(rp, 0, g_overlay.group, 0, nullptr);
-            wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
-        }
-        wgpuRenderPassEncoderEnd(rp);
-        wgpuRenderPassEncoderRelease(rp);
+        encode_present(enc, present_view, nullptr);
     }
     if (async) {
         post::Job &j = post::slot();
@@ -4096,6 +4236,8 @@ bool init(Mode m) {
         g_split = false;
     }
     if (g_split) std::fprintf(stderr, "[gpu] split tiles: a workgroup per two rows, lists per tile (%s)\n", g_split_why);
+    g_upload_blocks = os::env("PS2_GPU_UPLOAD_BLOCKS") != "0" && (shader_text.empty() || shader_text.find("PS2_GPU_UPLOAD_BLOCKS") != std::string::npos);
+    if (g_upload_blocks) std::fprintf(stderr, "[gpu] uploads in 8 x 8 squares (PS2_GPU_UPLOAD_BLOCKS=0 turns it off)\n");
     if (g_strips && !has_strips) {  // a shader from a file that cannot read lists per strip: back to lists per tile (no list is built yet)
         std::fprintf(stderr, "[gpu] the shader has no STRIPS, so the tile lists are kept per tile\n");
         g_strips = false;
@@ -4931,11 +5073,25 @@ bool attach_surface(const SurfaceTarget &target) {
     g_surface_height = target.height;
     configure_surface();
 
-    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
-    source.code = view(kBlitShader);
-    WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
-    md.nextInChain = &source.chain;
-    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
+    // PS2_BLIT_SHADER=<file>: the present pass from this WGSL text instead of the built-in blit.wgsl (measuring aid, as PS2_GS_SHADER)
+    std::string blit_text;
+    if (const std::string path = os::env("PS2_BLIT_SHADER"); !path.empty()) {
+        if (std::FILE *f = os::open(path.c_str(), "rb")) {
+            char buffer[65536];
+            for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, f)) > 0;) blit_text.append(buffer, n);
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "[gpu] blit shader from %s (%zu bytes)\n", path.c_str(), blit_text.size());
+    }
+    // (without wgpu's run-time checks, wgpuDeviceCreateShaderModuleTrusted, the present pass took the same time on an Intel laptop)
+    const auto make_module = [&](WGPUStringView code) {
+        WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+        source.code = code;
+        WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+        md.nextInChain = &source.chain;
+        return wgpuDeviceCreateShaderModule(g_device, &md);
+    };
+    WGPUShaderModule module = make_module(blit_text.empty() ? view(kBlitShader) : WGPUStringView{blit_text.data(), blit_text.size()});
     WGPUBindGroupLayoutEntry le[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
     le[0].binding = 0;
     le[0].visibility = WGPUShaderStage_Fragment;
@@ -4965,6 +5121,22 @@ bool attach_surface(const SurfaceTarget &target) {
     rd.fragment = &fragment;
     g_blit = wgpuDeviceCreateRenderPipeline(g_device, &rd);
     wgpuShaderModuleRelease(module);
+    if (const std::string path = os::env("PS2_BLIT_CHECK"); !path.empty() && !g_blit_ref) {
+        std::string ref_text;
+        if (std::FILE *f = os::open(path.c_str(), "rb")) {
+            char buffer[65536];
+            for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, f)) > 0;) ref_text.append(buffer, n);
+            std::fclose(f);
+        }
+        if (!ref_text.empty()) {
+            WGPUShaderModule ref = make_module(WGPUStringView{ref_text.data(), ref_text.size()});
+            fragment.module = ref;
+            rd.vertex.module = ref;
+            g_blit_ref = wgpuDeviceCreateRenderPipeline(g_device, &rd);
+            wgpuShaderModuleRelease(ref);
+        }
+        std::fprintf(stderr, "[gpu] blit check against %s (%zu bytes)%s\n", path.c_str(), ref_text.size(), g_blit_ref ? "" : ": not made");
+    }
     wgpuPipelineLayoutRelease(pipeline_layout);
     g_blit_params = make_buffer(32, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
     WGPUBindGroupEntry be[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};

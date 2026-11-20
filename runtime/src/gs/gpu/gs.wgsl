@@ -20,7 +20,7 @@ override TILE: u32 = 16u;
 override STRIPS: bool = false;
 override ROWS: u32 = 16u;  // rows of a raster workgroup: TILE, or 2 with STRIPS or SPLIT (set by gpu.cpp)
 // Split tiles (gpu.cpp PS2_GPU_STRIPS=2): the lists stay per tile, as without strips, but each strip of two pixel rows of a tile is drawn by a
-// workgroup of its own (TILE x 2 threads, ROWS = 2), which walks the tile's whole list. On the laptop's Intel graphics this alone gave most of what
+// workgroup of its own (TILE x 2 threads, ROWS = 2), which walks the tile's whole list. On a laptop's Intel graphics this alone gave most of what
 // the lists per strip saved in the God of War fights, with no extra work for the processor.
 override SPLIT: bool = false;
 
@@ -295,13 +295,54 @@ fn cache_bits_at(offset: u32, bit: u32, count: u32) -> u32 {
 }
 
 
+// One upload command: records of 12 words (prm(0) where, prm(1) how many), one thread per pixel in the order the pixels arrive. With prm(3) = 1
+// (gpu.cpp emit_pre, PS2_GPU_UPLOAD_BLOCKS) the records have 16 words and each workgroup takes an 8 x 8 square of a record's rectangle instead:
+// word 11 is the record's first square, 12 and 13 the column and row of its top-left square, 14 the squares per row. The same pixel gets the same
+// value through the same write as before; only which thread does it changes. The squares make the threads that run side by side write
+// neighbouring places of graphics memory (a 32-bit texture's 8 x 8 block is 256 bytes in a row), and the search for the record and the
+// division of a pixel's number by the row width are done once per square instead of once per pixel.
 @compute @workgroup_size(64)
-fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn upload(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let records = prm(0u);
+    var r = 0u;
+    var k = 0u;
+    var x = 0u;
+    var y = 0u;
+    if (prm(3u) == 1u) {
+        let g = wid.x + wid.y * 1024u;
+        if (g >= prm(2u)) {
+            return;
+        }
+        var lo = 0u;
+        var hi = prm(1u);
+        while (hi - lo > 1u) {
+            let mid = (lo + hi) / 2u;
+            if (data[records + mid * 16u + 11u] <= g) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        r = records + lo * 16u;
+        let b = g - data[r + 11u];
+        let across = data[r + 14u];
+        let row = b / across;
+        let ux = (data[r + 12u] + b - row * across) * 8u + (lid & 7u);
+        let uy = (data[r + 13u] + row) * 8u + (lid >> 3u);
+        let rrw = data[r + 5u];
+        let dx = ux - data[r + 3u];
+        let dy = uy - data[r + 4u];
+        k = dy * rrw + dx - data[r + 6u];
+        if (dx >= rrw || dy > 0x7FFu || k >= data[r + 7u]) {
+            return;
+        }
+        x = ux & 0x7FFu;
+        y = uy & 0x7FFu;
+    } else {
     let i = gid.x + gid.y * 64u * 1024u;
     if (i >= prm(2u)) {
         return;
     }
-    let records = prm(0u);
     var lo = 0u;
     var hi = prm(1u);
     while (hi - lo > 1u) {
@@ -312,12 +353,13 @@ fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
             hi = mid;
         }
     }
-    let r = records + lo * 12u;
-    let k = i - data[r + 11u];
+    r = records + lo * 12u;
+    k = i - data[r + 11u];
     let rrw = data[r + 5u];
     let p = data[r + 6u] + k;
-    let x = (data[r + 3u] + p % rrw) & 0x7FFu;
-    let y = (data[r + 4u] + p / rrw) & 0x7FFu;
+    x = (data[r + 3u] + p % rrw) & 0x7FFu;
+    y = (data[r + 4u] + p / rrw) & 0x7FFu;
+    }
     let bpp = data[r + 10u] & 0xFFu;
     var v = 0u;
     if ((data[r + 10u] & 0x80000000u) != 0u) {

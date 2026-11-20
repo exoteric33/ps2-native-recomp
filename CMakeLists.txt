@@ -351,6 +351,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2talestest PRIVATE synchronization)
     endif()
+    # ADMA sound on core 0 and what a second sceSdInit does to it (issue 51, no game needed): ninja ps2spu2core0test
+    add_executable(ps2spu2core0test EXCLUDE_FROM_ALL tests/spu2_core0.cpp)
+    target_include_directories(ps2spu2core0test PRIVATE runtime/src)
+    target_link_libraries(ps2spu2core0test PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2spu2core0test PRIVATE synchronization)
+    endif()
     # the sound lines of the F9 problem report, no game needed: ninja ps2spu2summarytest
     add_executable(ps2spu2summarytest EXCLUDE_FROM_ALL tests/spu2_summary.cpp)
     target_include_directories(ps2spu2summarytest PRIVATE runtime/src)

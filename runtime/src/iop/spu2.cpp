@@ -243,13 +243,15 @@ void check_irq(std::uint32_t address, std::uint32_t words) {
     }
 }
 
-void decode_block(Voice &v, std::int16_t *out) {
+// samples = false reads only the block's header (its flags and where the next block is), for a voice whose envelope has stopped:
+// its samples are never heard, and a key on decodes the voice afresh.
+void decode_block(Voice &v, std::int16_t *out, bool samples = true) {
     static const int kFilter[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
     const std::uint32_t at = v.next & kRamMask;
     const std::uint16_t header = g_ram[at];
     const int shift = header & 0xF, filter = std::min((header >> 4) & 0xF, 4);
     const unsigned flags = header >> 8;
-    for (int i = 0; i < 28; ++i) {
+    for (int i = 0; samples && i < 28; ++i) {
         const std::uint16_t word = g_ram[(at + 1 + i / 4) & kRamMask];
         std::int32_t sample = static_cast<std::int16_t>(((word >> ((i & 3) * 4)) & 0xF) << 12) >> shift;
         sample += (v.s1 * kFilter[filter][0] + v.s2 * kFilter[filter][1] + 32) >> 6;
@@ -375,10 +377,10 @@ void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (
         const std::uint32_t index = position >> 12, frac = position & 0xFFFu;
         const std::int32_t sample = stopped ? 0 : noise ? noise[n] :
             (v.buffer[index] * static_cast<std::int32_t>(0x1000 - frac) + v.buffer[index + 1] * static_cast<std::int32_t>(frac)) >> 12;
-        position += step;
+        position += stopped ? step * (kBatch - n) : step;  // a stopped voice moves over the rest of the batch at once
         while ((position >> 12) >= 28) {
             position -= 28u << 12;
-            std::memmove(v.buffer, v.buffer + 28, 28 * sizeof(std::int16_t));
+            if (!stopped) std::memmove(v.buffer, v.buffer + 28, 28 * sizeof(std::int16_t));
             if (block_end(v)[0]) {
                 v.end = true;
                 if (!stopped && !((g_ram[v.block[0] & kRamMask] >> 8) & 2u)) {
@@ -390,11 +392,12 @@ void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (
             block_end(v)[0] = block_end(v)[1];
             v.position = position;
             check_irq(v.block[0], 8);
-            decode_block(v, v.buffer + 28);
+            decode_block(v, v.buffer + 28, !stopped);
         }
-        // The sample reader can update NAX, ENDX and IRQA after the envelope
-        // stops. The stopped voice still contributes no samples to the mix.
-        if (stopped) continue;
+        // The sample reader keeps moving NAX, setting ENDX and reaching the IRQ address after the envelope
+        // stops (psx-spx, "SPU Interrupt": every voice keeps reading sound memory, even after its release has
+        // finished). The stopped voice still contributes no samples to the mix.
+        if (stopped) break;
         update_envelope(v);
         const std::int32_t out = sample * v.env.level >> 15;
         if (raw) raw[n] = clamp16(out);

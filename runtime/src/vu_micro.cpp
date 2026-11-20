@@ -576,32 +576,37 @@ struct BranchView {
         std::uint16_t before[16] = {};
         std::uint8_t def = 0;
     };
-    Step hist[4] = {};
+    // A ring of four: at(0) is the instruction before the one about to run, at(3) the oldest. A new step takes the
+    // place of the oldest, so nothing is shifted per instruction.
+    Step ring[4] = {};
+    unsigned head = 0;
     std::uint16_t view[16] = {};
+    const Step &at(unsigned age) const { return ring[(head + age) & 3u]; }
 
     // Before an instruction runs: what its branch, if it is one, reads.
     void arm(Unit &u, const Vu0Regs &r) {
-        const unsigned reg = hist[0].def;
+        const unsigned reg = at(0).def;
         if (reg == 0 || (reg & 0x80u)) {
             u.branch_vi = nullptr;
             return;
         }
         unsigned j = 0;
         for (unsigned i = 0; i < 4; ++i) {
-            if (hist[i].def == reg) j = i;
+            if (at(i).def == reg) j = i;
             else break;
         }
         std::memcpy(view, r.vi, sizeof view);
-        view[reg] = hist[j].before[reg];
+        view[reg] = at(j).before[reg];
         u.branch_vi = view;
     }
     // Keep the registers as they are before this instruction for the next one.
     void snapshot(const Vu0Regs &r, std::uint16_t (&now)[16]) const { std::memcpy(now, r.vi, sizeof now); }
     void commit(const std::uint16_t (&was)[16], std::uint32_t lo, std::uint32_t hi) {
-        for (int i = 3; i > 0; --i) hist[i] = hist[i - 1];
-        std::memcpy(hist[0].before, was, sizeof hist[0].before);
+        head = (head - 1u) & 3u;
+        Step &s = ring[head];
+        std::memcpy(s.before, was, sizeof s.before);
         const unsigned reg = vi_written_reg(lo, hi);
-        hist[0].def = static_cast<std::uint8_t>(reg == 0 ? 0 : branch_delay_exempt(lo) ? (0x80u | reg) : reg);
+        s.def = static_cast<std::uint8_t>(reg == 0 ? 0 : branch_delay_exempt(lo) ? (0x80u | reg) : reg);
     }
 };
 

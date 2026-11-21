@@ -18,6 +18,7 @@ bool cpcond0();
 void enable_write(std::uint32_t v);
 std::uint32_t read(std::uint32_t a);
 void write(std::uint32_t a, std::uint32_t v);
+void finish_vif1_read();
 void resume(int ch);
 bool ipu_pull(std::uint8_t *qword);
 bool ipu_push(const std::uint8_t *qword);

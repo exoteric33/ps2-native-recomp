@@ -505,6 +505,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2viftest PRIVATE synchronization)
     endif()
+    # VIF1 GS-to-RAM DMA completes separately from a pending upload (TimeSplitters 2, no game needed): ninja ps2vifreadbacktest
+    add_executable(ps2vifreadbacktest EXCLUDE_FROM_ALL tests/vif_readback_dma.cpp)
+    target_include_directories(ps2vifreadbacktest PRIVATE runtime/src)
+    target_link_libraries(ps2vifreadbacktest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2vifreadbacktest PRIVATE synchronization)
+    endif()
     # every UNPACK form under every STMOD, mask and write cycle equals the lane-by-lane rules, no game needed: ninja ps2vifunpacktest
     add_executable(ps2vifunpacktest EXCLUDE_FROM_ALL tests/vif_unpack_modes.cpp)
     target_include_directories(ps2vifunpacktest PRIVATE runtime/src)

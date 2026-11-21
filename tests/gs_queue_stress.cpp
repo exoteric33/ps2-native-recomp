@@ -7,7 +7,8 @@
 // published without waking it (the third thread's wake() every 250 ms only shortens such a sleep). Some runs hold long batches with a
 // small wake amount (Ring::set_wake_bytes), so a sleeping consumer is often left asleep by a held publish and must be woken by the
 // flush or the wait for space that follows; now and then the producer flushes and pauses 30 ms, and the ring must be
-// empty by then (a flush that forgot the wake it owed would leave the consumer asleep).
+// empty by then (a flush that forgot the wake it owed would leave the consumer asleep). lend_case below checks passing data on as
+// pointers between two rings.
 #include "gs/queue.hpp"
 
 #include <atomic>
@@ -139,8 +140,119 @@ int deferred_wake_case() {
 
 }  // namespace
 
+// Lending (Ring::lend_into) with three threads, as the vector-unit thread uses it: a producer fills ring A, a middle
+// thread reads A and passes each message on into ring B (whole, in pieces, as a copy from its own buffer, or only partly), holding
+// batches as that thread does, and a consumer checks every message of B. The pieces that lie in A's message go as pointers, so A must
+// keep that space until the consumer has popped them: the producer writes new patterns as soon as A gives space back, so a message
+// given back too early shows as wrong bytes. The consumer is sometimes slow (A then keeps more than a quarter of itself and the middle
+// thread must wait for the consumer) and the producer sometimes pauses (the middle thread sleeps with messages still kept). Fails on any
+// wrong message or when nothing moves for 1 s (a hang, or a sleep that only its time limit ended).
+int lend_case(std::size_t cap_a, std::size_t cap_b, std::uint32_t messages, std::uint32_t seed) {
+    Ring a, b;
+    a.start(cap_a);
+    b.start(cap_b);
+    std::atomic<std::uint32_t> errors{0}, got{0};
+    std::atomic<bool> done{false};
+    std::atomic<std::uint64_t> lent{0}, copied{0};
+
+    std::thread middle([&] {
+        a.lend_into(b);
+        std::mt19937 rng(seed * 3 + 2);
+        std::vector<std::uint8_t> own(cap_a);
+        std::uint32_t seen = 0;
+        while (seen < messages) {
+            Header h;
+            const std::uint8_t *payload = nullptr;
+            b.hold();
+            while (a.peek(h, payload)) {
+                const std::uint32_t n = h.arg0, bytes = h.bytes, way = rng() % 8;
+                // each message of A becomes one or more messages of B: (number, offset) in the arguments, the bytes in the payload
+                if (way == 0 && bytes) {   // through a copy of its own (must be copied)
+                    std::memcpy(own.data(), payload, bytes);
+                    b.post(kGif, n, 0, own.data(), bytes);
+                    copied.fetch_add(1, std::memory_order_relaxed);
+                } else if (way == 1 && bytes > 64) {   // in three pieces
+                    const std::uint32_t c1 = bytes / 3 & ~15u, c2 = bytes * 2 / 3 & ~15u;
+                    b.post(kGif, n, 0, payload, c1);
+                    b.post(kGif, n, c1, payload + c1, c2 - c1);
+                    b.post(kGif, n, c2, payload + c2, bytes - c2);
+                } else if (way == 2 && bytes > 32) {   // only its middle
+                    b.post(kGif, n, 16, payload + 16, bytes - 32);
+                } else {
+                    b.post(kGif, n, 0, payload, bytes);
+                }
+                if (bytes >= Ring::kLendMin && way != 0) lent.fetch_add(1, std::memory_order_relaxed);
+                a.pop(h);
+                ++seen;
+                if (rng() % 16 == 0) {
+                    b.flush();
+                    b.hold();
+                }
+            }
+            b.flush();
+            if (seen < messages) a.wait_for_work(2000);
+        }
+        b.post(kVblank, ~0u, 0, nullptr, 0);   // the end
+        b.flush();
+    });
+
+    std::thread consumer([&] {
+        std::mt19937 rng(seed * 5 + 3);
+        for (;;) {
+            Header h;
+            const std::uint8_t *payload = nullptr;
+            if (!b.peek(h, payload)) {
+                b.wait_for_work(2000);
+                continue;
+            }
+            if (h.type == kVblank) break;
+            const std::uint32_t n = h.arg0, off = h.arg1;
+            bool ok = h.type == kGif;
+            for (std::uint32_t i = 0; ok && i < h.bytes; ++i) ok = payload[i] == pattern(n, off + i);
+            if (!ok && errors.fetch_add(1) < 5) std::fprintf(stderr, "lend: wrong bytes in message %u (offset %u, %u bytes)\n", n, off, h.bytes);
+            b.pop(h);
+            got.store(n, std::memory_order_relaxed);
+            if (rng() % 2048 == 0) std::this_thread::sleep_for(std::chrono::microseconds(rng() % 4000));   // let A keep a lot
+        }
+        done.store(true);
+    });
+
+    std::thread watchdog([&] {
+        std::uint32_t last = ~0u;
+        for (int still = 0; !done.load(); std::this_thread::sleep_for(std::chrono::milliseconds(100))) {
+            const std::uint32_t now = got.load();
+            still = now == last ? still + 1 : 0;
+            last = now;
+            if (still == 10) {   // the middle thread sleeps at most 2 s at a time: a stall of 1 s means it slept with work to do
+                std::printf("FAIL: lending stood still for 1 s at message %u\n", now);
+                std::fflush(stdout);
+                std::_Exit(1);
+            }
+        }
+    });
+
+    std::mt19937 rng(seed);
+    std::vector<std::uint8_t> data(cap_a / 4);
+    for (std::uint32_t n = 0; n < messages; ++n) {
+        const std::uint32_t r = rng() % 100;
+        const std::uint32_t bytes = r < 10 ? 0 : r < 60 ? rng() % 1024 : r < 95 ? rng() % 8192 : rng() % static_cast<std::uint32_t>(cap_a / 4 - 32);
+        for (std::uint32_t i = 0; i < bytes; ++i) data[i] = pattern(n, i);
+        a.post(kGif, n, 0, data.data(), bytes);
+        if (rng() % 2048 == 0) std::this_thread::sleep_for(std::chrono::microseconds(rng() % 500));   // the middle thread sleeps
+    }
+    middle.join();
+    consumer.join();
+    watchdog.join();
+    std::printf("lend: rings %zu and %zu KiB, %u messages (%llu passed on as pointers, %llu copied first): %u wrong\n", cap_a >> 10, cap_b >> 10, messages,
+                static_cast<unsigned long long>(lent.load()), static_cast<unsigned long long>(copied.load()), errors.load());
+    return errors.load() ? 1 : 0;
+}
+
 int main() {
     int failed = deferred_wake_case();
+    failed |= lend_case(256u << 10, 64u << 10, 400000, 7);
+    failed |= lend_case(1u << 20, 256u << 10, 400000, 8);
+    failed |= lend_case(256u << 10, 1u << 20, 400000, 9);
     failed |= run(64u << 10, 2000000, 1);
     failed |= run(256u << 10, 2000000, 2);
     failed |= run(1u << 20, 1000000, 3);

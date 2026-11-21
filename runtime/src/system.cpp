@@ -964,6 +964,9 @@ void run_vu_thread() {
     // (present, download, state, reset, ...) at once with what came before it. The order of the messages stays as it was.
     gs::queue::Ring &out = gs::queue::render();
     static const int batch = [] { const std::string v = os::env("PS2_HANDOVER_BATCH"); return v.empty() ? 2 : std::atoi(v.c_str()); }();
+    // PATH3 textures and VIF1 DIRECT data go on to the drawing thread as a pointer into this thread's own queue instead of a copy;
+    // PS2_HANDOVER_LEND=0 copies them as before.
+    if (os::env("PS2_HANDOVER_LEND") != "0") in.lend_into(out);
     for (;;) {
         gs::queue::Header h;
         const std::uint8_t *payload = nullptr;

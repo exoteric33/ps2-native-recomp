@@ -753,6 +753,9 @@ PS2_VU_INLINE v4u vload_ptr(const void *p) {
 }
 PS2_VU_INLINE v4u vsplat(std::uint32_t x) { return v4u{x, x, x, x}; }
 PS2_VU_INLINE v4u vsel(v4u old, v4u now, v4u mask) { return (now & mask) | (old & ~mask); }
+// The lanes of `v` in the order A, B, C, D (OPMULA and OPMSUB of the compiled programs turn their operands with it).
+template <int A, int B, int C, int D>
+PS2_VU_INLINE v4u vswz(v4u v) { return __builtin_shufflevector(v, v, A, B, C, D); }
 // What the vector units do to every number they take in or give out: an exponent of 255 is an ordinary number that is cut
 // down to the largest float (0x7F7FFFFF), and a denormal becomes a zero with its sign.
 PS2_VU_INLINE v4u vfix_generic(v4u x) {
@@ -907,6 +910,27 @@ PS2_VU_INLINE std::uint32_t clip_value(const Vu0Regs &r, const Reg128 &s, std::u
         if (x < -lim) f |= 2u << (i * 2);
     }
     return ((r.clip << 6) | f) & 0xFFFFFFu;
+}
+
+// clip_value with vector instructions, for the compiled programs (the same bits on every input, tests/test_vu_clip.cpp). fp::key
+// makes a number with exponent 0 a zero and otherwise compares sign and magnitude as a signed integer, and the limit is the
+// magnitude of w (0 for exponent 0). So a lane is above +|w| when it is positive and its magnitude is above the limit, below
+// -|w| when it is negative and its magnitude is above it; a zero (or a flushed denormal) of either sign is neither.
+inline constexpr std::uint8_t kClipSpread[8] = {0, 1, 4, 5, 16, 17, 20, 21};
+PS2_VU_INLINE std::uint32_t vclip_value(const Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
+#if defined(__SSE2__)
+    __m128i v;
+    std::memcpy(&v, &s, 16);
+    const __m128i zero_exp = _mm_cmpeq_epi32(_mm_and_si128(v, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+    const __m128i mag = _mm_andnot_si128(zero_exp, _mm_and_si128(v, _mm_set1_epi32(0x7FFFFFFF)));
+    const std::uint32_t lim = (w & 0x7F800000u) ? (w & 0x7FFFFFFFu) : 0u;
+    const __m128i above = _mm_cmpgt_epi32(mag, _mm_set1_epi32(static_cast<int>(lim)));
+    const unsigned pos = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_andnot_si128(v, above)))) & 7u;
+    const unsigned neg = static_cast<unsigned>(_mm_movemask_ps(_mm_castsi128_ps(_mm_and_si128(v, above)))) & 7u;
+    return ((r.clip << 6) | kClipSpread[pos] | (static_cast<std::uint32_t>(kClipSpread[neg]) << 1)) & 0xFFFFFFu;
+#else
+    return clip_value(r, s, w);
+#endif
 }
 
 PS2_VU_INLINE void clip(Vu0Regs &r, const Reg128 &s, std::uint32_t w) {

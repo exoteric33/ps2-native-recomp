@@ -301,6 +301,13 @@ if(NOT EMSCRIPTEN)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
         target_compile_options(ps2vucleanuptest PRIVATE -msse4.1)
     endif()
+    # the vector CLIP of the compiled VU1 programs against the scalar reference, every bit pattern against six limits plus random
+    # cases (ps2/vu_ops.hpp), no game needed: ninja ps2vucliptest
+    add_executable(ps2vucliptest EXCLUDE_FROM_ALL tests/test_vu_clip.cpp)
+    target_include_directories(ps2vucliptest PRIVATE runtime/include)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        target_compile_options(ps2vucliptest PRIVATE -msse4.1)
+    endif()
     # the decode cache's blocks (runtime/src/gs/gpu/gpu.cpp, for_cells) against the drawing program's address tables, no game needed: ninja ps2decodecachetest
     add_executable(ps2decodecachetest EXCLUDE_FROM_ALL tests/decode_cache.cpp)
     target_link_libraries(ps2decodecachetest PRIVATE ps2runtime)

@@ -174,7 +174,7 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
     }
     if (kind == Nop) return u;
     if (kind == Clip) {
-        u.pre = std::format("const std::uint32_t uclip = clip_value(r, r.vf[{}], r.vf[{}].w[3]); ", fs, ft);
+        u.pre = std::format("const std::uint32_t uclip = vclip_value(r, r.vf[{}], r.vf[{}].w[3]); ", fs, ft);
         u.post = "r.clip = uclip; fl.set_clip(uclip, fl.t); ";
         return u;
     }
@@ -190,8 +190,12 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
         }
     };
     const std::string dst = target == kAcc ? "r.acc" : std::format("r.vf[{}]", target);
-    const bool vector = !exact && (kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || kind == Max || kind == Min || kind == Abs || kind == Ftoi || kind == Itof);
-    const bool arithmetic = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub;
+    // OPMULA and OPMSUB (the cross product) are a MUL and an MSUB of the operands' lanes turned (y, z, x) and (z, x, y): done as one
+    // vector operation on the turned shadows, they give the bits of the three scalar mul()/msub() of the lanes (the same per-lane rule as
+    // MUL and MSUB, vu_ops.hpp), without three separate 4-byte stores that the next 16-byte read of the register waits for.
+    const bool outer = kind == Opmula || kind == Opmsub;
+    const bool vector = !exact && (kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || kind == Max || kind == Min || kind == Abs || kind == Ftoi || kind == Itof || outer);
+    const bool arithmetic = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || outer;
     if (target != 0) {
         u.target = target;
         u.mask = d;
@@ -214,8 +218,12 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
         case Q: nb = "vqd(r.q)"; break;
         default: nb = "vfix(vsplat(r.i))"; break;
         }
-        const std::string ns = operand(fs);
-        if (kind == Madd || kind == Msub) u.shadow_reads.push_back(kAcc);
+        std::string ns = operand(fs);
+        if (outer) {
+            ns = std::format("vswz<1, 2, 0, 3>({})", ns);
+            nb = std::format("vswz<2, 0, 1, 3>({})", nb);
+        }
+        if (kind == Madd || kind == Msub || kind == Opmsub) u.shadow_reads.push_back(kAcc);
         // vf00 is the constant (0, 0, 0, 1), and its broadcast lanes are 0 or 1. Both operands have been through vfix, so a sum, difference
         // or product with such a constant needs no vfix of its own: x +- 0 is x (or +0 for -0), x +- 1 stays clear of the largest
         // float (it rounds back to it) and of the denormals (a sum with 1 is 0 or at least 2^-24 away from it), x * 1 is x and x * 0 is
@@ -227,7 +235,8 @@ Upper upper(std::uint32_t hi, bool flags_live, bool exact = false, FlagMode mode
         switch (kind) {
         case Add: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} + (v4f){}); ", ns, nb) : std::format("const v4u uv = vaddd({}, {}); ", ns, nb); break;
         case Sub: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} - (v4f){}); ", ns, nb) : std::format("const v4u uv = vsubd({}, {}); ", ns, nb); break;
-        case Mul: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} * (v4f){}); ", ns, nb) : std::format("const v4u uv = vmuld({}, {}); ", ns, nb); break;
+        case Mul:
+        case Opmula: u.pre += constant_lanes ? std::format("const v4u uv = (v4u)((v4f){} * (v4f){}); ", ns, nb) : std::format("const v4u uv = vmuld({}, {}); ", ns, nb); break;
         case Madd: u.pre += constant_lanes ? std::format("const v4u uv = vaddd(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmaddd(nacc, {}, {}); ", ns, nb); break;
         default: u.pre += constant_lanes ? std::format("const v4u uv = vsubd(nacc, (v4u)((v4f){} * (v4f){})); ", ns, nb) : std::format("const v4u uv = vmsubd(nacc, {}, {}); ", ns, nb); break;
         }
@@ -1169,7 +1178,7 @@ namespace ps2::vurecomp {
 // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
 // are then left alone and built again (vu_live.cpp). 16: VU1 programs keyed by program_key_moved, with the shift `sh` in them.
 // 17: a read of Q decided from the program's own pairs only (q_read_kind with the entry), so one key always means one result.
-const char *const kGeneratorVersion = "vurecomp 17";
+const char *const kGeneratorVersion = "vurecomp 18";
 
 // The key a program is built and found under, worked out from its code: VU0 keeps program_key (the address counts), VU1 has program_key_moved
 // (the same code at any address is one program). A recording of the old kind (VU1, its name holds a key that counted the address) is a

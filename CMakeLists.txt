@@ -365,6 +365,14 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2spu2core0test PRIVATE synchronization)
     endif()
+    # the sound-chip mixer on 120 random set-ups, every output sample, envelope and the sound memory fingerprinted,
+    # no game needed: ninja ps2spu2mixrandomtest
+    add_executable(ps2spu2mixrandomtest EXCLUDE_FROM_ALL tests/spu2_mix_random.cpp)
+    target_include_directories(ps2spu2mixrandomtest PRIVATE runtime/src)
+    target_link_libraries(ps2spu2mixrandomtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2spu2mixrandomtest PRIVATE synchronization)
+    endif()
     # the sound lines of the F9 problem report, no game needed: ninja ps2spu2summarytest
     add_executable(ps2spu2summarytest EXCLUDE_FROM_ALL tests/spu2_summary.cpp)
     target_include_directories(ps2spu2summarytest PRIVATE runtime/src)

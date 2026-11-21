@@ -247,18 +247,28 @@ void check_irq(std::uint32_t address, std::uint32_t words) {
 // its samples are never heard, and a key on decodes the voice afresh.
 void decode_block(Voice &v, std::int16_t *out, bool samples = true) {
     static const int kFilter[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
+    const std::uint16_t *const ram = g_ram.data();
     const std::uint32_t at = v.next & kRamMask;
-    const std::uint16_t header = g_ram[at];
+    const std::uint16_t header = ram[at];
     const int shift = header & 0xF, filter = std::min((header >> 4) & 0xF, 4);
     const unsigned flags = header >> 8;
-    for (int i = 0; samples && i < 28; ++i) {
-        const std::uint16_t word = g_ram[(at + 1 + i / 4) & kRamMask];
-        std::int32_t sample = static_cast<std::int16_t>(((word >> ((i & 3) * 4)) & 0xF) << 12) >> shift;
-        sample += (v.s1 * kFilter[filter][0] + v.s2 * kFilter[filter][1] + 32) >> 6;
-        sample = std::clamp(sample, -32768, 32767);
-        v.s2 = v.s1;
-        v.s1 = sample;
-        out[i] = static_cast<std::int16_t>(sample);
+    if (samples) {
+        // the history in locals, so the 28 dependent steps do not go through memory
+        const int f0 = kFilter[filter][0], f1 = kFilter[filter][1];
+        std::int32_t s1 = v.s1, s2 = v.s2;
+        for (int j = 0; j < 7; ++j) {
+            const std::uint16_t word = ram[(at + 1 + j) & kRamMask];
+            for (int q = 0; q < 4; ++q) {
+                std::int32_t sample = static_cast<std::int16_t>(((word >> (q * 4)) & 0xF) << 12) >> shift;
+                sample += (s1 * f0 + s2 * f1 + 32) >> 6;
+                sample = std::clamp(sample, -32768, 32767);
+                s2 = s1;
+                s1 = sample;
+                out[j * 4 + q] = static_cast<std::int16_t>(sample);
+            }
+        }
+        v.s1 = s1;
+        v.s2 = s2;
     }
     v.block[out == v.buffer ? 0 : 1] = at;
     block_end(v)[out == v.buffer ? 0 : 1] = (flags & 1u) != 0;
@@ -280,23 +290,50 @@ void key_on(Voice &v) {
     check_irq(v.block[0], 8);
 }
 
-void update_envelope(Voice &v) {
-    Envelope &e = v.env;
-    switch (v.phase) {
+// The envelope (ADSR) one sample on: the rate of the voice's phase is worked out once (the shifts and the direction of
+// Envelope::step), and each sample does only the counting and the step itself. The same arithmetic in the same order as step().
+struct EnvRate {
+    int cycles = 1, delta = 0;
+    bool slow_top = false;  // exponential increase: 4 times the cycles above 0x6000
+    bool scaled = false;    // exponential decrease: the step times the level
+};
+
+EnvRate env_rate(int rate, bool decrease, bool exponential) {
+    const int shift = rate >> 2;
+    EnvRate r;
+    r.cycles = 1 << std::max(0, shift - 11);
+    r.delta = (decrease ? -8 + (rate & 3) : 7 - (rate & 3)) << std::max(0, 11 - shift);
+    r.slow_top = exponential && !decrease;
+    r.scaled = exponential && decrease;
+    return r;
+}
+
+EnvRate phase_rate(const Voice &v, Phase phase) {
+    switch (phase) {
+    case kAttack: return env_rate((v.adsr1 >> 8) & 0x7F, false, v.adsr1 & 0x8000u);
+    case kDecay: return env_rate(((v.adsr1 >> 4) & 0xF) << 2, true, true);
+    case kSustain: return env_rate((v.adsr2 >> 6) & 0x7F, v.adsr2 & 0x4000u, v.adsr2 & 0x8000u);
+    case kRelease: return env_rate((v.adsr2 & 0x1F) << 2, true, v.adsr2 & 0x20u);
+    default: return EnvRate{};
+    }
+}
+
+inline void step_envelope(Phase &phase, Envelope &e, std::uint16_t adsr1, const EnvRate &r) {
+    const int cycles = r.slow_top && e.level > 0x6000 ? r.cycles * 4 : r.cycles;
+    if (++e.counter >= cycles) {
+        e.counter = 0;
+        const int delta = r.scaled ? (r.delta * e.level) >> 15 : r.delta;
+        e.level = std::clamp(e.level + delta, 0, 0x7FFF);
+    }
+    switch (phase) {
     case kAttack:
-        e.step((v.adsr1 >> 8) & 0x7F, false, v.adsr1 & 0x8000u);
-        if (e.level >= 0x7FFF) v.phase = kDecay;
+        if (e.level >= 0x7FFF) phase = kDecay;
         break;
     case kDecay:
-        e.step(((v.adsr1 >> 4) & 0xF) << 2, true, true);
-        if (e.level <= ((v.adsr1 & 0xF) + 1) * 0x800) v.phase = kSustain;
-        break;
-    case kSustain:
-        e.step((v.adsr2 >> 6) & 0x7F, v.adsr2 & 0x4000u, v.adsr2 & 0x8000u);
+        if (e.level <= ((adsr1 & 0xF) + 1) * 0x800) phase = kSustain;
         break;
     case kRelease:
-        e.step((v.adsr2 & 0x1F) << 2, true, v.adsr2 & 0x20u);
-        if (e.level <= 0) v.phase = kOff;
+        if (e.level <= 0) phase = kOff;
         break;
     default:
         break;
@@ -364,28 +401,38 @@ void run_noise(Core &k, std::int16_t *out) {
     k.regs[(kNoiseTimer + 2) >> 1] = static_cast<std::uint16_t>(static_cast<std::uint32_t>(timer) >> 16);
 }
 
-void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (*dry)[2], std::int32_t (*wet)[2], std::int16_t *raw, const std::int16_t *noise) {
-    if (v.key_on) key_on(v);
-    const std::uint32_t bit = 1u << voice;
+// One voice's 32 samples. The loop below is the chip's sample by sample order (interpolate, move on, cross into the next block, envelope,
+// volumes). With both volumes fixed (no sweep), what the loop makes is kept per sample and the volumes and the four sends are applied
+// afterwards in loops of their own, which the compiler turns into vector code: the same products and sums in the same per-sample order
+// (only additions into separate accumulators, which do not depend on each other), so the mix is bit for bit what it was.
+template <bool kSweep>
+void render_voice_batch(Voice &v, std::uint32_t bit, const Routing &route, std::int32_t (*dry)[2], std::int32_t (*wet)[2], std::int16_t *raw, const std::int16_t *noise) {
     const std::uint32_t step = std::min<std::uint32_t>(v.pitch, 0x3FFFu);
-    const bool sweep_l = v.voll & 0x8000u, sweep_r = v.volr & 0x8000u;
     const std::int32_t fixed_l = static_cast<std::int16_t>(v.voll << 1), fixed_r = static_cast<std::int16_t>(v.volr << 1);
+    const bool to_dry_l = route.dry[0] & bit, to_dry_r = route.dry[1] & bit, to_wet_l = route.wet[0] & bit, to_wet_r = route.wet[1] & bit;
+    std::int32_t made[kBatch];  // !kSweep: the voice's sample after its envelope, for the samples 0 .. count-1
+    unsigned count = 0;
     std::uint32_t position = v.position;
+    Phase rate_phase = kOff;  // the phase `rate` belongs to
+    EnvRate rate;
+    // the voice's phase and envelope in locals during the loop (nothing it calls looks at them), written back after it
+    Phase phase = v.phase;
+    Envelope env = v.env;
     for (unsigned n = 0; n < kBatch; ++n) {
-        const bool stopped = v.phase == kOff;
+        const bool stopped = phase == kOff;
         if (stopped && step == 0) break;
         const std::uint32_t index = position >> 12, frac = position & 0xFFFu;
         const std::int32_t sample = stopped ? 0 : noise ? noise[n] :
             (v.buffer[index] * static_cast<std::int32_t>(0x1000 - frac) + v.buffer[index + 1] * static_cast<std::int32_t>(frac)) >> 12;
         position += stopped ? step * (kBatch - n) : step;  // a stopped voice moves over the rest of the batch at once
-        while ((position >> 12) >= 28) {
+        while ((position >> 12) >= 28) [[unlikely]] {
             position -= 28u << 12;
             if (!stopped) std::memmove(v.buffer, v.buffer + 28, 28 * sizeof(std::int16_t));
             if (block_end(v)[0]) {
                 v.end = true;
                 if (!stopped && !((g_ram[v.block[0] & kRamMask] >> 8) & 2u)) {
-                    v.phase = kRelease;
-                    v.env.level = 0;
+                    phase = kRelease;
+                    env.level = 0;
                 }
             }
             v.block[0] = v.block[1];
@@ -398,18 +445,51 @@ void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (
         // stops (psx-spx, "SPU Interrupt": every voice keeps reading sound memory, even after its release has
         // finished). The stopped voice still contributes no samples to the mix.
         if (stopped) break;
-        update_envelope(v);
-        const std::int32_t out = sample * v.env.level >> 15;
-        if (raw) raw[n] = clamp16(out);
-        // the volume sweeps step once per sample whatever the voice is sent to
-        const std::int32_t l = out * (sweep_l ? volume(v.voll, v.vol[0]) : fixed_l) >> 15;
-        const std::int32_t r = out * (sweep_r ? volume(v.volr, v.vol[1]) : fixed_r) >> 15;
-        if (route.dry[0] & bit) dry[n][0] += l;
-        if (route.dry[1] & bit) dry[n][1] += r;
-        if (route.wet[0] & bit) wet[n][0] += l;
-        if (route.wet[1] & bit) wet[n][1] += r;
+        if (phase != rate_phase) {
+            rate_phase = phase;
+            rate = phase_rate(v, phase);
+        }
+        step_envelope(phase, env, v.adsr1, rate);
+        const std::int32_t out = sample * env.level >> 15;
+        if constexpr (kSweep) {
+            if (raw) raw[n] = clamp16(out);
+            // the volume sweeps step once per sample whatever the voice is sent to
+            const std::int32_t l = out * (v.voll & 0x8000u ? volume(v.voll, v.vol[0]) : fixed_l) >> 15;
+            const std::int32_t r = out * (v.volr & 0x8000u ? volume(v.volr, v.vol[1]) : fixed_r) >> 15;
+            if (to_dry_l) dry[n][0] += l;
+            if (to_dry_r) dry[n][1] += r;
+            if (to_wet_l) wet[n][0] += l;
+            if (to_wet_r) wet[n][1] += r;
+        } else {
+            made[n] = out;
+            count = n + 1;
+        }
     }
     v.position = position;
+    v.phase = phase;
+    v.env = env;
+    if constexpr (!kSweep) {
+        if (raw)
+            for (unsigned n = 0; n < count; ++n) raw[n] = clamp16(made[n]);
+        if (to_dry_l || to_wet_l) {
+            std::int32_t l[kBatch];
+            for (unsigned n = 0; n < count; ++n) l[n] = made[n] * fixed_l >> 15;
+            if (to_dry_l) for (unsigned n = 0; n < count; ++n) dry[n][0] += l[n];
+            if (to_wet_l) for (unsigned n = 0; n < count; ++n) wet[n][0] += l[n];
+        }
+        if (to_dry_r || to_wet_r) {
+            std::int32_t r[kBatch];
+            for (unsigned n = 0; n < count; ++n) r[n] = made[n] * fixed_r >> 15;
+            if (to_dry_r) for (unsigned n = 0; n < count; ++n) dry[n][1] += r[n];
+            if (to_wet_r) for (unsigned n = 0; n < count; ++n) wet[n][1] += r[n];
+        }
+    }
+}
+
+void render_voice(Voice &v, unsigned voice, const Routing &route, std::int32_t (*dry)[2], std::int32_t (*wet)[2], std::int16_t *raw, const std::int16_t *noise) {
+    if (v.key_on) key_on(v);
+    if ((v.voll | v.volr) & 0x8000u) render_voice_batch<true>(v, 1u << voice, route, dry, wet, raw, noise);
+    else render_voice_batch<false>(v, 1u << voice, route, dry, wet, raw, noise);
 }
 
 void feed_input(int core) {
@@ -515,36 +595,52 @@ void run_reverb(Core &k, std::uint64_t step_base, const std::int32_t (*in)[2], s
     std::uint32_t address[22];
     for (unsigned i = 0; i < 22; ++i) address[i] = reg32(kRevAddress + i * 4);
     const std::uint16_t *vol = &k.regs[kRevVolume >> 1];
-    for (unsigned t = 0; t < kBatch / 2; ++t) {
-        const std::uint64_t at = (step_base + t) % size;
+    // A cell of the ring is (at + offset + size + adjust) % size. Every offset is the same for the whole batch, so it is taken modulo the
+    // ring's size once here, and a step only adds and subtracts the size (at < size and offset < size): the same cell, without a 64-bit
+    // division for each of the 28 cells a step touches. The all-pass filters' "offset - back" is first cut to 32 bits as before.
+    std::uint32_t off[22];
+    for (unsigned i = 0; i < 22; ++i) off[i] = static_cast<std::uint32_t>(address[i] % size);
+    const auto back_off = [&](unsigned apf, unsigned back) {
+        return static_cast<std::uint32_t>(static_cast<std::uint32_t>(address[apf] + size - address[back] % size) % size);
+    };
+    const std::uint32_t back_l[2] = {back_off(kApf1LDst, kApf1Size), back_off(kApf2LDst, kApf2Size)};
+    const std::uint32_t back_r[2] = {back_off(kApf1RDst, kApf1Size), back_off(kApf2RDst, kApf2Size)};
+    const auto n32 = static_cast<std::uint32_t>(size);  // at most kRamWords
+    std::uint32_t at = static_cast<std::uint32_t>(step_base % size);
+    for (unsigned t = 0; t < kBatch / 2; ++t, at = at + 1 == n32 ? 0 : at + 1) {
         // a cell of the ring, 'offset' words away from where this step is (a step further on, the same cell is one nearer to the writer)
-        const auto cell = [&](std::uint32_t offset, int adjust = 0) -> std::uint16_t & { return g_ram[start + (at + offset + size + adjust) % size]; };
+        const auto cell = [&](std::uint32_t offset, bool before = false) -> std::uint16_t & {
+            std::uint32_t x = at + offset;  // below 2 * size
+            if (before) x += n32 - 1;       // below 3 * size
+            if (x >= n32) x -= n32;
+            if (x >= n32) x -= n32;
+            return g_ram[start + x];
+        };
         const std::int32_t in_l = mul15((in[t * 2][0] + in[t * 2 + 1][0]) / 2, vol[kVolInL]), in_r = mul15((in[t * 2][1] + in[t * 2 + 1][1]) / 2, vol[kVolInR]);
         const auto reflect = [&](std::int32_t input, std::uint32_t source, std::uint32_t target) {
-            const std::int32_t before = static_cast<std::int16_t>(cell(target, -1));
+            const std::int32_t before = static_cast<std::int16_t>(cell(target, true));
             const std::int32_t sum = input + mul15(static_cast<std::int16_t>(cell(source)), vol[kVolWall]) - before;
             cell(target) = static_cast<std::uint16_t>(clamp16(mul15(sum, vol[kVolIir]) + before));
         };
-        reflect(in_l, address[kSameLSrc], address[kSameLDst]);
-        reflect(in_r, address[kSameRSrc], address[kSameRDst]);
-        reflect(in_l, address[kDiffRSrc], address[kDiffLDst]);
-        reflect(in_r, address[kDiffLSrc], address[kDiffRDst]);
-        const auto side = [&](unsigned c1, unsigned c2, unsigned c3, unsigned c4, unsigned apf1, unsigned apf2) {
-            std::int32_t o = mul15(static_cast<std::int16_t>(cell(address[c1])), vol[kVolComb1]) + mul15(static_cast<std::int16_t>(cell(address[c2])), vol[kVolComb2]) +
-                             mul15(static_cast<std::int16_t>(cell(address[c3])), vol[kVolComb3]) + mul15(static_cast<std::int16_t>(cell(address[c4])), vol[kVolComb4]);
+        reflect(in_l, off[kSameLSrc], off[kSameLDst]);
+        reflect(in_r, off[kSameRSrc], off[kSameRDst]);
+        reflect(in_l, off[kDiffRSrc], off[kDiffLDst]);
+        reflect(in_r, off[kDiffLSrc], off[kDiffRDst]);
+        const auto side = [&](unsigned c1, unsigned c2, unsigned c3, unsigned c4, unsigned apf1, unsigned apf2, const std::uint32_t (&back)[2]) {
+            std::int32_t o = mul15(static_cast<std::int16_t>(cell(off[c1])), vol[kVolComb1]) + mul15(static_cast<std::int16_t>(cell(off[c2])), vol[kVolComb2]) +
+                             mul15(static_cast<std::int16_t>(cell(off[c3])), vol[kVolComb3]) + mul15(static_cast<std::int16_t>(cell(off[c4])), vol[kVolComb4]);
             o = clamp16(o);
-            const std::uint32_t back1 = address[kApf1Size], back2 = address[kApf2Size];
-            const std::int32_t d1 = static_cast<std::int16_t>(cell(address[apf1] + size - back1 % size));
+            const std::int32_t d1 = static_cast<std::int16_t>(cell(back[0]));
             o = clamp16(o - mul15(d1, vol[kVolApf1]));
-            cell(address[apf1]) = static_cast<std::uint16_t>(o);
+            cell(off[apf1]) = static_cast<std::uint16_t>(o);
             o = clamp16(mul15(o, vol[kVolApf1]) + d1);
-            const std::int32_t d2 = static_cast<std::int16_t>(cell(address[apf2] + size - back2 % size));
+            const std::int32_t d2 = static_cast<std::int16_t>(cell(back[1]));
             o = clamp16(o - mul15(d2, vol[kVolApf2]));
-            cell(address[apf2]) = static_cast<std::uint16_t>(o);
+            cell(off[apf2]) = static_cast<std::uint16_t>(o);
             return clamp16(mul15(o, vol[kVolApf2]) + d2);
         };
-        const std::int32_t left = side(kComb1L, kComb2L, kComb3L, kComb4L, kApf1LDst, kApf2LDst);
-        const std::int32_t right = side(kComb1R, kComb2R, kComb3R, kComb4R, kApf1RDst, kApf2RDst);
+        const std::int32_t left = side(kComb1L, kComb2L, kComb3L, kComb4L, kApf1LDst, kApf2LDst, back_l);
+        const std::int32_t right = side(kComb1R, kComb2R, kComb3R, kComb4R, kApf1RDst, kApf2RDst, back_r);
         // two output samples for one step: halfway from the last step's result, then the new one
         out[t * 2][0] = (last[0] + left) / 2;
         out[t * 2][1] = (last[1] + right) / 2;

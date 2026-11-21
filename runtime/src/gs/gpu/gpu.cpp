@@ -88,8 +88,10 @@ WGPURenderPipeline g_blit = nullptr;
 // with g_blit into two textures of the window's size after every timed present of a PS2_GPU_PROFILE window run; the bytes are compared
 // and a line "[blit-check]" says how many window pixels differ (a measuring aid for changes to blit.wgsl: they must give the same pixels)
 WGPURenderPipeline g_blit_ref = nullptr;
+WGPUBindGroupLayout g_blit_layout = nullptr;
 WGPUBindGroup g_blit_group = nullptr;
 WGPUBuffer g_blit_params = nullptr;
+DisplaySource g_last_src = {};
 // The overlay (overlay.hpp): the quick menu's panel, drawn over the game's picture in the present pass with alpha blending. Its pixels
 // sit in a storage buffer like everything else here (no texture: the same code on every backend and in the browser build).
 struct Overlay {
@@ -4024,6 +4026,8 @@ static bool open_backend([[maybe_unused]] std::uint32_t backends, const char *na
     return true;
 }
 
+static bool compile_pipelines();
+
 bool init(Mode m) {
     if (m == Mode::off) return false;
     stat::init();
@@ -4111,6 +4115,7 @@ bool init(Mode m) {
         }
     }
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 4u);
+    ps2::set_video_scale(g_scale);
     // PS2_SHARP_2D: how upscaled 2D art (text, icons, menus) is filtered, see SHARP in gs.wgsl: 0 plain bilinear, 1 sharp (the
     // default), 2 sharpest
     if (const char *sharp = std::getenv("PS2_SHARP_2D")) g_sharp_2d = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(sharp)), 0u, 2u);
@@ -4179,6 +4184,18 @@ bool init(Mode m) {
     pld.bindGroupLayouts = &g_layout;
     g_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
 
+    if (!compile_pipelines()) return false;
+    ensure_capacity();
+    if (hw::enabled() && !g_bench.configured && os::env("PS2_GPU_HW_LIVE") != "0") {  // PS2_GPU_HW=1 without the bench draws the running game's plain shapes on the card
+        hw::Context hc{g_device, g_queue, g_vram, g_tables, g_clut, g_scratch, g_cache, g_layout, {}, kUpload, kLoadClut, kRaster, kDecode, kSnapshot, g_scale, nullptr, bytes_of_vram(), kGsShader};
+        g_live = hw::live_init(hc);
+    }
+    g_mode = m;
+    g_current_mode = m;
+    return true;
+}
+
+static bool compile_pipelines() {
     // PS2_GS_SHADER=<file>: use this WGSL text instead of the built-in one (shader experiments without a rebuild)
     std::string shader_text;
     if (const std::string path = os::env("PS2_GS_SHADER"); !path.empty()) {
@@ -4282,6 +4299,13 @@ bool init(Mode m) {
         delete g_raster_mip_thread;
         g_raster_mip_thread = nullptr;
     }
+    if (g_raster_mip) wgpuComputePipelineRelease(g_raster_mip);
+    if (g_raster_strips) wgpuComputePipelineRelease(g_raster_strips);
+    if (g_raster_strips_mip) wgpuComputePipelineRelease(g_raster_strips_mip);
+    for (int i = 0; i < kPipelines; ++i) {
+        if (g_pipelines[i]) wgpuComputePipelineRelease(g_pipelines[i]);
+        g_pipelines[i] = nullptr;
+    }
     g_raster_mip = nullptr;
     g_raster_strips = g_raster_strips_mip = nullptr;
     g_raster_mip_ready.store(true, std::memory_order_release);  // nothing to wait for unless the thread below starts
@@ -4314,13 +4338,6 @@ bool init(Mode m) {
     if (has_mip) build_mip();  // the browser build has no threads
 #endif
     release_module();
-    ensure_capacity();
-    if (hw::enabled() && !g_bench.configured && os::env("PS2_GPU_HW_LIVE") != "0") {  // PS2_GPU_HW=1 without the bench draws the running game's plain shapes on the card
-        hw::Context hc{g_device, g_queue, g_vram, g_tables, g_clut, g_scratch, g_cache, g_layout, {}, kUpload, kLoadClut, kRaster, kDecode, kSnapshot, g_scale, nullptr, bytes_of_vram(), kGsShader};
-        g_live = hw::live_init(hc);
-    }
-    g_mode = m;
-    g_current_mode = m;
     return true;
 }
 
@@ -5103,6 +5120,8 @@ bool attach_surface(const SurfaceTarget &target) {
     ld.entryCount = 2;
     ld.entries = le;
     WGPUBindGroupLayout layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    if (g_blit_layout) wgpuBindGroupLayoutRelease(g_blit_layout);
+    g_blit_layout = layout;
     WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
     pld.bindGroupLayoutCount = 1;
     pld.bindGroupLayouts = &layout;
@@ -5147,11 +5166,10 @@ bool attach_surface(const SurfaceTarget &target) {
     be[1].buffer = g_blit_params;
     be[1].size = 32;
     WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-    bd.layout = layout;
+    bd.layout = g_blit_layout;
     bd.entryCount = 2;
     bd.entries = be;
     g_blit_group = wgpuDeviceCreateBindGroup(g_device, &bd);
-    wgpuBindGroupLayoutRelease(layout);
     return g_blit != nullptr;
 }
 
@@ -5288,6 +5306,83 @@ std::uint32_t display_params(const DisplaySource &src, std::uint32_t scratch_at)
                         o.active ? 1u : 0u, o.fbp, o.fbw, o.psm, o.dbx, o.dby, static_cast<std::uint32_t>(o.x), static_cast<std::uint32_t>(o.y), o.width, o.height});
 }
 
+std::uint32_t scale() { return g_scale; }
+
+void set_scale(std::uint32_t new_scale) {
+    new_scale = std::clamp<std::uint32_t>(new_scale, 1u, 4u);
+    if (new_scale == g_scale || g_mode == Mode::off || !g_device) {
+        ps2::set_video_scale(g_scale);
+        return;
+    }
+    if (g_pending.busy) finish_download(g_pending.serial);
+    std::vector<std::uint32_t> base_vram(kMemorySize / 4);
+    download(reinterpret_cast<std::uint8_t *>(base_vram.data()), 0, kMemorySize);
+    wait_idle();
+    finish_tiles(false);
+    drop_stream();
+    for (TripCopy &t : g_trip) {
+        if (t.buffer) wgpuBufferRelease(t.buffer);
+        t.buffer = nullptr;
+        t.capacity = 0;
+    }
+
+    g_scale = new_scale;
+    ps2::set_video_scale(g_scale);
+    g_copy_words = (1u << 20) * g_scale * g_scale;
+    g_field_words = (1u << 19) * g_scale * g_scale;
+    tiles::configure(static_cast<int>(g_scale), g_tile, g_strips, g_strip_ratio);
+    g_strips = tiles::strips() != 0;
+
+    if (g_vram) wgpuBufferRelease(g_vram);
+    if (g_scratch) wgpuBufferRelease(g_scratch);
+    if (g_readback) wgpuBufferRelease(g_readback);
+    g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
+    g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
+    g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+
+    rebuild_group();
+    if (g_blit_layout && g_blit_params) {
+        if (g_blit_group) wgpuBindGroupRelease(g_blit_group);
+        WGPUBindGroupEntry be[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+        be[0].binding = 0;
+        be[0].buffer = g_scratch;
+        be[0].size = WGPU_WHOLE_SIZE;
+        be[1].binding = 1;
+        be[1].buffer = g_blit_params;
+        be[1].size = 32;
+        WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        bd.layout = g_blit_layout;
+        bd.entryCount = 2;
+        bd.entries = be;
+        g_blit_group = wgpuDeviceCreateBindGroup(g_device, &bd);
+    }
+
+    compile_pipelines();
+
+    g_have_previous = false;
+    write_state(base_vram, 1, {});
+    if (g_last_src.width > 0 && g_last_src.height > 0 && g_blit_params) {
+        const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
+        const std::uint32_t param = display_params(g_last_src, current);
+        push_display(g_last_src, current, param);
+        const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
+        const float aspect = g_options.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
+        const float vw = std::min(sw, sh * aspect), vh = vw / aspect;
+        const std::uint32_t blit[8] = {g_last_src.width * g_scale, g_last_src.height * g_scale, current, previous, 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), ps2::video_options()};
+        wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, blit, sizeof blit);
+        ++g_field;
+        g_have_previous = true;
+        submit();
+        wait_idle();
+    }
+    std::fprintf(stderr, "[gpu] resolution scale switched to %ux\n", g_scale);
+}
+
+void apply_pending_scale() {
+    const std::uint32_t wanted = std::clamp<std::uint32_t>(ps2::video_scale(), 1u, 4u);
+    if (wanted != g_scale) set_scale(wanted);
+}
+
 // A picture the game has not changed since the last present (nothing drawn, uploaded or copied, the same read circuits, the same
 // window and picture look) is not handed to the screen again: the screen already shows it. PS2_PRESENT_SKIP=1 turns this on, 0 off.
 // At most kMaxSkipped in a row, so a window that lost its picture (a resize, a cover) gets one soon anyway.
@@ -5319,6 +5414,8 @@ void picture_key(const DisplaySource &src, std::uint32_t (&key)[29]) {
 
 bool present(const DisplaySource &src) {
     if (!g_surface) return false;
+    g_last_src = src;
+    apply_pending_scale();
     static PresentLog log;
     const double flush0 = log.flush, acquire0 = log.acquire, submit0 = log.submit, present0 = log.present;
     if (log.on) log.mark = PresentLog::Clock::now();
@@ -5559,8 +5656,10 @@ void set_overlay(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t h
 }
 
 bool present_again() {
-    if (!g_surface || !g_have_previous) return false;
+    if (!g_surface) return false;
     post::drain();
+    apply_pending_scale();
+    if (!g_have_previous) return false;
     // the same picture as the last present (its fields are still in the scratch buffer: the game draws nothing while it waits), with the
     // window's size and the picture look of now
     const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
@@ -5601,6 +5700,8 @@ std::uint64_t g_copy_order = 0;
 
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
     post::drain();
+    g_last_src = src;
+    apply_pending_scale();
 #ifdef __EMSCRIPTEN__
     wgpuInstanceProcessEvents(g_instance);
 #else
@@ -5663,6 +5764,8 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
 }
 
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+    g_last_src = src;
+    apply_pending_scale();
     flush_all();
     const std::uint32_t param = display_params(src, 0);
     push_display(src, 0, param);

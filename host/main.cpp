@@ -877,6 +877,16 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "[vu%d] recording vector programs that are not compiled yet into %s\n", unit, ps2::os::env(setting).c_str());
         }
     }
+    // A window run with no --memcard has no card in slot 1, so the game cannot save and says so in its own words. The line
+    // port.sh prints at the end did not name a card, and a tester who started a game that way thought memory cards were
+    // broken (issue #129). Say it once at the start, with the card the app uses for this game (games/<name>/<name>.ps2).
+    if (window && ps2::g_options.memcard_path.empty()) {
+        if (game_dir.empty())
+            std::fprintf(stderr, "[mc] no memory card in slot 1, so the game cannot save: start it with --memcard <file>.ps2 (a new file is made)\n");
+        else
+            std::fprintf(stderr, "[mc] no memory card in slot 1, so the game cannot save: start it with --memcard %s (the app's card for this game; a new file is made)\n",
+                         ps2::os::utf8((game_dir / (ps2::os::utf8(game_dir.filename()) + ".ps2")).lexically_normal()).c_str());
+    }
     // The window says which game runs: PS2_WINDOW_TITLE when a launcher sets it, else the disc's serial.
     if (window && ps2::os::env("PS2_WINDOW_TITLE").empty())
         if (const std::string serial = disc_serial(program_location); !serial.empty()) ps2::os::set_env("PS2_WINDOW_TITLE", serial);

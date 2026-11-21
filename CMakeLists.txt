@@ -542,6 +542,12 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2vifdefertest PRIVATE synchronization)
     endif()
+    # QFSRV (mmi.hpp) equals the byte-buffer form it replaced for every shift amount, also written over its inputs, no game needed: ninja ps2mmitest
+    add_executable(ps2mmitest EXCLUDE_FROM_ALL tests/mmi_qfsrv.cpp)
+    target_link_libraries(ps2mmitest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2mmitest PRIVATE synchronization)
+    endif()
 endif()
 
 if(PS2_GENERATED)

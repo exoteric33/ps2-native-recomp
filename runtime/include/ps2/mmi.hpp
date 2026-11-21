@@ -144,13 +144,22 @@ inline void plzcw(Reg128 &d, const Reg128 &s) {
     d.w[1] = b;
 }
 
+// QFSRV: the 32 bytes s:t (s the upper half) shifted right by sa & 15 bytes, the low 16 bytes kept. Done on 64-bit words with
+// selects and shifts. It used to build the 32 bytes in a stack buffer and read 16 of them back at a byte offset; the processor
+// cannot forward that read from the two stores just before it and waits for them (God of War II's film decoder runs it in its
+// motion compensation loops, about 3 % of the emulation thread). Every input word is read before d is written (d may be s or t).
 inline void qfsrv(Reg128 &d, const Reg128 &s, const Reg128 &t, std::uint32_t sa) {
-    std::uint8_t bytes[32];
-    __builtin_memcpy(bytes, &t, 16);
-    __builtin_memcpy(bytes + 16, &s, 16);
-    Reg128 r;
-    __builtin_memcpy(&r, bytes + (sa & 15), 16);
-    d = r;
+    const std::uint32_t n = sa & 15u;
+    const bool upper = n >= 8u;
+    const std::uint64_t w0 = upper ? t.d[1] : t.d[0];
+    const std::uint64_t w1 = upper ? s.d[0] : t.d[1];
+    const std::uint64_t w2 = upper ? s.d[1] : s.d[0];
+    const std::uint32_t b = (n & 7u) * 8u;
+    // (x << 1) << (63 - b) is x << (64 - b) for b from 8 to 56 and 0 for b == 0, with no shift by 64
+    const std::uint64_t r0 = (w0 >> b) | ((w1 << 1) << (63u - b));
+    const std::uint64_t r1 = (w1 >> b) | ((w2 << 1) << (63u - b));
+    d.d[0] = r0;
+    d.d[1] = r1;
 }
 
 inline std::int64_t sext32(std::uint32_t v) { return static_cast<std::int32_t>(v); }

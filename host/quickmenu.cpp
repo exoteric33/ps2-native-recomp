@@ -147,9 +147,8 @@ std::string entry_text(int i, const Values &v, bool quit_armed) {
     case Command::load: return "Quick load";
     case Command::look: return "Picture look:  < " + v.look + " >";
     case Command::scale: {
-        const std::string now = std::to_string(v.scale_now) + "x";
-        if (v.scale_locked) return "Resolution: " + now + " (set by PS2_SCALE)";
-        return "Resolution:  < " + std::to_string(v.scale_next) + "x >" + (v.scale_next != v.scale_now ? "  at the next start" : "");
+        const char *label = v.scale_next == 1 ? "1x (480p)" : v.scale_next == 2 ? "2x (720p)" : v.scale_next == 3 ? "3x (1080p)" : "4x (4K)";
+        return std::string("Resolution:  < ") + label + " >";
     }
     case Command::sharp_2d: {
         static const char *const kNames[] = {"soft", "sharp", "sharpest"};

@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #ifdef __linux__
 #include <pthread.h>
 #endif
@@ -1112,14 +1113,14 @@ void everything_fresh() {
 }
 
 // A host-to-local upload (`rec` as queue_upload builds it: dbp, dbw, dpsm, dsax, dsay, rrw, done, pixels, offset, lead bits, bits per pixel) of
-// bytes whose number is `content`.
-void id_upload(const std::uint32_t *rec, std::uint64_t content) {
+// bytes whose number is `content`. Returns true when any cell's block identity changed.
+bool id_upload(const std::uint32_t *rec, std::uint64_t content) {
     const std::uint32_t rrw = rec[5], done = rec[6], pixels = rec[7], psm = rec[2];
-    if (!rrw || !pixels) return;
+    if (!rrw || !pixels) return false;
     const std::uint32_t x0 = rec[3], x1 = rec[3] + rrw - 1, y0 = rec[4] + done / rrw, y1 = rec[4] + (done + pixels - 1) / rrw;
     if (x1 > 2047 || y1 > 2047) {  // wraps around the 2048 x 2048 space: not followed, everything counts as written
         everything_fresh();
-        return;
+        return true;
     }
     const std::uint32_t full0 = rec[4] + (done + rrw - 1) / rrw, full_end = rec[4] + (done + pixels) / rrw;  // the rows written whole
     const bool whole_words = psm != 0x01 && psm != 0x31 && psm != 0x1B && psm != 0x24 && psm != 0x2C;
@@ -1128,13 +1129,18 @@ void id_upload(const std::uint32_t *rec, std::uint64_t content) {
     chunk = mix64(chunk, rec[10] & 0x7FFFFFFFu);
     std::uint32_t f[5];
     fmt_words(psm, rec[0], rec[1], f);
+    bool changed = false;
     for_cells(f, x0, y0, x1, y1, [&](std::uint32_t b, std::uint32_t cx0, std::uint32_t cy0, std::uint32_t cx1, std::uint32_t cy1) {
         const bool full = whole_words && cx0 >= x0 && cx1 <= x1 && cy0 >= full0 && cy1 < full_end;
         bool drawn = false;
-        g_id.block[b] = (full ? mix64(chunk, b) : mix64(mix64(block_id(b, drawn), chunk), b)) | 1;
+        const std::uint64_t prev = block_id(b, drawn);
+        const std::uint64_t next = (full ? mix64(chunk, b) : mix64(mix64(prev, chunk), b)) | 1;
+        if (!full || drawn || prev != next) changed = true;
+        g_id.block[b] = next;
         g_id.block_seq[b] = ++g_id.seq;
         g_id.touched[b >> 5] = g_id.block_write[b >> 5] = g_id.seq;
     });
+    return changed;
 }
 
 std::uint64_t bytes_id(const std::uint8_t *p, std::size_t n) {
@@ -1364,6 +1370,8 @@ struct TexIndexEntry {
 };
 
 std::unordered_map<std::uint64_t, TexIndexEntry> g_tex_index;
+std::unordered_map<std::uint64_t, std::uint64_t> g_ident_tex_key;
+bool g_tex_size_in_index[11][11] = {};
 std::vector<std::uint64_t> g_tracked_tex_keys;
 std::uint64_t g_dbp_tex_key[16384] = {};
 std::vector<std::uint8_t> g_state_vram_1x;
@@ -1371,6 +1379,10 @@ std::uint32_t g_override_used = 0;
 bool g_tex_overrides_enabled = false;
 bool g_tex_override_all = false;
 bool g_tex_hot_reload = false;
+bool g_tex_dump_enabled = false;
+std::string g_tex_dump_dir;
+std::unordered_set<std::uint64_t> g_dumped_tex_keys;
+std::vector<std::array<std::uint32_t, kClutEntries>> g_dump_clut;
 
 // Canonical Huffman table construction (Huff::build, decode_huff) and RFC 1951 block
 // decoding in inflate_rfc1951 are derived from Mark Adler's puff.c / puff.h
@@ -1622,6 +1634,231 @@ bool decode_png_rgba_ps2(const std::string &path, std::uint32_t &out_w, std::uin
     return true;
 }
 
+bool write_png_rgba(const std::string &path, std::uint32_t w, std::uint32_t h, const std::uint8_t *rgba) {
+    if (!w || !h || !rgba) return false;
+    const auto crc32_step = [](std::uint32_t crc, const std::uint8_t *buf, std::size_t len) {
+        for (std::size_t i = 0; i < len; ++i) {
+            crc ^= buf[i];
+            for (int k = 0; k < 8; ++k) crc = (crc >> 1u) ^ ((crc & 1u) ? 0xEDB88320u : 0u);
+        }
+        return crc;
+    };
+    const auto put_be32 = [](std::vector<std::uint8_t> &out, std::uint32_t v) {
+        out.push_back(static_cast<std::uint8_t>(v >> 24));
+        out.push_back(static_cast<std::uint8_t>(v >> 16));
+        out.push_back(static_cast<std::uint8_t>(v >> 8));
+        out.push_back(static_cast<std::uint8_t>(v));
+    };
+    const auto put_chunk = [&](std::vector<std::uint8_t> &out, const char type[4], const std::uint8_t *data, std::size_t len) {
+        put_be32(out, static_cast<std::uint32_t>(len));
+        const auto *tbytes = reinterpret_cast<const std::uint8_t *>(type);
+        out.insert(out.end(), tbytes, tbytes + 4);
+        if (len) out.insert(out.end(), data, data + len);
+        std::uint32_t crc = crc32_step(0xFFFFFFFFu, tbytes, 4);
+        if (len) crc = crc32_step(crc, data, len);
+        put_be32(out, ~crc);
+    };
+
+    const std::size_t stride = static_cast<std::size_t>(w) * 4;
+    std::vector<std::uint8_t> raw(static_cast<std::size_t>(h) * (1 + stride), 0);
+    for (std::uint32_t y = 0; y < h; ++y) {
+        const std::uint8_t *src = rgba + static_cast<std::size_t>(y) * stride;
+        const std::uint8_t *up = y > 0 ? (src - stride) : nullptr;
+        std::uint8_t *dst = &raw[static_cast<std::size_t>(y) * (1 + stride)];
+        std::uint64_t score1 = 0, score2 = 0;
+        for (std::size_t i = 0; i < stride; ++i) {
+            const std::uint8_t a = i >= 4 ? src[i - 4] : 0;
+            const std::uint8_t b = up ? up[i] : 0;
+            score1 += static_cast<std::uint32_t>(std::abs(static_cast<std::int8_t>(src[i] - a)));
+            score2 += static_cast<std::uint32_t>(std::abs(static_cast<std::int8_t>(src[i] - b)));
+        }
+        if (score1 <= score2) {
+            dst[0] = 1;
+            for (std::size_t i = 0; i < stride; ++i) dst[1 + i] = static_cast<std::uint8_t>(src[i] - (i >= 4 ? src[i - 4] : 0));
+        } else {
+            dst[0] = 2;
+            for (std::size_t i = 0; i < stride; ++i) dst[1 + i] = static_cast<std::uint8_t>(src[i] - (up ? up[i] : 0));
+        }
+    }
+
+    std::uint32_t s1 = 1, s2 = 0;
+    for (std::uint8_t b : raw) {
+        s1 = (s1 + b) % 65521u;
+        s2 = (s2 + s1) % 65521u;
+    }
+
+    std::vector<std::uint8_t> zstream;
+    zstream.reserve(raw.size() / 2 + 64);
+    zstream.push_back(0x78);
+    zstream.push_back(0x01);
+
+    std::uint64_t bit_buf = 0;
+    int bit_cnt = 0;
+    const auto put_bits = [&](std::uint32_t val, int nbits) {
+        bit_buf |= (static_cast<std::uint64_t>(val) << bit_cnt);
+        bit_cnt += nbits;
+        while (bit_cnt >= 8) {
+            zstream.push_back(static_cast<std::uint8_t>(bit_buf & 0xFFu));
+            bit_buf >>= 8;
+            bit_cnt -= 8;
+        }
+    };
+    const auto put_huff = [&](std::uint32_t code_msb, int nbits) {
+        std::uint32_t rev = 0;
+        for (int i = 0; i < nbits; ++i) rev = (rev << 1u) | ((code_msb >> i) & 1u);
+        put_bits(rev, nbits);
+    };
+    const auto put_lit = [&](int sym) {
+        if (sym <= 143) put_huff(0x30u + static_cast<std::uint32_t>(sym), 8);
+        else if (sym <= 255) put_huff(0x190u + static_cast<std::uint32_t>(sym - 144), 9);
+        else if (sym <= 279) put_huff(static_cast<std::uint32_t>(sym - 256), 7);
+        else put_huff(0xC0u + static_cast<std::uint32_t>(sym - 280), 8);
+    };
+    static const int kLenBase[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static const int kLenExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static const int kDistBase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+    static const int kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+    put_bits(1, 1);  // BFINAL = 1
+    put_bits(1, 2);  // BTYPE = 01 (Fixed Huffman)
+    std::array<std::int32_t, 4096> head;
+    head.fill(-1);
+    const auto hash3 = [&](std::size_t p) -> std::uint32_t {
+        const std::uint32_t v = static_cast<std::uint32_t>(raw[p]) | (static_cast<std::uint32_t>(raw[p + 1]) << 8) | (static_cast<std::uint32_t>(raw[p + 2]) << 16);
+        return (v * 0x1E35A7BDu) >> 20;
+    };
+    std::size_t pos = 0;
+    while (pos < raw.size()) {
+        int best_len = 0;
+        std::size_t best_dist = 0;
+        if (pos + 3 <= raw.size()) {
+            const std::uint32_t h3 = hash3(pos);
+            const std::int32_t prev = head[h3];
+            head[h3] = static_cast<std::int32_t>(pos);
+            if (prev >= 0 && pos - static_cast<std::size_t>(prev) <= 32768) {
+                const std::size_t mpos = static_cast<std::size_t>(prev);
+                const std::size_t max_l = std::min<std::size_t>(258, raw.size() - pos);
+                std::size_t l = 0;
+                while (l < max_l && raw[mpos + l] == raw[pos + l]) ++l;
+                if (l >= 3) {
+                    best_len = static_cast<int>(l);
+                    best_dist = pos - mpos;
+                }
+            }
+        }
+        if (best_len >= 3) {
+            int li = 28;
+            while (li > 0 && best_len < kLenBase[li]) --li;
+            put_lit(257 + li);
+            if (kLenExtra[li]) put_bits(static_cast<std::uint32_t>(best_len - kLenBase[li]), kLenExtra[li]);
+            int di = 29;
+            while (di > 0 && static_cast<int>(best_dist) < kDistBase[di]) --di;
+            put_huff(static_cast<std::uint32_t>(di), 5);
+            if (kDistExtra[di]) put_bits(static_cast<std::uint32_t>(static_cast<int>(best_dist) - kDistBase[di]), kDistExtra[di]);
+            for (int step = 1; step < best_len; ++step) {
+                if (pos + step + 3 <= raw.size()) head[hash3(pos + step)] = static_cast<std::int32_t>(pos + step);
+            }
+            pos += static_cast<std::size_t>(best_len);
+        } else {
+            put_lit(raw[pos]);
+            ++pos;
+        }
+    }
+    put_lit(256);
+    if (bit_cnt > 0) zstream.push_back(static_cast<std::uint8_t>(bit_buf & 0xFFu));
+    put_be32(zstream, (s2 << 16) | s1);
+
+    std::vector<std::uint8_t> png = {137, 80, 78, 71, 13, 10, 26, 10};
+    const std::uint8_t ihdr[13] = {
+        static_cast<std::uint8_t>(w >> 24), static_cast<std::uint8_t>(w >> 16), static_cast<std::uint8_t>(w >> 8), static_cast<std::uint8_t>(w),
+        static_cast<std::uint8_t>(h >> 24), static_cast<std::uint8_t>(h >> 16), static_cast<std::uint8_t>(h >> 8), static_cast<std::uint8_t>(h),
+        8, 6, 0, 0, 0
+    };
+    put_chunk(png, "IHDR", ihdr, sizeof ihdr);
+    put_chunk(png, "IDAT", zstream.data(), zstream.size());
+    put_chunk(png, "IEND", nullptr, 0);
+
+    std::FILE *f = os::open(path.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fwrite(png.data(), 1, png.size(), f) == png.size();
+    std::fclose(f);
+    return ok;
+}
+
+std::uint32_t loc_at_1x(const std::uint32_t *f, std::uint32_t x, std::uint32_t y, std::uint32_t &shift, std::uint32_t &mask) {
+    const std::uint32_t pws = f[3] & 15u, phs = (f[3] >> 4) & 15u, amask = (f[3] >> 8) & 3u, nbit = (f[3] >> 10) & 1u;
+    const std::uint32_t n = g_swizzle[f[2] + ((y & ((1u << phs) - 1u)) << pws) + (x & ((1u << pws) - 1u))];
+    const std::uint32_t a = f[0] + ((x >> pws) + (y >> phs) * f[1]) * 8192u + (n >> nbit);
+    shift = (f[3] >> 11u) + (a & amask) * 8u + (n & nbit) * 4u;
+    mask = f[4];
+    return (a & 0x3FFFFFu) >> 2u;
+}
+
+std::uint32_t read_pixel_1x(const std::uint32_t *f, std::uint32_t x, std::uint32_t y) {
+    std::uint32_t shift = 0, mask = 0;
+    const std::uint32_t w = loc_at_1x(f, x, y, shift, mask);
+    std::uint32_t word = 0;
+    std::memcpy(&word, &g_state_vram_1x[w * 4], 4);
+    return (word >> shift) & mask;
+}
+
+void write_pixel_1x(const std::uint32_t *f, std::uint32_t x, std::uint32_t y, std::uint32_t val) {
+    std::uint32_t shift = 0, mask = 0;
+    const std::uint32_t w = loc_at_1x(f, x, y, shift, mask);
+    if (mask == 0xFFFFFFFFu) {
+        std::memcpy(&g_state_vram_1x[w * 4], &val, 4);
+        return;
+    }
+    std::uint32_t word = 0;
+    std::memcpy(&word, &g_state_vram_1x[w * 4], 4);
+    word = (word & ~(mask << shift)) | ((val & mask) << shift);
+    std::memcpy(&g_state_vram_1x[w * 4], &word, 4);
+}
+
+std::uint32_t expand16_1x(std::uint32_t c, const std::uint32_t *w) {
+    const std::uint32_t r = (c & 0x1Fu) << 3u;
+    const std::uint32_t g = ((c >> 5u) & 0x1Fu) << 3u;
+    const std::uint32_t b = ((c >> 10u) & 0x1Fu) << 3u;
+    const std::uint32_t ta0 = w[20] & 0xFFu, ta1 = (w[20] >> 8u) & 0xFFu;
+    std::uint32_t a = ta0;
+    if (c & 0x8000u) a = ta1;
+    else if ((w[0] & 32768u) && (c & 0x7FFFu) == 0u) a = 0u;
+    return r | (g << 8u) | (b << 16u) | (a << 24u);
+}
+
+std::uint32_t convert_texel_1x(const std::uint32_t *w, std::uint32_t raw) {
+    const std::uint32_t tpsm = w[14], cpsm = w[16], csa = w[17], clut_slot = w[22] % kClutSlots;
+    switch (tpsm) {
+    case 0x00u:
+    case 0x30u:
+        return raw;
+    case 0x01u:
+    case 0x31u: {
+        std::uint32_t a = w[20] & 0xFFu;
+        if ((w[0] & 32768u) && (raw & 0xFFFFFFu) == 0u) a = 0u;
+        return (raw & 0xFFFFFFu) | (a << 24u);
+    }
+    case 0x02u:
+    case 0x0Au:
+    case 0x32u:
+    case 0x3Au:
+        return expand16_1x(raw, w);
+    case 0x13u:
+    case 0x1Bu: {
+        const std::uint32_t e = g_dump_clut[clut_slot][raw & 255u];
+        return (cpsm == PSMCT32 || cpsm == PSMCT24) ? e : expand16_1x(e, w);
+    }
+    case 0x14u:
+    case 0x24u:
+    case 0x2Cu: {
+        const std::uint32_t e = g_dump_clut[clut_slot][((csa & 15u) * 16u + (raw & 15u)) & 511u];
+        return (cpsm == PSMCT32 || cpsm == PSMCT24) ? e : expand16_1x(e, w);
+    }
+    default:
+        return raw;
+    }
+}
+
 void check_tex_entry_stat(TexIndexEntry &e) {
     for (const TexCandidateFile &cf : e.files) {
 #if defined(_WIN32)
@@ -1653,9 +1890,15 @@ void check_tex_entry_stat(TexIndexEntry &e) {
     e.modified = false;
 }
 
-void note_tex_upload_key(std::uint32_t dbp, std::uint64_t key) {
-    g_dbp_tex_key[dbp & 0x3FFFu] = key;
-    if (!g_tex_overrides_enabled) return;
+void note_tex_size_in_index(std::uint32_t w, std::uint32_t h) {
+    for (std::uint32_t tw = 0; tw <= 10; ++tw)
+        if ((1u << tw) == w)
+            for (std::uint32_t th = 0; th <= 10; ++th)
+                if ((1u << th) == h) g_tex_size_in_index[tw][th] = true;
+}
+
+void track_tex_key(std::uint64_t key) {
+    if (!g_tex_overrides_enabled || !key || key == 1ull) return;
     auto it = g_tex_index.find(key);
     if (it == g_tex_index.end()) return;
     TexIndexEntry &e = it->second;
@@ -1664,6 +1907,11 @@ void note_tex_upload_key(std::uint32_t dbp, std::uint64_t key) {
         g_tracked_tex_keys.push_back(key);
         check_tex_entry_stat(e);
     }
+}
+
+void note_tex_upload_key(std::uint32_t dbp, std::uint64_t key) {
+    g_dbp_tex_key[dbp & 0x3FFFu] = key;
+    track_tex_key(key);
 }
 
 void poll_tex_overrides_frame() {
@@ -1691,22 +1939,53 @@ void load_tex_index_file(const std::filesystem::path &tsv_path) {
             e.orig_h = h;
             e.files.push_back({os::utf8(base_dir / os::path(rel_buf)), mtime_ns, fsize});
             if (e.active_path.empty()) e.active_path = e.files.back().png_path;
+            note_tex_size_in_index(w, h);
             ++count;
         }
     }
     if (count > 0) {
         g_tex_overrides_enabled = true;
+        if (g_state_vram_1x.size() < kMemorySize) g_state_vram_1x.assign(kMemorySize, 0);
+        if (g_dump_clut.size() < kClutSlots) g_dump_clut.assign(kClutSlots, {});
         std::fprintf(stderr, "[gpu] indexed %zu moddable textures from %s (live 1x/HD .png overrides active)\n", count, os::utf8(tsv_path).c_str());
     }
 }
 
 void init_tex_overrides() {
     g_tex_index.clear();
+    g_ident_tex_key.clear();
+    std::memset(g_tex_size_in_index, 0, sizeof g_tex_size_in_index);
     g_tracked_tex_keys.clear();
     g_override_used = 0;
     g_tex_overrides_enabled = false;
     g_tex_override_all = os::env("PS2_TEX_OVERRIDE_ALL") == "1";
     g_tex_hot_reload = os::env("PS2_TEX_HOT_RELOAD") == "1";
+    g_tex_dump_enabled = false;
+    g_tex_dump_dir.clear();
+    g_dumped_tex_keys.clear();
+
+    const std::string dump_opt = os::env("PS2_TEX_DUMP");
+    if (!dump_opt.empty() && dump_opt != "0") {
+        g_tex_dump_enabled = true;
+        g_tex_dump_dir = (dump_opt == "1") ? "tex_dump" : dump_opt;
+        std::error_code ec;
+        const std::filesystem::path dump_p = os::path(g_tex_dump_dir);
+        std::filesystem::create_directories(dump_p, ec);
+        g_state_vram_1x.assign(kMemorySize, 0);
+        g_dump_clut.assign(kClutSlots, {});
+        const std::filesystem::path dump_tsv = dump_p / "textures_index.tsv";
+        if (std::filesystem::is_regular_file(dump_tsv, ec)) {
+            std::ifstream tf(dump_tsv);
+            std::string line;
+            while (std::getline(tf, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                unsigned long long k = 0;
+                if (std::sscanf(line.c_str(), "%llx", &k) == 1 && k != 0) g_dumped_tex_keys.insert(static_cast<std::uint64_t>(k));
+            }
+        }
+        std::fprintf(stderr, "[gpu] texture dump enabled: writing drawn textures to %s (%zu already indexed)\n", os::utf8(dump_p).c_str(), g_dumped_tex_keys.size());
+    }
+
     std::string opt = os::env("PS2_TEX_OVERRIDES");
     const std::string opt_dir = os::env("PS2_TEX_OVERRIDE_DIR");
     if (!opt_dir.empty() && opt_dir != "0") opt = opt_dir;
@@ -1718,6 +1997,10 @@ void init_tex_overrides() {
         if (std::filesystem::is_directory(p, ec)) p /= "textures_index.tsv";
         if (std::filesystem::is_regular_file(p, ec)) {
             load_tex_index_file(p);
+            return;
+        }
+        if (g_tex_dump_enabled) {
+            g_tex_overrides_enabled = true;
             return;
         }
     }
@@ -1750,6 +2033,7 @@ void init_tex_overrides() {
         }
         if (g_tex_overrides_enabled) return;
     }
+    if (g_tex_dump_enabled) g_tex_overrides_enabled = true;
 }
 
 std::uint64_t recover_state_vram_tex_key(const std::uint32_t *w, std::uint32_t base_w, std::uint32_t base_h) {
@@ -1757,46 +2041,104 @@ std::uint64_t recover_state_vram_tex_key(const std::uint32_t *w, std::uint32_t b
     const std::uint32_t psm = w[14];
     const std::uint32_t *f = w + 25;
     const std::uint32_t pws = f[3] & 15u, phs = (f[3] >> 4) & 15u, nbit = (f[3] >> 10) & 1u;
-    const auto addr_of = [&](std::uint32_t x, std::uint32_t y, std::uint32_t &n_out) -> std::uint32_t {
-        const std::uint32_t n = g_swizzle[f[2] + ((y & ((1u << phs) - 1u)) << pws) + (x & ((1u << pws) - 1u))];
-        n_out = n;
-        return (f[0] + ((x >> pws) + (y >> phs) * f[1]) * 8192u + (n >> nbit)) & (kMemorySize - 1u);
-    };
-    std::vector<std::uint8_t> unswiz;
+    const std::uint32_t mask_x = (1u << pws) - 1u, mask_y = (1u << phs) - 1u;
+    const std::uint32_t f0 = f[0], f1 = f[1], f2 = f[2];
+    const std::uint8_t *vram = g_state_vram_1x.data();
+    const std::uint32_t *swz = g_swizzle.data();
+    static thread_local std::vector<std::uint8_t> unswiz;
     if (psm == PSMT8) {
         unswiz.resize(static_cast<std::size_t>(base_w) * base_h);
-        for (std::uint32_t y = 0; y < base_h; ++y)
-            for (std::uint32_t x = 0; x < base_w; ++x) {
-                std::uint32_t n = 0;
-                unswiz[y * base_w + x] = g_state_vram_1x[addr_of(x, y, n)];
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            std::uint8_t *dst = unswiz.data() + static_cast<std::size_t>(y) * base_w;
+            std::uint32_t x = 0;
+            for (; x + 4 <= base_w; x += 4) {
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                dst[x + 0] = vram[a + 0];
+                dst[x + 1] = vram[a + 4];
+                dst[x + 2] = vram[a + 16];
+                dst[x + 3] = vram[a + 20];
             }
-    } else if (psm == PSMT4) {
-        unswiz.assign((static_cast<std::size_t>(base_w) * base_h) / 2, 0);
-        for (std::uint32_t y = 0; y < base_h; ++y)
+            for (; x < base_w; ++x) {
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                dst[x] = vram[a];
+            }
+        }
+    } else if (psm == PSMT8H) {
+        unswiz.resize(static_cast<std::size_t>(base_w) * base_h);
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            std::uint8_t *dst = unswiz.data() + static_cast<std::size_t>(y) * base_w;
             for (std::uint32_t x = 0; x < base_w; ++x) {
-                std::uint32_t n = 0;
-                const std::uint8_t b = g_state_vram_1x[addr_of(x, y, n)];
-                const std::uint8_t nib = (n & 1u) ? (b >> 4) : (b & 0xFu);
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                dst[x] = vram[a + 3u];
+            }
+        }
+    } else if (psm == PSMT4 || psm == PSMT4HL || psm == PSMT4HH) {
+        unswiz.assign((static_cast<std::size_t>(base_w) * base_h) / 2, 0);
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            for (std::uint32_t x = 0; x < base_w; ++x) {
+                const std::uint32_t n = swz_row[x & mask_x];
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + (n >> nbit)) & (kMemorySize - 1u);
+                std::uint8_t nib = 0;
+                if (psm == PSMT4) {
+                    const std::uint8_t b = vram[a];
+                    nib = (n & 1u) ? (b >> 4) : (b & 0xFu);
+                } else {
+                    const std::uint8_t b = vram[(a & ~3u) + 3u];
+                    nib = (psm == PSMT4HH) ? (b >> 4) : (b & 0xFu);
+                }
                 const std::size_t idx = static_cast<std::size_t>(y) * base_w + x;
                 if (idx & 1u) unswiz[idx >> 1] |= static_cast<std::uint8_t>(nib << 4);
                 else unswiz[idx >> 1] = nib;
             }
+        }
     } else if (psm == PSMCT32) {
         unswiz.resize(static_cast<std::size_t>(base_w) * base_h * 4);
-        for (std::uint32_t y = 0; y < base_h; ++y)
-            for (std::uint32_t x = 0; x < base_w; ++x) {
-                std::uint32_t n = 0;
-                const std::uint32_t a = addr_of(x, y, n) & ~3u;
-                std::memcpy(&unswiz[(y * base_w + x) * 4], &g_state_vram_1x[a], 4);
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            std::uint8_t *dst = unswiz.data() + static_cast<std::size_t>(y) * base_w * 4;
+            std::uint32_t x = 0;
+            for (; x + 8 <= base_w; x += 8) {
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                std::memcpy(dst + x * 4 + 0, vram + a + 0, 8);
+                std::memcpy(dst + x * 4 + 8, vram + a + 16, 8);
+                std::memcpy(dst + x * 4 + 16, vram + a + 32, 8);
+                std::memcpy(dst + x * 4 + 24, vram + a + 48, 8);
             }
+            for (; x < base_w; ++x) {
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                std::memcpy(dst + x * 4, vram + a, 4);
+            }
+        }
+    } else if (psm == PSMCT24) {
+        unswiz.resize(static_cast<std::size_t>(base_w) * base_h * 4);
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            std::uint8_t *dst = unswiz.data() + static_cast<std::size_t>(y) * base_w * 4;
+            for (std::uint32_t x = 0; x < base_w; ++x) {
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                std::memcpy(dst + x * 4, vram + a, 4);
+                dst[x * 4 + 3] = 0x80u;
+            }
+        }
     } else if (psm == PSMCT16 || psm == PSMCT16S) {
         unswiz.resize(static_cast<std::size_t>(base_w) * base_h * 2);
-        for (std::uint32_t y = 0; y < base_h; ++y)
+        for (std::uint32_t y = 0; y < base_h; ++y) {
+            const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+            const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+            std::uint8_t *dst = unswiz.data() + static_cast<std::size_t>(y) * base_w * 2;
             for (std::uint32_t x = 0; x < base_w; ++x) {
-                std::uint32_t n = 0;
-                const std::uint32_t a = addr_of(x, y, n) & ~1u;
-                std::memcpy(&unswiz[(y * base_w + x) * 2], &g_state_vram_1x[a], 2);
+                const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 2u);
+                std::memcpy(dst + x * 2, vram + a, 2);
             }
+        }
     } else {
         return 1ull;
     }
@@ -1804,19 +2146,328 @@ std::uint64_t recover_state_vram_tex_key(const std::uint32_t *w, std::uint32_t b
     return key ? key : 1ull;
 }
 
+void copy_upload_to_vram_1x(const Image &im, const std::uint8_t *bytes, std::size_t n, std::uint32_t pixels, std::uint32_t lead_bits) {
+    if (g_swizzle.empty() || !im.rrw || !pixels) return;
+    if (g_state_vram_1x.size() < kMemorySize) g_state_vram_1x.assign(kMemorySize, 0);
+    std::uint32_t f[5];
+    fmt_words(im.dpsm, im.dbp, im.dbw, f);
+    const std::uint32_t pws = f[3] & 15u, phs = (f[3] >> 4) & 15u;
+    const std::uint32_t mask_x = (1u << pws) - 1u, mask_y = (1u << phs) - 1u;
+    const std::uint32_t f0 = f[0], f1 = f[1], f2 = f[2];
+    std::uint8_t *vram = g_state_vram_1x.data();
+    const std::uint32_t *swz = g_swizzle.data();
+
+    if (lead_bits == 0) {
+        std::uint32_t k = 0;
+        std::uint32_t x_off = im.done % im.rrw;
+        std::uint32_t y = (im.dsay + im.done / im.rrw) & 0x7FFu;
+        if (im.dpsm == PSMCT32 || im.dpsm == PSMZ32) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                const std::uint8_t *src = bytes + static_cast<std::size_t>(k) * 4;
+                std::uint32_t i = 0;
+                while (i < span && ((im.dsax + x_off + i) & 7u) != 0) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                    std::memcpy(vram + a, src + static_cast<std::size_t>(i) * 4, 4);
+                    ++i;
+                }
+                for (; i + 8 <= span; i += 8) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                    const std::uint8_t *s = src + static_cast<std::size_t>(i) * 4;
+                    std::memcpy(vram + a + 0, s + 0, 8);
+                    std::memcpy(vram + a + 16, s + 8, 8);
+                    std::memcpy(vram + a + 32, s + 16, 8);
+                    std::memcpy(vram + a + 48, s + 24, 8);
+                }
+                for (; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                    std::memcpy(vram + a, src + static_cast<std::size_t>(i) * 4, 4);
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+        if (im.dpsm == PSMCT16 || im.dpsm == PSMCT16S || im.dpsm == PSMZ16 || im.dpsm == PSMZ16S) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                const std::uint8_t *src = bytes + static_cast<std::size_t>(k) * 2;
+                std::uint32_t i = 0;
+                while (i < span && ((im.dsax + x_off + i) & 7u) != 0) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 2u);
+                    std::memcpy(vram + a, src + static_cast<std::size_t>(i) * 2, 2);
+                    ++i;
+                }
+                for (; i + 8 <= span; i += 8) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                    const std::uint8_t *s = src + static_cast<std::size_t>(i) * 2;
+                    std::memcpy(vram + a + 0, s + 0, 2);
+                    std::memcpy(vram + a + 4, s + 2, 2);
+                    std::memcpy(vram + a + 16, s + 4, 2);
+                    std::memcpy(vram + a + 20, s + 6, 2);
+                    std::memcpy(vram + a + 32, s + 8, 2);
+                    std::memcpy(vram + a + 36, s + 10, 2);
+                    std::memcpy(vram + a + 48, s + 12, 2);
+                    std::memcpy(vram + a + 52, s + 14, 2);
+                }
+                for (; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 2u);
+                    std::memcpy(vram + a, src + static_cast<std::size_t>(i) * 2, 2);
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+        if (im.dpsm == PSMT8) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                const std::uint8_t *src = bytes + k;
+                std::uint32_t i = 0;
+                while (i < span && ((im.dsax + x_off + i) & 3u) != 0) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                    vram[a] = src[i];
+                    ++i;
+                }
+                for (; i + 4 <= span; i += 4) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                    vram[a + 0] = src[i + 0];
+                    vram[a + 4] = src[i + 1];
+                    vram[a + 16] = src[i + 2];
+                    vram[a + 20] = src[i + 3];
+                }
+                for (; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 1u);
+                    vram[a] = src[i];
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+        if (im.dpsm == PSMT8H) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                const std::uint8_t *src = bytes + k;
+                for (std::uint32_t i = 0; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                    vram[a + 3u] = src[i];
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+        if (im.dpsm == PSMT4) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                for (std::uint32_t i = 0; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t sw = swz_row[x & mask_x];
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + (sw >> 1u)) & (kMemorySize - 1u);
+                    const std::uint32_t ki = k + i;
+                    const std::uint8_t src_b = bytes[ki >> 1u];
+                    const std::uint8_t nib = (ki & 1u) ? (src_b >> 4u) : (src_b & 0xFu);
+                    if (sw & 1u) vram[a] = static_cast<std::uint8_t>((vram[a] & 0x0Fu) | (nib << 4u));
+                    else vram[a] = static_cast<std::uint8_t>((vram[a] & 0xF0u) | nib);
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+        if (im.dpsm == PSMCT24 || im.dpsm == PSMZ24) {
+            while (k < pixels) {
+                const std::uint32_t span = std::min(pixels - k, im.rrw - x_off);
+                const std::uint32_t *swz_row = swz + f2 + ((y & mask_y) << pws);
+                const std::uint32_t row_base = f0 + (y >> phs) * f1 * 8192u;
+                const std::uint8_t *src = bytes + static_cast<std::size_t>(k) * 3;
+                for (std::uint32_t i = 0; i < span; ++i) {
+                    const std::uint32_t x = (im.dsax + x_off + i) & 0x7FFu;
+                    const std::uint32_t a = (row_base + (x >> pws) * 8192u + swz_row[x & mask_x]) & (kMemorySize - 4u);
+                    std::memcpy(vram + a, src + static_cast<std::size_t>(i) * 3, 3);
+                }
+                k += span;
+                x_off = 0;
+                y = (y + 1) & 0x7FFu;
+            }
+            return;
+        }
+    }
+
+    for (std::uint32_t k = 0; k < pixels; ++k) {
+        const std::uint32_t p = im.done + k;
+        const std::uint32_t x = (im.dsax + p % im.rrw) & 0x7FFu;
+        const std::uint32_t y = (im.dsay + p / im.rrw) & 0x7FFu;
+        const std::uint64_t bit = lead_bits + static_cast<std::uint64_t>(k) * im.bpp;
+        const std::size_t byte_idx = static_cast<std::size_t>(bit >> 3);
+        std::uint64_t raw64 = 0;
+        if (byte_idx < n) std::memcpy(&raw64, bytes + byte_idx, std::min<std::size_t>(8, n - byte_idx));
+        const std::uint32_t v = im.bpp == 32 ? static_cast<std::uint32_t>(raw64 >> (bit & 7u))
+                                             : static_cast<std::uint32_t>((raw64 >> (bit & 7u)) & ((1ull << im.bpp) - 1ull));
+        write_pixel_1x(f, x, y, v);
+    }
+}
+
+std::uint64_t lookup_drawn_tex_key(const std::uint32_t *w, std::uint32_t base_w, std::uint32_t base_h) {
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    std::uint64_t ident = 0;
+    if (g_dec_on && tw <= 10 && th <= 10) {
+        if (!texture_id(w, ident)) return 1ull;
+        auto it = g_ident_tex_key.find(ident);
+        if (it != g_ident_tex_key.end()) return it->second;
+    }
+    const std::uint32_t dbp = w[12] & 0x3FFFu;
+    std::uint64_t key = g_dbp_tex_key[dbp];
+    if (key && key != 1ull) {
+        auto it = g_tex_index.find(key);
+        if (it == g_tex_index.end() || it->second.orig_w != base_w || it->second.orig_h != base_h) key = 1ull;
+    }
+    if ((!key || key == 1ull) && !g_state_vram_1x.empty()) {
+        key = recover_state_vram_tex_key(w, base_w, base_h);
+        if (!ident) note_tex_upload_key(dbp, key);
+        else track_tex_key(key);
+    }
+    if (ident != 0) {
+        if (g_ident_tex_key.size() >= 16384) g_ident_tex_key.clear();
+        g_ident_tex_key[ident] = key ? key : 1ull;
+    }
+    return key;
+}
+
+std::uint64_t clut_tex_key(const std::uint32_t *w, std::uint64_t base_key) {
+    if (!base_key || base_key == 1ull) return base_key;
+    const std::uint32_t tpsm = w[14];
+    const bool eight = (tpsm == PSMT8 || tpsm == PSMT8H);
+    const bool four = (tpsm == PSMT4 || tpsm == PSMT4HL || tpsm == PSMT4HH);
+    if (!eight && !four) return base_key;
+    if (g_dump_clut.size() < kClutSlots) return base_key;
+    const std::uint32_t cpsm = w[16], csa = w[17], clut_slot = w[22] % kClutSlots;
+    const std::uint32_t count = eight ? 256u : 16u;
+    const std::uint32_t start = eight ? 0u : (csa & 15u) * 16u;
+    const std::uint32_t mask = (cpsm == PSMCT32) ? 0xFFFFFFFFu : (cpsm == PSMCT24) ? 0x00FFFFFFu : 0x0000FFFFu;
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    const auto &slot = g_dump_clut[clut_slot];
+    for (std::uint32_t k = 0; k < count; ++k) {
+        const std::uint32_t e = slot[(start + k) & 511u] & mask;
+        h ^= e;
+        h *= 0x100000001b3ull;
+    }
+    const std::uint64_t combined = mix64(base_key, h);
+    return (combined && combined != 1ull) ? combined : base_key;
+}
+
+void dump_drawn_texture(const std::uint32_t *w, std::uint32_t base_w, std::uint32_t base_h) {
+    if (!g_tex_dump_enabled || g_state_vram_1x.size() < kMemorySize || g_swizzle.empty() || base_w > 1024 || base_h > 1024) return;
+    if (rendered(pages(w[12], w[13], w[14], 0, 0, static_cast<int>(base_w) - 1, static_cast<int>(base_h) - 1))) return;
+    const std::uint64_t base_key = lookup_drawn_tex_key(w, base_w, base_h);
+    const std::uint64_t key = clut_tex_key(w, base_key);
+    if (!key || key == 1ull) return;
+    if (!g_dumped_tex_keys.insert(key).second) return;
+
+    if (g_dump_clut.size() < kClutSlots) g_dump_clut.assign(kClutSlots, {});
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(base_w) * base_h * 4);
+    const std::uint32_t *tf = w + 25;
+    for (std::uint32_t y = 0; y < base_h; ++y) {
+        for (std::uint32_t x = 0; x < base_w; ++x) {
+            const std::uint32_t raw = read_pixel_1x(tf, x, y);
+            const std::uint32_t c = convert_texel_1x(w, raw);
+            const std::size_t idx = (static_cast<std::size_t>(y) * base_w + x) * 4;
+            rgba[idx + 0] = static_cast<std::uint8_t>(c & 0xFFu);
+            rgba[idx + 1] = static_cast<std::uint8_t>((c >> 8u) & 0xFFu);
+            rgba[idx + 2] = static_cast<std::uint8_t>((c >> 16u) & 0xFFu);
+            const std::uint32_t ps2_a = c >> 24u;
+            rgba[idx + 3] = (ps2_a >= 128u) ? 255u : static_cast<std::uint8_t>(ps2_a << 1u);
+        }
+    }
+
+    char fname[32] = {};
+    std::snprintf(fname, sizeof fname, "%016llx.png", static_cast<unsigned long long>(key));
+    const std::filesystem::path dump_dir = os::path(g_tex_dump_dir);
+    const std::filesystem::path png_path = dump_dir / fname;
+    const std::string png_utf8 = os::utf8(png_path);
+    if (!write_png_rgba(png_utf8, base_w, base_h, rgba.data())) return;
+
+#if defined(_WIN32)
+    struct _stat64 st = {};
+    if (::_wstat64(png_path.c_str(), &st) != 0) return;
+    const std::uint64_t mtime_ns = static_cast<std::uint64_t>(st.st_mtime) * 1000000000ULL;
+#elif defined(__linux__)
+    struct stat st = {};
+    if (::stat(png_utf8.c_str(), &st) != 0) return;
+    const std::uint64_t mtime_ns = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
+#else
+    struct stat st = {};
+    if (::stat(png_utf8.c_str(), &st) != 0) return;
+    const std::uint64_t mtime_ns = static_cast<std::uint64_t>(st.st_mtime) * 1000000000ULL;
+#endif
+    const auto fsize = static_cast<std::uint64_t>(st.st_size);
+
+    std::error_code ec;
+    const std::filesystem::path tsv_path = dump_dir / "textures_index.tsv";
+    const bool need_header = !std::filesystem::exists(tsv_path, ec);
+    if (std::FILE *f = os::open(os::utf8(tsv_path).c_str(), "ab")) {
+        if (need_header) std::fprintf(f, "# key_hex\twidth\theight\tmtime_ns\tsize_bytes\trel_path\n");
+        std::fprintf(f, "%016llx\t%u\t%u\t%llu\t%llu\t%s\n", static_cast<unsigned long long>(key), base_w, base_h,
+                     static_cast<unsigned long long>(mtime_ns), static_cast<unsigned long long>(fsize), fname);
+        std::fclose(f);
+    }
+
+    if (g_tex_overrides_enabled && g_tex_index.find(key) == g_tex_index.end()) {
+        TexIndexEntry &e = g_tex_index[key];
+        e.orig_w = base_w;
+        e.orig_h = base_h;
+        e.files.push_back({png_utf8, mtime_ns, fsize});
+        e.active_path = png_utf8;
+        e.tracked = true;
+        g_tracked_tex_keys.push_back(key);
+        note_tex_size_in_index(base_w, base_h);
+    }
+}
+
 // Called during plan_decodes: never calls stat(); reads only in-memory flags updated at upload time and every 120 frames at frame end.
 std::uint32_t resolve_tex_override(const std::uint32_t *w, std::uint32_t base_w, std::uint32_t base_h) {
     if (!g_tex_overrides_enabled) return 0xFFFFFFFFu;
-    const std::uint32_t dbp = w[12] & 0x3FFFu;
-    std::uint64_t key = g_dbp_tex_key[dbp];
-    if (!key && !g_state_vram_1x.empty()) {
-        key = recover_state_vram_tex_key(w, base_w, base_h);
-        note_tex_upload_key(dbp, key);
-    }
-    if (!key || key == 1ull) return 0xFFFFFFFFu;
-    auto it = g_tex_index.find(key);
+    const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+    if (tw > 10 || th > 10 || !g_tex_size_in_index[tw][th]) return 0xFFFFFFFFu;
+    if (rendered(pages(w[12], w[13], w[14], 0, 0, static_cast<int>(base_w) - 1, static_cast<int>(base_h) - 1))) return 0xFFFFFFFFu;
+    const std::uint64_t base_key = lookup_drawn_tex_key(w, base_w, base_h);
+    if (!base_key || base_key == 1ull) return 0xFFFFFFFFu;
+    const std::uint64_t pal_key = clut_tex_key(w, base_key);
+    auto it = g_tex_index.find(pal_key);
+    if (it == g_tex_index.end() && pal_key != base_key) it = g_tex_index.find(base_key);
     if (it == g_tex_index.end()) return 0xFFFFFFFFu;
     TexIndexEntry &e = it->second;
+    if (!e.tracked) {
+        e.tracked = true;
+        g_tracked_tex_keys.push_back(it->first);
+        check_tex_entry_stat(e);
+    }
     if (!e.modified || base_w != e.orig_w || base_h != e.orig_h) return 0xFFFFFFFFu;
     if (!e.dirty && e.cached_dec != 0xFFFFFFFFu) return e.cached_dec;
 
@@ -1864,13 +2515,37 @@ void plan_decodes(std::uint32_t prims) {
     g_assigned.clear();
     g_setup_taps.clear();
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
-    if (g_tex_overrides_enabled) {
+    const auto ensure_setup_taps = [&] {
+        if (g_setup_taps.empty()) {
+            g_setup_taps.assign(setups, 0.0);
+            for (std::uint32_t q = 0; q < prims; ++q) {
+                const std::uint32_t *rec = b.prims.data() + q * kPrimWords;
+                if (rec[0] < setups)
+                    g_setup_taps[rec[0]] += static_cast<double>((rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1) * static_cast<double>((rec[3] >> 16) - (rec[2] >> 16) + 1);
+            }
+        }
+    };
+    if (g_tex_dump_enabled || g_tex_overrides_enabled) {
         for (std::uint32_t i = 0; i < setups; ++i) {
             std::uint32_t *w = b.setups.data() + i * kSetupWords;
             if (!(w[0] & 2u)) continue;
             const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
-            const std::uint32_t ov = resolve_tex_override(w, 1u << tw, 1u << th);
-            if (ov != 0xFFFFFFFFu) w[24] = ov;
+            const std::uint32_t bw = 1u << tw, bh = 1u << th;
+            // Large dynamic text/glyph pages (such as Silent Hill 2's 512x512 message pages) are drawn with only a few pixels per setup:
+            // skip them for both dumping and overriding so text pages are not snapshotted or frozen when loading a dumped folder back.
+            bool skip_sparse_page = false;
+            if (bw * bh >= 262144u) {
+                ensure_setup_taps();
+                const double taps = g_setup_taps[i] * ((w[0] & 16384u) ? 4.0 : 1.0);
+                if (taps * 8.0 < static_cast<double>(bw * bh)) skip_sparse_page = true;
+            }
+            if (!skip_sparse_page) {
+                if (g_tex_dump_enabled) dump_drawn_texture(w, bw, bh);
+                if (g_tex_overrides_enabled) {
+                    const std::uint32_t ov = resolve_tex_override(w, bw, bh);
+                    if (ov != 0xFFFFFFFFu) w[24] = ov;
+                }
+            }
         }
     }
     if (!g_decode) return;
@@ -1904,14 +2579,7 @@ void plan_decodes(std::uint32_t prims) {
         // its 512 x 512 palette pages with a few pixels per set-up and many palettes, and decoded 6 to 8 million texels a frame for that.
         // The pixels are the shapes' boxes (more than they cover), four taps each when filtered, and decoding wins from an eighth of the texels on.
         const auto worth = [&] {
-            if (g_setup_taps.empty()) {
-                g_setup_taps.assign(setups, 0.0);
-                for (std::uint32_t q = 0; q < prims; ++q) {
-                    const std::uint32_t *rec = b.prims.data() + q * kPrimWords;
-                    if (rec[0] < setups)
-                        g_setup_taps[rec[0]] += static_cast<double>((rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1) * static_cast<double>((rec[3] >> 16) - (rec[2] >> 16) + 1);
-                }
-            }
+            ensure_setup_taps();
             const double taps = g_setup_taps[i] * ((w[0] & 16384u) ? 4.0 : 1.0) * g_scale * g_scale;
             return taps * 8.0 >= static_cast<double>(words);
         };
@@ -2424,7 +3092,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
         }
         if (cached) source = 0x80000000u;
         if (g_cache_seen.size() > 65536) g_cache_seen.clear();
-    } else if (g_tex_overrides_enabled && im.done == 0 && n >= 64) {
+    } else if ((g_tex_overrides_enabled || g_tex_dump_enabled) && im.done == 0 && n >= 64) {
         upload_key = content_key(bytes, n);
     }
     if (!source) offset = arena_append(bytes, n);
@@ -2440,15 +3108,18 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     op.image = im.id;
     const Range pal_range_of_upload = op.range;
     queue_pre(op);
-    if (g_tex_overrides_enabled) {
+    const bool upload_changed = g_dec_on ? id_upload(op.rec, source ? mix64(g_cache_uid, 0xCAC4Eull) : n < kCacheMinBytes ? bytes_id(bytes, n) : fresh_id()) : true;  // after queue_pre, as hwcache below
+    if (g_tex_overrides_enabled || g_tex_dump_enabled) {
         if (op.range.lo < op.range.hi) {
             const std::uint32_t b0 = static_cast<std::uint32_t>(op.range.lo >> 8) & 0x3FFFu;
             const std::uint32_t b1 = static_cast<std::uint32_t>((op.range.hi - 1) >> 8) & 0x3FFFu;
             for (std::uint32_t b = b0; b <= b1; ++b) g_dbp_tex_key[b] = 1ull;
         }
-        if (im.done == 0 && im.dsax == 0 && im.dsay == 0 && upload_key != 0) note_tex_upload_key(im.dbp, upload_key);
+        const bool single_whole = (im.done == 0 && pixels >= im.total && im.dsax == 0 && im.dsay == 0 && im.dpsm != PSMCT32 && im.dpsm != PSMZ32);
+        if (single_whole && upload_key != 0 && g_tex_index.find(upload_key) != g_tex_index.end())
+            note_tex_upload_key(im.dbp, upload_key);
+        if (upload_changed) copy_upload_to_vram_1x(im, bytes, n, pixels, lead_bits);
     }
-    if (g_dec_on) id_upload(op.rec, source ? mix64(g_cache_uid, 0xCAC4Eull) : n < kCacheMinBytes ? bytes_id(bytes, n) : fresh_id());  // after queue_pre, as hwcache below
     if (g_live) hw::pal_upload(im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, static_cast<std::uint32_t>(lead_bits), im.bpp, bytes, size, pal_range_of_upload.lo, pal_range_of_upload.hi);
     if (hwcache::g_on)  // after queue_pre: a batch that reads this memory was flushed by it and saw the old numbers
         hwcache::write_upload(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1), static_cast<int>(im.dsay + last),
@@ -4691,6 +5362,30 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
+    if ((g_tex_dump_enabled || g_tex_overrides_enabled) && !g_swizzle.empty() && g_state_vram_1x.size() >= kMemorySize) {
+        if (g_dump_clut.size() < kClutSlots) g_dump_clut.assign(kClutSlots, {});
+        g_dump_clut[next] = g_dump_clut[g_clut_slot];
+        std::uint32_t f[5];
+        fmt_words(cpsm, cbp, csm ? cbw : 1u, f);
+        const bool eight = rec[6] != 0;
+        const std::uint32_t csa = rec[5], start = csm ? (csa * 16u) & 511u : eight ? 0u : (csa & 15u) * 16u;
+        const std::uint32_t count = eight ? 256u : 16u;
+        for (std::uint32_t k = 0; k < count; ++k) {
+            std::uint32_t x = 0, y = 0;
+            if (csm) {
+                x = cou * 16u + k;
+                y = cov;
+            } else if (eight) {
+                const std::uint32_t j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
+                x = j & 15u;
+                y = j >> 4u;
+            } else {
+                x = k & 7u;
+                y = k >> 3u;
+            }
+            g_dump_clut[next][(start + k) & 511u] = read_pixel_1x(f, x, y);
+        }
+    }
     if (g_dec_on) id_clut(op.rec);
     if (g_live) hw::pal_clut(g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, psm == PSMT8 || psm == PSMT8H);  // after queue_pre (a pending batch that overwrites the palette was flushed by it)
     if (hwcache::g_on) hwcache::clut_load(g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u, cbw, cou, cov);
@@ -4910,13 +5605,18 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     dec_reset();  // memory and palette are new: nothing kept is valid
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
-    if (g_tex_overrides_enabled && from > 0 && vram.size() >= words * from) {
+    if ((g_tex_overrides_enabled || g_tex_dump_enabled) && from > 0 && vram.size() >= words * from) {
         std::memset(g_dbp_tex_key, 0, sizeof g_dbp_tex_key);
+        g_ident_tex_key.clear();
         g_state_vram_1x.resize(kMemorySize);
         for (std::size_t w = 0; w < words; ++w) {
             const std::uint32_t word = vram[w * from];
             std::memcpy(&g_state_vram_1x[w * 4], &word, 4);
         }
+    }
+    if ((g_tex_dump_enabled || g_tex_overrides_enabled) && clut.size() >= kClutEntries) {
+        if (g_dump_clut.size() < kClutSlots) g_dump_clut.assign(kClutSlots, {});
+        std::memcpy(g_dump_clut[g_clut_slot].data(), clut.data(), kClutEntries * 4);
     }
     // A page counts as drawn by the GS when its samples differ within a texel; one that is the same in all of them was uploaded (or
     // is flat, which reads the same either way).

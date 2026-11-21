@@ -4850,6 +4850,7 @@ namespace {
 struct TripCopy {
     WGPUBuffer buffer = nullptr;
     std::uint64_t capacity = 0;
+    std::uint32_t scale = 1;  // the internal scale it was taken at (the quick menu can change it between a save and a read)
 } g_trip[kTripSlots];
 
 void copy_buffer(WGPUBuffer from, std::uint64_t from_offset, WGPUBuffer to, std::uint64_t to_offset, std::uint64_t bytes) {
@@ -4875,6 +4876,7 @@ void trip_save(std::uint32_t slot, std::uint32_t offset, std::uint32_t bytes) {
         t.buffer = make_buffer(size, WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
         t.capacity = size;
     }
+    t.scale = g_scale;
     copy_buffer(g_vram, static_cast<std::uint64_t>(offset) * g_scale * g_scale, t.buffer, 0, size);
 }
 
@@ -4882,7 +4884,7 @@ bool trip_restore(std::uint32_t slot, std::uint32_t offset, std::uint32_t bytes)
     TripCopy &t = g_trip[slot % kTripSlots];
     Image &im = g_image;
     const std::uint64_t size = static_cast<std::uint64_t>(bytes) * g_scale * g_scale;
-    if (!t.buffer || t.capacity < size || !im.active || im.done || im.lead_bits || !im.pending.empty()) return false;
+    if (!t.buffer || t.scale != g_scale || t.capacity < size || !im.active || im.done || im.lead_bits || !im.pending.empty()) return false;
     im.active = false;  // the upload this stands for is done, all of it
     copy_buffer(t.buffer, 0, g_vram, static_cast<std::uint64_t>(offset) * g_scale * g_scale, size);
     // the caches as after a write: at 1x as after the upload (its samples are all one), scaled as after a local copy (they may differ)
@@ -4896,7 +4898,7 @@ bool trip_restore(std::uint32_t slot, std::uint32_t offset, std::uint32_t bytes)
 
 void trip_read(std::uint32_t slot, std::uint32_t bytes, std::uint8_t *out) {
     TripCopy &t = g_trip[slot % kTripSlots];
-    const std::uint32_t samples = g_scale * g_scale;
+    const std::uint32_t samples = t.scale * t.scale;
     std::vector<std::uint32_t> all(static_cast<std::size_t>(bytes / 4) * samples);
     if (!t.buffer || t.capacity < all.size() * 4) {
         std::memset(out, 0, bytes);
@@ -5314,17 +5316,20 @@ void set_scale(std::uint32_t new_scale) {
         ps2::set_video_scale(g_scale);
         return;
     }
+    // the card path (PS2_GPU_HW=1) holds its own handles to the graphics memory and draws at scale 1 only, and the bench keeps a copy of it:
+    // both keep the scale they started with
+    if (hw::enabled() || g_live || hwcache::g_on || g_bench.configured) {
+        std::fprintf(stderr, "[gpu] the resolution stays %ux: it cannot change while the card path (PS2_GPU_HW) or the bench runs\n", g_scale);
+        ps2::set_video_scale(g_scale);
+        return;
+    }
     if (g_pending.busy) finish_download(g_pending.serial);
     std::vector<std::uint32_t> base_vram(kMemorySize / 4);
     download(reinterpret_cast<std::uint8_t *>(base_vram.data()), 0, kMemorySize);
     wait_idle();
     finish_tiles(false);
     drop_stream();
-    for (TripCopy &t : g_trip) {
-        if (t.buffer) wgpuBufferRelease(t.buffer);
-        t.buffer = nullptr;
-        t.capacity = 0;
-    }
+    // the depth round trip's copies stay: each knows its scale, so a read still gives the game its bytes and a put-back at the new scale is refused
 
     g_scale = new_scale;
     ps2::set_video_scale(g_scale);

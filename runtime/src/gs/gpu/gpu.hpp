@@ -54,6 +54,8 @@ bool attach_surface(const SurfaceTarget &target);
 void resize_surface(std::uint32_t width, std::uint32_t height);
 bool has_surface();
 bool present(const DisplaySource &src);
+std::uint32_t scale();
+void set_scale(std::uint32_t s);
 double busy_ms();
 void stats();
 

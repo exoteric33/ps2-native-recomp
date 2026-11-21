@@ -8,4 +8,6 @@ namespace ps2 {
 // bit 1: soft enlargement (a smooth blend everywhere) instead of the sharp one (hard pixels, only their borders blend).
 void set_video_options(std::uint32_t options);
 std::uint32_t video_options();
+void set_video_scale(std::uint32_t scale);
+std::uint32_t video_scale();
 }

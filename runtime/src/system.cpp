@@ -119,6 +119,7 @@ std::string g_state_path;
 void (*g_state_complete)(bool, bool) = nullptr;
 
 std::atomic<std::uint32_t> g_video_options{0};
+std::atomic<std::uint32_t> g_video_scale{1};
 
 std::uint64_t next_event_time() {
     std::uint64_t t = UINT64_MAX;
@@ -496,6 +497,8 @@ bool request_state_operation(bool loading, const char *path, void (*complete)(bo
 
 void set_video_options(std::uint32_t options) { g_video_options.store(options, std::memory_order_relaxed); }
 std::uint32_t video_options() { return g_video_options.load(std::memory_order_relaxed); }
+void set_video_scale(std::uint32_t scale) { g_video_scale.store(scale, std::memory_order_relaxed); }
+std::uint32_t video_scale() { return g_video_scale.load(std::memory_order_relaxed); }
 
 namespace {
 

@@ -1089,7 +1089,7 @@ void menu_command(quickmenu::Command c, int step) {
         ps2::set_video_scale(static_cast<std::uint32_t>(g_scale_next));
         g_keys.scale = g_scale_next;
         rewrite_keys_file([](const std::string &t) { return keymap::with_scale(t, g_scale_next); }, "resolution");
-        set_notice("Resolution " + std::to_string(g_scale_next) + "x");
+        set_notice("Resolution " + std::to_string(g_scale_next) + "x" + (g_scale_locked ? " (PS2_SCALE still sets the next start)" : ""));
         std::fprintf(stderr, "[menu] resolution switched live to %dx\n", g_scale_next);
         break;
     case Command::sharp_2d:

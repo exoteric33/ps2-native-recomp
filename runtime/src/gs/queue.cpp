@@ -117,6 +117,9 @@ void Ring::start(std::size_t capacity) {
     capacity_ = capacity;
     mask_ = capacity - 1;
     spill_above_ = capacity / 4;
+    // PS2_HANDOVER_WAKE_KB=<n>: how much a held batch publishes before it wakes a sleeping consumer (default 256 KiB, 0 = at every publish)
+    const char *wake = std::getenv("PS2_HANDOVER_WAKE_KB");
+    wake_bytes_ = wake ? std::strtoull(wake, nullptr, 10) << 10 : kWakeBytes;
 }
 
 void Ring::post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, std::uint32_t bytes) {
@@ -162,20 +165,34 @@ void Ring::post_spilled(Type type, std::uint32_t arg0, std::uint32_t arg1, const
     put(Header{static_cast<std::uint32_t>(type) | kSpilled, bytes, arg0, arg1}, &copy, sizeof copy);
 }
 
-// Makes everything written visible to the consumer and wakes it if it sleeps. The head store and the flag load are seq_cst, and so are
+// Makes everything written visible to the consumer and wakes it if it sleeps (a held batch wakes a sleeping consumer
+// only once wake_bytes_ have been published since it was found asleep; flush() and wait_for_space() always wake). The head store and the flag load are seq_cst, and so are
 // the consumer's flag store and head load before it sleeps (wait_for_work): of two such pairs one always sees the other's store, so
 // either this sees the flag or the consumer sees the new head and does not sleep. On x86 that is one locked instruction (the store);
 // the load is a plain read of a line the consumer writes only when it goes to sleep.
-void Ring::publish() {
+void Ring::publish(bool force) {
     if (qs_on()) g_qs[this == &g_render ? 0 : 1].publishes.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t before = published_;
     published_ = write_;
     head_.store(write_, std::memory_order_seq_cst);
     if (consumer_waiting_.load(std::memory_order_seq_cst)) [[unlikely]] {
+        // Held: the producer is the slower side right now (the consumer ran dry). Waking it for every batch costs the producer a system
+        // call each time (over 100 a frame in the God of War II film); let it sleep until a bigger piece is ready.
+        if (holding_ && !force && wake_bytes_) {
+            if (!wake_owed_) {
+                wake_owed_ = true;
+                owed_from_ = before;
+            }
+            if (write_ - owed_from_ < wake_bytes_) return;
+        }
+        wake_owed_ = false;
         if (consumer_waiting_.exchange(0)) {
             posted_.fetch_add(1);
             if (qs_on()) g_qs[this == &g_render ? 0 : 1].notifies.fetch_add(1, std::memory_order_relaxed);
             notify(posted_);
         }
+    } else {
+        wake_owed_ = false;
     }
 }
 
@@ -184,7 +201,7 @@ void Ring::publish() {
 // ring empty or goes to sleep; a wake missed between the two costs at most the 1 ms the sleep is bounded by, and needs the whole ring
 // unread.
 void Ring::wait_for_space(std::uint64_t until_tail) {
-    if (write_ != published_) publish();
+    if (write_ != published_ || wake_owed_) publish(true);
     const std::uint64_t t0 = qs_on() ? now_us() : 0;
     for (;;) {
         const std::uint32_t seen = freed_.load(std::memory_order_acquire);
@@ -202,6 +219,13 @@ void Ring::wait_for_space(std::uint64_t until_tail) {
     }
     producer_waiting_.store(0, std::memory_order_relaxed);
     if (qs_on()) { QStats &q = g_qs[this == &g_render ? 0 : 1]; q.full_waits.fetch_add(1); q.full_us.fetch_add(now_us() - t0); }
+}
+
+// Out of line on purpose: inlined into the vector-unit thread's loop it changed that loop's code enough to cost the God of War I ship
+// about 3 % (measured), with the same logic called here at base speed.
+void Ring::flush() {
+    holding_ = false;
+    if (write_ != published_ || wake_owed_) publish();
 }
 
 void Ring::wake_producer() {

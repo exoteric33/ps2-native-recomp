@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
@@ -107,7 +108,23 @@ int g_current = 0;
 int g_next_handler = 1;
 std::uint64_t g_order = 0;
 bool g_in_handler = false;
-std::vector<std::uint32_t> g_guest_calls;
+// The game routines the kernel is running to the end right now (run_guest), innermost last: what each is, where, and since when.
+// A routine that never returns is stuck there with the clock still running (issue #127), so the closing lines and the F9 report name
+// it. Written on entry and on return only, never per instruction.
+enum class Routine : std::uint8_t { kIntc = 1, kDmac, kAlarm, kSyscall };
+struct GuestCall {
+    std::uint32_t address;
+    Routine kind;
+    std::uint32_t number;  // the INTC cause, DMAC channel, alarm id or system call number
+    std::uint64_t cycles, frame;  // game time and refresh count at entry
+};
+std::vector<GuestCall> g_guest_calls;
+// The innermost one again, for the window thread (the F9 report written when the emulation does not answer): kind << 24 | number
+// (0 = none), address, refresh count at entry. Relaxed: a hint read while the emulation runs.
+std::atomic<std::uint32_t> g_live_routine{0}, g_live_address{0};
+std::atomic<std::uint64_t> g_live_frame{0};
+// The routine a halt (the window closed, the frame limit) broke out of after it had run for a while; printed with the closing lines.
+std::string g_stuck_line;
 bool g_reschedule = false;
 std::vector<int> g_pending_alarms;
 std::uint32_t g_vsync_flag = 0, g_vsync_data = 0;
@@ -206,8 +223,33 @@ void release(Thread &t, std::int64_t result) {
     else make_ready(t);
 }
 
-std::uint32_t run_guest(Cpu &c, std::uint32_t address, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2, std::uint32_t gp,
-                        std::uint32_t a3 = 0) {
+const char *irq_name(bool dmac, unsigned n);
+
+// "INTC 2 (VBLANK start) handler", "alarm 3 callback", "system call 0x40 (set by the game)"
+std::string routine_words(Routine kind, std::uint32_t number) {
+    char b[64];
+    switch (kind) {
+    case Routine::kIntc: std::snprintf(b, sizeof b, "INTC %u (%s) handler", number, irq_name(false, number)); break;
+    case Routine::kDmac: std::snprintf(b, sizeof b, "DMAC %u (%s) handler", number, irq_name(true, number)); break;
+    case Routine::kAlarm: std::snprintf(b, sizeof b, "alarm %u callback", number); break;
+    default: std::snprintf(b, sizeof b, "system call 0x%02X (set by the game)", number); break;
+    }
+    return b;
+}
+
+void publish_routine() {
+    if (g_guest_calls.empty()) {
+        g_live_routine.store(0, std::memory_order_relaxed);
+        return;
+    }
+    const GuestCall &g = g_guest_calls.back();
+    g_live_address.store(g.address, std::memory_order_relaxed);
+    g_live_frame.store(g.frame, std::memory_order_relaxed);
+    g_live_routine.store(static_cast<std::uint32_t>(g.kind) << 24 | (g.number & 0xFFFFFFu), std::memory_order_relaxed);
+}
+
+std::uint32_t run_guest(Cpu &c, Routine kind, std::uint32_t number, std::uint32_t address, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2,
+                        std::uint32_t gp, std::uint32_t a3 = 0) {
     ThreadContext saved;
     save_context(c, saved);
     const bool nested = g_in_handler;
@@ -222,14 +264,27 @@ std::uint32_t run_guest(Cpu &c, std::uint32_t address, std::uint32_t a0, std::ui
     c.r[29].sd[0] = static_cast<std::int32_t>(kKernelStackTop - (nested ? 0x4000u : 0u));
     c.r[31].sd[0] = static_cast<std::int32_t>(kHandlerReturn);
     c.pc = address;
-    g_guest_calls.push_back(address);
+    g_guest_calls.push_back({address, kind, number, now(), frame_count()});
+    publish_routine();
     while (!halted()) {
         c.pc &= ~kUnwind;
         if (c.pc == kHandlerReturn) break;
         if (c.budget <= 0) set_budget(c, 20000);
         dispatch(c, 0, 0);
     }
+    // Broken off by a halt after more than a refresh of game time (a routine entered after the halt stops at once and says nothing):
+    // note it for the closing lines, innermost first, with where the code was.
+    if ((c.pc & ~kUnwind) != kHandlerReturn && g_stuck_line.empty() && now() - g_guest_calls.back().cycles >= kEeClock / 50) {
+        const GuestCall &g = g_guest_calls.back();
+        const std::uint64_t cycles = now() - g.cycles;
+        char b[256];
+        std::snprintf(b, sizeof b, " at 0x%08X had not returned when the run ended: running for %llu frames (%.1f s of game time); pc 0x%08X ra 0x%08X",
+                      g.address, static_cast<unsigned long long>(frame_count() - g.frame), static_cast<double>(cycles) / kEeClock, c.pc & ~kUnwind,
+                      c.r[31].w[0]);
+        g_stuck_line = "[ee] stuck in a game routine: the " + routine_words(g.kind, g.number) + b + "\n";
+    }
     g_guest_calls.pop_back();
+    publish_routine();
     const std::uint32_t result = c.r[2].w[0];
     load_context(c, saved);
     c.cop0[12] = status;
@@ -248,7 +303,7 @@ void run_intc(Cpu &c, unsigned cause) {
     }
     for (const Handler &h : handlers) {
         if (h.cause != cause) continue;
-        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, h.address, cause, h.arg, 0, h.gp));
+        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, Routine::kIntc, cause, h.address, cause, h.arg, 0, h.gp));
         if (result < 0) break;
     }
 }
@@ -264,7 +319,7 @@ void run_dmac(Cpu &c, unsigned channel) {
     }
     for (const Handler &h : handlers) {
         if (h.cause != channel) continue;
-        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, h.address, channel, h.arg, 0, h.gp));
+        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, Routine::kDmac, channel, h.address, channel, h.arg, 0, h.gp));
         if (result < 0) break;
     }
 }
@@ -342,7 +397,7 @@ void run_traced(Cpu &c, bool dmac, unsigned cause, const std::vector<Handler> &h
     for (const Handler &h : handlers) {
         if (h.cause != cause) continue;
         ++at;
-        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, h.address, cause, h.arg, 0, h.gp));
+        const std::int32_t result = static_cast<std::int32_t>(run_guest(c, dmac ? Routine::kDmac : Routine::kIntc, cause, h.address, cause, h.arg, 0, h.gp));
         HandlerStat &st = g_irq_handler[h.id];
         const bool changed = st.any && st.last != static_cast<std::uint32_t>(result);
         ++st.calls;
@@ -439,7 +494,7 @@ void run_alarms(Cpu &c) {
         if (it == g_alarms.end()) continue;
         const Alarm alarm = it->second;
         g_alarms.erase(it);
-        run_guest(c, alarm.callback, static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(now() / hblank_cycles()), alarm.arg, alarm.gp);
+        run_guest(c, Routine::kAlarm, static_cast<std::uint32_t>(id), alarm.callback, static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(now() / hblank_cycles()), alarm.arg, alarm.gp);
         g_reschedule = true;
     }
 }
@@ -557,7 +612,7 @@ void wait_sema(Cpu &c, int id) {
         return;
     }
     if (g_in_handler) {
-        std::fprintf(stderr, "[kernel] WaitSema(%d) inside an interrupt handler (ra 0x%08X, thread %d, handler 0x%08X)\n", id, c.r[31].w[0], g_current, g_guest_calls.empty() ? 0u : g_guest_calls.back());
+        std::fprintf(stderr, "[kernel] WaitSema(%d) inside an interrupt handler (ra 0x%08X, thread %d, handler 0x%08X)\n", id, c.r[31].w[0], g_current, g_guest_calls.empty() ? 0u : g_guest_calls.back().address);
         return;
     }
     s.waiters.push_back(g_current);
@@ -803,6 +858,7 @@ static std::string state_words(const Thread &t) {
 }
 
 void dump() {
+    if (!g_stuck_line.empty()) std::fputs(g_stuck_line.c_str(), stderr);  // a game routine the halt broke out of
     if (g_trace_irq) std::fputs(interrupt_report("[irq] ").c_str(), stderr);  // PS2_TRACE_INTC: the interrupt side at the end of the run
     for (const auto &[id, t] : g_threads) {
         std::fprintf(stderr, "[thread] %d status %d prio %d wait %d/%d pc 0x%08X ra 0x%08X (%s)\n", id, t.status, t.priority, t.wait, t.wait_id,
@@ -916,6 +972,20 @@ static std::string handler_lines(const std::vector<Handler> &list, bool dmac, co
     return out;
 }
 
+std::string routine_report(const char *prefix) {
+    const std::uint32_t live = g_live_routine.load(std::memory_order_relaxed);
+    if (!live) return {};
+    const std::uint64_t since = g_live_frame.load(std::memory_order_relaxed), frames = frame_count();
+    // Read while the emulation may be running: one word each, a hint of where the code is, not an exact place.
+    const std::uint32_t pc = std::atomic_ref<std::uint32_t>(g_cpu.pc).load(std::memory_order_relaxed) & ~kUnwind;
+    const std::uint32_t ra = std::atomic_ref<std::uint32_t>(g_cpu.r[31].w[0]).load(std::memory_order_relaxed);
+    char b[256];
+    std::snprintf(b, sizeof b, " at 0x%08X is running since frame %llu (%llu frames ago); pc 0x%08X ra 0x%08X\n",
+                  g_live_address.load(std::memory_order_relaxed), static_cast<unsigned long long>(since),
+                  static_cast<unsigned long long>(frames >= since ? frames - since : 0), pc, ra);
+    return std::string(prefix) + "the EE is inside a game routine: the " + routine_words(static_cast<Routine>(live >> 24), live & 0xFFFFFFu) + b;
+}
+
 std::string interrupt_report(const char *prefix) {
     std::string out;
     char b[400];
@@ -989,7 +1059,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     if (n < 0x100u) {
         const std::uint32_t custom = ld32(kSyscallTable + n * 4u);
         if (custom && has_code(custom & 0x1FFFFFFFu)) {
-            const std::uint32_t result = run_guest(c, custom & 0x1FFFFFFFu, arg(c, 0), arg(c, 1), arg(c, 2), c.r[28].w[0], arg(c, 3));
+            const std::uint32_t result = run_guest(c, Routine::kSyscall, n, custom & 0x1FFFFFFFu, arg(c, 0), arg(c, 1), arg(c, 2), c.r[28].w[0], arg(c, 3));
             ret(c, static_cast<std::int32_t>(result));
             return;
         }

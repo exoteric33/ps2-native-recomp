@@ -39,6 +39,9 @@ void trace_register_write(int reg, std::uint32_t value, std::uint32_t before, st
 // What the interrupt side looks like now, one line each, every line starting with `prefix`: the Status register's IE/EIE bits, the INTC
 // and DMAC mask and status, the installed handlers (and, with the trace on, how often each ran). The F9 report and the end-of-run list use it.
 std::string interrupt_report(const char *prefix);
+// The game routine (interrupt handler, alarm callback, system call the game set) the EE is inside right now, one line starting with
+// `prefix`, or nothing when it is inside none. Safe from any thread: the F9 report written by the window uses it.
+std::string routine_report(const char *prefix);
 
 // The picture pace (ps2/pace.hpp). pace_setup sets the refreshes per picture (1 = off) and says where it came from
 // in the log; pace_picture is called when the game changes the buffer the TV shows (DISPFB1/2); pace_report prints the end-of-run line.

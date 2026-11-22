@@ -436,6 +436,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2irqtracetest PRIVATE synchronization)
     endif()
+    # a game routine that never returns (handler, callback) is named at the end of the run and in the F9 report; no game needed: ninja ps2stuckroutinetest
+    add_executable(ps2stuckroutinetest EXCLUDE_FROM_ALL tests/stuck_routine.cpp)
+    target_include_directories(ps2stuckroutinetest PRIVATE runtime/src)
+    target_link_libraries(ps2stuckroutinetest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2stuckroutinetest PRIVATE synchronization)
+    endif()
     # the IPU's inverse transform (BDEC) gives the same pixels bit for bit as the one it replaced, on millions of random blocks (no game needed): ninja ps2idctexacttest
     add_executable(ps2idctexacttest EXCLUDE_FROM_ALL tests/idct_exact.cpp)
     target_include_directories(ps2idctexacttest PRIVATE runtime/src)

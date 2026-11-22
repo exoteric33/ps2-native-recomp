@@ -839,6 +839,7 @@ std::string report_info(bool emergency, const fs::path &dir, bool has_state, boo
     // The thread lists are read on this thread, between two instructions. An emergency report is written by the window while the
     // emulation is stuck, where the maps could be half changed, so it gets none.
     t += "\nthreads (what each game thread waits for):\n";
+    t += kernel::routine_report("    ");  // an interrupt handler or callback the EE is stuck in, safe to read here
     if (emergency) {
         t += "    (not listed: the emulation did not answer, so the lists could not be read safely)\n";
     } else {

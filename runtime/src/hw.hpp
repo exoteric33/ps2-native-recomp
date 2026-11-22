@@ -31,6 +31,7 @@ enum Event {
     kEventTimer2,
     kEventTimer3,
     kEventDma0,
+    kEventVif1Read = kEventDma0 + 1,
     kEventIop = kEventDma0 + 10,
     kEventGsFinish,
     kEventCount

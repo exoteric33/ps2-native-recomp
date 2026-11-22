@@ -345,9 +345,14 @@ void Ring::pop(const Header &header) {
     if (producer_waiting_.load(std::memory_order_relaxed)) [[unlikely]] wake_producer();
 }
 
+// The flag is taken before the count moves, as in publish(): moving the count first let a consumer read the new count, raise its flag
+// and sleep, and then this cleared the flag and sent its wake before the sleep began. The consumer then slept with its flag down, so no
+// publish woke it until its own time limit. This way a consumer that read the count before this moved it does not
+// sleep (the count differs), and one that read it after keeps its flag up for the next publish.
 void Ring::wake() {
+    const bool asleep = consumer_waiting_.exchange(0);
     posted_.fetch_add(1);
-    if (consumer_waiting_.exchange(0)) notify(posted_);
+    if (asleep) notify(posted_);
 }
 
 // Looking for new work for a few microseconds before going to sleep: a sleep and the wake-up of the other thread are two system calls

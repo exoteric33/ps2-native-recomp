@@ -330,6 +330,12 @@ void write32(std::uint32_t a, std::uint32_t v) {
         return;
     }
     if (a == kDmacStat) {
+        // A channel end that is enabled while interrupts are on is taken by the console as soon as the channel ends, so a program can
+        // never clear one before its handler ran. Here the handler waits for the next safe point, and a program that acknowledges in
+        // between erased it: Airblade (issue #110) starts a GIF transfer and then resets the DMAC (D_STAT 0xFF1F, then the masks off),
+        // and its graphics library's handler for that transfer never ran. So what is pending runs first, as at EI.
+        // (take_pending does nothing inside a handler or with interrupts off.)
+        if (v & dmac_pending()) kernel::take_pending(g_cpu);
         const std::uint32_t before = g_dmac_stat;
         g_dmac_stat &= ~(v & 0xFFFFu);
         g_dmac_stat ^= v & 0xFFFF0000u;

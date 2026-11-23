@@ -22,6 +22,9 @@ void service(Cpu &c);
 bool must_unwind();
 bool in_handler();
 bool interruptible();
+// Runs the handlers of every pending, enabled interrupt now, nested like those a system call runs (the caller's registers are kept).
+// EI, MTC0 to Status and a program's D_STAT acknowledge (hw.cpp) use it; it does nothing inside a handler or with interrupts off.
+void take_pending(Cpu &c);
 int current_thread();
 void on_vblank_start();
 void on_hblank();

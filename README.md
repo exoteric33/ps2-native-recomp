@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 55
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 56
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -150,6 +150,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Red Faction (USA) | plays well, not played through yet: about 3 hours (a third of the game) at full speed (about 30 fps) with a game controller; no problems found ([#107](https://github.com/exoteric33/ps2-native-recomp/issues/107)) | m3tabolic |
 | Half-Life (USA) | runs, not played through yet: menus and maps at full speed; the missing sound in the maps is fixed since the update of 2026-11-14 ([#105](https://github.com/exoteric33/ps2-native-recomp/issues/105)) | ChuckBurry200 |
 | Wacky Races: Starring Dastardly & Muttley (Europe) | plays well: played from start to end at full speed with a game controller, and at 60 Hz the picture fits the window without being cropped; at 50 Hz the picture shakes, so 60 Hz is the way to play it (Linux, a Radeon RX 6900 XT; [#129](https://github.com/exoteric33/ps2-native-recomp/issues/129)) | Roblox90864 |
+| Resident Evil Code: Veronica X (USA) | plays well, not played through yet: the first areas at 60 fps with a game controller; it slowed down with several zombies until *Make it faster*; thin lines around text and in the inventory at 2x and above, which PCSX2 shows too ([#135](https://github.com/exoteric33/ps2-native-recomp/issues/135)) | ultra-magic-peta |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

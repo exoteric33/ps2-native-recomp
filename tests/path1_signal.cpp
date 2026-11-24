@@ -87,8 +87,8 @@ Times scenario(const char *mode) {
     hw::write64(kImr, 0x7F00u & ~0x300u);  // SIGNAL and FINISH may interrupt
     hw::write64(kSiglblid, 0);
 
-    // 1. Not used yet: the SIGNAL comes at the second vblank after the kick (a fence at the next one closes what was kicked before it,
-    //    the one after hands it on), whatever reads CSR meanwhile.
+    // 1. Not used yet: the SIGNAL comes at the third vblank after the kick (a fence at the next one closes what was kicked before it,
+    //    the vblank two after that hands it on, when the vector thread is surely past that fence), whatever reads CSR meanwhile.
     for (const std::uint64_t f = ps2::frame_count(); ps2::frame_count() == f;) advance(1000);
     const std::uint64_t kicked_in = ps2::frame_count();
     const std::uint32_t signal_regs[1] = {0x60};
@@ -107,7 +107,7 @@ Times scenario(const char *mode) {
     t.signal_frames = ps2::frame_count() - kicked_in;
     check((hw::read64(kCsr) & kSignal) != 0, mode, "CSR.SIGNAL comes");
     check(at_vblank, mode, "the SIGNAL is handed on at a vblank");
-    check(t.signal_frames == 2, mode, "the SIGNAL comes at the second vblank after the kick");
+    check(t.signal_frames == 3, mode, "the SIGNAL comes at the third vblank after the kick");
     check(gs_interrupt(), mode, "the SIGNAL raises the EE's GS interrupt");
     check((hw::read64(kSiglblid) & 0xFFFFFFFFu) == 0x1234u, mode, "SIGLBLID holds the SIGNAL's ID");
 

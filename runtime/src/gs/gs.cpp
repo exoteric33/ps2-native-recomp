@@ -1494,7 +1494,7 @@ void render_read_image(std::uint8_t *data, std::uint32_t qwords) {
 
 std::uint64_t read_privileged(std::uint32_t address) {
     // CSR and SIGLBLID show PATH1's SIGNAL, FINISH and LABEL: in a run that uses them, what VU1 kicked before this read is in them (gif.hpp)
-    if ((address & 0x1FFFu) == 0x1000 || (address & 0x1FFFu) == 0x1080) gif::deliver_path1();
+    if (gif::path1_live() && ((address & 0x1FFFu) == 0x1000 || (address & 0x1FFFu) == 0x1080)) gif::deliver_path1_live();
     switch (address & 0x1FFFu) {
     case 0x1000: return g_csr | (g_odd_field ? 0x2000u : 0u);
     case 0x1010: return g_imr;
@@ -1506,7 +1506,7 @@ std::uint64_t read_privileged(std::uint32_t address) {
 
 void write_privileged(std::uint32_t address, std::uint64_t value) {
     // in a run that uses PATH1's SIGNAL, FINISH and LABEL, a write to CSR, IMR or SIGLBLID acts on what was sent before it (gif.hpp)
-    if (const std::uint32_t a = address & 0x1FF0u; a == 0x1000 || a == 0x1010 || a == 0x1080) gif::deliver_path1();
+    if (const std::uint32_t a = address & 0x1FF0u; gif::path1_live() && (a == 0x1000 || a == 0x1010 || a == 0x1080)) gif::deliver_path1_live();
     switch (address & 0x1FF0u) {
     case 0x0000:
         if (trace_display() && value != g_pmode) std::fprintf(stderr, "[gs] pmode 0x%llX\n", static_cast<unsigned long long>(value));

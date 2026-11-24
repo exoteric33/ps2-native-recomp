@@ -415,7 +415,7 @@ void vblank() {
 
 void idle(Cpu &c) {
     // A game that waits for a SIGNAL or FINISH interrupt from PATH1 gets it here (gif.hpp): then its handler runs before the clock moves on
-    if (gs::path1_may_interrupt() && gif::deliver_path1()) return;
+    if (gif::path1_live() && gs::path1_may_interrupt() && gif::deliver_path1_live()) return;
     std::uint64_t next = next_event_time();
     if (next == UINT64_MAX && iop::idle()) {
         halt("deadlock: every thread waits and no event is pending");
@@ -546,14 +546,17 @@ void sync_vu_thread() {
 }
 
 // PATH1's SIGNAL, FINISH and LABEL at a vblank (gif.hpp): a fence closes what was sent before it, and what the fence of two vblanks ago
-// closed is handed on. post_present (on_vblank) lets the emulation run at most two pictures ahead of the drawing thread, so the vector
-// thread, which hands the drawing thread its pictures, has passed that fence already: the wait below only matters without a drawing
-// thread to pace it (tests), where it costs nothing to speak of.
-std::uint32_t g_path1_fences[2] = {0, 0};
+// closed is handed on. post_present (on_vblank) returns only once the drawing thread has shown all but the last two pictures, so the
+// vector thread, which hands the drawing thread its pictures, has passed the fence posted just before the picture of two vblanks ago: the
+// wait below only matters without a drawing thread to pace it (tests), where it costs nothing to speak of. The fence of the vblank before
+// is not that far yet: handing on what it closed waited for the vector thread at one vblank in six in Silent Hill 2.
+// [0] two vblanks ago, [1] the last vblank, [2] this one.
+std::uint32_t g_path1_fences[3] = {0, 0, 0};
 
 void path1_vblank_fence() {
     g_path1_fences[0] = g_path1_fences[1];
-    g_path1_fences[1] = post_fence();
+    g_path1_fences[1] = g_path1_fences[2];
+    g_path1_fences[2] = post_fence();
 }
 
 void path1_vblank_hand_on() {
@@ -602,7 +605,7 @@ void machine_state(state::Stream &s) {
     sync_vu_thread();
     if (s.loading()) {
         gif::forget_path1();
-        g_path1_fences[0] = g_path1_fences[1] = 0;
+        g_path1_fences[0] = g_path1_fences[1] = g_path1_fences[2] = 0;
     }
     vif::state(s);
     vu::state(s);

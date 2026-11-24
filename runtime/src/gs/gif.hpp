@@ -34,8 +34,12 @@ void vif1_idle();
 //   so this never waits): deliver_path1_before;
 // - once a run has handed any on (since it started or its last state save or load), also at once at a read or write of CSR, IMR or
 //   SIGLBLID and at an idle EE while the GS may interrupt for SIGNAL or FINISH, after the vector thread has read everything it was sent:
-//   deliver_path1 (true when it handed any on). A game that never sends them never waits for the vector thread.
-bool deliver_path1();
+//   deliver_path1 (true when it handed any on). A game that never sends them never waits for the vector thread, and pays one inline test
+//   of g_path1_live at those points (no call).
+extern bool g_path1_live;
+bool deliver_path1_live();
+inline bool path1_live() { return g_path1_live; }
+inline bool deliver_path1() { return g_path1_live && deliver_path1_live(); }
 void deliver_path1_before(std::uint32_t fence);
 // The thread that runs VU1 has passed one more fence (a kVuFence message, or the emulation thread's own count without the vector thread)
 void path1_fence();

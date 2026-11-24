@@ -194,9 +194,6 @@ std::vector<Found> g_path1;
 std::atomic<std::uint32_t> g_path1_count{0};
 std::atomic<std::uint32_t> g_path1_fences{0};  // written only by the thread that runs VU1
 std::uint64_t g_path1_delivered = 0;
-// The emulation thread's: this run has handed PATH1 writes on since it started or since its last state save or load, so it hands them on
-// at every delivery point from now on, not only at a vblank.
-bool g_path1_live = false;
 
 void keep_path1(std::uint32_t reg, std::uint64_t value) {
     std::lock_guard<std::mutex> lock(g_path1_lock);
@@ -368,6 +365,10 @@ void release(bool only_one) {
 
 }
 
+// The emulation thread's: this run has handed PATH1 writes on since it started or since its last state save or load, so it hands them on
+// at every delivery point from now on, not only at a vblank. Read inline by deliver_path1 and path1_live (gif.hpp).
+bool g_path1_live = false;
+
 void drop_held() {
     const bool masked = g_held.masked;
     g_held = Held{};
@@ -525,8 +526,9 @@ void read_all_sent() {
 
 }
 
-bool deliver_path1() {
-    if (!g_path1_live) return false;  // a run that has not used them yet waits for the vblank (deliver_path1_before) and costs nothing here
+// Only called once the run is live (deliver_path1 in gif.hpp checks that inline): a run that has not used them yet gets them at the
+// vblank (deliver_path1_before) and pays nothing at the delivery points.
+bool deliver_path1_live() {
     read_all_sent();
     return hand_on(true, 0);
 }

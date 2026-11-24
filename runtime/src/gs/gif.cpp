@@ -6,11 +6,14 @@
 #include "../vu_micro.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/system.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace ps2::gif {
@@ -179,7 +182,32 @@ struct GsSink {
     void image(const std::uint8_t *data, std::uint32_t qwords) { gs::write_image(data, qwords); }
 };
 
-void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
+// PATH1's SIGNAL, FINISH and LABEL (gif.hpp): found by the thread that runs VU1 (the emulation thread or the vector thread), kept here
+// in order until the emulation thread hands them on. Each carries the number of fences (path1_fence) that thread had passed when it found
+// it, so the emulation thread can tell what was sent before a fence it posted. The count lets a delivery with nothing waiting skip the lock.
+struct Found {
+    std::uint32_t reg, fence;
+    std::uint64_t value;
+};
+std::mutex g_path1_lock;
+std::vector<Found> g_path1;
+std::atomic<std::uint32_t> g_path1_count{0};
+std::atomic<std::uint32_t> g_path1_fences{0};  // written only by the thread that runs VU1
+std::uint64_t g_path1_delivered = 0;
+// The emulation thread's: this run has handed PATH1 writes on since it started or since its last state save or load, so it hands them on
+// at every delivery point from now on, not only at a vblank.
+bool g_path1_live = false;
+
+void keep_path1(std::uint32_t reg, std::uint64_t value) {
+    std::lock_guard<std::mutex> lock(g_path1_lock);
+    g_path1.push_back({reg, g_path1_fences.load(std::memory_order_relaxed), value});
+    g_path1_count.fetch_add(1, std::memory_order_release);
+}
+
+// `path1`: the packet is an XGKICK one, read by the thread that runs VU1. Its SIGNAL, FINISH and LABEL are kept for deliver_path1, and
+// the transfer registers are noted only on the emulation thread (they are its shadow; with the vector thread on it does not see them,
+// as before).
+void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc, bool path1 = false) {
     std::uint32_t i = 0;
     while (i < qwc) {
         Reg128 q;
@@ -205,8 +233,12 @@ void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
                 if (((p.regs >> (p.reg * 4)) & 0xFu) == 0xEu && at[8] >= 0x50 && at[8] <= 0x62) {
                     std::uint64_t value;
                     std::memcpy(&value, at, 8);
-                    if (at[8] >= 0x60) gs::signal(at[8], value);
-                    else if (at[8] <= 0x53) gs::note_transfer(at[8], value);
+                    if (at[8] >= 0x60) {
+                        if (path1) keep_path1(at[8], value);
+                        else gs::signal(at[8], value);
+                    } else if (at[8] <= 0x53 && (!path1 || gs::queue::role() != gs::queue::Role::Vu)) {
+                        gs::note_transfer(at[8], value);
+                    }
                 }
                 if (++p.reg >= p.nreg) {
                     p.reg = 0;
@@ -256,9 +288,23 @@ struct Held {
 
 bool hold_here() { return !gs::queue::vu_active() || gs::queue::role() == gs::queue::Role::Vu; }
 
+// The emulation thread reads PATH2 and PATH3 packets for SIGNAL, FINISH and LABEL before it sends them on (the vector thread only passes
+// them on). PATH1 packets come only from the thread that runs VU1, which reads them itself (g_scan[1] is that thread's).
+void scan_here(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (path == 1) scan(g_scan[1], data, qwc, true);
+    else if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
+}
+
 void out(int path, const std::uint8_t *data, std::uint32_t qwc) {
     if (!qwc) return;
     if (!gs::queue::active()) {
+        if (path == 1) {  // one thread: PATH1's SIGNAL, FINISH and LABEL wait for deliver_path1 here too, so the run matches one with threads
+            scan(g_scan[1], data, qwc, true);
+            gs::path1_drawing(true);
+            render(path, data, qwc);
+            gs::path1_drawing(false);
+            return;
+        }
         render(path, data, qwc);
         return;
     }
@@ -268,11 +314,11 @@ void out(int path, const std::uint8_t *data, std::uint32_t qwc) {
     }
     if (gs::TripTicket ticket; gs::trip_match(data, qwc, ticket)) {
         // a depth download's bytes going back untouched: the ticket goes instead (the scan reads image data only if it is not)
-        if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
+        scan_here(path, data, qwc);
         gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path | kTripFlag), qwc, &ticket, sizeof ticket);
         return;
     }
-    if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
+    scan_here(path, data, qwc);
     gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
 }
 
@@ -330,9 +376,12 @@ void drop_held() {
 
 void reset() {
     g_stat = 0;
-    if (hold_here()) drop_held();
+    if (hold_here()) {
+        drop_held();
+        g_scan[1] = Path{};  // PATH1's reader belongs to the thread that runs VU1; the vector thread resets its own (reset_path1_scan)
+    }
     if (gs::queue::active()) {
-        for (Path &p : g_scan) p = Path{};
+        g_scan[0] = g_scan[2] = g_scan[3] = Path{};
         gs::queue::post(gs::queue::kGifReset, 0, 0, nullptr, 0);
         return;
     }
@@ -380,7 +429,7 @@ void end_runaway_kick(std::uint32_t address) {
         render(1 | kEndPacket, nullptr, address);
         return;
     }
-    if (gs::queue::role() != gs::queue::Role::Vu) g_scan[1].active = false;
+    g_scan[1].active = false;  // called on the thread that runs VU1, whose reader this is
     gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(1 | kEndPacket), address, nullptr, 0);
 }
 
@@ -435,6 +484,72 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
 
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }
 
+namespace {
+std::uint64_t g_path1_waits = 0;  // deliveries that had to let the vector thread finish first (stats)
+bool trace_path1() {
+    static const bool on = std::getenv("PS2_TRACE_PATH1") != nullptr;  // debugging: a line for every PATH1 SIGNAL, FINISH and LABEL handed on
+    return on;
+}
+
+// Hands on, in order, everything kept (all) or what was found before the thread that runs VU1 passed fence `before`.
+bool hand_on(bool all, std::uint32_t before) {
+    if (!g_path1_count.load(std::memory_order_acquire)) return false;
+    std::vector<Found> found;
+    {
+        std::lock_guard<std::mutex> lock(g_path1_lock);
+        std::size_t n = 0;
+        while (n < g_path1.size() && (all || static_cast<std::int32_t>(g_path1[n].fence - before) < 0)) ++n;
+        found.assign(g_path1.begin(), g_path1.begin() + static_cast<std::ptrdiff_t>(n));
+        g_path1.erase(g_path1.begin(), g_path1.begin() + static_cast<std::ptrdiff_t>(n));
+        g_path1_count.store(static_cast<std::uint32_t>(g_path1.size()), std::memory_order_relaxed);
+    }
+    for (const Found &f : found) {
+        if (trace_path1())
+            std::fprintf(stderr, "[gif] PATH1 %s 0x%016llX handed to the GS at cycle %llu (frame %llu)\n", f.reg == 0x60 ? "SIGNAL" : f.reg == 0x61 ? "FINISH" : "LABEL",
+                         static_cast<unsigned long long>(f.value), static_cast<unsigned long long>(now()), static_cast<unsigned long long>(frame_count()));
+        gs::signal(f.reg, f.value);
+    }
+    g_path1_delivered += found.size();
+    if (!found.empty()) g_path1_live = true;
+    return !found.empty();
+}
+
+// Everything the emulation thread sent before this point has been read for PATH1 writes: with the vector thread on, an empty queue
+// means it has (a message is taken off after its work); otherwise it is let finish first.
+void read_all_sent() {
+    if (gs::queue::vu_active() && gs::queue::role() == gs::queue::Role::Emulation && !gs::queue::vu().empty()) {
+        ++g_path1_waits;
+        drain_vu_thread();
+    }
+}
+
+}
+
+bool deliver_path1() {
+    if (!g_path1_live) return false;  // a run that has not used them yet waits for the vblank (deliver_path1_before) and costs nothing here
+    read_all_sent();
+    return hand_on(true, 0);
+}
+
+void deliver_path1_before(std::uint32_t fence) { hand_on(false, fence); }
+
+void path1_fence() { g_path1_fences.store(g_path1_fences.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+
+void save_path1() {
+    read_all_sent();
+    hand_on(true, 0);
+    g_path1_live = false;
+}
+
+void forget_path1() {
+    std::lock_guard<std::mutex> lock(g_path1_lock);
+    g_path1.clear();
+    g_path1_count.store(0, std::memory_order_relaxed);
+    g_path1_live = false;
+}
+
+void reset_path1_scan() { g_scan[1] = Path{}; }
+
 bool busy(int path) { return g_paths[path].active; }
 
 void stats() {
@@ -451,6 +566,9 @@ void stats() {
                          p, static_cast<unsigned long long>(o.count), o.frame);
     }
     vu::runaway_summary();
+    if (g_path1_delivered || trace_path1())
+        std::fprintf(stderr, "[gif] path 1: %llu SIGNAL, FINISH and LABEL writes handed to the GS; the emulation thread waited %llu times for the vector thread to read its packets first\n",
+                     static_cast<unsigned long long>(g_path1_delivered), static_cast<unsigned long long>(g_path1_waits));
 }
 
 std::uint32_t read(std::uint32_t a) {

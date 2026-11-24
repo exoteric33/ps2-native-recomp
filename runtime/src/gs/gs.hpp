@@ -52,6 +52,11 @@ void state(ps2::state::Stream &s);
 void reset();
 void write(std::uint32_t reg, std::uint64_t value);
 void signal(std::uint32_t reg, std::uint64_t value);
+// With one thread, gif.cpp sends PATH1 packets through write() between path1_drawing(true) and (false): their SIGNAL, FINISH and LABEL
+// are left to gif::deliver_path1 then, as with threads.
+void path1_drawing(bool on);
+// IMR lets SIGNAL or FINISH interrupt the EE (an idle EE then hands PATH1's on, gif::deliver_path1)
+bool path1_may_interrupt();
 void raise_finish();
 void note_transfer(std::uint32_t reg, std::uint64_t value);
 void write_packed(std::uint32_t reg, const Reg128 &q);

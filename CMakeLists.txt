@@ -534,6 +534,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2vifreadbacktest PRIVATE synchronization)
     endif()
+    # SIGNAL, FINISH and LABEL in a VU1 XGKICK packet reach CSR and the EE at the same time with the vector thread on or off: ninja ps2path1signaltest
+    add_executable(ps2path1signaltest EXCLUDE_FROM_ALL tests/path1_signal.cpp)
+    target_include_directories(ps2path1signaltest PRIVATE runtime/src)
+    target_link_libraries(ps2path1signaltest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2path1signaltest PRIVATE synchronization)
+    endif()
     # when the VIF1 and GIF channel ends come in Airblade's start-up sequence (issue #110), and a program acknowledge that eats a pending end: ninja ps2airbladedmatest
     add_executable(ps2airbladedmatest EXCLUDE_FROM_ALL tests/airblade_dma_order.cpp)
     target_include_directories(ps2airbladedmatest PRIVATE runtime/src)

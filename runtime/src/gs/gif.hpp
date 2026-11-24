@@ -27,5 +27,23 @@ void set_path3_masked(bool masked);
 void drop_held();
 // VIF1 has run out of work (its DMA ended), so an unmasked PATH3 has the GIF to itself
 void vif1_idle();
+// SIGNAL, FINISH and LABEL in VU1's XGKICK packets (PATH1). The thread that runs VU1 (the emulation thread, or the
+// vector thread when it is on) finds them and keeps them; the emulation thread hands them to the GS registers at points it fixes itself,
+// the same with the vector thread on or off, so a run gives the same result either way and replays stay exact:
+// - at every vblank, what was found before the fence posted two vblanks earlier (system.cpp; the vector thread is always past it by then,
+//   so this never waits): deliver_path1_before;
+// - once a run has handed any on (since it started or its last state save or load), also at once at a read or write of CSR, IMR or
+//   SIGLBLID and at an idle EE while the GS may interrupt for SIGNAL or FINISH, after the vector thread has read everything it was sent:
+//   deliver_path1 (true when it handed any on). A game that never sends them never waits for the vector thread.
+bool deliver_path1();
+void deliver_path1_before(std::uint32_t fence);
+// The thread that runs VU1 has passed one more fence (a kVuFence message, or the emulation thread's own count without the vector thread)
+void path1_fence();
+// A state has no room for them: a save hands everything on first, a load forgets what the run it leaves had found. Both start the run
+// over as one that has not used them.
+void save_path1();
+void forget_path1();
+// The vector thread's own PATH1 reader, at a GIF reset that reaches it through its queue
+void reset_path1_scan();
 
 }

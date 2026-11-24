@@ -466,3 +466,15 @@ timestamp measurements. The frame identifies when the log is emitted, which may
 be ahead of the rendering thread. Only reads with a measured wait/encoding
 interval of at least 10 ms are reported: the first 20, then every 100th slow read
 across both paths. With the variable unset, no readback timers or lines are added.
+
+### Texture dumping and overrides
+
+Set `PS2_TEX_DUMP=<folder>` (or `PS2_TEX_DUMP=1` for `tex_dump/`) to write each texture the first time it is drawn as `<key>.png` alongside a `textures_index.tsv` manifest:
+
+```sh
+PS2_TEX_DUMP=tex_dump ./ps2run game.elf --window
+PS2_TEX_OVERRIDES=tex_dump ./ps2run game.elf --window
+```
+
+Set `PS2_TEX_OVERRIDES=<folder>` (or `PS2_TEX_OVERRIDE_DIR=<folder>`) to load modified `.png` files from that folder at 1x, 2x, 4x, or 8x resolution. Only files whose size or modification time differs from the `textures_index.tsv` baseline are loaded; set `PS2_TEX_HOT_RELOAD=1` to poll tracked files every 120 frames while the game runs. Screen copies and dynamic text pages are runtime snapshots that should not be edited.
+

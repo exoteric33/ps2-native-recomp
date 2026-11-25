@@ -158,6 +158,16 @@ std::map<std::uint32_t, Server> g_servers;
 std::map<std::uint32_t, Server> g_guest_servers;
 std::map<std::uint32_t, std::vector<std::uint32_t>> g_server_order;
 std::map<std::uint32_t, PendingBind> g_binds;
+// Server ids an EE bind already waited the full kBindWait for in vain, with the number of later binds answered after kBindRetryWait.
+// A retail IOP answers a bind to a server that is not registered at once with a null server (ps2sdk iop/system/sifcmd sifrpc.c,
+// _request_bind, AFL-2.0), and the EE library's caller loops. The first wait (bind()) only helps a server that registers a moment
+// later (TSNDDRV's in Gundam: Federation vs. Zeon); but a game that asks for a server that never comes paid it on every try:
+// Mercenaries (PAL) binds 0x00534E03 about 150 times, 4 s each, so it sat 10 minutes on its rating screen. So once an id timed out,
+// later binds to it are answered "no server" after one frame, until a server with that id registers (bind() then answers as before
+// and forgets the id). Not in save states (the layout stays as it is): after a load the first bind waits the full time again.
+std::map<std::uint32_t, std::uint64_t> g_absent_servers;
+constexpr std::uint64_t kBindWait = kEeClock * 4;
+constexpr std::uint64_t kBindRetryWait = kEeClock / 60;
 std::map<std::uint32_t, Call> g_held_calls;
 std::deque<Call> g_hle_replies;
 std::map<std::uint32_t, std::deque<Request>> g_requests;
@@ -473,11 +483,18 @@ void bind(const std::uint8_t *packet) {
     ++g_ee_binds[server];
     Rend r = make_rend(*h, record, paddr, rpc, client, 0x80000009u);
     if (fill_bind_endpoint(r, server)) {
+        g_absent_servers.erase(server);
         send(&r, sizeof r);
         return;
     }
+    const auto absent = g_absent_servers.find(server);
+    if (absent != g_absent_servers.end()) {
+        ++absent->second;
+        g_binds[server] = PendingBind{r, now() + kBindRetryWait};
+        return;
+    }
     std::fprintf(stderr, "[sif] bind to 0x%08X waits for the server\n", server);
-    g_binds[server] = PendingBind{r, now() + kEeClock * 4};
+    g_binds[server] = PendingBind{r, now() + kBindWait};
 }
 
 // Remember a call for the report's list; reply_call forgets it.
@@ -1576,6 +1593,7 @@ void reset() {
     g_guest_servers.clear();
     g_server_order.clear();
     g_binds.clear();
+    g_absent_servers.clear();
     g_iop_binds.clear();
     g_held_calls.clear();
     g_open_calls.clear();
@@ -1660,7 +1678,9 @@ void pump() {
     const std::uint64_t t = now();
     for (auto it = g_binds.begin(); it != g_binds.end();) {
         if (t > it->second.deadline) {
-            std::fprintf(stderr, "[sif] bind to 0x%08X timed out\n", it->first);
+            if (g_absent_servers.emplace(it->first, 0).second)
+                std::fprintf(stderr, "[sif] bind to 0x%08X timed out; later binds to it are answered after one frame until it registers\n",
+                             it->first);
             Rend r = it->second.reply;
             r.server_data = 0;
             g_outgoing.emplace_back(reinterpret_cast<const std::uint8_t *>(&r), reinterpret_cast<const std::uint8_t *>(&r) + sizeof r);
@@ -1733,6 +1753,9 @@ void dump() {
     for (const auto &[queue, list] : g_requests)
         if (!list.empty()) std::fprintf(stderr, "[sif] queue 0x%08X has %zu requests\n", queue, list.size());
     for (const auto &[id, b] : g_binds) std::fprintf(stderr, "[sif] bind to 0x%08X is waiting\n", id);
+    for (const auto &[id, n] : g_absent_servers)
+        std::fprintf(stderr, "[sif] no server 0x%08X: a bind to it timed out, %llu later binds were answered after one frame\n", id,
+                     static_cast<unsigned long long>(n));
     std::fprintf(stderr, "[sif] %zu packets wait for the EE (processed %d)\n", g_outgoing.size(), g_processed ? 1 : 0);
     // Who talked to whom during the run, a few lines: which commands and binds the EE sent, which ones no IOP handler took, and what
     // the IOP's modules registered (command handlers, RPC servers). Enough to tell from a player's log how a game's EE side reaches
@@ -1894,6 +1917,7 @@ void state(ps2::state::Stream &s) {
         }
     }
     s.map(g_binds);
+    if (s.loading()) g_absent_servers.clear();
     s.map(g_held_calls);
     s.map(g_requests, [&s](std::deque<Request> &queue) {
         s.deque(queue, [&s](Request &r) {

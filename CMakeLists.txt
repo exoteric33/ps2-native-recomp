@@ -521,6 +521,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2sifcalloverlaptest PRIVATE synchronization)
     endif()
+    # a bind to an RPC server nobody registered waits once, later binds to it are answered within a frame (Mercenaries, no game needed): ninja ps2sifbindtest
+    add_executable(ps2sifbindtest EXCLUDE_FROM_ALL tests/sif_bind_wait.cpp)
+    target_include_directories(ps2sifbindtest PRIVATE runtime/src)
+    target_link_libraries(ps2sifbindtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2sifbindtest PRIVATE synchronization)
+    endif()
     # ioman AddDrv and DelDrv call the driver's init and deinit and keep a table of its devices (no game needed): ninja ps2iomandrvtest
     add_executable(ps2iomandrvtest EXCLUDE_FROM_ALL tests/ioman_drivers.cpp)
     target_include_directories(ps2iomandrvtest PRIVATE runtime/src)

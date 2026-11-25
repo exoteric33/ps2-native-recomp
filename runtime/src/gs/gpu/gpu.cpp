@@ -109,6 +109,7 @@ std::uint32_t g_picture_epoch = 0;  // counts what changes the picture without t
 bool g_have_previous = false;
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 std::uint32_t g_sharp_2d = 1;
+bool g_scale_edges = true;  // PS2_SCALE_EDGES=0: upscaled 2D pieces drawn as triangles may read past their texels (EDGE_CLAMP in gs.wgsl)
 
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
 
@@ -4790,6 +4791,7 @@ bool init(Mode m) {
     // PS2_SHARP_2D: how upscaled 2D art (text, icons, menus) is filtered, see SHARP in gs.wgsl: 0 plain bilinear, 1 sharp (the
     // default), 2 sharpest
     if (const char *sharp = std::getenv("PS2_SHARP_2D")) g_sharp_2d = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(sharp)), 0u, 2u);
+    g_scale_edges = os::env("PS2_SCALE_EDGES") != "0";
     g_copy_words = (1u << 20) * g_scale * g_scale;
     if (const int tile = std::atoi(os::env("PS2_TILE").c_str()); tile == 4 || tile == 8 || tile == 16) g_tile = tile;
     g_strips = os::env("PS2_GPU_STRIPS") == "1";
@@ -4912,11 +4914,12 @@ static bool compile_pipelines() {
     if (trusted) std::fprintf(stderr, "[gpu] draw program without wgpu's run-time checks (%s)\n", trusted_why);
     WGPUShaderModule module = trusted ? wgpuDeviceCreateShaderModuleTrusted(g_device, &md, WGPUShaderRuntimeChecks_None) : wgpuDeviceCreateShaderModule(g_device, &md);
 #endif
-    // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE, EXPLICIT_FMA, SHARP and HAS_MIP are listed only when it declares them
+    // a shader loaded with PS2_GS_SHADER may lack the later constants; TILE, EXPLICIT_FMA, SHARP, EDGE_CLAMP and HAS_MIP are listed only when it declares them
     const bool has_tile = shader_text.empty() || shader_text.find("override TILE") != std::string::npos;
     const bool has_fma = shader_text.empty() || shader_text.find("override EXPLICIT_FMA") != std::string::npos;
     const bool has_mip = shader_text.empty() || shader_text.find("override HAS_MIP") != std::string::npos;
     const bool has_sharp = shader_text.empty() || shader_text.find("override SHARP") != std::string::npos;
+    const bool has_edges = shader_text.empty() || shader_text.find("override EDGE_CLAMP") != std::string::npos;
     const bool has_strips = shader_text.empty() || shader_text.find("override STRIPS") != std::string::npos;
     const bool has_split = shader_text.empty() || shader_text.find("override SPLIT") != std::string::npos;
     if (g_split && !has_split) {  // a shader from a file without SPLIT: whole tiles
@@ -4933,6 +4936,7 @@ static bool compile_pipelines() {
     }
     const int scale = static_cast<int>(g_scale), tile = g_tile;
     const std::uint32_t sharp = g_sharp_2d;
+    const bool edges = g_scale_edges;
     // `mip`: the draw program that reads mipmap levels (HAS_MIP in gs.wgsl); without it the program is the plain one. `strips`: the draw program for
     // lists per strip (STRIPS in gs.wgsl, PS2_GPU_STRIPS)
     auto make_pipeline = [=](int entry, bool mip, bool strips = false) {
@@ -4941,7 +4945,7 @@ static bool compile_pipelines() {
         cd.compute.module = module;
         cd.compute.entryPoint = view(kEntryPoints[entry]);
         // a shader loaded with PS2_GS_SHADER may lack the later constants; each is listed only when the shader declares it
-        WGPUConstantEntry constants[8];
+        WGPUConstantEntry constants[9];
         std::size_t count = 0;
         const auto set = [&](bool declared, const char *key, double value) {
             if (!declared) return;
@@ -4954,6 +4958,7 @@ static bool compile_pipelines() {
         set(has_tile, "TILE", static_cast<double>(tile));
         set(has_fma, "EXPLICIT_FMA", explicit_fma ? 1.0 : 0.0);
         set(has_sharp, "SHARP", static_cast<double>(sharp));
+        set(has_edges, "EDGE_CLAMP", edges ? 1.0 : 0.0);
         set(has_mip, "HAS_MIP", mip ? 1.0 : 0.0);
         set(has_strips, "STRIPS", strips && !g_split ? 1.0 : 0.0);  // (the plain programs get false and TILE rows)
         set(has_split, "SPLIT", strips && g_split ? 1.0 : 0.0);       // the strip programs of split tiles (PS2_GPU_STRIPS=2)

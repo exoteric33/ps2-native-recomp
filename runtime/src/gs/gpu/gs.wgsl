@@ -893,6 +893,9 @@ fn tap32(s: Setup, page: u32, n: u32, k: u32) -> u32 {
 // colour is the texel's own and the edges stay smooth. A sprite that copies an upscaled picture one to one gets closer to the
 // picture's own samples too (plain bilinear blends each with the same sample of the neighbouring pixel).
 override SHARP: u32 = 0u;
+// A 2D piece drawn as two triangles reads its texture only within the native pixels it covers when upscaled, as a sprite does (shade_at;
+// PS2_SCALE_EDGES=0 turns it off)
+override EDGE_CLAMP: bool = true;
 var<private> sharp_sprite: bool = false;
 var<private> upscaled_source: bool = false;
 
@@ -1516,8 +1519,23 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
                 return;
             }
             let extended = !at_s;
-            let qx = select(px, cx, extended);
-            let qy = select(py, cy, extended);
+            var qx = select(px, cx, extended);
+            var qy = select(py, cy, extended);
+            // The finer samples of the last native pixel row and column lie past its corner (x + 1/SCALE ...), where a 2D piece's
+            // texture coordinates run on beyond the texels the console reads: the neighbour on the texture sheet (another letter,
+            // another icon, the sheet's border) shows as a thin line along the piece's right and bottom edges, filtered or not (lines
+            // around text and in menus at 2x and up). As for sprites: the colour, texture coordinates and depth are taken within the
+            // native pixels the rectangle covers, so its edges end on its own texels as at native size; inside it nothing changes.
+            // Only the last native column and row move (the samples there all take the place of its corner, which the console reads);
+            // at 1x `rect` is false. An upscaled picture read back by its own samples (a full-screen effect drawn in strips) is left
+            // alone, as for sprites: its samples lie inside the native pixels it covers, and flattening them would make each strip's
+            // last column blocky.
+            if (rect && EDGE_CLAMP && !upscaled_source) {
+                let ax = ceil(rx0);
+                let ay = ceil(ry0);
+                qx = clamp(qx, ax, max(ax, ceil(rx1) - 1.0));
+                qy = clamp(qy, ay, max(ay, ceil(ry1) - 1.0));
+            }
             let w0 = cross2(x1 - qx, y2 - qy, x2 - qx, y1 - qy) * inv;
             let w1 = cross2(x2 - qx, y0 - qy, x0 - qx, y2 - qy) * inv;
             let w2 = 1.0 - w0 - w1;

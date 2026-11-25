@@ -77,7 +77,7 @@ jobs:
           ROOT="$PWD"
           . scripts/cxx.sh
           cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release "${cxx_flags[@]}"
-          ninja -C build/ci ps2runtime vujit_dump ps2thbasetest ps2sifcmdtest ps2savetest ps2discinputtest ps2iopboundstest chdunpack
+          ninja -C build/ci ps2runtime vujit_dump ps2thbasetest ps2sifcmdtest ps2savetest ps2discinputtest ps2iopboundstest ps2romdirtest chdunpack
           ninja -C build/ci ps2vifreadbacktest
           ccache -s | head -n 5 || true
           echo "CXX_BIN=$cxx_bin" >> "$GITHUB_ENV"
@@ -90,6 +90,7 @@ jobs:
           build/ci/ps2savetest "$RUNNER_TEMP/savetest"
           build/ci/ps2discinputtest
           build/ci/ps2iopboundstest
+          build/ci/ps2romdirtest
           "$CXX_BIN" -std=c++20 -O2 tests/stretch_test.cpp host/stretch.cpp -o build/ci/stretchtest
           build/ci/stretchtest
           for t in analysis_tailcall elf_bss codegen_fallthrough codegen_labels; do

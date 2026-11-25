@@ -103,6 +103,7 @@ else()
         runtime/src/iop/io.cpp
         runtime/src/iop/cdvd.cpp
         runtime/src/iop/sif.cpp
+        runtime/src/iop/romdir.cpp
         runtime/src/iop/cdvdfsv.cpp)
     target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
     if(NOT EMSCRIPTEN)
@@ -407,6 +408,13 @@ if(NOT EMSCRIPTEN)
     target_link_libraries(ps2iopresettest PRIVATE ps2runtime)
     if(WIN32)
         target_link_libraries(ps2iopresettest PRIVATE synchronization)
+    endif()
+    # the log lines that list an IOP reboot image's modules and boot list, from crafted images (no game needed): ninja ps2romdirtest
+    add_executable(ps2romdirtest EXCLUDE_FROM_ALL tests/iop_romdir.cpp)
+    target_include_directories(ps2romdirtest PRIVATE runtime/src)
+    target_link_libraries(ps2romdirtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2romdirtest PRIVATE synchronization)
     endif()
     # SMFLAG's SIFINIT, CMDINIT and BOOTEND while the IOP boots after a reset (public issue 61, no game needed): ninja ps2iopbootflagstest
     add_executable(ps2iopbootflagstest EXCLUDE_FROM_ALL tests/iop_boot_flags.cpp)

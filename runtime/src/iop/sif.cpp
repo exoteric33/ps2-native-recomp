@@ -4,6 +4,7 @@
 #include "iop.hpp"
 #include "io.hpp"
 #include "kernel.hpp"
+#include "romdir.hpp"
 #include "ps2/disc.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
@@ -695,9 +696,17 @@ char g_loadfile_version[4] = {'3', '0', '0', '0'};
 
 void read_reboot_image(const std::string &image_path) {
     const auto entry = disc::find(image_path);
-    if (!entry || entry->directory) return;
+    if (!entry || entry->directory) {
+        std::fprintf(stderr, "[sif] the IOP image %s is not on the disc\n", image_path.c_str());
+        return;
+    }
     std::vector<std::uint8_t> image((entry->size + disc::kSector - 1) / disc::kSector * disc::kSector);
-    if (image.empty() || !disc::read(entry->sector, static_cast<std::uint32_t>(image.size() / disc::kSector), image.data())) return;
+    if (image.empty() || !disc::read(entry->sector, static_cast<std::uint32_t>(image.size() / disc::kSector), image.data())) {
+        std::fprintf(stderr, "[sif] the IOP image %s could not be read (%u bytes)\n", image_path.c_str(), entry->size);
+        return;
+    }
+    // What the image holds and which modules its boot list starts, for the log only: none of its modules runs here.
+    std::fputs(iop::romdir::describe(iop::romdir::parse(image.data(), entry->size), image_path).c_str(), stderr);
     for (std::size_t at = 0; at + 16 <= image.size() && image[at]; at += 16)
         if (std::memcmp(&image[at], "FILEIO\0", 7) == 0) g_fileio_async = true;
     // A FILEIO module older than 2.0 speaks the synchronous protocol, whatever else was found above (follows upstream 8ebb09b)
@@ -736,7 +745,7 @@ std::uint32_t smflag() {
 // the text length at +16, the mode at +20 and the text at +24 (iopcontrol.c, AFL-2.0). The text is "rom0:UDNL <image>" to start the
 // IOP again from an image that replaces the ROM's modules (IOPRP*.IMG), or empty (SifIopReset("", 0)) to start it from the ROM's
 // own modules. The console forgets everything the game loaded in both cases; `reboot` wipes the IOP only for the empty text, because
-// an image's modules are not read here (only their FILEIO and LOADFILE versions) and the games that reboot with one are the ones
+// an image's modules are not run here (only listed in the log, with their FILEIO and LOADFILE versions) and the games that reboot with one are the ones
 // that work today (docs/iop-reboot-empty.md).
 void reboot(std::uint32_t src) {
     constexpr std::uint32_t kCmdReset = 0x80000003u;

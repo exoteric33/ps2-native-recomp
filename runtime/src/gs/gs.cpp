@@ -243,6 +243,16 @@ std::mutex g_cache_mutex;
 std::vector<CachedDownload> g_download_cache;
 std::uint64_t g_cache_clock = 0;
 DownloadKey g_shadow{};
+// The GS-to-memory download the last TRXDIR seen by the emulation thread started, latched at that write as the GS does (the game may
+// set up its next transfer's registers before it is done reading). None while that TRXDIR started no download: a rectangle set up
+// where the GIF scan does not see it (REGLIST, PATH1 on the vector thread) then keeps the FIFO reading as full (download_left).
+struct ShadowDownload {
+    bool active = false;
+    std::uint32_t w = 0, h = 0, psm = 0;
+    std::uint64_t qwords = 0;  // the rectangle's size, a last part-filled quadword counted
+    std::uint32_t reads = 0;   // read_image calls since (PS2_TRACE_DOWNLOADS)
+};
+ShadowDownload g_shadow_download{};
 
 void remember(const DownloadKey &key, const std::uint8_t *data, std::size_t bytes) {
     std::lock_guard lock(g_cache_mutex);
@@ -580,6 +590,7 @@ void soft_reset() {
 
 void reset() {
     g_shadow = DownloadKey{};
+    g_shadow_download = ShadowDownload{};
     {
         std::lock_guard lock(g_cache_mutex);
         g_download_cache.clear();
@@ -826,6 +837,9 @@ void write(std::uint32_t reg, std::uint64_t value) {
         static std::uint64_t n = 0, start = std::strtoull(g_gsseq, nullptr, 10);
         if (++n >= start && n < start + 100000) std::fprintf(stderr, "[gs] w %02X %016llX\n", reg, static_cast<unsigned long long>(value));
     }
+    // With one thread the GIF does not scan its packets (gif.cpp, out()): the emulation thread's copy of the transfer registers
+    // (download_left, the VIF1 FIFO count) is kept here, since this is the emulation thread then
+    if (reg >= 0x50 && reg <= 0x53 && !queue::active()) note_transfer(reg, value);
     switch (reg) {
     case 0x00:
         s.prim = value;
@@ -1411,13 +1425,14 @@ const std::vector<std::uint8_t> &trip_bytes(const TripTicket &ticket) {
 }
 
 void read_image(std::uint8_t *data, std::uint32_t qwords) {
+    DownloadKey key = g_shadow;
+    key.qwords = qwords;
+    g_shadow.offset += qwords * 16;  // with one thread too: download_left follows it
+    ++g_shadow_download.reads;
     if (!queue::active()) {
         render_read_image(data, qwords);
         return;
     }
-    DownloadKey key = g_shadow;
-    key.qwords = qwords;
-    g_shadow.offset += qwords * 16;
     const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
     const std::uint32_t kind = static_cast<std::uint32_t>(key.buf >> 24) & 0x3Fu;
     if ((kind == PSMZ32 || kind == PSMZ16 || kind == PSMZ16S) && trip::arm(key, data, qwords)) return;
@@ -1450,8 +1465,35 @@ void note_transfer(std::uint32_t reg, std::uint64_t value) {
     case 0x50: g_shadow.buf = value; break;
     case 0x51: g_shadow.pos = value; break;
     case 0x52: g_shadow.reg = value; break;
-    default: g_shadow.offset = 0; break;
+    default: {
+        ShadowDownload &d = g_shadow_download;
+        if (static const bool trace = std::getenv("PS2_TRACE_DOWNLOADS") != nullptr; trace && d.active)
+            // One line per download, written when the next transfer starts: the rectangle and how much of it the game read
+            std::fprintf(stderr, "[gs] download %ux%u psm %02X: %llu qwords, read %u in %u reads (frame %llu)\n", d.w, d.h, d.psm,
+                         static_cast<unsigned long long>(d.qwords), g_shadow.offset / 16, d.reads,
+                         static_cast<unsigned long long>(frames_run()));
+        g_shadow.offset = 0;
+        d = ShadowDownload{};
+        if ((value & 3u) == 1u && g_shadow.reg) {
+            d.active = true;
+            d.w = g_shadow.reg & 0xFFFu;
+            d.h = (g_shadow.reg >> 32) & 0xFFFu;
+            d.psm = (g_shadow.buf >> 24) & 0x3Fu;
+            d.qwords = (std::uint64_t{d.w} * d.h * bits_per_pixel(d.psm) + 127) / 128;
+        }
+        break;
     }
+    }
+}
+
+int download_left() {
+    const ShadowDownload &d = g_shadow_download;
+    if (!d.active) return -1;
+    // A last part-filled quadword counts as waiting: a game that polls FQC before each quadword it reads from the FIFO gets it. (Before
+    // this count the FIFO read as full all the time, so a game that reads fewer quadwords than this and then waits for an empty FIFO
+    // would have waited before too. ATV Offroad Fury 3 reads whole rectangles: 512x256 PSMCT32 in one DMA transfer.)
+    const std::uint64_t read = g_shadow.offset / 16;
+    return read >= d.qwords ? 0 : static_cast<int>(std::min<std::uint64_t>(d.qwords - read, 0x7FFFFFFF));
 }
 
 void render_read_image(std::uint8_t *data, std::uint32_t qwords) {

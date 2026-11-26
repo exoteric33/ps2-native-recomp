@@ -2,6 +2,7 @@
 
 #include "dmac.hpp"
 #include "gs/gif.hpp"
+#include "gs/gs.hpp"
 #include "gs/queue.hpp"
 #include "hw.hpp"
 #include "vu_micro.hpp"
@@ -662,8 +663,15 @@ std::uint32_t read(int unit, std::uint32_t reg) {
         const std::uint32_t vps = u.pending.empty() ? 0u : u.stalled ? 2u : 1u;
         std::uint32_t stat = u.stat | vps | (u.dbf ? 0x80u : 0u);
         // With FDR set the FIFO runs from the GS, and a download keeps it as full as the
-        // game drains it: sceGsExecStoreImage polls FQC before each qword it reads.
-        if (unit == 1 && (u.stat & 0x800000u)) stat |= 16u << 24;
+        // game drains it: sceGsExecStoreImage polls FQC before each qword it reads. Once the
+        // game has read the whole rectangle the FIFO is empty: ATV Offroad Fury 3's map loader
+        // reads it by DMA and then waits for FQC and VPS to be 0 before it clears FDR (a FIFO
+        // that stayed full hung it on the loading screen). With no rectangle known (-1) it
+        // reads as full, as before.
+        if (unit == 1 && (u.stat & 0x800000u)) {
+            const int left = gs::download_left();
+            stat |= static_cast<std::uint32_t>(left < 0 ? 16 : std::min(left, 16)) << 24;
+        }
         return stat;
     }
     case 0x20: return u.err;

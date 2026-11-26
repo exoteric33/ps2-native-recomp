@@ -59,6 +59,10 @@ void path1_drawing(bool on);
 bool path1_may_interrupt();
 void raise_finish();
 void note_transfer(std::uint32_t reg, std::uint64_t value);
+// Emulation thread: the quadwords of the current GS-to-memory download (TRXDIR 1) the game has not read yet, by DMA channel 1 or from
+// the VIF1 FIFO, counted from TRXREG and the pixel format since the last TRXDIR write; -1 when that write did not start a download or
+// no rectangle was ever set (vif.cpp FQC). PS2_TRACE_DOWNLOADS=1 prints each download's size and what the game read of it.
+int download_left();
 void write_packed(std::uint32_t reg, const Reg128 &q);
 void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64_t regs, std::uint32_t nreg, std::uint32_t reg);
 void write_image(const std::uint8_t *data, std::uint32_t qwords);

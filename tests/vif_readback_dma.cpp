@@ -119,6 +119,48 @@ void restore_readback() {
     fs::remove(file, error);
     fs::remove(directory, error);
 }
+
+unsigned fqc() { return (hw::read32(0x10003C00u) >> 24) & 0x1Fu; }
+
+// ATV Offroad Fury 3's map loader reads a rectangle by DMA and then waits, with FDR still set, for VIF1_STAT FQC and VPS to be 0.
+// A FIFO that read as full for as long as FDR was set hung it on the loading screen. sceGsExecStoreImage reads the FIFO itself and
+// polls FQC before each quadword, so FQC must stay non-zero until the last one.
+void fifo_empties() {
+    // 8x4 PSMCT32 pixels, eight quadwords (with one thread gs::write keeps the emulation thread's copy of these registers)
+    ps2::gs::write(0x50, 1u << 16);
+    ps2::gs::write(0x51, 0);
+    ps2::gs::write(0x52, (4ull << 32) | 8u);
+    ps2::gs::write(0x53, 1);
+    hw::write32(0x10003C00u, 0x800000u);
+    hw::write64(0x12001040u, 1);
+    check(fqc() == 8, "the FIFO holds the rectangle's eight quadwords before the game reads them");
+    for (int i = 0; i < 7; ++i) {
+        ps2::Reg128 q;
+        hw::read128(0x10005000u, q);
+    }
+    check(fqc() == 1, "one quadword is left after seven FIFO reads");
+    ps2::gs::write(0x52, (64ull << 32) | 64u);  // the next transfer's size, set before the game is done reading: the GS latched this one
+    check(fqc() == 1, "a new TRXREG does not change the download under way");
+    transfer(1, 0);
+    check(fqc() == 0, "the FIFO is empty once DMA channel 1 took the last quadword");
+    check((hw::read32(0x10003C00u) & 3u) == 0, "VPS is idle after the download");
+    advance(kReadCycles);
+    hw::dmac_ack(kVif1);
+    // 3x1 PSMCT32 pixels are 12 bytes: the part-filled quadword waits in the FIFO until the game reads it
+    ps2::gs::write(0x52, (1ull << 32) | 3u);
+    ps2::gs::write(0x53, 1);
+    check(fqc() == 1, "a rectangle smaller than a quadword leaves one in the FIFO");
+    {
+        ps2::Reg128 q;
+        hw::read128(0x10005000u, q);
+    }
+    check(fqc() == 0, "the FIFO is empty once that quadword is read");
+    // A TRXDIR that starts no download (an upload here, or a rectangle the GIF scan never saw) reads as full, as before the fix
+    ps2::gs::write(0x53, 0);
+    check(fqc() == 16, "with no download started the FIFO reads as full, as before");
+    hw::write32(0x10003C00u, 0);
+    hw::write64(0x12001040u, 0);
+}
 }
 
 int main() {
@@ -127,6 +169,7 @@ int main() {
     separate_interrupts();
     cancel_readback();
     restore_readback();
+    fifo_empties();
     std::printf("VIF1 readback DMA: %d failed\n", failed);
     return failed ? 1 : 0;
 }

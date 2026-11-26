@@ -623,7 +623,7 @@ if(PS2_GENERATED)
         return()
     endif()
 
-    add_executable(ps2run host/main.cpp host/crash.cpp)  # crash.cpp: the lines a crash writes to the log
+    add_executable(ps2run host/main.cpp host/crash.cpp host/switch_file.cpp)  # crash.cpp: the lines a crash writes to the log; switch_file.cpp: switches.txt
     target_link_libraries(ps2run PRIVATE ps2game ps2runtime)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         target_sources(ps2run PRIVATE host/profile.cpp)

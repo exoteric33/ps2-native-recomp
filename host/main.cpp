@@ -6,6 +6,7 @@
 #include "ps2/system.hpp"
 #include "ps2/ee_live.hpp"
 #include "ps2/vu_live.hpp"
+#include "switch_file.hpp"
 
 #include "big_stack_thread.hpp"
 #ifdef PS2_WINDOW
@@ -596,6 +597,48 @@ static std::vector<std::pair<std::string, std::string>> ps2_environment() {
     return found;
 }
 
+// The switch file: switches.txt in the game's folder, next to keys.ini and the quick saves, holds PS2_* switches,
+// one `PS2_NAME=value` per line (host/switch_file.cpp reads it). A tester who types `set PS2_...` in a Command Prompt and then starts the
+// game from its shortcut never hands the switch over; a line in this file always reaches the runner. Applied once, before the log starts
+// and before anything reads a switch; a switch already set in the real environment wins over the file. What it did is said in the log
+// head (log_start_lines), from these lines.
+static std::vector<std::string> g_switch_lines;
+
+[[maybe_unused]] static void apply_switch_file() {
+    std::filesystem::path file = ps2::os::path(ps2::quick_folder(switch_file::kName));
+    if (file.empty()) return;  // a runner without the quick keys has no game folder for it
+    std::string shown = switch_file::kName;
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(file, error)) {
+        // Windows hides known extensions: a file Notepad saved as "switches.txt" with "Text documents" picked is switches.txt.txt
+        std::filesystem::path doubled = file;
+        doubled += ".txt";
+        if (!std::filesystem::is_regular_file(doubled, error)) return;
+        file = doubled;
+        shown += ".txt";
+    }
+    std::string text;
+    std::FILE *f = ps2::os::open(ps2::os::utf8(file), "rb");
+    if (!f) {
+        g_switch_lines.push_back("[switches] could not read " + shown);
+        return;
+    }
+    char buffer[4096];
+    for (std::size_t got; text.size() < (1u << 16) && (got = std::fread(buffer, 1, sizeof buffer, f)) > 0;) text.append(buffer, got);
+    std::fclose(f);
+    const switch_file::Parsed parsed = switch_file::parse(text);
+    std::string taken, ignored;
+    const auto add = [](std::string &list, const std::string &item) { list += (list.empty() ? "" : "; ") + item; };
+    for (const auto &[name, value] : parsed.switches) {
+        if (!ps2::os::env(name.c_str()).empty()) add(ignored, name + " (also set outside the file: that one counts)");
+        else if (!ps2::os::set_env(name.c_str(), value)) add(ignored, name + " (the system refused it)");
+        else taken += (taken.empty() ? "" : " ") + name + "=" + for_log(short_path(value));
+    }
+    for (const std::string &note : parsed.ignored) add(ignored, note);
+    g_switch_lines.push_back(taken.empty() ? "[switches] " + shown + " sets no switch" : "[switches] from " + shown + ": " + taken);
+    if (!ignored.empty()) g_switch_lines.push_back("[switches] ignored in " + shown + ": " + ignored);
+}
+
 // The first lines of every log (window or headless) say how the runner was started: the arguments, which show the extras (--widescreen,
 // --patches <file>) and the disc, and the PS2_* switches that change what it does. Both are read once, here, before anything changes
 // the environment (the runner sets PS2_VU_RECORD and PS2_WINDOW_TITLE itself later; those are not the user's). Paths are shortened
@@ -604,6 +647,7 @@ static void log_start_lines(int argc, char **argv) {
     std::string line;
     for (int i = 0; i < argc; ++i) line += (i ? " " : "") + for_log(short_path(argv[i]));
     std::fprintf(stderr, "[run] started with: %s\n", line.c_str());
+    for (const std::string &switches : g_switch_lines) std::fprintf(stderr, "%s\n", switches.c_str());
     line.clear();
     for (const auto &[name, value] : ps2_environment()) line += (line.empty() ? "" : " ") + name + "=" + for_log(short_path(value));
     if (line.empty()) std::fprintf(stderr, "[env] no PS2_ variable is set\n");
@@ -662,8 +706,6 @@ int main(int argc, char **argv) {
     start_card_helper();
 #endif
     ps2::crash::enter_thread(ps2::crash::Thread::Main);
-    // PS2_CRASH_TEST=<thread>:<kind>[:<frame>]: a failure on purpose to look at the crash lines, off unless set (ps2/crash.hpp)
-    ps2::crash::test_parse(ps2::os::env("PS2_CRASH_TEST").c_str());
 #ifdef _WIN32
     // The runtime uses short SDL/condition-variable waits; request 1 ms timer granularity for Windows pacing.
     timeBeginPeriod(1);
@@ -702,8 +744,7 @@ int main(int argc, char **argv) {
     // whatever ends the run later leaves a log file behind: the app points a player at it ("Logs are not being created", public
     // issue 42). Only the arguments that say where it goes are read here; main reads them all again below.
     {
-        // PS2_LOG_COPY=1 (a test aid): a headless run keeps the log copy too, so the log file can be tested without a window
-        bool window_run = ps2::os::env("PS2_LOG_COPY") == "1";
+        bool window_run = false;
         bool has_max_frames = false;
         std::string early_disc, early_game_dir;
         for (int i = from_disc ? 1 : 2; i < argc; ++i) {
@@ -723,6 +764,13 @@ int main(int argc, char **argv) {
         // by now, as it is later. An image-only start has no program path yet: its folder stands in for it, as below.
         ps2::g_options.game_dir = use_self_bundle ? ps2::g_options.quick_dir
                                                   : ps2::os::utf8(find_game_dir(from_disc ? early_disc : argv[1], early_disc, early_game_dir).lexically_normal());
+        // the switches of switches.txt (that folder is known now), before any switch is read: the log copy's own two come next
+        apply_switch_file();
+        // PS2_CRASH_TEST=<thread>:<kind>[:<frame>]: a failure on purpose to look at the crash lines, off unless set (ps2/crash.hpp). Read
+        // after the switch file, so the file can hold it too, and before the log copy starts: its thread ("tee") checks the plan at once.
+        ps2::crash::test_parse(ps2::os::env("PS2_CRASH_TEST").c_str());
+        // PS2_LOG_COPY=1 (a test aid): a headless run keeps the log copy too, so the log file can be tested without a window
+        if (ps2::os::env("PS2_LOG_COPY") == "1") window_run = true;
         // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
         if (window_run && ps2::os::env("PS2_NO_LOG_COPY").empty() && g_log.start(ps2::os::path(ps2::quick_folder("logs")))) {
             ps2::g_options.recent_log = [](std::size_t lines) { return g_log.tail(lines); };
@@ -731,6 +779,8 @@ int main(int argc, char **argv) {
             std::atexit([] { g_log.stop(); });  // the window run that returns from main
         }
     }
+#else
+    ps2::crash::test_parse(ps2::os::env("PS2_CRASH_TEST").c_str());  // as in the block above, a runner without a window
 #endif
     log_start_lines(argc, argv);  // the first lines of the log: the arguments and the PS2_* switches
     ps2::crash::test_here("main");

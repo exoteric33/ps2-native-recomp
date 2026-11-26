@@ -852,7 +852,7 @@ std::string report_info(bool emergency, const fs::path &dir, bool has_state, boo
         t += "\nEE interrupts (are they on, and which handlers could run):\n" + kernel::interrupt_report("    ");
     }
     const std::string first = g_options.first_log ? g_options.first_log(80) : std::string();
-    const std::string startup = pick_lines(first, {"[gpu]", "[window]", "[audio] sound device", "[pad]"});
+    const std::string startup = pick_lines(first, {"[env]", "[switches]", "[gpu]", "[window]", "[audio] sound device", "[pad]"});
     t += "\nfrom the start of the log:\n" + (startup.empty() ? std::string("    (not captured)\n") : startup);
     return t;
 }

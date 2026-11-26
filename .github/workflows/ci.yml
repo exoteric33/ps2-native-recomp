@@ -94,6 +94,8 @@ jobs:
           build/ci/ps2romdirtest
           "$CXX_BIN" -std=c++20 -O2 tests/stretch_test.cpp host/stretch.cpp -o build/ci/stretchtest
           build/ci/stretchtest
+          "$CXX_BIN" -std=c++20 -O2 tests/switch_file_test.cpp host/switch_file.cpp -o build/ci/switchfiletest
+          build/ci/switchfiletest
           for t in analysis_tailcall elf_bss codegen_fallthrough codegen_labels; do
             python3 tests/$t.py --recompiler build/tools/eerecomp
           done

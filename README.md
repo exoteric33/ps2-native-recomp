@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 59
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 61
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -154,6 +154,8 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Resident Evil Code: Veronica X (USA) | plays well, not played through yet: the first areas at 60 fps with a game controller; it slowed down with several zombies until *Make it faster*; thin lines around text and in the inventory at 2x and above, which PCSX2 shows too ([#135](https://github.com/exoteric33/ps2-native-recomp/issues/135)) | ultra-magic-peta |
 | Mortal Kombat: Deception (USA) | plays well, not played through yet: the Konquest story mode with Shujinko at 60 fps, no problems found (Windows 10, an RTX 5050, keyboard and mouse; [#138](https://github.com/exoteric33/ps2-native-recomp/issues/138)) | udiorusfm-tech |
 | Mortal Kombat: Armageddon (USA) | plays well, not played through yet: fights, Konquest and Motor Kombat, "runs perfectly fine" ([#26](https://github.com/exoteric33/ps2-native-recomp/issues/26)) | nahshongraham97 |
+| Syphon Filter: Logan's Shadow (USA) | plays well, not played through yet: into gameplay, pretty smooth; the first start stays black for a few minutes while the game's code is translated (Windows 10, an RTX 4070 Ti Super, a game controller; [#147](https://github.com/exoteric33/ps2-native-recomp/issues/147)) | 2r1zt-byte |
+| Steambot Chronicles (USA) | plays well, not played through yet: to the Hayabusa Plateau in 16:9 with no visual or game-breaking bugs, about 60 fps at 2x resolution; at 3x it slows to 20 to 30 fps, and some new areas slow down for a few seconds (Windows 11, an RTX 3050 laptop, keyboard and mouse and a game controller; [#148](https://github.com/exoteric33/ps2-native-recomp/issues/148)) | GoofyLackin69 |
 
 Known not to work yet (reported by playtesters, on my list to fix):
 

@@ -214,8 +214,10 @@ const char *const kWhyName[kWhys] = {"buffers", "texel", "drawn-under", "overlap
 };
 Why g_why = kWhyFlush;
 std::uint32_t g_why_runs[kWhys] = {}, g_why_prims[kWhys] = {};
-const bool g_batch_log = std::getenv("PS2_BATCH_LOG") != nullptr;
-const unsigned long long g_batch_log_frame = std::getenv("PS2_BATCH_LOG") ? std::strtoull(std::getenv("PS2_BATCH_LOG"), nullptr, 10) : 0;  // >1: print every "drawn-under" end of that frame
+// Read in init(), not when the program loads: switches.txt (host/main.cpp) sets its switches at the start of main(), after every
+// static initializer has run, so a switch read here at load time never saw the file (a tester's window run printed no batch line).
+bool g_batch_log = false;
+unsigned long long g_batch_log_frame = 0;  // >1: print every "drawn-under" end of that frame
 // PS2_GPU_WGPU_TIME=<frames>: the drawing thread's time inside each kind of wgpu call (wall clock, so the waits show as waits), and the
 // calls, per frame, printed every <frames> vblanks (default 300). Off: one predictable branch per call site.
 namespace wt {
@@ -226,11 +228,15 @@ const char *const kName[kKinds] = {"create encoder", "begin compute pass", "set 
                                    "waiting for the submit thread"};
 std::uint64_t g_post_ns = 0, g_post_jobs = 0;  // the submit thread's totals at the block's start (post::State)
 bool post_totals(std::uint64_t &ns, std::uint64_t &jobs);
-const unsigned g_every = [] {
-    const char *v = std::getenv("PS2_GPU_WGPU_TIME");
-    return v ? std::max(1u, static_cast<unsigned>(std::strtoul(v, nullptr, 10) ? std::strtoul(v, nullptr, 10) : 300)) : 0u;
-}();
-const bool g_on = g_every != 0;
+unsigned g_every = 0;  // set in init() (switches.txt is applied after the static initializers, see g_batch_log)
+bool g_on = false;
+void read_switch() {
+    const std::string v = os::env("PS2_GPU_WGPU_TIME");
+    if (v.empty()) return;
+    const unsigned n = static_cast<unsigned>(std::strtoul(v.c_str(), nullptr, 10));
+    g_every = std::max(1u, n ? n : 300u);
+    g_on = true;
+}
 std::uint64_t g_ns[kKinds] = {}, g_cpu[kKinds] = {}, g_calls[kKinds] = {}, g_bytes = 0, g_frames = 0, g_submits = 0;
 std::chrono::steady_clock::time_point g_since;
 double g_cpu_since = 0;
@@ -665,6 +671,41 @@ bool sprite_reads(const std::uint32_t *rec, const std::uint32_t *setup, int minx
         return false;
     for (int j = 0; j < nv; ++j)
         for (int i = 0; i < nu; ++i) visit(word_at(setup + 25, static_cast<std::uint32_t>(us[i]), static_cast<std::uint32_t>(vs[j])));
+    return true;
+}
+
+// The rectangle of texels a sprite reads (sprite_taps, through the wrap mode the way texel_rect takes it), without texel_rect's texel to spare on each side.
+// False when it cannot be said; texel_rect's rectangle then decides alone. God of War's ship draws a full-screen effect as 32-pixel strips of the frame
+// that read the frame itself: texel_rect's spare texel reaches back into the strip before, the taps do not.
+bool sprite_rect(const std::uint32_t *rec, const std::uint32_t *setup, int minx, int miny, int maxx, int maxy, int rect[4]) {
+    int lo[2], hi[2];
+    if (!sprite_taps(rec, setup, minx, miny, maxx, maxy, lo, hi)) return false;
+    for (int axis = 0; axis < 2; ++axis) {
+        const int size = 1 << (axis ? (setup[15] >> 8) : (setup[15] & 0xFFu));
+        const std::uint32_t clamp = setup[18 + axis];
+        int a = lo[axis], b = hi[axis];
+        switch ((setup[7] >> (axis ? 26 : 24)) & 3u) {
+        case 0:  // repeat: a rectangle that leaves the texture comes round to the other side
+            if (a < 0 || b >= size) {
+                a = 0;
+                b = size - 1;
+            }
+            break;
+        case 1:
+            a = std::clamp(a, 0, size - 1);
+            b = std::clamp(b, 0, size - 1);
+            break;
+        case 2: {
+            const int minv = static_cast<int>(clamp & 0x3FFu), maxv = static_cast<int>(clamp >> 16);
+            a = std::clamp(a, minv, std::max(minv, maxv));
+            b = std::clamp(b, minv, std::max(minv, maxv));
+            break;
+        }
+        default: return false;
+        }
+        rect[axis] = std::max(a, 0);
+        rect[2 + axis] = std::max(b, 0);
+    }
     return true;
 }
 
@@ -4426,7 +4467,7 @@ void exact_selftest() {
         return static_cast<std::uint32_t>((seed >> 11) % n);
     };
     const std::uint32_t saved_scale = g_scale;
-    int failures = 0, sprites = 0, joined = 0, kept_out = 0, false_alarms = 0;
+    int failures = 0, sprites = 0, joined = 0, kept_out = 0, false_alarms = 0, rects = 0;
     for (int round = 0; round < 6000; ++round) {
         g_scale = 1 + rnd(3);
         reset_batch();
@@ -4517,6 +4558,18 @@ void exact_selftest() {
                     ++failures;
                     std::fprintf(stderr, "[exact-selftest] FAIL: axis %d reads %d..%d, sprite_taps says %d..%d (scale %u, bilinear %d, d %g, u %g..%g)\n", axis, actual_lo[axis], actual_hi[axis], lo[axis], hi[axis], g_scale, bilinear, geometry[2 + axis], uv[axis], uv[3 + axis]);
                 }
+            // sprite_rect (the cut test of a sprite in the frame's own layout): every texel read, after the wrap mode, lies in its rectangle
+            if (int box[4]; sprite_rect(rec, setup, minx, miny, maxx, maxy, box)) {
+                ++rects;
+                for (int axis = 0; axis < 2; ++axis)
+                    for (const int t : us[axis]) {
+                        const int r = axis ? wrap(wmt, t, 1 << th, minv, maxv) : wrap(wms, t, 1 << tw, minu, maxu);
+                        if (r >= box[axis] && r <= box[2 + axis]) continue;
+                        ++failures;
+                        std::fprintf(stderr, "[exact-selftest] FAIL: axis %d reads texel %d (mode %u), sprite_rect says %d..%d\n", axis, r, axis ? wmt : wms, box[axis], box[2 + axis]);
+                        break;
+                    }
+            }
             std::vector<std::uint32_t> reads;
             for (const int v : us[1])
                 for (const int u : us[0])
@@ -4551,7 +4604,7 @@ void exact_selftest() {
     }
     reset_batch();
     g_scale = saved_scale;
-    std::fprintf(stderr, "[exact-selftest] %s: %d sprites asked about, %d joined, %d kept out (%d of them with no shared word), %d failures\n", failures ? "FAIL" : "PASS", sprites, joined, kept_out, false_alarms, failures);
+    std::fprintf(stderr, "[exact-selftest] %s: %d sprites asked about, %d joined, %d kept out (%d of them with no shared word), %d rectangles checked, %d failures\n", failures ? "FAIL" : "PASS", sprites, joined, kept_out, false_alarms, rects, failures);
 }
 
 void attrs(std::uint32_t *rec, int n, const Vertex &v, bool fst, const Vertex *color) {
@@ -4702,6 +4755,11 @@ static bool compile_pipelines();
 
 bool init(Mode m) {
     if (m == Mode::off) return false;
+    if (const std::string v = os::env("PS2_BATCH_LOG"); !v.empty()) {
+        g_batch_log = true;
+        g_batch_log_frame = std::strtoull(v.c_str(), nullptr, 10);
+    }
+    wt::read_switch();
     stat::init();
     hwcache::init();
     struct Try {
@@ -5189,7 +5247,11 @@ void draw(const State &st, const Vertex *v, int count) {
                     const bool small = rect[2] - rect[0] < 64 && rect[3] - rect[1] < 64;
                     const bool cached = b.texflushes == g_texflushes && small && shares_frame(setup, b);
                     const bool same = shares_frame(setup, b);
-                    const bool frame = !cached && (same ? drawn_under(b, rect) : used.overlaps(b.fb_range.lo, b.fb_range.hi));
+                    bool frame = !cached && (same ? drawn_under(b, rect) : used.overlaps(b.fb_range.lo, b.fb_range.hi));
+                    // A sprite in the frame's own layout that the spare texel of texel_rect alone puts over an earlier shape: what it really reads (sprite_rect) decides.
+                    // Its reads come from the batch's snapshot (snapshot_batch takes read_rect, which still spares the texel), so a later shape writing them changes nothing.
+                    int taps[4] = {-1, -1, -1, -1};
+                    if (frame && same && prim == 6 && sprite_rect(rec, setup, minx, miny, maxx, maxy, taps) && !drawn_under(b, taps)) frame = false;
                     const bool zhit = b.zwrite && !z_untouched && used.overlaps(b.z_range.lo, b.z_range.hi);
                     if ((frame || zhit) && !(frame && !zhit && exact_ok && exact_join())) {
                         if (g_batch_log_frame > 1 && frame_count() == g_batch_log_frame) {
@@ -5200,7 +5262,7 @@ void draw(const State &st, const Vertex *v, int count) {
                                 if (rect[0] <= static_cast<int>(hi & 0xFFFFu) && static_cast<int>(lo & 0xFFFFu) <= rect[2] && rect[1] <= static_cast<int>(hi >> 16) && static_cast<int>(lo >> 16) <= rect[3]) hit = static_cast<int>(i);
                             }
                             const std::uint32_t hl = hit >= 0 ? b.prims.data()[hit * kPrimWords + 2] : 0, hh = hit >= 0 ? b.prims.data()[hit * kPrimWords + 3] : 0;
-                            std::fprintf(stderr, "[why] prim %d of batch (%zu shapes) type %u: texel rect %d,%d-%d,%d tex bp %u psm %u fb bp %u psm %u same %d cached %d small %d hit shape %d box %u,%u-%u,%u zwrite %d\n", count, n, prim, rect[0], rect[1], rect[2], rect[3],
+                            std::fprintf(stderr, "[why] prim %d of batch (%zu shapes) type %u: texel rect %d,%d-%d,%d taps %d,%d-%d,%d tex bp %u psm %u fb bp %u psm %u same %d cached %d small %d hit shape %d box %u,%u-%u,%u zwrite %d\n", count, n, prim, rect[0], rect[1], rect[2], rect[3], taps[0], taps[1], taps[2], taps[3],
                                          setup[12], setup[14], setup[1], setup[3], same, cached, small, hit, hl & 0xFFFFu, hl >> 16, hh & 0xFFFFu, hh >> 16, b.zwrite);
                         }
                         g_why = frame ? (same ? kWhyUnder : kWhyOverlap) : kWhyZ;

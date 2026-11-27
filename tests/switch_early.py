@@ -20,15 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FOLDERS = ['runtime', 'host']
 ENV = re.compile(r'\b(?:std::)?(?:getenv|secure_getenv|_wgetenv)\s*\(|\bos::env\s*\(|\bGetEnvironmentVariable[AW]?\s*\(')
 
-# Cases that are fine for now, as (path, the variable's or class's name), each with its reason.
-ALLOWED = {
-    # PS2_BATCH_LOG: a fix that reads it on first use is on its way; take these out with it
-    ('runtime/src/gs/gpu/gpu.cpp', 'g_batch_log'),
-    ('runtime/src/gs/gpu/gpu.cpp', 'g_batch_log_frame'),
-    # PS2_GPU_WGPU_TIME (a developer's timing switch): the same mistake, found by this test. It is fixed together with PS2_BATCH_LOG
-    # above; take it out of here with that fix.
-    ('runtime/src/gs/gpu/gpu.cpp', 'g_every'),
-}
+# Cases that are fine for now, as (path, the variable's or class's name), each with its reason. None left.
+ALLOWED = set()
 
 QUALIFIERS = r'(?:(?:static|const|inline|thread_local|extern|constinit|volatile)\s+)*'
 NOT_TYPES = {'return', 'using', 'typedef', 'namespace', 'template', 'struct', 'class', 'enum', 'union', 'friend', 'delete', 'goto'}

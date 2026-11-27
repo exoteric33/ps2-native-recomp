@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <string>
 #include <span>
+#include <vector>
 
 namespace ps2::ee::live {
 
@@ -64,5 +65,21 @@ void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank
 
 // The rank of the module that serves pc as an entry (the one dispatch() would run), or -1 when none does. For tests and the log.
 int serving_rank(std::uint32_t pc);
+
+// Reuse of a translation for the same code under another image name (runtime/src/ee_live.cpp).
+//
+// The fixed base modules that cover pc, oldest first: those of the build and of live libraries, not the views made from them.
+struct CoveringModule {
+    const ModuleInfo *module;
+    int rank;
+};
+std::vector<CoveringModule> modules_covering(std::uint32_t pc);
+// Adds a view of a module: the same translated code (the same unit functions), but only the entries whose code is word for word what
+// memory holds now, and as check words only the words that code runs. The arrays `view` points at must stay alive for good. `covers`:
+// the view serves (nearly) all its module did, so window_covered() counts it and the window needs no translation of its own; a view that
+// serves only some functions does not count.
+void add_view_module(const ModuleInfo &view, int rank, bool covers);
+// Is a view that covers its module (add_view_module with `covers`) in place for the window at `base` over its first `size` bytes?
+bool window_reused(std::uint32_t base, std::uint32_t size);
 
 }  // namespace ps2

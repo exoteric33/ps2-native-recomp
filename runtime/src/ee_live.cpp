@@ -98,6 +98,19 @@ struct Watch {
     int jobs = 0;                         // background jobs made for this window so far
 };
 
+// A view of a translated module (reuse, below): its code, fewer entries, fewer check words. Never freed: the dispatcher points at it.
+struct View {
+    std::string name;                         // the module's name with "~reuse<n>"
+    std::string source;                       // the image name of the module it was made from
+    std::uint32_t base = 0;
+    int rank = 0;
+    std::vector<std::uint32_t> checks;        // {offset, word} pairs, as ModuleInfo::checks
+    std::vector<ps2::UnitInfo> units;
+    std::deque<std::vector<std::uint16_t>> tables;   // the entry tables that serve fewer entries than the module's own
+    ps2::ModuleInfo info{};
+    std::size_t entries = 0, of = 0;          // entries served, of the module's
+};
+
 struct State {
     std::vector<std::uint8_t> program;  // ELF bytes, also available without an external boot file
     fs::path cache;         // ee-live: the libraries
@@ -155,6 +168,10 @@ struct State {
     std::mutex generate_mutex;            // the translator is used by one thread at a time
     std::thread prepare;                  // reads the program ahead of the first window translation (prepare_in_background)
     bool prepare_started = false;         // emulation thread only
+    // Reuse: views of translated modules for code that memory holds again under another image name. Emulation thread only.
+    bool reuse = true;                    // PS2_EE_LIVE_REUSE=0 turns it off
+    std::deque<std::unique_ptr<View>> views;
+    bool views_full_said = false;
 };
 
 State *g = nullptr;  // never freed: a compile may still be running while the process ends
@@ -564,6 +581,376 @@ Built build_library(recomp::LiveRequest request, const std::string &what, bool b
     return b;
 }
 
+// ---------------------------------------------------------------------------------------------------------------- reuse
+
+// A library of a window serves it only while every word of code it translated is what memory holds: all of them are its check words
+// (recomp::checks_for_window), and the dispatcher drops the module at the first one that differs. A game that keeps data in the window, or
+// loads a smaller file over a bigger one, breaks that for code that did not change at all: words the analysis took for code that are data
+// after all (a place after a return, a pointer found in memory) or the rest of the file loaded before change, and the whole library goes.
+// The image gets another name (a CRC of all of it), so the next miss in that code is a whole translation again. Steambot Chronicles
+// (#148) loads each menu into 0x00640000 and stopped for 2 to 6 s at the same address under a new name each time a menu opened.
+//
+// A view serves the entries of a module whose code is still word for word in memory. The translated code of an entry goes on, without the
+// dispatcher, to: the next word, the delay slot of a branch, the branch target, the target of a jump or a call, the word after a call, and
+// for a `jr` through any register but ra to any entry of its own unit (the unit's table, recomp/codegen.cpp). Everything else leaves through
+// the dispatcher, which finds the module for that address anew. An entry is served only when every word its code can run that way is a
+// check word of the module and is what memory holds now; a word inside the module that is not a check word (only a module checked by the
+// first words of its entries has those) or a delay slot that is itself a branch or a syscall is not served, since what it does cannot be
+// told from the check words. The view's check words are the words its entries run, checked by the dispatcher like any module's.
+
+constexpr std::size_t kMaxViews = 256;          // views in one run (a view holds its check words and the entry tables that changed)
+constexpr std::size_t kViewTries = 16;          // modules looked at for one miss
+constexpr double kViewCovers = 0.9;             // a view that serves this share of its module's entries stands for a translation of the window
+
+struct ViewPlan {
+    bool ok = false;
+    std::vector<std::uint32_t> checks;                    // {offset, word}
+    std::vector<std::vector<std::uint16_t>> tables;       // per unit; empty: the module's own table serves (it lost no entry)
+    std::size_t entries = 0, of = 0;
+    const char *why = "";
+};
+
+// What a view of module m would serve now. pc not 0: only if it serves pc (and the search ends early when pc cannot be served).
+ViewPlan plan_view(const ps2::ModuleInfo &m, std::uint32_t pc) {
+    ViewPlan p;
+    const std::uint32_t n = m.check_count, base = m.fixed_base;
+    const std::uint32_t *ck = m.checks;
+    if (!base || !n || !m.count || base >= kRamSize || m.size > kRamSize - base) {
+        p.why = "not a window module with check words";
+        return p;
+    }
+    for (std::uint32_t k = 1; k < n; ++k)
+        if (ck[2 * k] <= ck[2 * (k - 1)] || (ck[2 * k] & 3u)) {
+            p.why = "its check words are not in order";
+            return p;
+        }
+    const auto index_of = [&](std::uint32_t off) -> std::int64_t {
+        std::uint32_t lo = 0, hi = n;
+        while (lo < hi) {
+            const std::uint32_t mid = (lo + hi) / 2;
+            if (ck[2 * mid] < off) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo < n && ck[2 * lo] == off ? static_cast<std::int64_t>(lo) : -1;
+    };
+    const auto now = [&](std::uint32_t off) {
+        std::uint32_t w;
+        std::memcpy(&w, g_ram + base + off, 4);
+        return w;
+    };
+    const auto same = [&](std::int64_t k) { return now(ck[2 * k]) == ck[2 * k + 1]; };
+    const auto unit_of = [&](std::uint32_t off) -> std::int64_t {
+        for (std::uint32_t u = 0; u < m.count; ++u)
+            if (off - m.units[u].base < m.units[u].size) return u;
+        return -1;
+    };
+    // Where the code of check word k goes on to (check word indices; n + u stands for every entry of unit u) and its delay slot. False when
+    // k is not served: its word or its slot's differs from memory, or it can go on to a word inside the module that is not a check word.
+    const auto next_of = [&](std::uint32_t k, std::vector<std::uint32_t> &out, std::int64_t &slot) {
+        out.clear();
+        slot = -1;
+        const std::uint32_t off = ck[2 * k];
+        if (now(off) != ck[2 * k + 1]) return false;
+        bool ok = true;
+        const auto to = [&](std::uint32_t target) {
+            if (target >= m.size) return;   // outside the module (or below it): the dispatcher
+            const std::int64_t t = index_of(target);
+            if (t < 0) ok = false;
+            else out.push_back(static_cast<std::uint32_t>(t));
+        };
+        const recomp::Insn i = recomp::decode(ck[2 * k + 1], base + off);
+        const recomp::Flow f = recomp::flow(i.op);
+        if (f == recomp::Flow::None) {
+            to(off + 4);
+            return ok;
+        }
+        if (f == recomp::Flow::Stop) return true;
+        slot = off + 4 < m.size ? index_of(off + 4) : -1;
+        if (slot < 0 || !same(slot)) return false;
+        const recomp::Insn ds = recomp::decode(ck[2 * slot + 1], base + off + 4);
+        if (recomp::has_delay_slot(ds.op) || ds.op == recomp::Op::Syscall) return false;
+        const std::uint32_t target = i.branch_target_of() - base;
+        switch (f) {
+        case recomp::Flow::Branch:
+        case recomp::Flow::BranchLikely:
+        case recomp::Flow::Call:
+            to(target);
+            to(off + 8);
+            break;
+        case recomp::Flow::Jump:
+            to(target);
+            break;
+        case recomp::Flow::JumpRegister:
+            if (i.rs() != 31) {
+                const std::int64_t u = unit_of(off);
+                if (u < 0) return false;
+                out.push_back(n + static_cast<std::uint32_t>(u));
+            }
+            break;
+        case recomp::Flow::CallRegister:
+            to(off + 8);
+            break;
+        default:
+            return false;
+        }
+        return ok;
+    };
+    // The entries of unit u as check word indices; false when one is not a check word.
+    const auto unit_entries = [&](std::uint32_t u, std::vector<std::uint32_t> &out) {
+        out.clear();
+        const ps2::UnitInfo &unit = m.units[u];
+        for (std::uint32_t x = 0; x < unit.size / 4; ++x)
+            if (unit.entries[x]) {
+                const std::int64_t t = index_of(unit.base + 4 * x);
+                if (t < 0) return false;
+                out.push_back(static_cast<std::uint32_t>(t));
+            }
+        return true;
+    };
+    std::vector<std::uint32_t> next;
+    std::int64_t slot = -1;
+
+    // A settled window (no pc): a module of which more than a tenth of the words differ is not looked at further (it would not cover).
+    if (!pc) {
+        std::uint32_t differ = 0;
+        for (std::uint32_t k = 0; k < n; ++k) differ += !same(k);
+        if (differ > n / 10) {
+            p.why = "more than a tenth of its words differ";
+            return p;
+        }
+    }
+
+    // The quick look for a miss: can pc be served at all? Everything its code can run, until the first word that rules it out.
+    if (pc) {
+        const std::int64_t start = pc - base < m.size ? index_of(pc - base) : -1;
+        if (start < 0) {
+            p.why = "pc is not a word of its code";
+            return p;
+        }
+        std::vector<std::uint8_t> seen(n + m.count, 0);
+        std::vector<std::uint32_t> stack{static_cast<std::uint32_t>(start)};
+        seen[start] = 1;
+        while (!stack.empty()) {
+            const std::uint32_t v = stack.back();
+            stack.pop_back();
+            if (v >= n ? !unit_entries(v - n, next) : !next_of(v, next, slot)) {
+                p.why = "the code there differs from what memory holds";
+                return p;
+            }
+            for (const std::uint32_t t : next)
+                if (!seen[t]) {
+                    seen[t] = 1;
+                    stack.push_back(t);
+                }
+        }
+    }
+
+    // The whole module: every word that is not served, and everything whose code can reach one, is out.
+    const std::uint32_t nodes = n + m.count;
+    std::vector<std::uint8_t> bad(nodes, 0);
+    std::vector<std::int32_t> slots(n, -1);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> edges;
+    edges.reserve(static_cast<std::size_t>(n) * 2);
+    for (std::uint32_t k = 0; k < n; ++k) {
+        if (!next_of(k, next, slot)) {
+            bad[k] = 1;
+            continue;
+        }
+        slots[k] = static_cast<std::int32_t>(slot);
+        for (const std::uint32_t t : next) edges.emplace_back(k, t);
+    }
+    for (std::uint32_t u = 0; u < m.count; ++u) {
+        if (!unit_entries(u, next)) bad[n + u] = 1;
+        else
+            for (const std::uint32_t t : next) edges.emplace_back(n + u, t);
+    }
+    // Both directions as offset lists (compressed rows).
+    const auto rows = [&](bool reverse, std::vector<std::uint32_t> &start, std::vector<std::uint32_t> &list) {
+        start.assign(nodes + 1, 0);
+        list.resize(edges.size());
+        for (const auto &[a, b] : edges) ++start[(reverse ? b : a) + 1];
+        for (std::uint32_t k = 0; k < nodes; ++k) start[k + 1] += start[k];
+        std::vector<std::uint32_t> fill(start.begin(), start.end() - 1);
+        for (const auto &[a, b] : edges) list[fill[reverse ? b : a]++] = reverse ? a : b;
+    };
+    std::vector<std::uint32_t> start, list, stack;
+    rows(true, start, list);
+    for (std::uint32_t k = 0; k < nodes; ++k)
+        if (bad[k]) stack.push_back(k);
+    while (!stack.empty()) {
+        const std::uint32_t v = stack.back();
+        stack.pop_back();
+        for (std::uint32_t e = start[v]; e < start[v + 1]; ++e)
+            if (!bad[list[e]]) {
+                bad[list[e]] = 1;
+                stack.push_back(list[e]);
+            }
+    }
+    // The entries that are served, and what their code runs.
+    std::vector<std::uint8_t> reached(nodes, 0);
+    p.tables.resize(m.count);
+    bool serves_pc = pc == 0;
+    for (std::uint32_t u = 0; u < m.count; ++u) {
+        const ps2::UnitInfo &unit = m.units[u];
+        std::vector<std::uint16_t> table(unit.entries, unit.entries + unit.size / 4);
+        bool all = true;
+        for (std::uint32_t x = 0; x < table.size(); ++x) {
+            if (!table[x]) continue;
+            ++p.of;
+            const std::int64_t t = index_of(unit.base + 4 * x);
+            if (t < 0 || bad[t]) {
+                table[x] = 0;
+                all = false;
+                continue;
+            }
+            ++p.entries;
+            if (base + unit.base + 4 * x == pc) serves_pc = true;
+            if (!reached[t]) {
+                reached[t] = 1;
+                stack.push_back(static_cast<std::uint32_t>(t));
+            }
+        }
+        if (!all) p.tables[u] = std::move(table);
+    }
+    if (!serves_pc || !p.entries) {
+        p.why = "no entry of it is word for word in memory";
+        return p;
+    }
+    rows(false, start, list);
+    while (!stack.empty()) {
+        const std::uint32_t v = stack.back();
+        stack.pop_back();
+        if (bad[v]) {   // cannot be: a word that is served goes on only to words that are served
+            p.why = "served code reaches a word that is not";
+            return p;
+        }
+        for (std::uint32_t e = start[v]; e < start[v + 1]; ++e)
+            if (!reached[list[e]]) {
+                reached[list[e]] = 1;
+                stack.push_back(list[e]);
+            }
+    }
+    std::vector<std::uint8_t> checked(n, 0);
+    for (std::uint32_t k = 0; k < n; ++k)
+        if (reached[k]) {
+            checked[k] = 1;
+            if (slots[k] >= 0) checked[static_cast<std::uint32_t>(slots[k])] = 1;
+        }
+    for (std::uint32_t k = 0; k < n; ++k)
+        if (checked[k]) {
+            p.checks.push_back(ck[2 * k]);
+            p.checks.push_back(ck[2 * k + 1]);
+        }
+    p.ok = true;
+    return p;
+}
+
+// Makes the view of m that `plan` describes and hands it to the dispatcher. False when the run has made its share of views.
+bool add_view(const ps2::ModuleInfo &m, int rank, ViewPlan &&plan, const std::string &source) {
+    if (g->views.size() >= kMaxViews) {
+        if (!g->views_full_said) say("%zu views of translated code were made in this run: no more (each new image is translated as before)", g->views.size());
+        g->views_full_said = true;
+        return false;
+    }
+    auto v = std::make_unique<View>();
+    v->name = std::string(m.name) + "~reuse" + std::to_string(g->views.size() + 1);
+    v->source = source;
+    v->base = m.fixed_base;
+    v->rank = rank;
+    v->checks = std::move(plan.checks);
+    v->entries = plan.entries;
+    v->of = plan.of;
+    v->units.assign(m.units, m.units + m.count);
+    for (std::uint32_t u = 0; u < m.count; ++u)
+        if (!plan.tables[u].empty()) v->units[u].entries = v->tables.emplace_back(std::move(plan.tables[u])).data();
+    v->info = m;
+    v->info.name = v->name.c_str();
+    v->info.checks = v->checks.data();
+    v->info.check_count = static_cast<std::uint32_t>(v->checks.size() / 2);
+    v->info.units = v->units.data();
+    const bool covers = static_cast<double>(v->entries) >= kViewCovers * static_cast<double>(v->of);
+    ps2::add_view_module(v->info, rank, covers);
+    g->views.push_back(std::move(v));
+    return true;
+}
+
+// The modules that cover pc, the better rank first and the newest first among equals (the latest image is the likeliest to be back).
+std::vector<ps2::CoveringModule> reuse_candidates(std::uint32_t pc) {
+    std::vector<ps2::CoveringModule> c = ps2::modules_covering(pc);
+    std::reverse(c.begin(), c.end());
+    std::stable_sort(c.begin(), c.end(), [](const ps2::CoveringModule &a, const ps2::CoveringModule &b) { return a.rank > b.rank; });
+    return c;
+}
+
+// Does module m have an entry at pc (whether in place or not)?
+bool has_entry(const ps2::ModuleInfo &m, std::uint32_t pc) {
+    const std::uint32_t off = pc - m.fixed_base;
+    for (std::uint32_t u = 0; u < m.count; ++u)
+        if (off - m.units[u].base < m.units[u].size) return m.units[u].entries[(off - m.units[u].base) >> 2] != 0;
+    return false;
+}
+
+// A miss at pc: when a module translated earlier (this run, or a library of the cache) has pc and its code there is word for word what memory
+// holds, a view of it serves pc and the game goes on with no translation. `where` names the image for the log line.
+bool reuse_for_miss(std::uint32_t pc, const std::string &where) {
+    if (!g->reuse || pc & 3u || g->views.size() >= kMaxViews) return false;
+    const auto began = Clock::now();
+    std::size_t tried = 0;
+    for (const ps2::CoveringModule &c : reuse_candidates(pc)) {
+        if (!has_entry(*c.module, pc)) continue;
+        if (++tried > kViewTries) break;
+        ViewPlan plan = plan_view(*c.module, pc);
+        if (!plan.ok) {
+            if (g->verbose) say("miss 0x%08X: the module %s does not serve it: %s", pc, c.module->name, plan.why);
+            continue;
+        }
+        const std::size_t entries = plan.entries, of = plan.of, words = plan.checks.size() / 2;
+        const std::string source = c.module->name;
+        if (!add_view(*c.module, c.rank, std::move(plan), source) || !ps2::has_code(pc)) return false;
+        say("no translated code at 0x%08X (%s): the code there is word for word what %s was translated from, its translation is used again (%zu of its %zu entries, %zu words checked, %.1f ms): the game goes on", pc, where.c_str(), source.c_str(), entries, of, words,
+            lb::seconds_since(began) * 1e3);
+        return true;
+    }
+    return false;
+}
+
+// A window settled with content no module serves as a whole: when an earlier module of the same window serves nearly all of it as it is now
+// (kViewCovers), its view stands for the translation the background would make. True when the window is served that way.
+bool reuse_for_window(std::uint32_t base, std::uint32_t extent) {
+    if (!g->reuse || g->views.size() >= kMaxViews) return false;
+    const auto began = Clock::now();
+    std::size_t tried = 0;
+    for (const ps2::CoveringModule &c : reuse_candidates(base)) {
+        if (c.module->fixed_base != base || c.module->size < extent) continue;
+        if (++tried > kViewTries / 2) break;
+        ViewPlan plan = plan_view(*c.module, 0);
+        if (!plan.ok || static_cast<double>(plan.entries) < kViewCovers * static_cast<double>(plan.of)) continue;
+        const std::size_t entries = plan.entries, of = plan.of;
+        const std::string source = c.module->name;
+        if (!add_view(*c.module, c.rank, std::move(plan), source)) return false;
+        if (g->verbose) say("window 0x%08X settled with content that %s serves as it is (%zu of its %zu entries, %.1f ms): no translation of its own", base, source.c_str(), entries, of, lb::seconds_since(began) * 1e3);
+        return ps2::window_covered(base, extent);
+    }
+    return false;
+}
+
+// The library made with the normal flags for image `name` is in: the views of its quick library are made again from it.
+void refresh_views(const std::string &name) {
+    std::vector<std::pair<std::uint32_t, std::string>> stale;   // {base, source}
+    for (const std::unique_ptr<View> &v : g->views)
+        if (v->rank == 0 && v->source == name) stale.emplace_back(v->base, v->source);
+    std::set<std::uint32_t> done;
+    for (const auto &[base, source] : stale) {
+        if (!done.insert(base).second) continue;
+        for (const ps2::CoveringModule &c : reuse_candidates(base)) {
+            if (c.rank < 1 || c.module->fixed_base != base || source != c.module->name) continue;
+            ViewPlan plan = plan_view(*c.module, 0);
+            if (plan.ok) add_view(*c.module, c.rank, std::move(plan), source);
+            break;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------- background
 
 // The worker thread: one background build at a time, in the order the windows settled.
@@ -715,6 +1102,7 @@ void finish_background(const std::shared_ptr<BgJob> &job) {
         }
         g->fast.erase(job->name);
         write_marker(job->name, false);
+        refresh_views(job->name);
         say("switched in the library of window 0x%08X (image %s, %u KiB) made with the normal flags: %.1f s after the quick one (translate %.1f, compile %.1f, link %.1f), %zu instructions, %zu files", job->base, job->name.c_str(), size / 1024,
             lb::seconds_since(job->queued), job->timing.generate, job->timing.compile, job->timing.link, job->code, job->files);
         return;
@@ -882,6 +1270,8 @@ bool start_background(Watch &w, std::uint32_t base, std::uint32_t extent) {
         queue_upgrade(base, name, std::vector<std::uint8_t>(g_ram + base, g_ram + base + extent));
         return true;
     }
+    // An earlier translation of this window serves its content as it is now (other data, the same code): nothing to translate.
+    if (reuse_for_window(base, extent)) return true;
     if (w.jobs >= kJobsPerWindow) return true;
     const std::vector<std::uint64_t> units = unit_hashes(g_ram + base, extent);
     if (inside_started(base, extent, units)) return true;
@@ -1017,6 +1407,7 @@ void start(std::span<const std::uint8_t> program, const std::string &cache, cons
     g->quick_flags = lb::compile_flags(quick == "off" ? opt : quick);
     g->two_step = quick != "off" && g->quick_flags != g->flags;
     g->keep_work = !ps2::os::env("PS2_EE_LIVE_KEEP").empty();
+    g->reuse = ps2::os::env("PS2_EE_LIVE_REUSE") != "0";   // PS2_EE_LIVE_REUSE=0 turns the reuse off
     g->jobs = std::clamp<std::size_t>(std::thread::hardware_concurrency() * 3 / 4, 2, 9);   // a build in the background: most of the machine, below normal priority
     g->jobs_now = std::clamp<std::size_t>(std::thread::hardware_concurrency(), 2, 16);   // the game is paused while this runs: all of it
     if (const std::string v = ps2::os::env("PS2_EE_LIVE_JOBS"); !v.empty()) g->jobs = g->jobs_now = std::clamp<std::size_t>(std::strtoul(v.c_str(), nullptr, 10), 1, 16);
@@ -1315,6 +1706,10 @@ bool translate_missing(std::uint32_t pc) {
     std::vector<std::uint8_t> image(g_ram + base, g_ram + base + size);
     const std::string name = (region ? "main_" : "") + recomp::window_name(base, image.data(), image.size());
 
+    // The same code as an image translated before, under another name (the game changed data in the window, or loaded the same file over
+    // other leftovers): its translation serves again, nothing is translated.
+    if (reuse_for_miss(pc, std::string(region ? "program code at 0x" : flat ? "loaded code at 0x" : "window 0x") + lb::hex(base, 8) + ", image " + name)) return true;
+
     // The window settled a while ago and its translation is under way in the background: wait for the rest of it.
     if (!region && !flat && use_background(pc, base, name)) {
         say("switched in after %.1f s of waiting for the background translation", lb::seconds_since(began));
@@ -1324,7 +1719,8 @@ bool translate_missing(std::uint32_t pc) {
     // A window image that was translated as a whole before (by this run or an earlier one) only lacks the entry point that was missed:
     // translating all of it again for that costs seconds. One that was not (the build has a module of the same code, made from the
     // entry points it knew) is looked through completely this time.
-    const bool whole_done = g->whole.count(name) != 0 || (flat && g->flat_started.count(base) != 0);
+    // A view that serves nearly all of an earlier translation of this window is in place: what is missing is new code, translated alone.
+    const bool whole_done = g->whole.count(name) != 0 || (flat && g->flat_started.count(base) != 0) || (!region && ps2::window_reused(base, size));
     if (g->verbose) say("miss 0x%08X: %s", pc, ps2::module_report(pc).c_str());
     if (region) say("no translated code at 0x%08X (the program's own code, not reached by the build): translating it now, the game waits", pc);
     else say("no translated code at 0x%08X (%s 0x%08X, image %s, %u KiB): translating it now, the game waits", pc, flat ? "loaded code at" : "window", base, name.c_str(), size / 1024);

@@ -51,6 +51,10 @@ std::deque<ModuleInfo> g_modules;
 std::deque<int> g_ranks;
 // The soft checks of each module, in step with g_modules (empty for a module that has none).
 std::deque<SoftIndex> g_soft;
+// What each module is, in step with g_modules: a module of the build or of a live library (kModule), or a view of one that ee_live.cpp made
+// when the memory holds the same code under another image name (kViewCovers, kViewPartial; ee_live.hpp, add_view_module).
+enum ModuleKind : std::uint8_t { kModule, kViewCovers, kViewPartial };
+std::deque<std::uint8_t> g_kinds;
 int g_max_rank = 0;
 std::uint32_t g_epoch = 0;   // modules_epoch(): counts the modules added while the game runs
 std::uint32_t g_module_span = 0;
@@ -195,6 +199,7 @@ void register_modules(const ModuleInfo *modules, std::uint32_t count) {
     g_modules.assign(modules, modules + count);
     g_ranks.assign(count, 0);
     g_soft.assign(count, SoftIndex{});
+    g_kinds.assign(count, kModule);
     g_max_rank = 0;
     ++g_epoch;
     g_instances.clear();
@@ -210,6 +215,7 @@ void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank
     for (std::uint32_t k = 0; k < count; ++k) {
         g_modules.push_back(modules[k]);
         g_ranks.push_back(rank);
+        g_kinds.push_back(kModule);
         SoftIndex &index = g_soft.emplace_back();
         if (soft && soft[k].words)
             for (std::uint32_t at = 0; at + 2 <= soft[k].count && at + 2 + 2 * soft[k].words[at + 1] <= soft[k].count; at += 2 + 2 * soft[k].words[at + 1])
@@ -223,6 +229,32 @@ void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank
     if (rank > 0) g_instances.clear();
 }
 
+void add_view_module(const ModuleInfo &view, int rank, bool covers) {
+    g_modules.push_back(view);
+    g_ranks.push_back(rank);
+    g_kinds.push_back(covers ? kViewCovers : kViewPartial);
+    g_soft.emplace_back();
+    g_module_span = std::max(g_module_span, view.size);
+    ++g_epoch;
+    if (rank > g_max_rank) g_max_rank = rank;
+    if (rank > 0) g_instances.clear();
+}
+
+std::vector<CoveringModule> modules_covering(std::uint32_t pc) {
+    std::vector<CoveringModule> out;
+    for (std::size_t k = 0; k < g_modules.size(); ++k)
+        if (g_kinds[k] == kModule && g_modules[k].fixed_base && pc - g_modules[k].fixed_base < g_modules[k].size) out.push_back({&g_modules[k], g_ranks[k]});
+    return out;
+}
+
+bool window_reused(std::uint32_t base, std::uint32_t size) {
+    for (std::size_t k = 0; k < g_modules.size(); ++k) {
+        const ModuleInfo &m = g_modules[k];
+        if (g_kinds[k] == kViewCovers && base >= m.fixed_base && base - m.fixed_base <= m.size && size <= m.size - (base - m.fixed_base) && loaded_at(m, m.fixed_base)) return true;
+    }
+    return false;
+}
+
 bool window_module_in_place(std::uint32_t pc) { return instance_for(pc) != nullptr; }
 
 int serving_rank(std::uint32_t pc) {
@@ -233,16 +265,20 @@ int serving_rank(std::uint32_t pc) {
 bool window_covered(std::uint32_t base, std::uint32_t size) {
     // A module that holds the range, whatever base it begins at (windows are steps of 16 KiB in one area, and a window inside a
     // translated one holds the same code).
-    for (const ModuleInfo &m : g_modules)
-        if (m.fixed_base && base >= m.fixed_base && base - m.fixed_base <= m.size && size <= m.size - (base - m.fixed_base) && loaded_at(m, m.fixed_base)) return true;
+    // A view that serves only part of its module (ee_live.cpp, add_view_module) does not count: the window still wants a translation of its own.
+    for (std::size_t k = 0; k < g_modules.size(); ++k) {
+        const ModuleInfo &m = g_modules[k];
+        if (g_kinds[k] != kViewPartial && m.fixed_base && base >= m.fixed_base && base - m.fixed_base <= m.size && size <= m.size - (base - m.fixed_base) && loaded_at(m, m.fixed_base)) return true;
+    }
     return false;
 }
 
 std::string module_report(std::uint32_t pc) {
     std::size_t covering = 0, changed = 0;
     std::string example;
-    for (const ModuleInfo &m : g_modules) {
-        if (!m.fixed_base || pc - m.fixed_base >= m.size) continue;
+    for (std::size_t i = 0; i < g_modules.size(); ++i) {
+        const ModuleInfo &m = g_modules[i];
+        if (g_kinds[i] != kModule || !m.fixed_base || pc - m.fixed_base >= m.size) continue;   // views are said by ee_live.cpp itself
         ++covering;
         std::uint32_t bad = 0, first = 0;
         for (std::uint32_t k = 0; k < m.check_count; ++k)

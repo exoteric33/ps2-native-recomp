@@ -173,6 +173,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2eelivelisttest PRIVATE synchronization)
     endif()
+    # The same code in a window under another image name is served by the translation made before, not translated again (#148),
+    # a made-up program and window, needs a C++ compiler on the PATH: ninja ps2eelivereusetest
+    add_executable(ps2eelivereusetest EXCLUDE_FROM_ALL tests/ee_live_reuse.cpp)
+    target_link_libraries(ps2eelivereusetest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2eelivereusetest PRIVATE synchronization)
+    endif()
 endif()
 # the IOP thread manager tested through a synthetic module, no game needed: ninja ps2thbasetest
 if(NOT EMSCRIPTEN)

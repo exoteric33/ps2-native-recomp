@@ -452,6 +452,13 @@ if(NOT EMSCRIPTEN)
         target_link_libraries(ps2sifunhandledtest PRIVATE synchronization)
     endif()
     # an interrupt pending at EI (or MTC0 Status, or a system call's return) is taken at once (issue 100, GTA Vice City, no game needed): ninja ps2eipendingtest
+    # the EE timers' gate, flag and ZRET rules (#141); no game needed: ninja ps2timergatetest && ./ps2timergatetest
+    add_executable(ps2timergatetest EXCLUDE_FROM_ALL tests/timer_gate.cpp)
+    target_include_directories(ps2timergatetest PRIVATE runtime/src)
+    target_link_libraries(ps2timergatetest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2timergatetest PRIVATE synchronization)
+    endif()
     add_executable(ps2eipendingtest EXCLUDE_FROM_ALL tests/ei_pending.cpp)
     target_include_directories(ps2eipendingtest PRIVATE runtime/src)
     target_link_libraries(ps2eipendingtest PRIVATE ps2runtime)

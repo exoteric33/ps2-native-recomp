@@ -48,6 +48,30 @@ struct Timer {
 
 Timer g_timers[4];
 
+// Tn_MODE bits, from the public EE User's Manual (timer chapter): CLKS 0-1, GATE 2, GATS 3 (0 H-blank, 1 V-blank), GATM 4-5, ZRET 6,
+// CUE 7, CMPE 8, OVFE 9, EQUF 10 and OVFF 11 (both cleared by writing 1).
+constexpr std::uint32_t kGate = 0x4u, kGats = 0x8u, kGatm = 0x30u, kZret = 0x40u, kCue = 0x80u, kCmpe = 0x100u, kOvfe = 0x200u,
+                        kEquf = 0x400u, kOvff = 0x800u;
+
+// PS2_TIMER_SIMPLE=1 brings back the earlier model: no V-blank gate, an interrupt at every match even while its flag
+// is still set, and no timer events while both interrupt enables are off. Read on first use, so switches.txt can set it.
+bool timer_simple() {
+    static const bool simple = std::getenv("PS2_TIMER_SIMPLE") != nullptr;
+    return simple;
+}
+
+// The V-blank gate (GATE=1, GATS=1). Our V-blank lasts from vblank_start() until the kEventVblankEnd event has run, so "inside the
+// V-blank" is "that event is still waiting", which a save state carries too.
+bool vblank_gate(const Timer &t) { return !timer_simple() && (t.mode & (kGate | kGats)) == (kGate | kGats); }
+bool inside_vblank() { return scheduled_at(kEventVblankEnd) != UINT64_MAX; }
+
+// GATM 0 counts only while the gate signal is low; the V-blank signal is high during the V-blank, so the counter stops there and keeps
+// its value in `frozen`, as with CUE off.
+bool counting(const Timer &t) {
+    if (!(t.mode & kCue)) return false;
+    return !(vblank_gate(t) && !(t.mode & kGatm) && inside_vblank());
+}
+
 std::uint64_t timer_divider(const Timer &t) {
     switch (t.mode & 3u) {
     case 0: return 2;
@@ -59,13 +83,13 @@ std::uint64_t timer_divider(const Timer &t) {
 
 std::uint32_t timer_count(int n) {
     const Timer &t = g_timers[n];
-    if (!(t.mode & 0x80u)) return t.frozen;
+    if (!counting(t)) return t.frozen;
     return static_cast<std::uint32_t>(((now() - t.base) / timer_divider(t)) & 0xFFFFu);
 }
 
 std::uint32_t timer_read(int n) {
     const std::uint64_t due = scheduled_at(kEventTimer0 + n);
-    if (due > now()) return timer_count(n);
+    if (due > now() || !counting(g_timers[n])) return timer_count(n);
     const Timer &t = g_timers[n];
     return static_cast<std::uint32_t>(((due - 1 - t.base) / timer_divider(t)) & 0xFFFFu);
 }
@@ -80,23 +104,33 @@ void timer_schedule(int n);
 
 void timer_event(int n, std::uint64_t at) {
     Timer &t = g_timers[n];
-    if (!(t.mode & 0x80u)) return;
+    if (!counting(t)) return;
     const std::uint32_t count = static_cast<std::uint32_t>(((at - t.base) / timer_divider(t)) & 0xFFFFu);
+    // The timer's interrupt request comes when EQUF or OVFF goes from 0 to 1 (the INTC takes edges); while the game has not
+    // written the flag back, a new match sets nothing new and raises nothing (EE User's Manual, timer chapter).
+    const bool simple = timer_simple();
     if (count == (t.comp & 0xFFFFu)) {
-        t.mode |= 0x400u;
-        if (t.mode & 0x100u) intc_raise(9u + static_cast<unsigned>(n));
-        if (t.mode & 0x40u) t.base = at;
+        const bool was = t.mode & kEquf;
+        t.mode |= kEquf;
+        if ((t.mode & kCmpe) && (simple || !was)) intc_raise(9u + static_cast<unsigned>(n));
+        if (t.mode & kZret) t.base = at;
     }
-    if (count == 0 && !(t.mode & 0x40u && t.comp == 0)) {
-        t.mode |= 0x800u;
-        if (t.mode & 0x200u) intc_raise(9u + static_cast<unsigned>(n));
+    if (count == 0 && !(t.mode & kZret && t.comp == 0)) {
+        const bool was = t.mode & kOvff;
+        t.mode |= kOvff;
+        if ((t.mode & kOvfe) && (simple || !was)) intc_raise(9u + static_cast<unsigned>(n));
     }
     timer_schedule(n);
 }
 
 void timer_schedule(int n) {
     Timer &t = g_timers[n];
-    if (!(t.mode & 0x80u) || !(t.mode & 0x300u)) {
+    // A match matters when it raises an interrupt, resets the counter (ZRET) or sets a flag the game may poll; with all of that
+    // already done, no event is needed.
+    const bool simple = timer_simple();
+    const bool want_compare = simple ? (t.mode & kCmpe) != 0 : (t.mode & (kCmpe | kZret)) || !(t.mode & kEquf);
+    const bool want_overflow = simple ? (t.mode & kOvfe) != 0 : (t.mode & kOvfe) || !(t.mode & kOvff);
+    if (!counting(t) || !(want_compare || want_overflow)) {
         schedule(kEventTimer0 + n, ~0ull, [] {});
         return;
     }
@@ -105,8 +139,8 @@ void timer_schedule(int n) {
     if (!to_compare) to_compare = 0x10000u;
     std::uint32_t to_overflow = 0x10000u - count;
     std::uint32_t ticks = to_compare;
-    if ((t.mode & 0x200u) && to_overflow < ticks) ticks = to_overflow;
-    if (!(t.mode & 0x100u)) ticks = to_overflow;
+    if (want_overflow && to_overflow < ticks) ticks = to_overflow;
+    if (!want_compare) ticks = to_overflow;
     const std::uint64_t div = timer_divider(t);
     const std::uint64_t at = t.base + ((now() - t.base) / div + ticks) * div;
     schedule(kEventTimer0 + n, at, [n, at] { timer_event(n, at); });
@@ -115,6 +149,48 @@ void timer_schedule(int n) {
 int timer_index(std::uint32_t a) { return static_cast<int>((a >> 11) & 3u); }
 
 bool is_timer(std::uint32_t a) { return a >= 0x10000000u && a < 0x10002000u && (a & 0x7FFu) < 0x40u; }
+
+// An edge of the V-blank gate signal (rising = the V-blank starts). GATM 1 resets the counter at the rising edge, 2 at the falling
+// edge, 3 at both; GATM 0 stops the counter for the V-blank (counting() above) and goes on from the same value after it. The H-blank
+// gate (GATS 0) is not modelled: it would need the line timing inside a frame.
+void timer_gate_edge(bool rising) {
+    for (int n = 0; n < 4; ++n) {
+        Timer &t = g_timers[n];
+        if (!vblank_gate(t) || !(t.mode & kCue)) continue;
+        const std::uint32_t gatm = (t.mode & kGatm) >> 4;
+        if (gatm == 0) timer_set_count(n, t.frozen);  // the value it stopped at (rising: set just before the V-blank began)
+        else if (gatm == 3 || gatm == (rising ? 1u : 2u)) timer_set_count(n, 0);
+        else continue;
+        timer_schedule(n);
+    }
+}
+
+void vblank_end() {
+    intc_raise(3);
+    timer_gate_edge(false);
+}
+
+// One line in the normal log for each new timer setting the game makes (a few per timer), so a tester's log shows how its clocks
+// are set up without a trace switch.
+void report_timer_mode(int n, std::uint32_t mode, std::uint32_t comp) {
+    static std::uint32_t last[4] = {~0u, ~0u, ~0u, ~0u};
+    static int shown[4] = {};
+    mode &= 0x3FFu;
+    if (!(mode & kCue) || mode == last[n]) return;
+    last[n] = mode;
+    if (++shown[n] > 6) {
+        if (shown[n] == 7) std::fprintf(stderr, "[timer] T%d: more settings follow, not shown\n", n);
+        return;
+    }
+    static const char *const clock[] = {"bus clock", "bus clock/16", "bus clock/256", "H-blank"};
+    static const char *const gatm[] = {"count outside the blank", "reset at its start", "reset at its end", "reset at start and end"};
+    char gate[80] = "no gate";
+    if (mode & kGate) std::snprintf(gate, sizeof gate, "%s gate, %s%s", mode & kGats ? "V-blank" : "H-blank", gatm[(mode >> 4) & 3u],
+                                    mode & kGats ? "" : " (H-blank gate not modelled)");
+    std::fprintf(stderr, "[timer] T%d mode 0x%03X: %s, %s%s%s%s, compare 0x%04X (frame %llu, pc 0x%08X)\n", n, mode, clock[mode & 3u], gate,
+                 mode & kZret ? ", zero at compare" : "", mode & kCmpe ? ", compare interrupt" : "", mode & kOvfe ? ", overflow interrupt" : "",
+                 comp & 0xFFFFu, static_cast<unsigned long long>(frame_count()), g_cpu.pc);
+}
 
 }
 
@@ -134,7 +210,12 @@ void reset() {
 void vblank_start() {
     intc_raise(2);
     gs::vblank(true);
-    schedule(kEventVblankEnd, now() + hblank_cycles() * 22u, [] { intc_raise(3); });
+    std::uint32_t counts[4];
+    for (int n = 0; n < 4; ++n) counts[n] = timer_count(n);  // before the V-blank begins: a GATM 0 counter stops at this value
+    schedule(kEventVblankEnd, now() + hblank_cycles() * 22u, vblank_end);
+    for (int n = 0; n < 4; ++n)
+        if (vblank_gate(g_timers[n]) && !(g_timers[n].mode & kGatm)) g_timers[n].frozen = counts[n];
+    timer_gate_edge(true);
 }
 
 std::uint32_t intc_pending() { return g_intc_stat & g_intc_mask; }
@@ -361,6 +442,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
             const std::uint32_t count = timer_count(n);
             t.mode = (t.mode & 0xC00u & ~(v & 0xC00u)) | (v & 0x3FFu);
             timer_set_count(n, count);
+            report_timer_mode(n, t.mode, t.comp);
             break;
         }
         case 0x20: t.comp = v & 0xFFFFu; break;
@@ -415,7 +497,7 @@ void write128(std::uint32_t a, const Reg128 &v) {
 namespace ps2::hw {
 
 std::function<void()> event_action(int id, std::uint64_t at) {
-    if (id == kEventVblankEnd) return [] { intc_raise(3); };
+    if (id == kEventVblankEnd) return vblank_end;
     if (id == kEventVif1Read) return dmac::finish_vif1_read;
     if (id == kEventGsFinish) return gs::raise_finish;
     if (id >= kEventTimer0 && id <= kEventTimer3) return [n = id - kEventTimer0, at] { timer_event(n, at); };

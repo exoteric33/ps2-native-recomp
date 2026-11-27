@@ -40,7 +40,7 @@ me what to fix next, and one fix often helps several games at once.
 
 ## How far it is
 
-Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 58
+Still early: the project went public on 28 October 2026. God of War II has been played from start to end. 59
 other games play as far as testers got, among them God of War, Gran Turismo 4, Resident Evil 4, Silent Hill 2,
 Shadow of the Colossus and Tekken 4 (the full list is in [*What runs*](#what-runs)). Most PS2 games have not been tried
 yet, and some still stop at a black screen or crash. 54 of the 55 programs of a free PS2 test suite print exactly what a
@@ -101,6 +101,7 @@ Tried with real discs (mine are US releases), as far as each was played; known p
 | Silent Hill 2 | plays well, not played through yet: the opening at the rest stop and about 20 minutes of play from there but works fine| me |
 | Shadow of the Colossus | plays well, not played through yet: played like 30 minutes that went very well | me |
 | Grand Theft Auto III | plays well, not played through yet: from power-on through the first mission, and the game's own save and load work, also in 16:9 | Chewing_Character, me |
+| Grand Theft Auto: Vice City | plays, not played through yet: from power-on through the opening film, the first streets and the first mission ("An Old Friend") | me |
 | The Super Dimension Fortress Macross | plays well, not played through yet: menus and gameplay at about 60 fps (Windows 11, a laptop with Intel graphics, a game controller; [#3](https://github.com/exoteric33/ps2-native-recomp/issues/3)) | omegakatana92 |
 | The King of Fighters XI | plays well, not played through yet: works perfectly | TsimpleD (Reddit) |
 | God Hand | plays well, not played through yet: as far as the casino hub, no problems so far | theraineydaze (Reddit) |

@@ -959,6 +959,7 @@ void signal(std::uint32_t reg, std::uint64_t value) {
         raise(1);
         break;
     case 0x61:
+        queue::note_finish();   // PS2_WAIT_STATS only
         // The GS only gets to FINISH after it has drawn what came before, so it must not be visible the
         // moment the DMA starts: ps2sdk's graph_wait_vsync writes CSR back right after starting the DMA,
         // and a FINISH that is already set would be wiped before draw_wait_finish ever sees it.
@@ -1268,7 +1269,7 @@ std::vector<std::uint8_t> fetch(std::uint32_t k, std::uint32_t id) {
     s.wanted.store(id, std::memory_order_release);
     g_wants.fetch_add(1, std::memory_order_acq_rel);
     queue::render().wake();
-    for (std::uint32_t r = s.ready.load(std::memory_order_acquire); r != id; r = s.ready.load(std::memory_order_acquire)) queue::wait(s.ready, r);
+    for (std::uint32_t r = s.ready.load(std::memory_order_acquire); r != id; r = s.ready.load(std::memory_order_acquire)) queue::wait(s.ready, r, queue::Wait::Download);
     return s.real;
 }
 
@@ -1456,7 +1457,7 @@ void read_image(std::uint8_t *data, std::uint32_t qwords) {
     const std::uint32_t seen = g_downloads.load();
     const std::uintptr_t target = reinterpret_cast<std::uintptr_t>(data);
     queue::post(queue::kDownload, qwords, 0, &target, sizeof target);
-    while (g_downloads.load() == seen) queue::wait(g_downloads, seen);
+    while (g_downloads.load() == seen) queue::wait(g_downloads, seen, queue::Wait::Download);
     remember(key, data, bytes);
 }
 
@@ -1802,7 +1803,8 @@ void post_present() {
     const DisplayRegs regs = display_regs();
     queue::post(queue::kPresent, static_cast<std::uint32_t>(frame_count()), 0, &regs, sizeof regs);
     ++g_posted_presents;
-    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
+    queue::stats_vblank(static_cast<std::uint32_t>(frame_count()), g_posted_presents - g_presented.load());   // PS2_WAIT_STATS only
+    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done, queue::Wait::Present);
 }
 
 Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms) {
@@ -1810,6 +1812,10 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
     queue::Header h;
     const std::uint8_t *payload = nullptr;
     const auto start = std::chrono::steady_clock::now();
+    struct BusyNote {   // PS2_WAIT_STATS only: how long the window thread works, for the share of its time
+        std::chrono::steady_clock::time_point from;
+        ~BusyNote() { if (queue::wait_stats()) queue::note_window_busy(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count())); }
+    } busy_note{start};
     // PS2_HITCH_LOG=<ms>: per picture, how long the window thread worked on each kind of message (wall clock and its own CPU time), and any
     // single message that took longer than the limit (docs/hitches.md). The picture's lines are printed when it is handed to the screen.
     static double busy[16] = {};
@@ -2070,7 +2076,7 @@ void state(ps2::state::Stream &s) {
     const std::uint32_t seen = g_state_done.load();
     const std::uintptr_t target = reinterpret_cast<std::uintptr_t>(&s);
     queue::post(queue::kState, 0, 0, &target, sizeof target);
-    while (g_state_done.load() == seen) queue::wait(g_state_done, seen);
+    while (g_state_done.load() == seen) queue::wait(g_state_done, seen, queue::Wait::State);
     if (!g_state_error.empty()) throw std::runtime_error(g_state_error);
 }
 

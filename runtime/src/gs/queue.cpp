@@ -1,5 +1,7 @@
 #include "queue.hpp"
 
+#include "ps2/hitch.hpp"
+
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -53,6 +55,35 @@ void note_size(int ring, std::uint32_t type, std::uint32_t bytes) {
 }
 std::uint64_t now_us() { return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
+// PS2_WAIT_STATS=1: where the emulation thread (and the vector-unit thread) wait, and the shape of the frame end.
+// Everything below is off unless the switch is set; a blocking wait or a post then costs one more clock read.
+constexpr int kWaitKinds = static_cast<int>(Wait::Count);
+std::atomic<std::uint64_t> g_wait_ns[2][kWaitKinds], g_wait_n[2][kWaitKinds];   // [0] emulation thread, [1] vector-unit thread
+std::atomic<std::uint64_t> g_window_busy_ns{0};
+std::uint64_t now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+int stat_role() { return g_role == Role::Vu ? 1 : 0; }   // the window thread never waits for these
+void note_wait(Wait why, std::uint64_t ns) {
+    const int r = stat_role(), k = static_cast<int>(why);
+    g_wait_ns[r][k].fetch_add(ns, std::memory_order_relaxed);
+    g_wait_n[r][k].fetch_add(1, std::memory_order_relaxed);
+}
+std::uint64_t emu_wait_total() {
+    std::uint64_t t = 0;
+    for (int k = 0; k < kWaitKinds; ++k) t += g_wait_ns[0][k].load(std::memory_order_relaxed);
+    return t;
+}
+// The frame's timeline on the emulation thread. A frame runs from one vblank hand-over to the next. "FINISH" is the last FINISH write the
+// game made in the frame, "first draw" the first drawing data it handed on after the vblank (the present wait is part of that gap).
+struct Timeline {
+    std::uint64_t vblank = 0, finish = 0, first_draw = 0;          // wall clock, ns
+    std::uint64_t w_vblank = 0, w_finish = 0, w_first_draw = 0;    // the emulation thread's wait total at those moments
+    bool have_finish = false, have_first_draw = false, armed = false;
+    // sums over the report period
+    double frames = 0, frame_ms = 0, to_finish_ms = 0, to_finish_wait = 0, after_finish_ms = 0, after_finish_wait = 0, to_draw_ms = 0, to_draw_wait = 0, finish_frames = 0, draw_frames = 0, in_flight = 0;
+    double cpu_start = 0;
+    std::uint64_t period_start = 0, seen_ns[2][kWaitKinds] = {}, seen_n[2][kWaitKinds] = {}, seen_window = 0;
+} g_tl;
+
 #if defined(__linux__) && !defined(__EMSCRIPTEN__)
 void futex_wait(std::atomic<std::uint32_t> &word, std::uint32_t seen, int timeout_ms) {
     timespec limit{timeout_ms / 1000, static_cast<long>(timeout_ms % 1000) * 1000000L};
@@ -77,7 +108,13 @@ EM_ASYNC_JS(void, ps2_wait_async, (std::atomic<std::uint32_t> *word, std::uint32
 });
 #endif
 
-void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen) {
+bool wait_stats() {
+    static const bool on = std::getenv("PS2_WAIT_STATS") != nullptr;
+    return on;
+}
+
+void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen, Wait why) {
+    const std::uint64_t t0 = wait_stats() ? now_ns() : 0;
 #ifdef __EMSCRIPTEN__
     emscripten_futex_wait(&value, seen, INFINITY);
 #elif defined(__linux__) || defined(_WIN32)
@@ -85,6 +122,7 @@ void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen) {
 #else
     value.wait(seen);
 #endif
+    if (t0) note_wait(why, now_ns() - t0);
 }
 
 void notify(std::atomic<std::uint32_t> &value) {
@@ -129,6 +167,11 @@ void Ring::post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *d
         if (qs_on()) g_qs[0].lent.fetch_add(bytes, std::memory_order_relaxed);
     } else if (sizeof(Header) + align16(bytes) > spill_above_) [[unlikely]] post_spilled(type, arg0, arg1, data, bytes);
     else put(Header{type, bytes, arg0, arg1}, data, bytes);
+    if (wait_stats() && g_role == Role::Emulation && g_tl.armed && !g_tl.have_first_draw && (type == kGif || type == kVif1 || type == kVif1Write)) {
+        g_tl.first_draw = now_ns();
+        g_tl.w_first_draw = emu_wait_total();
+        g_tl.have_first_draw = true;
+    }
     if (qs_on()) { QStats &q = g_qs[this == &g_render ? 0 : 1]; q.posts.fetch_add(1, std::memory_order_relaxed); q.bytes.fetch_add(sizeof(Header) + align16(bytes), std::memory_order_relaxed); }
     if (qmax_on()) [[unlikely]] note_size(this == &g_render ? 0 : 1, type, bytes);
 }
@@ -262,7 +305,7 @@ void Ring::publish(bool force) {
 // unread.
 void Ring::wait_for_space(std::uint64_t until_tail) {
     if (write_ != published_ || wake_owed_) publish(true);
-    const std::uint64_t t0 = qs_on() ? now_us() : 0;
+    const std::uint64_t t0 = qs_on() ? now_us() : 0, w0 = wait_stats() ? now_ns() : 0;
     for (;;) {
         const std::uint32_t seen = freed_.load(std::memory_order_acquire);
         producer_waiting_.store(1, std::memory_order_seq_cst);
@@ -278,6 +321,7 @@ void Ring::wait_for_space(std::uint64_t until_tail) {
 #endif
     }
     producer_waiting_.store(0, std::memory_order_relaxed);
+    if (w0) note_wait(Wait::RingFull, now_ns() - w0);
     if (qs_on()) { QStats &q = g_qs[this == &g_render ? 0 : 1]; q.full_waits.fetch_add(1); q.full_us.fetch_add(now_us() - t0); }
 }
 
@@ -417,6 +461,84 @@ void Ring::wait_for_work(int timeout_ms) {
     consumer_waiting_.store(0, std::memory_order_relaxed);   // awake (woken, timed out or never asleep): no wake needed until the next sleep
 }
 
+// ---- PS2_WAIT_STATS=1: the report -------------------------------------------------------------------------------
+
+void note_finish() {
+    if (!wait_stats() || g_role != Role::Emulation) return;
+    g_tl.finish = now_ns();
+    g_tl.w_finish = emu_wait_total();
+    g_tl.have_finish = true;
+}
+
+void note_window_busy(std::uint64_t ns) {
+    if (wait_stats()) g_window_busy_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void stats_vblank(std::uint32_t frame, std::uint32_t presents_in_flight) {
+    if (!wait_stats() || g_role != Role::Emulation) return;
+    Timeline &t = g_tl;
+    const std::uint64_t now = now_ns(), w_now = emu_wait_total();
+    auto ms = [](std::uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+    if (t.armed) {   // this frame's timeline, from the previous vblank hand-over to this one
+        t.frames += 1;
+        t.frame_ms += ms(now - t.vblank);
+        t.in_flight += presents_in_flight;
+        if (t.have_first_draw) {   // vblank (with the present wait) up to the first drawing data of the new frame
+            t.draw_frames += 1;
+            t.to_draw_ms += ms(t.first_draw - t.vblank);
+            t.to_draw_wait += ms(t.w_first_draw - t.w_vblank);
+        }
+        if (t.have_finish) {
+            t.finish_frames += 1;
+            t.to_finish_ms += ms(t.finish - t.vblank);
+            t.to_finish_wait += ms(t.w_finish - t.w_vblank);
+            t.after_finish_ms += ms(now - t.finish);
+            t.after_finish_wait += ms(w_now - t.w_finish);
+        }
+    }
+    t.armed = true;
+    t.vblank = now;   // taken before post_present waits: the present wait belongs to the next gap
+    t.w_vblank = w_now;
+    t.have_finish = t.have_first_draw = false;
+    if (!t.period_start) {
+        t.period_start = now;
+        t.cpu_start = hitch::thread_cpu_ms();
+        return;
+    }
+    if (now - t.period_start < 1000000000ull) return;
+    const double seconds = ms(now - t.period_start) / 1000.0, f = t.frames > 0 ? t.frames : 1;
+    double per[2][kWaitKinds], count[2][kWaitKinds];
+    for (int r = 0; r < 2; ++r)
+        for (int k = 0; k < kWaitKinds; ++k) {
+            const std::uint64_t ns = g_wait_ns[r][k].load(), n = g_wait_n[r][k].load();
+            per[r][k] = ms(ns - t.seen_ns[r][k]) / f;
+            count[r][k] = static_cast<double>(n - t.seen_n[r][k]) / f;
+            t.seen_ns[r][k] = ns;
+            t.seen_n[r][k] = n;
+        }
+    const std::uint64_t window = g_window_busy_ns.load();
+    const double window_busy = ms(window - t.seen_window) / (seconds * 1000.0) * 100.0;
+    t.seen_window = window;
+    double emu_total = 0, vu_total = 0;
+    for (int k = 0; k < kWaitKinds; ++k) emu_total += per[0][k], vu_total += per[1][k];
+    std::fprintf(stderr,
+        "[wait-stats] f%u %.1f frames/s, %.2f ms/frame; emulation thread waits %.2f ms/frame (present %.2f in %.2f waits, download %.2f in %.2f, vu-fence+other %.2f in %.2f, state %.2f, ring-full %.2f); "
+        "vu thread ring-full wait %.2f ms/frame; window thread busy %.0f %%; pictures in flight at frame end %.2f\n",
+        frame, f / seconds, t.frame_ms / f, emu_total, per[0][1], count[0][1], per[0][2], count[0][2], per[0][0], count[0][0], per[0][3], per[0][4], per[1][4], window_busy, t.in_flight / f);
+    (void)vu_total;
+    const double cpu = hitch::thread_cpu_ms() - t.cpu_start;   // what the emulation thread really computed (its own CPU clock)
+    const double cpu_f = cpu / f, unexplained = t.frame_ms / f - cpu_f - emu_total;
+    t.cpu_start += cpu;
+    std::fprintf(stderr, "[wait-stats]   emulation thread: %.2f ms/frame of its own CPU time, %.2f ms/frame waiting (counted above), %.2f ms/frame neither (paused by the system, other waits)\n", cpu_f, emu_total, unexplained);
+    const double nf = t.finish_frames > 0 ? t.finish_frames : 1, nd = t.draw_frames > 0 ? t.draw_frames : 1;
+    std::fprintf(stderr,
+        "[wait-stats]   frame end (ms, wait inside it): vblank to the game's FINISH write %.2f (%.2f); FINISH write to the next vblank %.2f (%.2f); vblank to the first drawing data of the next frame %.2f (%.2f) [%.0f of %.0f frames had a FINISH]\n",
+        t.to_finish_ms / nf, t.to_finish_wait / nf, t.after_finish_ms / nf, t.after_finish_wait / nf, t.to_draw_ms / nd, t.to_draw_wait / nd, t.finish_frames, t.frames);
+    t.period_start = now;
+    t.frames = t.frame_ms = t.to_finish_ms = t.to_finish_wait = t.after_finish_ms = t.after_finish_wait = t.to_draw_ms = t.to_draw_wait = t.finish_frames = t.draw_frames = t.in_flight = 0;
+}
+
+
 // Page guards for the depth round trip: memory the game must not see before the drawing thread has caught up
 // is made inaccessible, and the first touch of it, by any thread and any code, lands in the handler, which makes it right and lets
 // the access go on. Windows only for now (a vectored handler runs before the crash filter of host/crash.cpp); elsewhere guard()
@@ -449,8 +571,6 @@ void on_guard_fault(bool (*handler)(std::uintptr_t address)) { g_guard_handler =
 std::size_t guard_page() { return 4096; }
 
 }
-
-#include "ps2/hitch.hpp"
 
 namespace ps2::hitch {
 

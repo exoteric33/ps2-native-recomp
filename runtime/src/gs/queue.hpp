@@ -112,7 +112,17 @@ bool active();
 bool vu_active();
 void post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, std::uint32_t bytes);
 
-void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen);
+// What a thread waits for, for PS2_WAIT_STATS=1. Other is the wait for the vector-unit thread's fence (system.cpp).
+enum class Wait : unsigned { Other, Present, Download, State, RingFull, Count };
+
+void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen, Wait why = Wait::Other);
 void notify(std::atomic<std::uint32_t> &value);
+
+// PS2_WAIT_STATS=1: once a second the emulation thread prints, per frame, how long it waited and for what, and the shape of the frame end
+// (the game's FINISH write to the next frame's first draw). Off unless set; the calls below return at once then.
+bool wait_stats();
+void note_finish();                                                         // the emulation thread saw a FINISH write
+void note_window_busy(std::uint64_t ns);                                    // the window thread worked this long on a batch of messages
+void stats_vblank(std::uint32_t frame, std::uint32_t presents_in_flight);   // the emulation thread, at the end of each frame
 
 }

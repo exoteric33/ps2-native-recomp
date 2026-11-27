@@ -347,7 +347,12 @@ void run_chain(int ch) {
             deliver_ring(ch, data, qwc);
             c.madr = ring(data + qwc * 16);
         } else {
-            deliver(ch, data, qwc);
+            // The depth round trip (issue #122): a REF to exactly a depth download's bytes that are still missing
+            // from main memory, sent as VIF1 DIRECT data (Digital Devil Saga loads its depth back so), goes as a ticket instead of a copy.
+            // A GIF channel chain needs nothing here: its data reach gif::out in place, which asks the same.
+            const std::uint8_t *ram = ch == 1 && (id == 3 || id == 4) && qwc && !(data & 0x80000000u) && (data & 0x7FFF0000u) != 0x11000000u ? g_ram + (data & (kRamSize - 16)) : nullptr;
+            gs::TripTicket ticket;
+            if (!(ram && gs::trip_match(ram, qwc, ticket) && vif::transfer_trip(1, ram, qwc, ticket))) deliver(ch, data, qwc);
             c.madr = data + qwc * 16;
         }
         if (vif_stalled(ch)) {

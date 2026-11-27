@@ -74,6 +74,23 @@ def main():
     if not notes or ' 0 uploads put back' in notes[-1]:
         print('the trip was never taken')
         failed += 1
+    # the depth sent back through VIF1 and GIF chains, in all three thread modes (issue #122: a deadlock and an uncaught round trip)
+    vcode0, vexact, _ = run(exe, 0, ['vif'], scale=o.scale)
+    vcode1, vtrip, _ = run(exe, 1, ['vif'], scale=o.scale)
+    # memory and buffer hashes must be equal; with the trip on, every threaded mode puts the depth back from the copy, with no guard stop
+    for a, b in zip(vexact, vtrip):
+        if 'memory' not in b:
+            ok = b.endswith(' 0 failed') and a.endswith(' 0 failed')
+        else:
+            ok = a.split('  put back')[0] == b.split('  put back')[0]
+            if 'one thread' not in b:
+                ok = ok and 'put back from the copy 1' in b and 'guard stops 0' in b
+        ok = ok and not b.startswith('HANG')
+        failed += not ok
+        print(('same  ' if ok else 'DIFF  ') + 'vif: ' + b + ('' if ok else '\n      exact: ' + a))
+    if vcode0 or vcode1 or not vtrip or len(vexact) != len(vtrip):
+        print('the vif run failed: exit %d / %d, %d / %d lines' % (vcode0, vcode1, len(vexact), len(vtrip)))
+        failed += 1
     if o.timing:
         for trip in (0, 1):
             _, out, _ = run(exe, trip, ['timing', str(o.timing)], scale=o.scale, log='0')

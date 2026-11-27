@@ -5,6 +5,9 @@
 namespace ps2::state {
 class Stream;
 }
+namespace ps2::gs {
+struct TripTicket;
+}
 
 namespace ps2::gif {
 
@@ -13,6 +16,9 @@ void state(ps2::state::Stream &s);
 void reset();
 void stats();
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc);
+// qwc quadwords of image data that are a depth download's bytes sent back unchanged, as a ticket instead of the bytes (gs.cpp):
+// VIF1 DIRECT data whose DMA came straight from those bytes, on the thread that runs VIF1 for real (vif.cpp).
+void transfer_ticket(int path, const gs::TripTicket &ticket, std::uint32_t qwc);
 // An XGKICK packet that did not end within VU1's data memory (kicked at `address`): end it, so the next kick starts a new packet
 void end_runaway_kick(std::uint32_t address);
 void render(int path, const std::uint8_t *data, std::uint32_t qwc);

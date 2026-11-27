@@ -179,6 +179,14 @@ struct Ctx {
     bool dry;
 };
 
+// The last quadwords of a DIRECT's data when they are not in the word stream (transfer_trip): a depth download's bytes still in main
+// memory on the emulation thread, their ticket on the vector thread (gs.cpp).
+struct Tail {
+    const std::uint8_t *bytes = nullptr;
+    const gs::TripTicket *ticket = nullptr;
+    std::uint32_t qwc = 0;
+};
+
 void flush_vu(int unit) {
     if (unit != 1) return;
     Unit &u = state(1);
@@ -478,7 +486,7 @@ std::uint32_t data_words(std::uint32_t cmd, const Unit &u) {
     }
 }
 
-void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c) {
+void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &c, const Tail *tail = nullptr) {
     Unit &u = c.u;
     const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
     if (unit == 1 && u.vu_pending) {
@@ -523,10 +531,19 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data, const Ctx &
         if (changed) vu::code_changed(unit);
         break;
     }
-    case 0x50: case 0x51:
-        if (c.dry) gif::scan_signals(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
-        else gif::transfer(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
+    case 0x50: case 0x51: {
+        const std::uint32_t head = (imm ? imm : 0x10000u) - (tail ? tail->qwc : 0u);
+        const std::uint8_t *bytes = reinterpret_cast<const std::uint8_t *>(data);
+        if (c.dry) {
+            gif::scan_signals(2, bytes, head);
+            if (tail) gif::scan_signals(2, tail->bytes, tail->qwc);  // image data: the scan does not read it
+        } else {
+            if (head) gif::transfer(2, bytes, head);
+            if (tail && tail->ticket) gif::transfer_ticket(2, *tail->ticket, tail->qwc);
+            else if (tail) gif::transfer(2, tail->bytes, tail->qwc);  // gif::out finds the trip's bytes and sends the ticket
+        }
         break;
+    }
     default:
         if ((op & 0x60u) == 0x60u) unpack(unit, cmd, data, c);
         else note_unknown(unit, cmd);
@@ -583,6 +600,43 @@ void process(int unit) {
     u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
 }
 
+// The depth round trip through VIF1 (transfer_trip): the unit waits in a DIRECT whose data has all come but exactly qwc quadwords
+// (whole quadwords of it before them).
+bool waits_for_direct(const Unit &u, std::uint32_t qwc) {
+    if (u.stalled || u.pending.empty()) return false;
+    const std::uint32_t cmd = u.pending[0], op = (cmd >> 24) & 0x7Fu;
+    const std::size_t before = u.pending.size() - 1;
+    return (op == 0x50 || op == 0x51) && before % 4 == 0 && data_words(cmd, u) == before + static_cast<std::size_t>(qwc) * 4;
+}
+
+// Runs that DIRECT with its last quadwords given apart, as run() would with all of them in the stream.
+void finish_direct(int unit, Unit &u, const Tail &tail, const Ctx &c) {
+    History &h = g_hist[hist_index(unit)];
+    const std::uint32_t cmd = u.pending[0];
+    h.received += static_cast<std::uint64_t>(tail.qwc) * 4;
+    h.last[h.head++ & 7u] = {cmd, data_words(cmd, u), h.received - u.pending.size() - static_cast<std::uint64_t>(tail.qwc) * 4};
+    execute(unit, cmd, u.pending.data() + 1, c, &tail);
+    u.pending.clear();
+}
+
+// transfer_trip's message to the vector thread: kVif1 with this bit in the word count, the ticket as its data.
+constexpr std::uint32_t kTicketWords = 0x80000000u;
+
+// The vector thread's side of transfer_trip.
+void take_ticket(const std::uint32_t *payload, std::uint32_t qwc) {
+    gs::TripTicket ticket;
+    std::memcpy(&ticket, payload, sizeof ticket);
+    Unit &u = state(1);
+    if (!waits_for_direct(u, qwc)) {  // never expected (both sides read the same stream): the bytes, as a copy would have brought them
+        std::vector<std::uint8_t> bytes = gs::trip_fetch(ticket);
+        bytes.resize(static_cast<std::size_t>(qwc) * 16);
+        transfer_words(1, reinterpret_cast<const std::uint32_t *>(bytes.data()), qwc * 4);
+        return;
+    }
+    const Tail tail{nullptr, &ticket, qwc};
+    finish_direct(1, u, tail, Ctx{u, true, false});
+}
+
 }
 
 void reset() {
@@ -631,6 +685,10 @@ void describe_vu1() {
 // `count` words, not quadwords: the 64 bits of a DMA tag that a chain with the tag transfer enabled sends ahead of its data are two
 // words, and a command waiting for data (an UNPACK that spans several tags) takes exactly those two.
 void transfer_words(int unit, const std::uint32_t *words, std::uint32_t count) {
+    if (count & kTicketWords) [[unlikely]] {  // the vector thread: a depth trip's ticket from transfer_trip
+        take_ticket(words, count & ~kTicketWords);
+        return;
+    }
     if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, count, 0, words, count * 4);
     Unit &u = state(unit);
     g_hist[hist_index(unit)].received += count;
@@ -647,6 +705,14 @@ void transfer_words(int unit, const std::uint32_t *words, std::uint32_t count) {
 
 void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
     transfer_words(unit, reinterpret_cast<const std::uint32_t *>(data), qwc * 4);
+}
+
+bool transfer_trip(int unit, const std::uint8_t *data, std::uint32_t qwc, const gs::TripTicket &ticket) {
+    if (unit != 1 || on_vu_thread() || !waits_for_direct(g_units[1], qwc)) return false;
+    if (shadow(1)) gs::queue::vu().post(gs::queue::kVif1, kTicketWords | qwc, 0, &ticket, sizeof ticket);
+    const Tail tail{data, nullptr, qwc};
+    finish_direct(1, g_units[1], tail, Ctx{g_units[1], false, shadow(1)});
+    return true;
 }
 
 // The DMA keeps sending into a stalled unit until the unit's FIFO is full.

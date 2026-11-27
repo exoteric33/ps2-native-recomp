@@ -440,12 +440,12 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
         return;
     }
     Held &h = g_held;
-    if (path & kTripFlag) [[unlikely]] {  // a depth trip's ticket (out() above), here on the vector thread
+    if (path & kTripFlag) [[unlikely]] {  // a depth trip's ticket (out() above, or VIF1 DIRECT data: transfer_ticket), here on the vector thread
+        if (h.flowing && !h.masked) {  // as below: once the mask is down, whatever is still held goes ahead of anything new
+            h.flowing = false;
+            release(false);
+        }
         if ((path & 3) == 3) {
-            if (h.flowing && !h.masked) {
-                h.flowing = false;
-                release(false);
-            }
             if (!h.data.empty() || (h.masked && !h.mid_packet) || h.left < qwc) {  // it would be held or cut: as bytes, then
                 gs::TripTicket ticket;
                 std::memcpy(&ticket, data, sizeof ticket);
@@ -481,6 +481,10 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
         qwc -= done;
     }
     h.data.insert(h.data.end(), data, data + static_cast<std::size_t>(qwc) * 16);
+}
+
+void transfer_ticket(int path, const gs::TripTicket &ticket, std::uint32_t qwc) {
+    transfer(path | kTripFlag, reinterpret_cast<const std::uint8_t *>(&ticket), qwc);
 }
 
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }

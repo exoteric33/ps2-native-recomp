@@ -1169,16 +1169,21 @@ Slot g_slots[kSlots];
 std::atomic<std::uint32_t> g_wants{0};
 std::uint32_t g_served = 0;
 
-// The emulation side: downloads whose bytes are not in main memory yet.
+// The emulation side: downloads whose bytes are not in main memory yet. A slot is free, armed (its bytes still missing, the pages
+// guarded) or being made right by one thread (resolve). Only the emulation thread arms; any thread that touches the pages makes them
+// right. The state changes under g_mutex, but nobody ever waits while holding it (issue #122: the emulation thread waited for the
+// drawing thread inside it while the vector thread, which has to pass the download on, blocked on it in trip_match). trip_match reads
+// a slot without the lock (state, id and bytes are atomics; it checks state and id again after reading the bytes).
+constexpr std::uint32_t kFree = 0, kArmed = 1, kResolving = 2;
 struct Armed {
-    bool on = false;
-    std::uint32_t id = 0;
-    std::uint8_t *lo = nullptr, *hi = nullptr;            // the bytes the download wrote
-    std::uint8_t *page_lo = nullptr, *page_hi = nullptr;  // the guarded pages around them
+    std::atomic<std::uint32_t> state{kFree}, id{0};
+    std::atomic<std::uint8_t *> lo{nullptr}, hi{nullptr};  // the bytes the download wrote
+    std::uint8_t *page_lo = nullptr, *page_hi = nullptr;  // the guarded pages around them (under g_mutex)
+    std::atomic<std::uint32_t> freed{0};                   // counts the times it was made right, for a thread that waits for another's
 };
 std::recursive_mutex g_mutex;
 Armed g_armed[kSlots];
-std::atomic<std::uint32_t> g_armed_count{0};
+std::atomic<std::uint32_t> g_armed_count{0};  // slots that are not free
 std::uint32_t g_next_id = 0;
 
 struct Counts {
@@ -1273,19 +1278,51 @@ std::vector<std::uint8_t> fetch(std::uint32_t k, std::uint32_t id) {
     return s.real;
 }
 
-// Puts the real bytes of every armed trip into main memory and drops the guards. g_mutex held.
-void resolve_all() {
-    for (std::uint32_t k = 0; k < kSlots; ++k) {
-        Armed &a = g_armed[k];
-        if (!a.on) continue;
-        const std::vector<std::uint8_t> real = fetch(k, a.id);
-        queue::guard(a.page_lo, static_cast<std::size_t>(a.page_hi - a.page_lo), false);
-        if (real.size() == static_cast<std::size_t>(a.hi - a.lo)) std::memcpy(a.lo, real.data(), real.size());
-        a.on = false;
-        g_armed_count.fetch_sub(1);
-        g_counts.resolved.fetch_add(1);
+// Makes right every trip pick() chooses (called under g_mutex for each slot that is not free): an armed one is marked as being made
+// right, its real bytes are taken from the drawing thread (waiting for it if need be) with g_mutex released, then written into main
+// memory and the guard dropped; one that another thread is making right is waited for (on its count, not on the mutex). So no thread
+// ever waits for the drawing thread while holding g_mutex.
+template <class Pick>
+void resolve(Pick pick) {
+    for (;;) {
+        std::uint32_t mine[kSlots], ids[kSlots], n = 0, theirs = kSlots, seen = 0;
+        {
+            std::lock_guard lock(g_mutex);
+            for (std::uint32_t k = 0; k < kSlots; ++k) {
+                Armed &a = g_armed[k];
+                const std::uint32_t state = a.state.load();
+                if (state == kFree || !pick(a)) continue;
+                if (state == kArmed) {
+                    a.state.store(kResolving);
+                    ids[n] = a.id.load();
+                    mine[n++] = k;
+                } else if (theirs == kSlots) {
+                    theirs = k;
+                    seen = a.freed.load();
+                }
+            }
+        }
+        if (!n && theirs == kSlots) return;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const std::vector<std::uint8_t> real = fetch(mine[i], ids[i]);
+            std::lock_guard lock(g_mutex);
+            Armed &a = g_armed[mine[i]];
+            std::uint8_t *lo = a.lo.load(), *hi = a.hi.load();
+            queue::guard(a.page_lo, static_cast<std::size_t>(a.page_hi - a.page_lo), false);
+            if (real.size() == static_cast<std::size_t>(hi - lo)) std::memcpy(lo, real.data(), real.size());
+            a.state.store(kFree);
+            g_armed_count.fetch_sub(1);
+            g_counts.resolved.fetch_add(1);
+            a.freed.fetch_add(1);
+            queue::notify(a.freed);
+        }
+        if (theirs != kSlots) {
+            if (queue::role() == queue::Role::Vu) queue::outbox().flush();  // its held batch may hold the download the other thread waits for
+            Armed &a = g_armed[theirs];
+            for (std::uint32_t f = a.freed.load(); f == seen; f = a.freed.load()) queue::wait(a.freed, f, queue::Wait::Download);
+        }
+        report();
     }
-    report();
 }
 
 std::uint8_t *page_down(std::uint8_t *p) { return reinterpret_cast<std::uint8_t *>(reinterpret_cast<std::uintptr_t>(p) & ~(queue::guard_page() - 1)); }
@@ -1294,27 +1331,25 @@ std::uint8_t *page_up(std::uint8_t *p) { return page_down(p + queue::guard_page(
 bool on_fault(std::uintptr_t address) {
     const std::uintptr_t ram = reinterpret_cast<std::uintptr_t>(g_ram);
     if (address < ram || address >= ram + kRamSize) return false;
-    std::lock_guard lock(g_mutex);
     g_counts.touches.fetch_add(1);
-    for (const Armed &a : g_armed)
-        if (a.on && address >= reinterpret_cast<std::uintptr_t>(a.page_lo) && address < reinterpret_cast<std::uintptr_t>(a.page_hi)) {
-            resolve_all();
-            return true;
-        }
-    // Nothing armed there (any more): another thread made it right meanwhile. Nothing else guards main memory, so open the page.
-    queue::guard(page_down(reinterpret_cast<std::uint8_t *>(address)), queue::guard_page(), false);
-    return true;
+    const auto covers = [&](const Armed &a) { return address >= reinterpret_cast<std::uintptr_t>(a.page_lo) && address < reinterpret_cast<std::uintptr_t>(a.page_hi); };
+    for (;;) {
+        resolve(covers);
+        std::lock_guard lock(g_mutex);
+        bool held = false;
+        for (const Armed &a : g_armed) held = held || (a.state.load() != kFree && covers(a));
+        if (held) continue;  // armed again meanwhile: that one too
+        // Nothing holds the page (any more): it was made right just now or by another thread meanwhile. Nothing else guards main
+        // memory, so open the page.
+        queue::guard(page_down(reinterpret_cast<std::uint8_t *>(address)), queue::guard_page(), false);
+        return true;
+    }
 }
 
-// Emulation side: any armed trip whose pages meet these bytes is made right first (a download into that memory).
+// Emulation side: every trip whose pages meet these bytes is made right first (a download into that memory).
 void touch(const std::uint8_t *data, std::size_t bytes) {
     if (!g_armed_count.load(std::memory_order_acquire)) return;
-    std::lock_guard lock(g_mutex);
-    for (const Armed &a : g_armed)
-        if (a.on && a.page_lo < data + bytes && data < a.page_hi) {
-            resolve_all();
-            return;
-        }
+    resolve([&](const Armed &a) { return a.page_lo < data + bytes && data < a.page_hi; });
 }
 
 // Emulation side, for a depth download: true when it was left to the drawing thread.
@@ -1326,33 +1361,44 @@ bool arm(const DownloadKey &key, std::uint8_t *data, std::uint32_t qwords) {
     if (page_lo < g_ram || page_hi > g_ram + kRamSize) return false;
     static const bool handler = (queue::on_guard_fault(on_fault), true);
     (void)handler;
-    std::lock_guard lock(g_mutex);
-    for (Armed &a : g_armed) {
-        if (!a.on || a.page_hi <= page_lo || page_hi <= a.page_lo) continue;
-        if (a.lo == lo && a.hi == hi) {  // the same bytes again: the new download overwrites all of them, so the old ones are never seen
-            a.on = false;
-            g_armed_count.fetch_sub(1);
+    const auto meets = [&](const Armed &a) { return a.page_lo < page_hi && page_lo < a.page_hi; };
+    // the same bytes again: the new download overwrites all of them, so the old ones are never seen; it takes the old one's slot
+    const auto same = [&](const Armed &a) { return a.state.load() == kArmed && a.lo.load() == lo && a.hi.load() == hi; };
+    for (bool full = false;;) {
+        // Trips in the way are made right first, with g_mutex released (only this thread arms, so they stay so).
+        resolve([&](const Armed &a) { return full || (meets(a) && !same(a)); });
+        std::lock_guard lock(g_mutex);
+        std::uint32_t slot = kSlots;
+        bool busy = false;
+        for (std::uint32_t k = 0; k < kSlots; ++k) {
+            const Armed &a = g_armed[k];
+            if (same(a)) slot = k;
+            else if (a.state.load() != kFree && meets(a)) busy = true;  // another thread began to make it right meanwhile
+        }
+        if (busy) continue;
+        for (std::uint32_t k = 0; k < kSlots && slot == kSlots; ++k)
+            if (g_armed[k].state.load() == kFree) slot = k;
+        if (slot == kSlots) {  // all four in use: make them right first
+            full = true;
             continue;
         }
-        resolve_all();
-        break;
+        if (!queue::guard(page_lo, static_cast<std::size_t>(page_hi - page_lo), true)) return false;
+        Armed &a = g_armed[slot];
+        const bool replaced = a.state.load() == kArmed;
+        if (!++g_next_id) ++g_next_id;
+        a.id.store(g_next_id);
+        a.lo.store(lo);
+        a.hi.store(hi);
+        a.page_lo = page_lo;
+        a.page_hi = page_hi;
+        if (!replaced) g_armed_count.fetch_add(1);
+        a.state.store(kArmed);
+        const Payload p{key.buf, key.pos, key.reg, slot, g_next_id};
+        queue::post(queue::kDownloadTrip, qwords, 0, &p, sizeof p);
+        g_counts.kept.fetch_add(1);
+        report();
+        return true;
     }
-    std::uint32_t slot = kSlots;
-    for (std::uint32_t k = 0; k < kSlots && slot == kSlots; ++k)
-        if (!g_armed[k].on) slot = k;
-    if (slot == kSlots) {
-        resolve_all();
-        slot = 0;
-    }
-    if (!queue::guard(page_lo, static_cast<std::size_t>(page_hi - page_lo), true)) return false;
-    if (!++g_next_id) ++g_next_id;
-    g_armed[slot] = Armed{true, g_next_id, lo, hi, page_lo, page_hi};
-    g_armed_count.fetch_add(1);
-    const Payload p{key.buf, key.pos, key.reg, slot, g_next_id};
-    queue::post(queue::kDownloadTrip, qwords, 0, &p, sizeof p);
-    g_counts.kept.fetch_add(1);
-    report();
-    return true;
 }
 #else
 void serve_all() {}
@@ -1362,21 +1408,33 @@ bool arm(const DownloadKey &, std::uint8_t *, std::uint32_t) { return false; }
 }  // namespace trip
 }  // namespace
 
+// Without g_mutex: any thread may ask at any time (gif::out on the vector thread, for every XGKICK while a trip is armed), and the
+// answer "no" is always safe (the real bytes go, and a touch of them makes them right first).
 bool trip_match(const std::uint8_t *data, std::uint32_t qwc, TripTicket &ticket) {
 #ifdef PS2_GPU
     if (!trip::g_armed_count.load(std::memory_order_acquire)) return false;
-    std::lock_guard lock(trip::g_mutex);
+    const std::uint8_t *end = data + static_cast<std::size_t>(qwc) * 16;
     for (std::uint32_t k = 0; k < trip::kSlots; ++k) {
         const trip::Armed &a = trip::g_armed[k];
-        if (a.on && a.lo == data && a.hi == data + static_cast<std::size_t>(qwc) * 16) {
-            ticket = TripTicket{k, a.id};
-            return true;
-        }
+        if (a.state.load() != trip::kArmed) continue;
+        const std::uint32_t id = a.id.load();
+        if (a.lo.load() != data || a.hi.load() != end || a.state.load() != trip::kArmed || a.id.load() != id) continue;
+        ticket = TripTicket{k, id};
+        return true;
     }
 #else
     (void)data, (void)qwc, (void)ticket;
 #endif
     return false;
+}
+
+TripCounts trip_counts() {
+#ifdef PS2_GPU
+    const trip::Counts &c = trip::g_counts;
+    return TripCounts{c.kept.load(), c.restored.load(), c.uploaded.load(), c.resolved.load(), c.touches.load()};
+#else
+    return {};
+#endif
 }
 
 std::vector<std::uint8_t> trip_fetch(const TripTicket &ticket) {
@@ -1393,7 +1451,7 @@ bool trip_restore(const TripTicket &ticket, std::uint32_t qwc) {
     trip::Slot &s = trip::g_slots[ticket.slot % trip::kSlots];
     if (s.id != ticket.id || !s.saved || static_cast<std::size_t>(qwc) * 16 != s.bytes) return false;
     const std::uint64_t buf = g_state.bitbltbuf, pos = g_state.trxpos, reg = g_state.trxreg;
-    const bool same = g_transfer.active && (g_state.trxdir & 3u) == 0 && ((buf >> 32) & 0x3FFFu) == (s.buf & 0x3FFFu) && ((buf >> 48) & 0x3Fu) == ((s.buf >> 16) & 0x3Fu) &&
+    const bool same = g_transfer.active && (g_state.trxdir & 3u) == 0 && g_transfer.x == 0 && g_transfer.y == 0 && ((buf >> 32) & 0x3FFFu) == (s.buf & 0x3FFFu) && ((buf >> 48) & 0x3Fu) == ((s.buf >> 16) & 0x3Fu) &&
                       ((buf >> 56) & 0x3Fu) == ((s.buf >> 24) & 0x3Fu) && ((pos >> 32) & 0x7FFu) == (s.pos & 0x7FFu) && ((pos >> 48) & 0x7FFu) == ((s.pos >> 16) & 0x7FFu) &&
                       (reg & 0xFFFu) == (s.reg & 0xFFFu) && ((reg >> 32) & 0xFFFu) == ((s.reg >> 32) & 0xFFFu);
     if (!same || !gpu::trip_restore(ticket.slot % trip::kSlots, s.first, s.bytes)) return false;

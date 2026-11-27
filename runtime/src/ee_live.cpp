@@ -16,6 +16,7 @@ void frame_tick() {}
 #include "live_build.hpp"
 
 #include "eerecomp_gen.hpp"
+#include "r5900.hpp"
 #include "ps2/crash.hpp"
 #include "ps2/ee_live_abi.hpp"
 #include "ps2/generated.hpp"
@@ -416,6 +417,63 @@ void ensure_analysis() {
     } catch (const std::exception &e) {
         say("cannot read the program for its calls into the window: %s", e.what());
     }
+}
+
+// How far code_stretch looks from a miss, each way. The stretch only bounds where pointers in memory may name a function (they must also
+// follow a return and decode as code); what is translated is what those functions reach, not the stretch.
+constexpr std::uint32_t kStretchReach = 0x20000;
+constexpr std::uint32_t kStretchZeros = 16;   // more zero words in a row than padding between functions: the code ends there
+
+// The stretch of code around `pc` inside [lo, hi), for a miss in the program's own code outside the stretch the build's analysis reached
+// (a list of start-up routines the build never saw, issue 147: one stop per routine). It runs word by word both ways from the miss while
+// the words decode as instructions, and ends at the first one that does not (a float, text, a table) or at a long run of zeros, at most
+// kStretchReach each way. Its end is the last return (and delay slot) before that, so a function cut off by the cap is not taken.
+std::pair<std::uint32_t, std::uint32_t> code_stretch(std::uint32_t pc, std::uint32_t lo, std::uint32_t hi) {
+    constexpr std::uint32_t kJrRa = 0x03E00008u;
+    const auto word = [](std::uint32_t at) {
+        std::uint32_t w;
+        std::memcpy(&w, g_ram + at, 4);
+        return w;
+    };
+    const auto code = [&](std::uint32_t at) { return recomp::decode(word(at), at).op != recomp::Op::Invalid; };
+    pc &= ~3u;
+    hi = std::min(hi, kRamSize);
+    if (pc < lo || pc >= hi) return {pc, pc};
+    std::uint32_t end = pc, zeros = 0;
+    for (std::uint32_t at = pc; at + 8 <= hi && at - pc < kStretchReach && code(at); at += 4) {
+        zeros = word(at) ? 0 : zeros + 1;
+        if (zeros > kStretchZeros) break;
+        if (word(at) == kJrRa) end = at + 8;
+    }
+    std::uint32_t begin = pc;
+    zeros = 0;
+    for (std::uint32_t at = pc; at >= lo + 4 && pc - (at - 4) <= kStretchReach && code(at - 4); at -= 4) {
+        zeros = word(at - 4) ? 0 : zeros + 1;
+        if (zeros > kStretchZeros) break;
+        begin = at - 4;
+    }
+    return {begin, std::max(end, pc + 4)};
+}
+
+// The code of the program for a translation of its own segment (limit_to_new_code): the stretch its analysis reached, the rest of the
+// segment is data. A miss outside that stretch brings the code around it in too (code_stretch), so that the pointers in memory to its
+// neighbours count: a list of start-up routines then comes in one stop, not one stop per routine.
+void program_code_range(recomp::LiveRequest &request, const std::vector<std::uint32_t> &misses) {
+    ensure_analysis();
+    if (!g->program_analysis) return;
+    auto [begin, end] = g->program_analysis->code_range();
+    if (begin >= end) return;
+    const std::uint32_t image_end = request.base + static_cast<std::uint32_t>(request.image.size());
+    static const bool no_stretch = !ps2::os::env("PS2_EE_LIVE_NO_STRETCH").empty();   // debugging: the build's stretch only, as before issue 147
+    for (const std::uint32_t pc : misses) {
+        if (pc >= begin && pc < end) continue;
+        const auto [first, last] = no_stretch ? std::pair{pc, pc + 4} : code_stretch(pc, request.base, image_end);
+        if (g->verbose) say("0x%08X lies outside the code the build reached (0x%08X to 0x%08X): the code around it, 0x%08X to 0x%08X, counts too", pc, begin, end, first, last);
+        begin = std::min(begin, first);
+        end = std::max(end, last);
+    }
+    request.text_begin = begin;
+    request.text_end = end;
 }
 
 // The part of the work that needs the program analysis: the calls the program itself makes into the window and what entries.txt knows
@@ -1138,13 +1196,8 @@ std::vector<std::uint32_t> served_calls(const std::vector<std::uint8_t> &image, 
 // (tables, strings, the game's variables), and a word of memory that points into the data is a number, not a function. What is served
 // already is left alone (served_calls). The checks are the first words of the entries, as for any image with data between its code: a
 // guess that was data and is rewritten takes only its own entry out.
-void limit_to_new_code(recomp::LiveRequest &request) {
-    ensure_analysis();
-    if (g->program_analysis) {
-        const auto [begin, end] = g->program_analysis->code_range();
-        request.text_begin = begin;
-        request.text_end = end;
-    }
+void limit_to_new_code(recomp::LiveRequest &request, const std::vector<std::uint32_t> &misses) {
+    program_code_range(request, misses);
     request.sparse_checks = true;
     request.served = served_calls(request.image, request.base);
 }
@@ -1185,7 +1238,7 @@ void translate_program_calls(const std::vector<std::uint8_t> &image, std::uint32
         request.focused = true;
         request.entries = mine;
         request.candidates = function_starts(pointers_into(request.base, static_cast<std::uint32_t>(request.image.size())));
-        limit_to_new_code(request);
+        limit_to_new_code(request, mine);
         const auto began = Clock::now();
         const Built built = while_pumping([&] { return build_library(request, "functions of the program that " + std::to_string(mine.size()) + " calls reach", false, nullptr, nullptr); });
         std::size_t modules = 0;
@@ -1283,7 +1336,7 @@ bool translate_missing(std::uint32_t pc) {
     static const bool force_focus = !ps2::os::env("PS2_EE_LIVE_FOCUS").empty();   // debugging: every miss translates only what it reaches
     request.focused = region || whole_done || force_focus;
     request.sparse_checks = flat;
-    if (region) limit_to_new_code(request);
+    if (region) limit_to_new_code(request, {pc});
     const auto pointers_began = Clock::now();
     request.candidates = pointers_into(base, size);
     if (g->verbose && region) say("%zu pointers into the program's code, %zu of them follow a return", request.candidates.size(), function_starts(request.candidates).size());

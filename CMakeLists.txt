@@ -156,6 +156,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2eeliveupgradetest PRIVATE synchronization)
     endif()
+    # A list of start-up routines outside what the build's analysis reached comes in with one stop of the live translator, a made-up
+    # program, needs a C++ compiler on the PATH: ninja ps2eelivelisttest
+    add_executable(ps2eelivelisttest EXCLUDE_FROM_ALL tests/ee_live_list.cpp)
+    target_link_libraries(ps2eelivelisttest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2eelivelisttest PRIVATE synchronization)
+    endif()
 endif()
 # the IOP thread manager tested through a synthetic module, no game needed: ninja ps2thbasetest
 if(NOT EMSCRIPTEN)

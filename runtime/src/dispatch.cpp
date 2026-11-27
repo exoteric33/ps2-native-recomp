@@ -341,8 +341,12 @@ void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
                 const UnitInfo *mu = nullptr;
                 const std::uint16_t entry = module_entry(*m, pc, mu);
                 c.base = base;
-                mu->function(c, entry, depth);
-                return;
+                // A tail call, as for the program's own units below: translated code comes here for every jump its unit does not serve, and
+                // a plain call would keep this frame (224 bytes) until the game's function returns. A loop that jumps between a code window and
+                // other code then grows the stack by that much a round and overflowed even the emulation thread's 64 MB (issue #114,
+                // Medal of Honor: Vanguard's loader window; tests/dispatch_stack.cpp). module_entry() takes mu by reference, so the compiler
+                // did not make this a tail call by itself.
+                [[clang::musttail]] return mu->function(c, entry, depth);
             }
             // Code the build does not have: translate it now, while the game waits, and look again (ee_live.cpp, docs/ee-live.md).
             if (translated || !ee::live::translate_missing(pc)) break;
@@ -357,13 +361,14 @@ void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
         c.pc = pc | kUnwind;
         return;
     }
-    u->function(c, id, depth);
+    // A tail call in every build (an optimised one made it one by itself, a debug build would not)
+    [[clang::musttail]] return u->function(c, id, depth);
 }
 
 void call(Cpu &c, std::uint32_t target, std::uint32_t depth) {
     c.pc = target;
     if (depth >= kMaxDepth) return;
-    dispatch(c, 0, depth);
+    [[clang::musttail]] return dispatch(c, 0, depth);
 }
 
 void bad_entry(Cpu &c, std::uint32_t unit_base) {

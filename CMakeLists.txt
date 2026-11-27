@@ -152,6 +152,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2dispatchmoduletest PRIVATE synchronization)
     endif()
+    # dispatch() into a code window keeps no stack per jump (issue #114): made-up window and program code jumping to each other a
+    # million times on the emulation thread's 64 MB stack, no game needed: ninja ps2dispatchstacktest
+    add_executable(ps2dispatchstacktest EXCLUDE_FROM_ALL tests/dispatch_stack.cpp)
+    target_link_libraries(ps2dispatchstacktest PRIVATE ps2runtime Threads::Threads)
+    if(WIN32)
+        target_link_libraries(ps2dispatchstacktest PRIVATE synchronization)
+    endif()
     # The optimised library after a quick one serves what the quick one did, a made-up program and code image, needs a C++ compiler on
     # the PATH and takes a minute or two: ninja ps2eeliveupgradetest
     add_executable(ps2eeliveupgradetest EXCLUDE_FROM_ALL tests/ee_live_upgrade.cpp)
@@ -178,6 +185,10 @@ if(NOT EMSCRIPTEN)
     # the emulation thread's big stack (host/big_stack_thread.hpp), no game and no runtime needed: ninja ps2bigstacktest
     add_executable(ps2bigstacktest EXCLUDE_FROM_ALL tests/big_stack.cpp)
     target_link_libraries(ps2bigstacktest PRIVATE pthread)
+    # the same with the system's default thread stack: it must crash with a stack overflow, which shows the test above can fail
+    add_executable(ps2bigstacktest_small EXCLUDE_FROM_ALL tests/big_stack.cpp)
+    target_compile_definitions(ps2bigstacktest_small PRIVATE PS2_SMALL_STACK)
+    target_link_libraries(ps2bigstacktest_small PRIVATE pthread)
     # the memory card file and save state writes, no game needed: ninja ps2savetest
     add_executable(ps2savetest EXCLUDE_FROM_ALL tests/save_files.cpp)
     target_include_directories(ps2savetest PRIVATE runtime/src)

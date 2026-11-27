@@ -52,5 +52,8 @@ void pace_setup(int every, const char *source);
 int pace_every();
 void pace_picture();
 void pace_report();
+// The running totals behind it: refreshes in which the shown buffer changed, and refreshes (the PS2_WAIT_STATS line uses them).
+std::uint64_t pace_pictures();
+std::uint64_t pace_refreshes();
 
 }

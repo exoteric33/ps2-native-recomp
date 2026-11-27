@@ -123,6 +123,8 @@ void notify(std::atomic<std::uint32_t> &value);
 bool wait_stats();
 void note_finish();                                                         // the emulation thread saw a FINISH write
 void note_window_busy(std::uint64_t ns);                                    // the window thread worked this long on a batch of messages
-void stats_vblank(std::uint32_t frame, std::uint32_t presents_in_flight);   // the emulation thread, at the end of each frame
+// the emulation thread, at the end of each frame; pictures and refreshes are the game's running totals (kernel pace counters), so the
+// line can say how many new pictures the game showed that second
+void stats_vblank(std::uint32_t frame, std::uint32_t presents_in_flight, std::uint64_t pictures, std::uint64_t refreshes);
 
 }

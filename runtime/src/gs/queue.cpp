@@ -82,6 +82,7 @@ struct Timeline {
     double frames = 0, frame_ms = 0, to_finish_ms = 0, to_finish_wait = 0, after_finish_ms = 0, after_finish_wait = 0, to_draw_ms = 0, to_draw_wait = 0, finish_frames = 0, draw_frames = 0, in_flight = 0;
     double cpu_start = 0;
     std::uint64_t period_start = 0, seen_ns[2][kWaitKinds] = {}, seen_n[2][kWaitKinds] = {}, seen_window = 0;
+    std::uint64_t seen_pictures = 0, seen_refreshes = 0;            // the game's picture count (kernel pace counters) at the period start
 } g_tl;
 
 #if defined(__linux__) && !defined(__EMSCRIPTEN__)
@@ -474,7 +475,7 @@ void note_window_busy(std::uint64_t ns) {
     if (wait_stats()) g_window_busy_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
-void stats_vblank(std::uint32_t frame, std::uint32_t presents_in_flight) {
+void stats_vblank(std::uint32_t frame, std::uint32_t presents_in_flight, std::uint64_t pictures, std::uint64_t refreshes) {
     if (!wait_stats() || g_role != Role::Emulation) return;
     Timeline &t = g_tl;
     const std::uint64_t now = now_ns(), w_now = emu_wait_total();
@@ -503,6 +504,8 @@ void stats_vblank(std::uint32_t frame, std::uint32_t presents_in_flight) {
     if (!t.period_start) {
         t.period_start = now;
         t.cpu_start = hitch::thread_cpu_ms();
+        t.seen_pictures = pictures;
+        t.seen_refreshes = refreshes;
         return;
     }
     if (now - t.period_start < 1000000000ull) return;
@@ -521,10 +524,19 @@ void stats_vblank(std::uint32_t frame, std::uint32_t presents_in_flight) {
     t.seen_window = window;
     double emu_total = 0, vu_total = 0;
     for (int k = 0; k < kWaitKinds; ++k) emu_total += per[0][k], vu_total += per[1][k];
+    // The game's own picture rate this second: refreshes in which the shown buffer changed. Fewer pictures than refreshes while the frame
+    // rate holds means the game itself drops pictures; a low frame rate means the PC falls behind. A game that copies every picture into
+    // one shown buffer never changes it (pictures stays 0 for the whole run): no count then.
+    char game[64];
+    if (pictures) std::snprintf(game, sizeof game, "game pictures %llu of %llu refreshes", static_cast<unsigned long long>(pictures - t.seen_pictures),
+                                static_cast<unsigned long long>(refreshes - t.seen_refreshes));
+    else std::snprintf(game, sizeof game, "game pictures unknown (one shown buffer)");
+    t.seen_pictures = pictures;
+    t.seen_refreshes = refreshes;
     std::fprintf(stderr,
-        "[wait-stats] f%u %.1f frames/s, %.2f ms/frame; emulation thread waits %.2f ms/frame (present %.2f in %.2f waits, download %.2f in %.2f, vu-fence+other %.2f in %.2f, state %.2f, ring-full %.2f); "
+        "[wait-stats] f%u %.1f frames/s, %s, %.2f ms/frame; emulation thread waits %.2f ms/frame (present %.2f in %.2f waits, download %.2f in %.2f, vu-fence+other %.2f in %.2f, state %.2f, ring-full %.2f); "
         "vu thread ring-full wait %.2f ms/frame; window thread busy %.0f %%; pictures in flight at frame end %.2f\n",
-        frame, f / seconds, t.frame_ms / f, emu_total, per[0][1], count[0][1], per[0][2], count[0][2], per[0][0], count[0][0], per[0][3], per[0][4], per[1][4], window_busy, t.in_flight / f);
+        frame, f / seconds, game, t.frame_ms / f, emu_total, per[0][1], count[0][1], per[0][2], count[0][2], per[0][0], count[0][0], per[0][3], per[0][4], per[1][4], window_busy, t.in_flight / f);
     (void)vu_total;
     const double cpu = hitch::thread_cpu_ms() - t.cpu_start;   // what the emulation thread really computed (its own CPU clock)
     const double cpu_f = cpu / f, unexplained = t.frame_ms / f - cpu_f - emu_total;

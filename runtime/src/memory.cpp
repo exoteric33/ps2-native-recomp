@@ -4,6 +4,7 @@
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -206,8 +207,17 @@ void trap_unmapped(const char *what, std::uint32_t a) {
     std::fprintf(stderr, "\n");
 }
 
+// An access to an address that is not memory: the first 20 print, then one at each power of two with the running count, and
+// unmapped_report gives the total at the end of the run. A game that repeats a bad store millions of times (WRC 4 in the interpreter,
+// issue #127) filled the runner's 64 MB log with this one line. Only the printing is limited; the access does the same as before.
+std::atomic<std::uint64_t> g_unmapped{0};
+
 void unmapped(const char *what, std::uint32_t a) {
-    std::fprintf(stderr, "[mem] %s at unmapped 0x%08X (pc 0x%08X)\n", what, a, g_cpu.pc);
+    const std::uint64_t n = g_unmapped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n < 20) std::fprintf(stderr, "[mem] %s at unmapped 0x%08X (pc 0x%08X)\n", what, a, g_cpu.pc);
+    else if (n == 20) std::fprintf(stderr, "[mem] %s at unmapped 0x%08X (pc 0x%08X); 20 so far, from now on only every power of two prints\n", what, a, g_cpu.pc);
+    else if ((n & (n - 1)) == 0)
+        std::fprintf(stderr, "[mem] %s at unmapped 0x%08X (pc 0x%08X); %llu so far\n", what, a, g_cpu.pc, static_cast<unsigned long long>(n));
     trap_unmapped(what, a);
 }
 
@@ -250,6 +260,12 @@ void write_slow(std::uint32_t a, T v) {
     unmapped("write", a);
 }
 
+}
+
+void unmapped_report() {
+    if (const std::uint64_t n = g_unmapped.load(std::memory_order_relaxed))
+        std::fprintf(stderr, "[mem] %llu accesses to unmapped addresses in this run%s\n", static_cast<unsigned long long>(n),
+                     n > 20 ? " (the first 20 printed, then one at each power of two)" : "");
 }
 
 std::uint32_t physical(std::uint32_t a) {

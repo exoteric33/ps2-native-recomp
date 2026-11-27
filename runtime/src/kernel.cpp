@@ -810,6 +810,9 @@ void pace_picture() {
     g_reschedule = true;  // served at the next safe point (service), at most one time slice later
 }
 
+std::uint64_t pace_pictures() { return g_pace_count.pictures; }
+std::uint64_t pace_refreshes() { return g_pace_count.refreshes; }
+
 void pace_report() {
     const pace::Count &n = g_pace_count;
     if (!n.refreshes) return;

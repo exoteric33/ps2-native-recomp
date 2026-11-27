@@ -30,6 +30,8 @@ extern std::uint32_t g_watch_base, g_watch_end;
 void watch_hit(std::uint32_t a, std::uint32_t v, const char *via);
 void watch_span(std::uint32_t a, std::uint32_t n, const char *via);
 void init_watch();
+// The end-of-run line: how many accesses went to an address that is not memory (each one prints only up to a limit, memory.cpp).
+void unmapped_report();
 
 template <typename T>
 inline bool watched(std::uint32_t a, std::uint32_t v) {

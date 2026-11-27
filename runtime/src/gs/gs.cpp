@@ -1868,7 +1868,8 @@ void post_present() {
     const DisplayRegs regs = display_regs();
     queue::post(queue::kPresent, static_cast<std::uint32_t>(frame_count()), 0, &regs, sizeof regs);
     ++g_posted_presents;
-    queue::stats_vblank(static_cast<std::uint32_t>(frame_count()), g_posted_presents - g_presented.load());   // PS2_WAIT_STATS only
+    queue::stats_vblank(static_cast<std::uint32_t>(frame_count()), g_posted_presents - g_presented.load(), kernel::pace_pictures(),
+                        kernel::pace_refreshes());   // PS2_WAIT_STATS only
     for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done, queue::Wait::Present);
 }
 

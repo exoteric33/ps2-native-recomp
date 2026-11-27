@@ -973,6 +973,7 @@ int run() {
     }
     gs::stats();
     kernel::pace_report();
+    unmapped_report();
     ipu::stats();
     if (const std::string path = os::env("PS2_DUMP_AUDIO"); !path.empty()) iop::spu2::dump_audio(path.c_str());
     if (std::getenv("PS2_TRACE_SPU2")) iop::spu2::dump_voices();

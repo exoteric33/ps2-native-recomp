@@ -1154,17 +1154,38 @@ struct Attr {
 var<private> pix_fl: Loc;
 var<private> pix_zl: Loc;
 
-fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
+// The scissor, the scan mask and the depth test of a pixel, done by shade_at as soon as the shape's depth there is known, before its colour
+// and texture coordinates are worked out (plot then skips them). They only read, so doing them first changes nothing drawn; but in the God of
+// War fights every covered pixel of a third of the (shape, 8 x 2 group) pairs fails the depth test, and such a group now leaves before the
+// attribute sums.
+fn early(s: Setup, x: i32, y: i32, k: u32, zin: u32) -> bool {
     if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) {
-        return;
+        return false;
     }
     let scanmsk = mode(s, 28u, 2u);
     if (scanmsk == 2u && (y & 1) == 0) {
-        return;
+        return false;
     }
     if (scanmsk == 3u && (y & 1) != 0) {
-        return;
+        return false;
     }
+    if (has(s, F_ZTE)) {
+        let ztst = mode(s, 8u, 2u);
+        if (ztst == 0u) {
+            return false;
+        }
+        if (ztst != 1u) {
+            let z = min(zin, s.zmax);
+            let old = load_at(pix_zl, k) & s.zmax;
+            if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     let ux = u32(x);
     let uy = u32(y);
     let z = min(at.z, s.zmax);
@@ -1183,17 +1204,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
 
     let zte = has(s, F_ZTE);
     if (zte) {
-        let ztst = mode(s, 8u, 2u);
-        if (ztst == 0u) {
-            return;
-        }
         zl = pix_zl;
-        if (ztst != 1u) {
-            let old = load_at(zl, k) & s.zmax;
-            if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
-                return;
-            }
-        }
     }
 
     var r = i32(at.r);
@@ -1539,6 +1550,10 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let w0 = cross2(x1 - qx, y2 - qy, x2 - qx, y1 - qy) * inv;
             let w1 = cross2(x2 - qx, y0 - qy, x0 - qx, y2 - qy) * inv;
             let w2 = 1.0 - w0 - w1;
+            let tz = z_at(p, sum2(fat(p + 25u), fat(p + 26u), w1, w2));
+            if (!early(s, x, y, k, tz)) {
+                return;
+            }
             // Colour and fog as the first vertex's value plus weighted differences, like the depth: a value that is the same
             // at all vertices (flat shading) comes out exactly instead of a hair below, which truncation would turn into one
             // less (raster.cpp, lerp3).
@@ -1549,13 +1564,19 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let t2 = vertex_tex(p, 2u);
             var t = weighted4(t0, t1, t2, w0, w1, w2);
             t.w = bary1(t0.w, t1.w, t2.w, w1, w2);
-            at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, z_at(p, sum2(fat(p + 25u), fat(p + 26u), w1, w2)));
+            at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, tz);
         }
         case 1u {
             let x0 = fat(p + 4u);
             let y0 = fat(p + 5u);
             let dx = fat(p + 6u);
             let dy = fat(p + 7u);
+            if (SCALE > 1u && (f32(x) < min(x0, x0 + dx) || f32(x) >= max(x0, x0 + dx) || f32(y) < min(y0, y0 + dy) || f32(y) >= max(y0, y0 + dy))) {
+                return;
+            }
+            if (!early(s, x, y, k, data[p + 24u])) {
+                return;
+            }
             let a = vertex_tex(p, 0u);
             let b = vertex_tex(p, 1u);
             var du = b.x - a.x;
@@ -1656,16 +1677,23 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             if (steps != 0) {
                 t = f32(hit) / f32(steps);
             }
+            let lz = z_at(p, fat(p + 25u) * t);
+            if (!early(s, x, y, k, lz)) {
+                return;
+            }
             let c0 = vertex_attr(p, 0u);
             let c = lerp4(c0, vertex_attr(p, 1u), t);
             let e0 = vertex_tex(p, 0u);
             let e1 = vertex_tex(p, 1u);
             var tex = weighted2(e0, e1, t);
             tex.w = lerp1(e0.w, e1.w, t);
-            at = Attr(c.x, c.y, c.z, c.w, tex.x, tex.y, tex.z, tex.w, z_at(p, fat(p + 25u) * t));
+            at = Attr(c.x, c.y, c.z, c.w, tex.x, tex.y, tex.z, tex.w, lz);
         }
         default {
             if (x != i32(data[p + 4u]) || y != i32(data[p + 5u])) {
+                return;
+            }
+            if (!early(s, x, y, k, data[p + 24u])) {
                 return;
             }
             let c = vertex_attr(p, 0u);

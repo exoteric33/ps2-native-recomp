@@ -31,6 +31,8 @@ struct BadCode {};
 
 constexpr std::uint32_t kEcd = 0x4000u, kScd = 0x8000u, kReset = 0x40000000u;
 constexpr std::size_t kFifoBytes = 128;
+constexpr std::uint32_t kD3Qwc = 0x1000B020u;   // fromIPU's quadword count
+constexpr int kOutEvent = hw::kEventDma0 + 3;  // the held end of a fromIPU transfer (hold_output_end)
 
 constexpr std::uint8_t kDefaultIntra[64] = {
     8,  16, 19, 22, 26, 27, 29, 34, 16, 16, 22, 24, 27, 29, 34, 37, 19, 22, 26, 27, 29, 34, 34, 38, 22, 22, 26, 27, 29, 34, 37, 40,
@@ -115,6 +117,9 @@ std::uint16_t g_vqclut[16];
 std::uint16_t g_th0 = 0, g_th1 = 0;
 std::int16_t g_dc[3];
 std::uint64_t g_commands[16], g_stalls = 0, g_out_qwords = 0;
+// The last quadword of a fromIPU transfer waits for kOutEvent (hold_output_end). Not in the save state: it is set exactly while that
+// event is pending, and loading a state finds it again from the event (state below).
+bool g_out_held = false;
 
 // PS2_DUMP_IPU=file writes every byte the IPU takes in (DMA or FIFO writes) to that file, to compare the game's feed with the disc.
 void dump_input(const std::uint8_t *bytes, std::size_t n) {
@@ -733,6 +738,7 @@ bool run_command() {
 }
 
 void drain() {
+    if (g_out_held) return;
     while (g_out_pos + 16 <= g_out.size()) {
         const std::size_t done = dmac::ipu_push_many(g_out.data() + g_out_pos, (g_out.size() - g_out_pos) / 16);
         if (!done) break;
@@ -769,6 +775,39 @@ void step() {
     top_up();
 }
 
+void release_output() {
+    g_out_held = false;
+    step();
+}
+
+void cancel_held_output() {
+    g_out_held = false;
+    if (scheduled_at(kOutEvent) != UINT64_MAX) schedule(kOutEvent, UINT64_MAX, [] {});
+}
+
+// A fromIPU transfer that starts while the IPU already holds every quadword it will take (the program gave the command first and
+// starts the channel behind it) would end here inside the CHCR write that starts it, before the program's next instruction. On the
+// console the IPU's output FIFO holds 8 quadwords: the picture goes out only as fast as it is decoded and the bus takes it, so such a
+// transfer ends long after its start, and a program may acknowledge and enable the channel's interrupt right behind the start.
+// Harry Potter and the Prisoner of Azkaban (#146) does: its logo picture is 512 x 512 (65,536 quadwords, one more than a DMA
+// count holds), it gives IDEC, starts fromIPU for the first half, and its fromIPU handler starts the second half. Ending at the start
+// lost that interrupt, so the handler never ran for the logo; it started the stale second half much later, after the film's first
+// colour conversion, and that transfer never ended: the film stopped at its first B-picture, waiting for it.
+// So the data goes to memory at once, as before (the GIF chain the game starts behind it reads it right away here; the console
+// stalls that chain on the fromIPU address instead), all but the last quadword: that one, and with it the channel's end and its
+// interrupt, comes 2 cycles a quadword later (the bus time, as the VIF1 read-back in dmac.cpp). A transfer the waiting output
+// cannot fill still ends when a later command gives the rest, unchanged.
+void hold_output_end() {
+    const std::uint32_t qwc = dmac::read(kD3Qwc);
+    const std::size_t waiting = (g_out.size() - g_out_pos) / 16;
+    if (!qwc || waiting < qwc) return;
+    const std::size_t done = qwc > 1 ? dmac::ipu_push_many(g_out.data() + g_out_pos, qwc - 1) : 0;
+    g_out_pos += done * 16;
+    g_out_qwords += done;
+    g_out_held = true;
+    schedule(kOutEvent, now() + 2ull * qwc, release_output);
+}
+
 }
 
 void reset() {
@@ -783,6 +822,7 @@ void reset() {
     std::memset(g_vqclut, 0, sizeof g_vqclut);
     g_th0 = g_th1 = 0;
     std::memset(g_dc, 0, sizeof g_dc);
+    cancel_held_output();
 }
 
 std::uint32_t read32(std::uint32_t a) {
@@ -854,6 +894,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
             g_bit = g_out_pos = 0;
             g_busy = g_decoding = false;
             g_th0 = g_th1 = 0;
+            cancel_held_output();
         }
         g_ctrl = (g_ctrl & ~0x3FFF0000u) | (v & 0x3FFF0000u);
         break;
@@ -884,7 +925,12 @@ void read_fifo(std::uint8_t *qword) {
     step();
 }
 
-void dma_started(int) { step(); }
+void dma_started(int channel) {
+    // PS2_IPU_OUT_AT_ONCE=1: the old way, such a transfer ends inside its start (to compare, or if a film plays worse with the hold)
+    static const bool at_once = os::env("PS2_IPU_OUT_AT_ONCE") == "1";
+    if (channel == 3 && !g_out_held && !at_once) hold_output_end();
+    step();
+}
 
 std::uint64_t decode_commands() {
     return g_commands[kIdec] + g_commands[kBdec] + g_commands[kVdec] + g_commands[kFdec] + g_commands[kCsc];
@@ -927,6 +973,13 @@ void state(ps2::state::Stream &s) {
     s.pod(g_th0);
     s.pod(g_th1);
     s.pod(g_dc);
+    if (s.loading()) {
+        // The machine's events are loaded before this, without the action of the one for a held fromIPU end (hold_output_end): it is
+        // pending exactly while an end is held, so it gives the flag back and gets its action.
+        const std::uint64_t at = scheduled_at(kOutEvent);
+        g_out_held = at != UINT64_MAX;
+        if (g_out_held) schedule(kOutEvent, at, release_output);
+    }
 }
 
 }

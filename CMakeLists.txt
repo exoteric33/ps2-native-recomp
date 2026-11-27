@@ -486,6 +486,13 @@ if(NOT EMSCRIPTEN)
     if(WIN32)
         target_link_libraries(ps2idctexacttest PRIVATE synchronization)
     endif()
+    # a fromIPU transfer started behind the command ends after its bus time, not inside its start, so an interrupt the program enables right behind it is not lost (#146, Harry Potter and the Prisoner of Azkaban, no game needed): ninja ps2ipuoutendtest
+    add_executable(ps2ipuoutendtest EXCLUDE_FROM_ALL tests/ipu_out_end.cpp)
+    target_include_directories(ps2ipuoutendtest PRIVATE runtime/src)
+    target_link_libraries(ps2ipuoutendtest PRIVATE ps2runtime)
+    if(WIN32)
+        target_link_libraries(ps2ipuoutendtest PRIVATE synchronization)
+    endif()
     # a sound stream sent by auto-DMA moves the IOP DMA channel's address on as the chip takes it in (issue 100, GTA Vice City, no game needed): ninja ps2admaprogresstest
     add_executable(ps2admaprogresstest EXCLUDE_FROM_ALL tests/adma_progress.cpp)
     target_include_directories(ps2admaprogresstest PRIVATE runtime/src)

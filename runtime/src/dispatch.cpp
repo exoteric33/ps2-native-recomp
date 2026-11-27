@@ -1,3 +1,5 @@
+#include "interp.hpp"
+
 #include "ps2/ee_live.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/os.hpp"
@@ -6,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <set>
@@ -49,6 +52,7 @@ std::deque<int> g_ranks;
 // The soft checks of each module, in step with g_modules (empty for a module that has none).
 std::deque<SoftIndex> g_soft;
 int g_max_rank = 0;
+std::uint32_t g_epoch = 0;   // modules_epoch(): counts the modules added while the game runs
 std::uint32_t g_module_span = 0;
 std::vector<Instance> g_instances;
 
@@ -192,6 +196,7 @@ void register_modules(const ModuleInfo *modules, std::uint32_t count) {
     g_ranks.assign(count, 0);
     g_soft.assign(count, SoftIndex{});
     g_max_rank = 0;
+    ++g_epoch;
     g_instances.clear();
     g_module_span = 0;
     for (std::uint32_t k = 0; k < count; ++k) g_module_span = std::max(g_module_span, modules[k].size);
@@ -211,6 +216,7 @@ void add_modules_ranked(const ModuleInfo *modules, std::uint32_t count, int rank
                 index.groups.emplace(soft[k].words[at], soft[k].words + at);
         g_module_span = std::max(g_module_span, modules[k].size);
     }
+    ++g_epoch;
     // A module of a better rank than the ones in use must be looked at first: the instances made so far are made again when they are
     // needed (they are only a cache of which modules are in place; a function that is running goes on in the code it started in).
     if (rank > g_max_rank) g_max_rank = rank;
@@ -259,10 +265,73 @@ bool has_code(std::uint32_t pc) {
     return instance_for(pc, true) != nullptr;
 }
 
+// ---------------------------------------------------------------------------------------------------------------- the interpreter (interp.cpp)
+
+namespace {
+
+// PS2_INTERP_RANGE=lo,hi (hex) or "all"
+struct InterpRange {
+    bool on = false;
+    std::uint32_t lo = 0, hi = 0;
+    InterpRange() {
+#ifndef __EMSCRIPTEN__
+        const char *s = std::getenv("PS2_INTERP_RANGE");
+        if (!s || !*s) return;
+        if (std::string(s) == "all") {
+            on = true;
+            lo = 0;
+            hi = 0xFFFFFFFFu;
+        } else if (std::sscanf(s, "%x,%x", &lo, &hi) == 2) {
+            on = true;
+        }
+        if (on) std::fprintf(stderr, "[interp] code entered in 0x%08X..0x%08X runs in the interpreter\n", lo, hi);
+#endif
+    }
+};
+const InterpRange g_forced;
+
+}
+
+bool interp_forced_any() { return g_forced.on; }
+bool interp_forced(std::uint32_t pc) { return g_forced.on && pc - g_forced.lo < g_forced.hi - g_forced.lo; }
+
+std::uint32_t modules_epoch() { return g_epoch; }
+
+bool code_translated(std::uint32_t pc) { return !interp_forced(pc) && has_code(pc); }
+
+bool same_image(std::uint32_t from, std::uint32_t target) {
+    const std::uint32_t end = g_origin + static_cast<std::uint32_t>(g_index.size()) * g_unit_size;
+    const bool a = from - g_origin < end - g_origin, b = target - g_origin < end - g_origin;
+    if (a || b) return a && b;
+    return (from > target ? from - target : target - from) < 0x400000u;
+}
+
+void call_quiet(Cpu &c, std::uint32_t target, std::uint32_t depth) {
+    if (depth >= kMaxDepth) {
+        c.pc = target;
+        return;
+    }
+    if (!interp_forced(target) && !(target & kUnwind)) {
+        const UnitInfo *u = unit_for(target);
+        if (const std::uint16_t id = u ? u->entries[(target - u->base) >> 2] : 0) [[clang::musttail]] return u->function(c, id, depth);
+        if (const Instance *m = instance_for(target, true)) {
+            const UnitInfo *mu = nullptr;
+            const std::uint16_t entry = module_entry(*m, target, mu);
+            c.base = m->base;
+            [[clang::musttail]] return mu->function(c, entry, depth);
+        }
+        // nothing translated: the dispatcher's own miss path
+        c.pc = target;
+        [[clang::musttail]] return dispatch(c, 0u, depth);
+    }
+    [[clang::musttail]] return interpret_from(c, target, depth);
+}
+
 void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
     const std::uint32_t pc = c.pc;
     if (pc & kUnwind) return;
     if (pc == kHandlerReturn || pc == kIdle) return;
+    if (g_forced.on && interp_forced(pc)) [[clang::musttail]] return interpret(c, 0u, depth);
     const UnitInfo *u = unit_for(pc);
     const std::uint16_t id = u ? u->entries[(pc - u->base) >> 2] : 0;
     if (!id) {

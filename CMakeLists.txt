@@ -73,6 +73,8 @@ else()
         runtime/src/memory.cpp
         runtime/src/os.cpp
         runtime/src/dispatch.cpp
+        runtime/src/interp.cpp
+        recomp/r5900.cpp
         runtime/src/system.cpp
         runtime/src/kernel.cpp
         runtime/src/hw.cpp
@@ -106,6 +108,8 @@ else()
         runtime/src/iop/romdir.cpp
         runtime/src/iop/cdvdfsv.cpp)
     target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
+    # the interpreter (runtime/src/interp.cpp) decodes with the recompiler's tables
+    target_include_directories(ps2runtime PRIVATE recomp)
     if(NOT EMSCRIPTEN)
         # Vector programs the build does not know are compiled while the game runs (runtime/src/vu_live.cpp, docs/vu-live.md): the
         # generator is the one of the vurecomp tool, and the headers its output includes are embedded in the runner.
@@ -113,8 +117,7 @@ else()
         # Main processor code that the build does not know is translated, compiled and loaded while the game runs too
         # (runtime/src/ee_live.cpp, docs/ee-live.md): the translator is the one of the eerecomp tool, and the headers its output includes
         # are embedded in the runner as well.
-        target_sources(ps2runtime PRIVATE recomp/eerecomp_gen.cpp recomp/codegen.cpp recomp/analysis.cpp recomp/r5900.cpp recomp/elf.cpp recomp/snr2.cpp)
-        target_include_directories(ps2runtime PRIVATE recomp)
+        target_sources(ps2runtime PRIVATE recomp/eerecomp_gen.cpp recomp/codegen.cpp recomp/analysis.cpp recomp/elf.cpp recomp/snr2.cpp)
         foreach(entry "cpu:Cpu" "fpu:Fpu" "vu:Vu" "vu_ops:VuOps" "memory:Memory" "mmi:Mmi" "generated:Generated" "ee_live_abi:EeLiveAbi")
             string(REPLACE ":" ";" pair "${entry}")
             list(GET pair 0 hdr)

@@ -117,6 +117,10 @@ void sync_iop();
 
 bool load_elf(const std::string &path, std::uint32_t &entry);
 bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry);
+// Reads the switches that hot paths test as plain flags (PS2_TRACE_INTC, PS2_INTERP_RANGE, PS2_GPU_HW_MEMLOG). A runner
+// calls it once at the start of main(), after it has put the switches of switches.txt into the environment and before anything runs:
+// a global filled when the program loads would miss the file's switches. Other switches are read on first use.
+void read_switches();
 void boot(std::uint32_t entry, const std::vector<std::string> &args);
 int run();
 void halt(const std::string &reason);

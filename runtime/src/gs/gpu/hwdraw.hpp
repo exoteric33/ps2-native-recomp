@@ -117,6 +117,7 @@ void live_wgpu_time(bool card, std::uint64_t before_finish, std::uint64_t before
 // PS2_GPU_HW_MEMLOG=<n> prints one `[memlog]` line every n frames with what the card path holds (textures, buffers, bind groups, pipelines), what wgpu holds in all, and the
 // process's resident memory and how many queue submits the card is behind. gpu.cpp calls memlog_tick at the end of each submit; with the switch off that is one test of a bool.
 extern bool g_memlog;
+void read_switches();  // PS2_GPU_HW_MEMLOG, from ps2::read_switches() at the start of main()
 void memlog_report(void *instance, void *queue, std::uint64_t frame);
 inline void memlog_tick(void *instance, void *queue, std::uint64_t frame) {
     if (g_memlog) memlog_report(instance, queue, frame);

@@ -697,7 +697,7 @@ void run(std::uint64_t ee_cycles) {
             const cost::Timer exec_time(cost::kIopExec);
             execute(g_cpu, budget);
         }
-        if (cost::g_on) cost::g_exec_cycles += static_cast<std::uint64_t>(given - std::max<std::int64_t>(0, budget));
+        if (cost::on()) cost::g_exec_cycles += static_cast<std::uint64_t>(given - std::max<std::int64_t>(0, budget));
         g_now += static_cast<std::uint64_t>(std::max<std::int64_t>(1, given - std::max<std::int64_t>(0, budget)));
     }
 }

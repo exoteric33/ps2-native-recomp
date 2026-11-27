@@ -28,7 +28,8 @@ void interpret(Cpu &c, std::uint32_t entry, std::uint32_t depth);
 
 // PS2_INTERP_RANGE=<lo>,<hi> (hex) sends every entry into [lo, hi) to the interpreter, "all" sends everything: a debugging aid that tells a
 // translation bug from a runtime one, and the test that the interpreter does what the translated code does.
-bool interp_forced_any();               // is the switch on at all (read once)
+void read_dispatch_switches();          // PS2_INTERP_RANGE, from ps2::read_switches() at the start of main()
+bool interp_forced_any();               // is the switch on at all
 bool interp_forced(std::uint32_t pc);   // is pc in the range
 
 // Instructions interpreted so far (cycles charged).

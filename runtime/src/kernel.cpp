@@ -26,7 +26,8 @@
 namespace ps2::kernel {
 
 // PS2_TRACE_INTC=1: the EE interrupt side in the log. Off by default; every place that traces tests this one flag.
-bool g_trace_irq = std::getenv("PS2_TRACE_INTC") != nullptr;
+// ps2::read_switches() sets it at the start of main(), after the switches of switches.txt are in the environment.
+bool g_trace_irq = false;
 
 namespace {
 

@@ -412,6 +412,7 @@ int main(int argc, char **argv) {
         ps2::g_options.on_memcard_saved = [] { MAIN_THREAD_ASYNC_EM_ASM({ if (Module.ps2CardSaved) Module.ps2CardSaved(); }); };
     }
     ps2::set_audio_sink(push_audio);
+    ps2::read_switches();  // the switches the runtime tests as plain flags
     register_generated_code();
     register_generated_vu();
 

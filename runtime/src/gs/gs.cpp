@@ -34,7 +34,7 @@ namespace ps2::gs {
 namespace trace {  // defined further down (PS2_TRACE_DRAWS)
 extern std::uint64_t g_frame, g_number;
 bool traced(std::uint64_t frame);
-extern const bool g_any;  // PS2_TRACE_DRAWS is set: kick() looks at this flag instead of calling into the trace code for every shape
+bool any();  // PS2_TRACE_DRAWS is set: kick() looks at this flag instead of calling into the trace code for every shape
 }
 
 State g_state;
@@ -621,7 +621,10 @@ const char *spec() {
     return value;
 }
 
-extern const bool g_any = std::getenv("PS2_TRACE_DRAWS") != nullptr;
+bool any() {  // read on first use, not when the program loads, so switches.txt can set it
+    static const bool on = spec() != nullptr;
+    return on;
+}
 
 std::uint64_t g_frame = 0;  // frame of the draws the render side is doing now
 std::uint64_t g_number = 0; // primitives so far in this frame
@@ -777,7 +780,7 @@ void transfer(const State &s, std::uint64_t dir) {
     const int needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
     if (s.count < needed) return;
     if (draw) {
-        if (!trace::g_any || trace::draw(s, needed)) {
+        if (!trace::any() || trace::draw(s, needed)) {
             if (cpu_raster()) raster::draw(s, s.queue, needed);
 #ifdef PS2_GPU
             if (gpu_on()) gpu::draw(s, s.queue, needed);
@@ -826,15 +829,19 @@ void transfer(const State &s, std::uint64_t dir) {
     kick(draw);
 }
 
-static const char *const g_gsseq = std::getenv("PS2_TRACE_GSSEQ");
+// PS2_TRACE_GSSEQ=<n>: the register writes from the n-th on. Read on first use, so switches.txt can set it.
+static const char *gsseq() {
+    static const char *const value = std::getenv("PS2_TRACE_GSSEQ");
+    return value;
+}
 
 void write(std::uint32_t reg, std::uint64_t value) {
     State &s = g_state;
     ++g_writes[reg & 127u];
     constexpr std::uint64_t kVertexRegs = (1ull << 0x01) | (1ull << 0x02) | (1ull << 0x03) | (1ull << 0x04) | (1ull << 0x05) | (1ull << 0x0A) | (1ull << 0x0C) | (1ull << 0x0D);
     if (reg >= 64 || !((kVertexRegs >> reg) & 1u)) ++g_setup_generation;
-    if (g_gsseq) [[unlikely]] {
-        static std::uint64_t n = 0, start = std::strtoull(g_gsseq, nullptr, 10);
+    if (gsseq()) [[unlikely]] {
+        static std::uint64_t n = 0, start = std::strtoull(gsseq(), nullptr, 10);
         if (++n >= start && n < start + 100000) std::fprintf(stderr, "[gs] w %02X %016llX\n", reg, static_cast<unsigned long long>(value));
     }
     // With one thread the GIF does not scan its packets (gif.cpp, out()): the emulation thread's copy of the transfer registers
@@ -1019,7 +1026,7 @@ static void write_packed_generic(std::uint32_t reg, const Reg128 &q);
 }
 
 void write_packed(std::uint32_t reg, const Reg128 &q) {
-    if (g_gsseq) [[unlikely]] {
+    if (gsseq()) [[unlikely]] {
         write_packed_generic(reg, q);
         return;
     }
@@ -1034,7 +1041,7 @@ void write_packed_run(const std::uint8_t *data, std::uint32_t count, std::uint64
         Reg128 q;
         std::memcpy(&q, data + static_cast<std::size_t>(k) * 16, 16);
         const std::uint32_t r = static_cast<std::uint32_t>(regs >> (reg * 4)) & 0xFu;
-        if (g_gsseq) [[unlikely]] write_packed_generic(r, q);
+        if (gsseq()) [[unlikely]] write_packed_generic(r, q);
         else packed_one(r, q);
         if (++reg >= nreg) reg = 0;
     }

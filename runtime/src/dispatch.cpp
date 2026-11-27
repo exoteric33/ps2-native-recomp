@@ -269,27 +269,27 @@ bool has_code(std::uint32_t pc) {
 
 namespace {
 
-// PS2_INTERP_RANGE=lo,hi (hex) or "all"
+// PS2_INTERP_RANGE=lo,hi (hex) or "all". A plain struct the dispatcher tests directly, filled by read_dispatch_switches() at the start
+// of main(): a constructor would read the environment when the program loads, before main() puts switches.txt in.
 struct InterpRange {
     bool on = false;
     std::uint32_t lo = 0, hi = 0;
-    InterpRange() {
-#ifndef __EMSCRIPTEN__
-        const char *s = std::getenv("PS2_INTERP_RANGE");
-        if (!s || !*s) return;
-        if (std::string(s) == "all") {
-            on = true;
-            lo = 0;
-            hi = 0xFFFFFFFFu;
-        } else if (std::sscanf(s, "%x,%x", &lo, &hi) == 2) {
-            on = true;
-        }
-        if (on) std::fprintf(stderr, "[interp] code entered in 0x%08X..0x%08X runs in the interpreter\n", lo, hi);
-#endif
-    }
 };
-const InterpRange g_forced;
+InterpRange g_forced;
 
+}
+
+void read_dispatch_switches() {
+#ifndef __EMSCRIPTEN__
+    InterpRange r;
+    if (const char *s = std::getenv("PS2_INTERP_RANGE"); s && *s) {
+        if (std::string(s) == "all") r = {true, 0, 0xFFFFFFFFu};
+        else if (std::sscanf(s, "%x,%x", &r.lo, &r.hi) == 2) r.on = true;
+    }
+    if (r.on && !(g_forced.on && g_forced.lo == r.lo && g_forced.hi == r.hi))
+        std::fprintf(stderr, "[interp] code entered in 0x%08X..0x%08X runs in the interpreter\n", r.lo, r.hi);
+    g_forced = r;
+#endif
 }
 
 bool interp_forced_any() { return g_forced.on; }

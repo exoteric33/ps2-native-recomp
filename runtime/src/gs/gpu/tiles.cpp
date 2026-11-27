@@ -376,8 +376,9 @@ Builder g_own;  // the calling thread's (the window thread's) scratch for build_
 
 // ---- PS2_TILE_LOG ----------------------------------------------------------------------------------------------------------------------------
 
-const bool g_log = !os::env("PS2_TILE_LOG").empty();
-const std::uint64_t g_log_batches = g_log ? std::strtoull(os::env("PS2_TILE_LOG").c_str(), nullptr, 10) : 0;  // PS2_TILE_LOG=<n>, n > 1: also print the fingerprint after the first n batches
+// PS2_TILE_LOG, read on first use (not when the program loads), so switches.txt can set it
+bool log_on() { static const bool on = !os::env("PS2_TILE_LOG").empty(); return on; }
+std::uint64_t log_batches() { static const std::uint64_t n = log_on() ? std::strtoull(os::env("PS2_TILE_LOG").c_str(), nullptr, 10) : 0; return n; }  // PS2_TILE_LOG=<n>, n > 1: also print the fingerprint after the first n batches
 std::uint64_t g_hash = 0xCBF29CE484222325ull, g_batches = 0, g_entries = 0, g_words = 0;  // the window thread's (note_lists)
 std::uint64_t g_waits = 0, g_wait_ns = 0;                                                  // finish waits (window thread)
 constexpr std::uint64_t kTaken = ~0ull - 1;
@@ -518,18 +519,18 @@ bool run_job(Shared *s, Job *job) {
         }
         const std::uint32_t n = job->count.load(std::memory_order_acquire);
         if (n > at) {
-            const std::uint64_t t0 = g_log ? now_ns() : 0;
+            const std::uint64_t t0 = log_on() ? now_ns() : 0;
             b.add(job->prims.load(std::memory_order_acquire), at, n);  // read after the count: where the records are now, which holds the first n
-            if (g_log) g_busy_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+            if (log_on()) g_busy_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
             at = n;
             continue;
         }
         if (state == kClosed) break;
         wait_for_shapes(s, job, at);
     }
-    const std::uint64_t t0 = g_log ? now_ns() : 0;
+    const std::uint64_t t0 = log_on() ? now_ns() : 0;
     job->result = b.finish(job_room, job);
-    if (g_log) {
+    if (log_on()) {
         g_busy_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
         g_jobs.fetch_add(1, std::memory_order_relaxed);
     }
@@ -635,14 +636,14 @@ int strips() { return g_geo.strips; }
 
 Lists build_now(const std::uint32_t *prims, std::uint32_t count, Room room, void *context) { return g_own.build(prims, count, room, context); }
 
-bool logging() { return g_log; }
+bool logging() { return log_on(); }
 
 void report() {
-    if (g_log) print_log();
+    if (log_on()) print_log();
 }
 
 void note_lists(const std::uint32_t *words, const Lists &lists) {
-    if (!g_log) return;
+    if (!log_on()) return;
     std::uint64_t h = g_hash;
     const auto mix = [&h](std::uint32_t v) { h = (h ^ v) * 0x100000001B3ull; };
     mix(lists.tiles);
@@ -652,10 +653,10 @@ void note_lists(const std::uint32_t *words, const Lists &lists) {
     ++g_batches;
     g_entries += lists.total;
     g_words += lists.words;
-    if (g_batches == g_log_batches && g_batches > 1)
+    if (g_batches == log_batches() && g_batches > 1)
         std::fprintf(stderr, "[tiles] after %llu batches: %llu list entries, %llu words, fingerprint %016llx\n", static_cast<unsigned long long>(g_batches), static_cast<unsigned long long>(g_entries),
                      static_cast<unsigned long long>(g_words), static_cast<unsigned long long>(g_hash));
-    if (g_batches == g_log_batches && g_batches > 1) memory_note("after that");
+    if (g_batches == log_batches() && g_batches > 1) memory_note("after that");
 }
 
 #ifdef __EMSCRIPTEN__
@@ -780,7 +781,7 @@ Job *next_finished(bool wait) {
     Job *job = s.pending.front();
     if (!job->done.load(std::memory_order_acquire)) {
         if (!wait) return nullptr;
-        const std::uint64_t t0 = g_log ? now_ns() : 0;
+        const std::uint64_t t0 = log_on() ? now_ns() : 0;
         for (unsigned spins = 0; !job->done.load(std::memory_order_acquire); ++spins) {
             if (spins < 4000) {
 #if defined(__x86_64__) || defined(_M_X64)
@@ -794,7 +795,7 @@ Job *next_finished(bool wait) {
                 std::this_thread::yield();
             }
         }
-        if (g_log) {
+        if (log_on()) {
             ++g_waits;
             g_wait_ns += now_ns() - t0;
         }

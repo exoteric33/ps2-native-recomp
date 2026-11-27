@@ -783,6 +783,9 @@ int main(int argc, char **argv) {
     ps2::crash::test_parse(ps2::os::env("PS2_CRASH_TEST").c_str());  // as in the block above, a runner without a window
 #endif
     log_start_lines(argc, argv);  // the first lines of the log: the arguments and the PS2_* switches
+    // the switches the runtime tests as plain flags, now that switches.txt is in the environment (a global filled when the program loads
+    // would miss the file's switches); after the log's first lines, so the [interp] line lands in the log copy too
+    ps2::read_switches();
     ps2::crash::test_here("main");
 #ifdef _WIN32
     SetConsoleCtrlHandler(on_console_event, TRUE);

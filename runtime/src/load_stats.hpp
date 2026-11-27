@@ -10,16 +10,20 @@ namespace ps2::cost {
 
 enum Part { kSync, kIopRun, kIopExec, kIopJobs, kSpuTick, kSifPump, kDisc, kParts };
 
-inline const bool g_on = std::getenv("PS2_IOP_LOAD") != nullptr;
+// read on first use, not when the program loads, so switches.txt can set it
+inline bool on() {
+    static const bool value = std::getenv("PS2_IOP_LOAD") != nullptr;
+    return value;
+}
 inline std::uint64_t g_ns[kParts] = {}, g_count[kParts] = {}, g_exec_cycles = 0, g_disc_bytes = 0;
 
 class Timer {
 public:
     explicit Timer(Part part) : part_(part) {
-        if (g_on) start_ = std::chrono::steady_clock::now();
+        if (on()) start_ = std::chrono::steady_clock::now();
     }
     ~Timer() {
-        if (!g_on) return;
+        if (!on()) return;
         g_ns[part_] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start_).count());
         ++g_count[part_];
     }

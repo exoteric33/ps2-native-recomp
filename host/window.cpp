@@ -1575,7 +1575,10 @@ struct WaitLog {
         frames = 0;
     }
 };
-WaitLog g_waits;
+WaitLog &waits() {  // made on first use, not when the program loads, so switches.txt can set PS2_PRESENT_LOG
+    static WaitLog log;
+    return log;
+}
 
 // PS2_FRAME_LOG=<file>: one line per emulated frame, to find what happens when a scene suddenly gets slow (docs/speed.md, the arena).
 // Columns: frame number, milliseconds since the previous frame, CPU milliseconds all the threads used meanwhile, milliseconds the emulation
@@ -1606,14 +1609,17 @@ struct FrameLog {
         if (ps2::frames_run() % 60 == 0) std::fflush(file);
     }
 };
-FrameLog g_frame_log;
+FrameLog &frame_log() {  // made on first use, so switches.txt can set PS2_FRAME_LOG
+    static FrameLog log;
+    return log;
+}
 
 void on_vblank() {
     show_speed();
     poll();
     present();
     pace();
-    if (g_frame_log.file) g_frame_log.frame(0.0, 0.0, queued_ms());
+    if (frame_log().file) frame_log().frame(0.0, 0.0, queued_ms());
     if (g_menu.is_open()) {  // the quick menu: this thread is the window's too, so it answers the window while the game waits
         const double since = audio_seconds();
         while (g_menu.is_open()) {
@@ -1701,7 +1707,10 @@ struct PushLog {
         path.clear();
     }
 };
-PushLog g_pushlog;
+PushLog &pushlog() {  // made on first use, so switches.txt can set PS2_AUDIO_PUSHLOG
+    static PushLog log;
+    return log;
+}
 
 struct Tone {
     int hz, ms;
@@ -1748,7 +1757,7 @@ void mix_beep(std::int16_t *samples, std::size_t frames) {
 // The sound chip's batches of 32 frames arrive here on the emulation thread.
 void queue_audio(const std::int16_t *samples, std::size_t frames) {
     const double now = audio_seconds();
-    g_pushlog.add(0, static_cast<int>(frames), now);
+    pushlog().add(0, static_cast<int>(frames), now);
     g_pipe->push(samples, frames, now);
 }
 
@@ -1782,7 +1791,7 @@ void write_audio_dumps() {
 void note_audio() {
     static std::uint64_t seen = 0, last_report = 0;
     write_audio_dumps();
-    g_pushlog.add(1, 0, audio_seconds());
+    pushlog().add(1, 0, audio_seconds());
     const std::uint64_t dry = g_pipe->stats().dry;
     const std::uint64_t now = SDL_GetPerformanceCounter();
     if (dry > seen && (!last_report || now - last_report > 5 * SDL_GetPerformanceFrequency())) {
@@ -1810,7 +1819,7 @@ void finish_audio() {
                          static_cast<double>(s.at_cap) / 48000.0, g_pipe->config().max_ratio);
         else
             std::fprintf(stderr, "[audio] stretching is off (PS2_AUDIO_STRETCH=0)\n");
-        g_pushlog.write();
+        pushlog().write();
         g_dump.close();
         g_heard.close();
     }
@@ -2073,12 +2082,12 @@ int run_window(const std::function<int()> &emulate) {
             last = now;
             last_cpu = cpu;
         }
-        if (g_frame_log.file)
-            g_frame_log.frame(std::chrono::duration<double, std::milli>(t1 - t0).count(), WaitLog::ms(t1), queued_ms());
-        if (g_waits.on) {
-            g_waits.post += std::chrono::duration<double, std::milli>(t1 - t0).count();
-            g_waits.sound += WaitLog::ms(t1);
-            g_waits.emulation_frame();
+        if (frame_log().file)
+            frame_log().frame(std::chrono::duration<double, std::milli>(t1 - t0).count(), WaitLog::ms(t1), queued_ms());
+        if (waits().on) {
+            waits().post += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            waits().sound += WaitLog::ms(t1);
+            waits().emulation_frame();
         }
     };
     ps2::start_render_thread();
@@ -2107,7 +2116,7 @@ int run_window(const std::function<int()> &emulate) {
             poll();
         }
         window_stage("drawing the pictures of the emulation (render_pending)");
-        if (!g_waits.on) {
+        if (!waits().on) {
             if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) {
                 window_stage("waiting for the emulation to post work (wait_render_work)");
                 ps2::wait_render_work(4);
@@ -2121,8 +2130,8 @@ int run_window(const std::function<int()> &emulate) {
             window_stage("waiting for the emulation to post work (wait_render_work)");
             ps2::wait_render_work(4);
         }
-        g_waits.working.store(g_waits.working.load() + std::chrono::duration<double, std::milli>(t1 - t0).count());
-        if (idle) g_waits.idle.store(g_waits.idle.load() + WaitLog::ms(t1));
+        waits().working.store(waits().working.load() + std::chrono::duration<double, std::milli>(t1 - t0).count());
+        if (idle) waits().idle.store(waits().idle.load() + WaitLog::ms(t1));
     }
     emulation.join();
     ps2::flush_memory_card();

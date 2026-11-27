@@ -232,7 +232,6 @@ bool same_registers(const RegSnapshot &s) {
 }
 
 struct SpinWatch {
-    bool off = std::getenv("PS2_NO_SPIN_SKIP") != nullptr;
     std::uint32_t value = 0, streak = 0;
     std::uint64_t seq = 0, at = 0, delta = 0, skipped = 0;
     RegSnapshot regs;
@@ -243,7 +242,8 @@ constexpr std::uint32_t kSpinAfter = 24;  // reads in a row with the same value 
 
 void spin_watch(std::uint32_t value) {
     SpinWatch &w = g_spin;
-    if (w.off) return;
+    static const bool off = std::getenv("PS2_NO_SPIN_SKIP") != nullptr;  // read on first use, so switches.txt can set it
+    if (off) return;
     const std::uint64_t t = now();
     if (value != w.value || g_slow_seq != w.seq || t < w.at) {  // something else happened since the last read: start counting again
         w.value = value;

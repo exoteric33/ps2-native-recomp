@@ -101,8 +101,13 @@ namespace ps2::gs::gpu::hw {
 // ---------------------------------------------------------------- what the card path holds and creates
 // PS2_GPU_HW_MEMLOG=<n> prints one `[memlog] ...` line every n frames (gpu.cpp calls memlog_tick at the end of each submit; with the switch off the call is one test of a bool).
 // The wrappers below stand where hwdraw.cpp creates and drops its textures, buffers, bind groups, render pipelines, encoders and passes: with the switch off each is the plain call and one test.
-std::uint64_t g_memlog_every = std::strtoull(os::env("PS2_GPU_HW_MEMLOG").c_str(), nullptr, 10);
-bool g_memlog = g_memlog_every > 0;
+// Both are set by read_switches() at the start of main(), after the switches of switches.txt are in the environment.
+std::uint64_t g_memlog_every = 0;
+bool g_memlog = false;
+void read_switches() {
+    g_memlog_every = std::strtoull(os::env("PS2_GPU_HW_MEMLOG").c_str(), nullptr, 10);
+    g_memlog = g_memlog_every > 0;
+}
 namespace memlog {
 
 struct Tally {
@@ -4133,7 +4138,7 @@ Stage g_stage[kStages];
 int g_stage_next = 0, g_stage_now = -1;      // the stage to use next; the stage of this submit (copied in live_encode, mapped again in live_submitted)
 std::uint64_t g_stage_v = 0, g_stage_s = 0, g_stage_p = 0, g_stage_soff = 0, g_stage_poff = 0;
 bool g_stage_copy = false;                   // the copies of this submit are still to be recorded
-const bool g_staging = os::env("PS2_GPU_HW_STAGE") != "0";
+bool staging() { static const bool on = os::env("PS2_GPU_HW_STAGE") != "0"; return on; }  // read on first use, so switches.txt can set it
 
 std::uint64_t stage_bytes() {
     std::uint64_t n = 0;
@@ -4160,7 +4165,7 @@ bool stage_write(std::uint64_t vb, std::uint64_t sb, std::uint64_t pb) {
     using namespace live;
     g_stage_copy = false;
     g_stage_now = -1;
-    if (!g_staging || (!vb && !sb && !pb)) return !g_staging ? false : true;
+    if (!staging() || (!vb && !sb && !pb)) return staging();
     Context &c = *g_gpu.ctx;
     const auto up = [](std::uint64_t n) { return (n + 255) & ~std::uint64_t(255); };
     const std::uint64_t soff = up(vb), poff = soff + up(sb), need = poff + up(pb);
@@ -4317,7 +4322,7 @@ std::vector<WGPUBuffer> g_temp_buffers;
 // Every pass costs the window thread time in wgpu and in the driver (a new command buffer and its barriers), whatever is in it. PS2_GPU_HW_SHARE=1 lets the
 // card's loads and write-backs (compute work) share the caller's compute pass with the painter's commands around them, so only a render pass ends it.
 // Off by default: on an Intel laptop it saved no measurable time.
-const bool g_share_pass = os::env("PS2_GPU_HW_SHARE") == "1";
+bool share_pass() { static const bool on = os::env("PS2_GPU_HW_SHARE") == "1"; return on; }  // read on first use, so switches.txt can set it
 
 WGPUComputePassEncoder live_encode(WGPUCommandEncoder enc, std::uint32_t upto, WGPUComputePassEncoder pass) {
     using namespace live;
@@ -4334,7 +4339,7 @@ WGPUComputePassEncoder live_encode(WGPUCommandEncoder enc, std::uint32_t upto, W
             cp = nullptr;
         }
     };
-    if (!g_share_pass) close();
+    if (!share_pass()) close();
     if (g_stage_copy) {  // the frame's data from the staging buffer, before the first of the card's passes that reads it (a copy cannot be inside a pass)
         close();
         WGPUBuffer from = g_stage[g_stage_now].buf;
@@ -4477,7 +4482,7 @@ WGPUComputePassEncoder live_encode(WGPUCommandEncoder enc, std::uint32_t upto, W
         }
         }
     }
-    if (!g_share_pass) close();
+    if (!share_pass()) close();
     return cp;
 }
 
@@ -4778,6 +4783,7 @@ bool live_init(Context &ctx) {
 namespace ps2::gs::gpu::hw {
 
 bool g_memlog = false;
+void read_switches() {}
 bool enabled() { return false; }
 bool match() { return false; }
 bool left_out(const std::uint32_t *, const std::uint32_t *) { return false; }

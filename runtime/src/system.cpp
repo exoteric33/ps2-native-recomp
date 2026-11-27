@@ -5,6 +5,8 @@
 #include "gs/gs.hpp"
 #include "gs/queue.hpp"
 #include "hw.hpp"
+#include "gs/gpu/hwdraw.hpp"
+#include "interp.hpp"
 #include "iop/iop.hpp"
 #include "iop/sif.hpp"
 #include "iop/sio2.hpp"
@@ -278,7 +280,7 @@ void track_words() {
 
 // PS2_IOP_LOAD=1: every 100 frames, the real time per frame the emulation thread spent on the IOP side (see load_stats.hpp)
 void report_load() {
-    if (!cost::g_on || g_frames % 100 != 0) return;
+    if (!cost::on() || g_frames % 100 != 0) return;
     static std::uint64_t last_ns[cost::kParts] = {}, last_count[cost::kParts] = {}, last_cycles = 0, last_bytes = 0, last_frame = 0;
     const double frames = static_cast<double>(g_frames - last_frame);
     if (frames <= 0) return;
@@ -989,6 +991,11 @@ bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::
 bool attach_window(const WindowTarget &t) { return gs::attach_window(static_cast<int>(t.kind), t.display, t.window, t.surface, t.selector, t.width, t.height); }
 void resize_window(std::uint32_t width, std::uint32_t height) { gs::resize_window(width, height); }
 bool present_frame() { return gs::present(); }
+void read_switches() {
+    kernel::g_trace_irq = std::getenv("PS2_TRACE_INTC") != nullptr;  // PS2_TRACE_INTC=1: the interrupt trace
+    read_dispatch_switches();                                          // PS2_INTERP_RANGE
+    gs::gpu::hw::read_switches();                                      // PS2_GPU_HW_MEMLOG
+}
 void init_graphics() { gs::init(); }
 void start_render_thread() { gs::start_thread(); }
 void start_vu_thread() { gs::queue::vu().start(32u << 20); }

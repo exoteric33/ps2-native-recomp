@@ -2,7 +2,10 @@
 
 Builds tests/depth_trip.cpp against the newest native runtime in build/ (made by any port.sh build), runs it with PS2_DEPTH_TRIP=0
 (every depth download waits: the exact path) and =1, and wants the same line for every case; with =1 the trip log must show uploads
-put back from the copy. Then measures the trip case on both paths (--timing). Prints "depth trip: 0 failed" when all is well.
+put back from the copy. It also runs it with no PS2_DEPTH_TRIP set (the default: on on Windows, where the page guards exist, off
+elsewhere) and wants the =1 log on Windows and no trip elsewhere; and on Windows a build with host/crash.cpp that faults on purpose while a
+trip is armed (`crash`): the crash report must still be written. Then measures the trip case on both paths (--timing). Prints
+"depth trip: 0 failed" when all is well.
 
     python tests/depth_trip.py [--runtime build/runtime-native-.../libps2runtime.a] [--timing ROUNDS] [--scale N]
 """
@@ -16,7 +19,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def build(runtime, out):
+def build(runtime, out, crash=False):
     cxx = shutil.which('clang++')
     if not cxx:
         sys.exit('no clang++ on PATH')
@@ -29,7 +32,11 @@ def build(runtime, out):
                  '-lkernel32', '-luser32', '-lgdi32', '-lshell32', '-lole32', '-loleaut32', '-luuid', '-ladvapi32', '-lwinmm', '-ld3dcompiler', '-lopengl32']
     else:
         libs += ['-ldl', '-lpthread', '-lm']
-    cmd = [cxx] + flags + [os.path.join(ROOT, 'tests', 'depth_trip.cpp'), '-o', out] + libs
+    sources = [os.path.join(ROOT, 'tests', 'depth_trip.cpp')]
+    if crash:  # the runner's crash report (host/crash.cpp) linked in, for `depth_trip crash`
+        flags += ['-DDEPTH_TRIP_CRASH', '-I' + os.path.join(ROOT, 'host')]
+        sources.append(os.path.join(ROOT, 'host', 'crash.cpp'))
+    cmd = [cxx] + flags + sources + ['-o', out] + libs
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         sys.stderr.write(r.stderr[-6000:])
@@ -37,11 +44,47 @@ def build(runtime, out):
 
 
 def run(exe, trip, args=(), scale=None, log='2'):
-    env = dict(os.environ, PS2_DEPTH_TRIP=str(trip), PS2_DEPTH_TRIP_LOG=log)
+    env = dict(os.environ, PS2_DEPTH_TRIP_LOG=log)
+    env.pop('PS2_DEPTH_TRIP', None)
+    if trip is not None:  # None: the default
+        env['PS2_DEPTH_TRIP'] = str(trip)
     if scale:
         env['PS2_SCALE'] = str(scale)
     r = subprocess.run([exe] + list(args), capture_output=True, text=True, env=env, timeout=600)
     return r.returncode, r.stdout.splitlines(), r.stderr.splitlines()
+
+
+def notes_of(log):
+    return [l for l in log if l.startswith('[depth-trip]')]
+
+
+# A real crash while a trip is armed must reach host/crash.cpp's report (the guard's vectored handler passes on what is not a trip).
+def crash_check(runtime, scale):
+    exe = os.path.join(ROOT, 'build', 'depth-trip-crash-test.exe')
+    build(runtime, exe, crash=True)
+    failed = 0
+    reads = {}
+    for trip in (0, None):
+        code, out, err = run(exe, trip, ['crash'], scale=scale)
+        reads[trip] = [l for l in out if l.startswith('crash: the guarded buffer read')]
+        report = [l for l in err if l.startswith('[crash] ')]
+        hook = any(l.startswith("[test] the crash report's after hook ran (crashed 1)") for l in err)
+        stops = notes_of(err)
+        ok = (code & 0xFFFFFFFF) == 0xC0000005 and report and 'access violation writing address 0x10' in report[0] and hook and \
+            not any('swallowed' in l for l in out) and 'a trip is armed' in ' '.join(out)
+        if trip is None:  # the default: the trip ran, the read stopped in the guard
+            ok = ok and stops and ' 0 guard stops' not in stops[-1]
+        failed += not ok
+        print(('same  ' if ok else 'DIFF  ') + 'crash (PS2_DEPTH_TRIP=%s): exit 0x%08X, %s%s' % (
+            'default' if trip is None else trip, code & 0xFFFFFFFF, report[0] if report else 'no crash report',
+            '' if trip is not None else ', ' + (stops[-1].split(': ', 1)[-1] if stops else 'no trip')))
+        if not ok:
+            for l in (out + err)[-12:]:
+                print('      ' + l)
+    if reads[0] != reads[None] or not reads[0]:
+        print('DIFF  crash: the guarded buffer read %s with the trip, %s without' % (reads[None], reads[0]))
+        failed += 1
+    return failed
 
 
 def main():
@@ -65,6 +108,14 @@ def main():
         same = a == b
         failed += not same
         print(('same  ' if same else 'DIFF  ') + b + ('' if same else '\n      exact: ' + a))
+    # the default (no switch): the same lines; on Windows the trip as with =1, elsewhere no trip at all
+    coded, default, dlog = run(exe, None, scale=o.scale)
+    dnotes = [l for l in dlog if l.startswith('[depth-trip]')]
+    want = notes_of(log) if os.name == 'nt' else []
+    ok = coded == 0 and default == exact and (dnotes[-1:] == want[-1:])
+    failed += not ok
+    print(('same  ' if ok else 'DIFF  ') + 'default (no PS2_DEPTH_TRIP): ' + (dnotes[-1] if dnotes else 'no trip') +
+          ('' if ok else '\n      wanted: ' +(want[-1] if want else 'no trip') + ', exit %d, %d lines' % (coded, len(default))))
     if code0 or code1 or len(exact) != 7 or len(trip) != 7:
         print('a run failed: exit %d / %d, %d / %d lines' % (code0, code1, len(exact), len(trip)))
         failed += 1
@@ -88,9 +139,17 @@ def main():
         ok = ok and not b.startswith('HANG')
         failed += not ok
         print(('same  ' if ok else 'DIFF  ') + 'vif: ' + b + ('' if ok else '\n      exact: ' + a))
+    # the default (no switch): the =1 lines on Windows, the =0 lines elsewhere
+    vcoded, vdefault, _ = run(exe, None, ['vif'], scale=o.scale)
+    vwant = vtrip if os.name == 'nt' else vexact
+    ok = vcoded == 0 and vdefault == vwant
+    failed += not ok
+    print(('same  ' if ok else 'DIFF  ') + 'vif, default (no PS2_DEPTH_TRIP): ' + (vdefault[-1] if vdefault else '(no output)'))
     if vcode0 or vcode1 or not vtrip or len(vexact) != len(vtrip):
         print('the vif run failed: exit %d / %d, %d / %d lines' % (vcode0, vcode1, len(vexact), len(vtrip)))
         failed += 1
+    if os.name == 'nt':
+        failed += crash_check(runtime, o.scale)
     if o.timing:
         for trip in (0, 1):
             _, out, _ = run(exe, trip, ['timing', str(o.timing)], scale=o.scale, log='0')

@@ -22,6 +22,12 @@
 // from the copy, with no guard stop. Before issue #122's fixes it hung with the vector thread (the emulation thread waited for the
 // drawing thread inside the trip's lock, the vector thread blocked on that lock at its next XGKICK) and the VIF1 loads were not put back
 // with the drawing thread alone. Prints "depth trip through VIF1: 0 failed" when all is well. Built by CMake: ninja ps2depthtriptest.
+//
+// `depth_trip crash` (only when built with -DDEPTH_TRIP_CRASH and host/crash.cpp, as tests/depth_trip.py does): the crash report must
+// still come with the trip's guard handler in place. It installs the runner's crash handlers (host/crash.cpp), arms a trip (the
+// vectored handler is installed then), reads the guarded buffer (the guard handler makes it right and the read goes on), arms a trip
+// again and then writes to address 0x10 on purpose. That fault is not a trip, so the guard handler must pass it on and the crash
+// report must be written as in the runner; the program ends with the access violation.
 #include "gs/gif.hpp"
 #include "gs/gs.hpp"
 #include "gs/queue.hpp"
@@ -38,6 +44,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef DEPTH_TRIP_CRASH
+#include "crash.hpp"  // host/crash.hpp
+#endif
 
 using namespace ps2;
 
@@ -299,7 +309,11 @@ int vif_main() {
     ps2::boot(0x00100000u, {});
     hw::write32(0x1000E000u, 1);  // D_CTRL.DMAE
     const char *env = std::getenv("PS2_DEPTH_TRIP");
-    const bool trip_on = env && std::atoi(env) != 0;
+#if defined(_WIN32)
+    const bool trip_on = !env || !*env || std::atoi(env) != 0;  // on by default where the page guards exist (runtime/src/gs/gs.cpp)
+#else
+    const bool trip_on = env && *env && std::atoi(env) != 0;
+#endif
     std::thread([] {  // a hang is a failure, not a test that never ends
         for (int seen = -1;;) {
             const int now = g_mode_serial.load();
@@ -350,6 +364,15 @@ int vif_main() {
 
 int main(int argc, char **argv) {
     if (argc > 1 && std::string(argv[1]) == "vif") return vif_main();
+    const bool crash_test = argc > 1 && std::string(argv[1]) == "crash";
+#ifdef DEPTH_TRIP_CRASH
+    if (crash_test) crash::install([](bool crashed, const char *, std::size_t) { std::fprintf(stderr, "[test] the crash report's after hook ran (crashed %d)\n", crashed ? 1 : 0); });
+#else
+    if (crash_test) {
+        std::printf("crash: this build has no crash report (build it with -DDEPTH_TRIP_CRASH and host/crash.cpp)\n");
+        return 2;
+    }
+#endif
     gs::init();
     gs::start_thread();
     std::atomic<bool> stop{false};
@@ -374,6 +397,17 @@ int main(int argc, char **argv) {
         memory_sum(gs::PSMZ32);  // waits for the drawing thread
         const double all = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::printf("timing: %d rounds, emulation thread %.3f ms a round, until drawn %.3f ms a round\n", rounds, emu / rounds, all / rounds);
+    } else if (crash_test) {
+        const std::uint32_t size = bytes_of(gs::PSMZ32, kWidth, kHeight);
+        scene(gs::PSMZ32);
+        store_depth(gs::PSMZ32, kBuffer);  // a trip: the pages are guarded and the guard handler installed (with PS2_DEPTH_TRIP on)
+        std::printf("crash: the guarded buffer read %016llx\n", static_cast<unsigned long long>(fnv(ram(kBuffer), size)));  // a guard stop
+        store_depth(gs::PSMZ32, kBuffer);  // armed again, and left armed
+        std::printf("crash: a trip is armed, now a fault that is not one\n");
+        std::fflush(stdout);
+        std::fflush(stderr);
+        *reinterpret_cast<volatile std::uint32_t *>(static_cast<std::uintptr_t>(0x10)) = 1;
+        std::printf("crash: the fault was swallowed\n");
     } else {
         for (const char *name : {"trip", "read", "write", "other", "neighbour", "twice", "z16"}) std::printf("%s\n", run_case(name).c_str());
     }

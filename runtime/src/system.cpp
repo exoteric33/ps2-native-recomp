@@ -225,11 +225,22 @@ void latch_pads() {
     }
 }
 
+// PS2_TIME=<from>[,<count>] (count 500 if not given): the wall time per frame of frames <from> to <from>+<count>, as one [time] line.
+// The frame numbers are those of --press and PS2_TRACE_DRAWS, which go on after --load-state; a <from> below the run's first frame
+// counts from that frame instead, so PS2_TIME=1 means "from the start of this run" with a state as without (issue #122).
 void time_frames() {
-    static const char *spec = std::getenv("PS2_TIME");
+    static const char *spec = std::getenv("PS2_TIME");  // read on the first frame, after switches.txt is applied
     if (!spec) return;
-    static const std::uint64_t from = std::strtoull(spec, nullptr, 10);
+    static const std::uint64_t asked = std::strtoull(spec, nullptr, 10);
+    static const std::uint64_t first = g_frames;  // the frame of the first call: 1 on a run from the start, the state's frame + 1 after --load-state
+    static const std::uint64_t from = asked < first ? first + (asked ? asked - 1 : 0) : asked;  // 0 and 1 both: the first frame
     static const std::uint64_t count = std::strchr(spec, ',') ? std::strtoull(std::strchr(spec, ',') + 1, nullptr, 10) : 500;
+    static const bool said = [] {
+        std::fprintf(stderr, "[time] window frames %llu-%llu (PS2_TIME=%s, this run's first frame %llu)\n", static_cast<unsigned long long>(from),
+                     static_cast<unsigned long long>(from + count), spec, static_cast<unsigned long long>(first));
+        return true;
+    }();
+    (void)said;
     static std::chrono::steady_clock::time_point start;
     if (g_frames == from) {
         gs::flush_and_wait();

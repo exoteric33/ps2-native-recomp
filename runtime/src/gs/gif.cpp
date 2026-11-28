@@ -16,6 +16,8 @@
 #include <mutex>
 #include <vector>
 
+namespace ps2::gs::trace { extern int g_path; }  // gs.cpp: the path the draw trace (PS2_TRACE_DRAWS) prints
+
 namespace ps2::gif {
 
 namespace {
@@ -394,6 +396,7 @@ void render_reset() {
 }
 
 void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    gs::trace::g_path = path & 3;  // one store a message; the draw trace prints it with each shape
     if (path & kTripFlag) [[unlikely]] {
         path &= 3;
         gs::TripTicket ticket;

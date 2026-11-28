@@ -33,7 +33,9 @@ namespace ps2::gs {
 
 namespace trace {  // defined further down (PS2_TRACE_DRAWS)
 extern std::uint64_t g_frame, g_number;
+extern int g_path;
 bool traced(std::uint64_t frame);
+void offset_set(int ctx, std::uint64_t value);
 bool any();  // PS2_TRACE_DRAWS is set: kick() looks at this flag instead of calling into the trace code for every shape
 }
 
@@ -608,7 +610,10 @@ void reset() {
 // is the time from one vertical blank to the next, numbered like the --frames-dir pictures and --press (the numbers go on
 // after --load-state); the draws of frame N first show in the picture of frame N+1 or later. Primitives in a row that draw
 // with the same registers share one line: their numbers within the frame, how many, the box they cover, the first one's
-// vertices, then the registers. Image transfers into GS memory and copies inside it get a [gs-xfer] line.
+// vertices (with the context's offset already taken off), then the registers, the context's XYOFFSET in pixels ("ofs x,y": a
+// vertex's raw value is its printed one plus this) and the GIF path whose data drew it ("path 1" VU1 XGKICK, "2" VIF1 DIRECT,
+// "3" GIF DMA). Every XYOFFSET write gets a [gs-ofs] line in order with the draws: which context, which path, the new offset.
+// Image transfers into GS memory and copies inside it get a [gs-xfer] line.
 // PS2_DRAW_RANGE=<first>,<last> draws only the primitives with those numbers in the traced frames and skips the others,
 // to see what the frame looks like part way through; PS2_DRAW_SKIP=<first>,<last> skips just those, to see what they add.
 // PS2_TRACE_PIXEL=<x>,<y> adds a [gs-pixel] line for every primitive of the traced frames that reaches that pixel (of any
@@ -627,6 +632,7 @@ bool any() {  // read on first use, not when the program loads, so switches.txt 
 }
 
 std::uint64_t g_frame = 0;  // frame of the draws the render side is doing now
+int g_path = 0;             // GIF path (1-3) of the data the render side is reading now (gif::render sets it; 0 before any)
 std::uint64_t g_number = 0; // primitives so far in this frame
 std::string g_state;        // registers of the line being collected
 std::uint64_t g_first = 0, g_count = 0, g_line_frame = 0;
@@ -646,6 +652,15 @@ void flush() {
                  static_cast<unsigned long long>(g_first), static_cast<unsigned long long>(g_first + g_count - 1), static_cast<unsigned long long>(g_count), g_x0, g_y0,
                  g_x1, g_y1, g_vertices.c_str(), g_state.c_str());
     g_count = 0;
+}
+
+// An XYOFFSET write (A+D or REGLIST) in a traced frame: in order with the draws, so a sprite drawn with the offset before or after
+// the one meant for it shows (issue #128).
+void offset_set(int ctx, std::uint64_t value) {
+    if (!traced(g_frame)) return;
+    flush();
+    std::fprintf(stderr, "[gs-ofs] f%llu after #%llu ctx%d path %d ofs %.4g,%.4g\n", static_cast<unsigned long long>(g_frame), static_cast<unsigned long long>(g_number), ctx,
+                 g_path, static_cast<double>(value & 0xFFFFu) / 16.0, static_cast<double>((value >> 32) & 0xFFFFu) / 16.0);
 }
 
 void frame_start(std::uint64_t frame) {
@@ -739,7 +754,11 @@ bool draw(const State &s, int needed) {
         std::fprintf(stderr, "\n");
     }
     std::string state = registers(s, attr);
-    { char tail[32]; std::snprintf(tail, sizeof tail, "| vu1pc %X ", ps2::vu::g_trace_vu1_pc); state += tail; }
+    {
+        char tail[80];
+        std::snprintf(tail, sizeof tail, "| ofs %.4g,%.4g | path %d | vu1pc %X ", ofx / 16.0, ofy / 16.0, g_path, ps2::vu::g_trace_vu1_pc);
+        state += tail;
+    }
     if (g_count && state == g_state && n == g_first + g_count) {
         ++g_count;
         g_x0 = std::min(g_x0, x0), g_y0 = std::min(g_y0, y0), g_x1 = std::max(g_x1, x1), g_y1 = std::max(g_y1, y1);
@@ -877,7 +896,10 @@ void write(std::uint32_t reg, std::uint64_t value) {
         load_clut(c.tex0);
         break;
     }
-    case 0x18: case 0x19: s.ctx[reg - 0x18].xyoffset = value; break;
+    case 0x18: case 0x19:
+        s.ctx[reg - 0x18].xyoffset = value;
+        if (trace::any()) [[unlikely]] trace::offset_set(static_cast<int>(reg - 0x18), value);
+        break;
     case 0x1A: s.prmodecont = value; break;
     case 0x1B: s.prmode = value; break;
     case 0x1C: s.texclut = value; break;
